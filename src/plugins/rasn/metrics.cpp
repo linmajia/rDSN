@@ -114,6 +114,10 @@ enum core_counter
     CC_MODEL_ADMISSION_DELAYED,
     CC_MODEL_RATE_LIMITED,
     CC_MODEL_RATE_DELAYED,
+    CC_TOOL_ADMISSION_REJECTED,
+    CC_TOOL_ADMISSION_DELAYED,
+    CC_TOOL_RATE_LIMITED,
+    CC_TOOL_RATE_DELAYED,
     CC_COUNT
 };
 
@@ -151,6 +155,18 @@ const counter_def k_core_counters[CC_COUNT] = {
     {"rasn_model_rate_delayed_total",
      "model.rate.delayed",
      "model requests delayed (paced) by the client-side rate limiter"},
+    {"rasn_tool_admission_rejected_total",
+     "tool.admission.rejected",
+     "tool invocations rejected by the admission-control concurrency cap"},
+    {"rasn_tool_admission_delayed_total",
+     "tool.admission.delayed",
+     "tool invocations delayed by admission-control backpressure"},
+    {"rasn_tool_rate_limited_total",
+     "tool.rate.limited",
+     "tool invocations rejected by the client-side rate limiter"},
+    {"rasn_tool_rate_delayed_total",
+     "tool.rate.delayed",
+     "tool invocations delayed (paced) by the client-side rate limiter"},
 };
 
 enum latency_counter
@@ -193,6 +209,10 @@ const std::unordered_map<std::string, int> &kind_to_core_counter()
         {"model.admission.delayed", CC_MODEL_ADMISSION_DELAYED},
         {"model.rate.limited", CC_MODEL_RATE_LIMITED},
         {"model.rate.delayed", CC_MODEL_RATE_DELAYED},
+        {"tool.admission.rejected", CC_TOOL_ADMISSION_REJECTED},
+        {"tool.admission.delayed", CC_TOOL_ADMISSION_DELAYED},
+        {"tool.rate.limited", CC_TOOL_RATE_LIMITED},
+        {"tool.rate.delayed", CC_TOOL_RATE_DELAYED},
     };
     return m;
 }

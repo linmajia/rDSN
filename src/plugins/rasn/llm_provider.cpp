@@ -60,7 +60,12 @@ std::string llm_config(const std::string &key, const std::string &fallback, cons
     {
         return model_value;
     }
-    return config_string("rasn.llm", key, fallback, help);
+    const std::string legacy_value = config_string("rasn.llm", key, "", help);
+    if (!legacy_value.empty())
+    {
+        return legacy_value;
+    }
+    return fallback;
 }
 
 uint64_t llm_config_uint64(const std::string &key, uint64_t fallback, const std::string &help)

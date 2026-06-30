@@ -914,6 +914,68 @@ void nucleus_runtime::record_model_rate_delayed(const agent_task &task,
                  0);
 }
 
+void nucleus_runtime::record_tool_admission_rejected(const agent_task &task,
+                                                     const std::string &tool,
+                                                     uint32_t in_flight,
+                                                     uint32_t limit)
+{
+    record_event(task,
+                 "tool.admission.rejected",
+                 tool,
+                 "in_flight=" + std::to_string(in_flight) + " limit=" + std::to_string(limit),
+                 "",
+                 "",
+                 "",
+                 false,
+                 0);
+}
+
+void nucleus_runtime::record_tool_admission_delayed(const agent_task &task,
+                                                    const std::string &tool,
+                                                    uint32_t in_flight,
+                                                    uint32_t delay_ms)
+{
+    record_event(task,
+                 "tool.admission.delayed",
+                 tool,
+                 "in_flight=" + std::to_string(in_flight) + " delay_ms=" + std::to_string(delay_ms),
+                 "",
+                 "",
+                 "",
+                 false,
+                 0);
+}
+
+void nucleus_runtime::record_tool_rate_limited(const agent_task &task,
+                                               const std::string &tool,
+                                               uint32_t limit_per_min)
+{
+    record_event(task,
+                 "tool.rate.limited",
+                 tool,
+                 "requests_per_min=" + std::to_string(limit_per_min),
+                 "",
+                 "",
+                 "",
+                 false,
+                 0);
+}
+
+void nucleus_runtime::record_tool_rate_delayed(const agent_task &task,
+                                               const std::string &tool,
+                                               uint32_t delay_ms)
+{
+    record_event(task,
+                 "tool.rate.delayed",
+                 tool,
+                 "delay_ms=" + std::to_string(delay_ms),
+                 "",
+                 "",
+                 "",
+                 false,
+                 0);
+}
+
 std::string nucleus_runtime::resolve_nondeterminism(const agent_task &task,
                                                     const std::string &name,
                                                     const std::string &source,

@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -141,6 +142,7 @@ public:
     void stop();
     void set_tool_provider(std::unique_ptr<agent_tool_provider> tools);
     std::string describe_tools() const;
+    std::string tool_resilience_report() const;
     tool_result run_tool(const std::string &name,
                          const std::vector<std::string> &args,
                          nucleus_runtime &runtime,
@@ -149,8 +151,29 @@ public:
     agent_response invoke(const agent_request &request, nucleus_runtime &runtime) const;
 
 private:
-    std::unique_ptr<agent_tool_provider> _tools;
+    std::shared_ptr<agent_tool_provider> current_tool_provider() const;
+    void ensure_tool_admission_config() const;
+    void ensure_tool_rate_config() const;
+    admission_slot tool_admission_admit(const std::string &tool,
+                                        const agent_task &task,
+                                        nucleus_runtime &runtime,
+                                        tool_result *fast_fail) const;
+    rate_decision tool_rate_acquire(const std::string &tool,
+                                    const agent_task &task,
+                                    nucleus_runtime &runtime,
+                                    tool_result *fast_fail) const;
+    void apply_tool_backpressure(const std::string &tool,
+                                 const agent_task &task,
+                                 nucleus_runtime &runtime,
+                                 const admission_slot &slot,
+                                 const rate_decision &rate) const;
+
+    std::shared_ptr<agent_tool_provider> _tools;
     mutable ::dsn::service::zlock _tool_lock;
+    mutable admission_gate_registry _tool_admission;
+    mutable std::once_flag _tool_admission_config_once;
+    mutable rate_limiter_registry _tool_rate;
+    mutable std::once_flag _tool_rate_config_once;
 };
 
 class rasn_coordinator_service : public agent_runtime
@@ -205,6 +228,9 @@ public:
     // admission control, and rate limiting (shared by the `rasn.resilience`
     // command and CodePilot's `observe resilience`).
     std::string model_resilience_report() const;
+    // Human-readable per-tool resilience report covering tool admission/rate
+    // controls.
+    std::string tool_resilience_report() const;
     std::string topology() const;
     std::string tools_summary() const;
     void set_tool_provider(std::unique_ptr<agent_tool_provider> tools);

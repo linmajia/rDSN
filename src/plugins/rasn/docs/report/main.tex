@@ -278,15 +278,12 @@ latency percentiles) exported as text/Prometheus/JSON via \texttt{observe
 metrics} and a \texttt{command\_manager} command & No bundled scrape gateway,
 retention store, or dashboards \\
 Resilience & Bounded coordinator retry, request deadlines, a per-provider
-model circuit breaker (closed/open/half-open) that fast-fails failing endpoints,
-a per-provider admission gate (concurrency bulkhead plus \texttt{exp\_delay}
-backpressure) that protects healthy-but-slow endpoints, and a per-provider
-token-bucket rate limiter that paces calls under the endpoint's
-requests-per-minute quota --- the failure, concurrency, and throughput dimensions
---- surfaced through \texttt{perf\_counter} metrics and a \texttt{rasn.resilience}
-command & Tool and remote-agent gateways are not yet guarded; the limits are
-per-provider rather than a single process-wide budget, and govern request count
-rather than token/cost budgets \\
+model circuit breaker (closed/open/half-open), per-provider admission and rate
+gates for model calls, and per-tool admission/rate gates for tool execution,
+all surfaced through \texttt{perf\_counter} metrics and a
+\texttt{rasn.resilience} command & Remote-agent gateways are not yet guarded;
+the limits are per-dependency rather than a single process-wide budget, and
+govern request count rather than token/cost budgets \\
 \bottomrule
 \end{tabular}
 \end{table*}
@@ -1161,6 +1158,21 @@ disabled by default so existing behavior is unchanged. Its two counters follow t
 same pattern, and live per-provider rate, burst, and tokens appear in the
 \texttt{rasn.resilience} command.
 
+The tool gateway reuses the same admission and rate engines, keyed by tool name.
+After replay lookup and policy approval, \texttt{rasn.tool.agent} reserves an
+admission slot, optionally acquires a rate token, coalesces the requested delays,
+and then invokes the registered provider. Replayed results, replay-missing
+side-effect failures, and policy denials bypass the gates, so robustness controls do
+not perturb replay or safety semantics. The service now holds its provider
+registration lock only while taking a shared provider reference; actual tool
+execution is governed by explicit per-tool limits rather than an implicit global
+mutex. Four additional counters
+(\texttt{rasn\_tool\_admission\_rejected\_total},
+\texttt{rasn\_tool\_admission\_delayed\_total},
+\texttt{rasn\_tool\_rate\_limited\_total}, and
+\texttt{rasn\_tool\_rate\_delayed\_total}) and live per-tool state are exposed
+through the same \texttt{rasn.resilience} surface.
+
 \section{Implementation Details}
 
 \subsection{Code Organization}
@@ -1227,8 +1239,8 @@ Files & Layer & Responsibility \\
 \texttt{observability} & Service & Events, failures, snapshots, replay metadata \\
 \texttt{metrics} & Observability & Perf-counter metric registry and text/Prometheus/JSON rendering \\
 \texttt{circuit\_breaker} & Resilience & Per-provider model circuit breaker (closed/open/half-open) \\
-\texttt{admission\_gate} & Resilience & Per-provider concurrency bulkhead and \texttt{exp\_delay} backpressure \\
-\texttt{rate\_limiter} & Resilience & Per-provider token-bucket rate limiter (requests/minute pacing) \\
+\texttt{admission\_gate} & Resilience & Per-provider/per-tool concurrency bulkhead and \texttt{exp\_delay} backpressure \\
+\texttt{rate\_limiter} & Resilience & Per-provider/per-tool token-bucket rate limiter (requests/minute pacing) \\
 \texttt{llm\_provider/model\_agent} & Provider & Simulator and HTTP-compatible model adapters \\
 \texttt{agent\_tools} & Provider API & Generic tool provider interface \\
 \texttt{codepilot/*} & Application & CLI commands, local tools, skills, provider configuration \\
@@ -1271,11 +1283,13 @@ runtime. The important integration points are:
   to expose the \texttt{rasn.metrics} and \texttt{rasn.resilience} operational
   commands over the \rdsn local and remote CLI.
   \item \texttt{exp\_delay} (\texttt{include/dsn/utility/exp\_delay.h}), \rdsn's
-  staged admission-control delay, reused as the model gateway's backpressure curve
-  so overload throttling matches the host runtime's own task-queue policy.
+  staged admission-control delay, reused as the model and tool gateways'
+  backpressure curve so overload throttling matches the host runtime's own
+  task-queue policy.
   \item \texttt{dsn\_now\_ms} (the env-provider clock) injected into the model
-  circuit breaker and token-bucket rate limiter, so cooldown and token refill are
-  deterministic under replay and seedable rather than reading a private wall clock.
+  circuit breaker and model/tool token-bucket rate limiters, so cooldown and token
+  refill are deterministic under replay and seedable rather than reading a private
+  wall clock.
 \end{itemize}
 
 The implementation currently still has same-process globals for convenience,
@@ -1908,8 +1922,9 @@ through the same
 \texttt{rasn\_model\_breaker\_short\_circuit\_total}); live per-provider state is
 reachable through \codepilot's \texttt{observe resilience} and a
 \texttt{rasn.resilience} command registered with \rdsn's
-\texttt{command\_manager}. Tool and remote-agent gateways are not yet
-breaker-guarded, which is noted as future work.
+\texttt{command\_manager}. Tool gateways are not breaker-guarded (they use
+admission/rate controls instead), and remote-agent gateway guards remain future
+work.
 
 \subsection{Model Admission Control}
 
@@ -2012,6 +2027,39 @@ exported as \texttt{rasn\_model\_rate\_limited\_total} and
 choke point, and live per-provider rate, burst, and available tokens are shown by
 the \texttt{rasn.resilience} command. Rate limiting governs request count;
 token/cost budgets and a process-wide budget are noted as future work.
+
+\subsection{Tool Gateway Admission and Rate Controls}
+
+The tool gateway is another dependency boundary: local filesystem tools, shell
+commands, and future remote tool adapters can be fanned out by workflows or model
+responses independently of model-provider health. Earlier versions protected tools
+with policy, replay, workspace scoping, and timeouts, but they did not provide an
+explicit overload governor. \rasn now reuses \texttt{admission\_gate.*} and
+\texttt{rate\_limiter.*} for tool execution, keyed by tool name.
+
+The ordering preserves existing safety semantics. \texttt{rasn\_tool\_agent\_service}
+first validates the generic request, checks for a recorded replay result, fails
+closed on missing side-effect replay, and evaluates \texttt{rasn.policy}. Only an
+actual, policy-approved provider call reserves a tool admission slot or rate token.
+Thus a replayed shell/write result is deterministic and a policy-denied tool call
+does not consume capacity. When both gates admit, their requested delays are
+coalesced into a single wait (the larger of admission backpressure and rate pacing)
+before invoking the provider. The \texttt{admission\_slot} RAII guard releases
+capacity on success, tool failure, output-bound truncation, validation failure after
+execution, or any early return.
+
+The implementation also removes accidental serialization from the provider pointer
+lock. The service now takes a \texttt{std::shared\_ptr} to the current
+\texttt{agent\_tool\_provider} while holding \rdsn's \texttt{zlock}, releases the
+lock, and then runs validation, policy, governors, and provider execution with that
+stable reference. Concurrency is therefore controlled by product-level
+\texttt{[rasn.tool]} settings rather than by an all-tool mutex. The new events
+\texttt{tool.admission.rejected}, \texttt{tool.admission.delayed},
+\texttt{tool.rate.limited}, and \texttt{tool.rate.delayed} feed four counters and
+the expanded \texttt{rasn.resilience} command, which now reports both model and tool
+gateway state. Tool admission defaults are generous for sequential \codepilot usage,
+and the tool rate limiter remains unlimited unless an operator sets
+\texttt{rate\_limit\_requests\_per\_min}.
 
 \subsection{Testing and Validation}
 
@@ -2391,6 +2439,12 @@ percentiles over \rdsn \texttt{perf\_counter}, exported as text, Prometheus, and
 JSON via \texttt{observe metrics} and the \texttt{rasn.metrics} command & No
 bundled scrape gateway, retention store, or prebuilt dashboards; latency
 percentiles depend on \rdsn's periodic counter timers \\
+Overload/dependency isolation & Model providers have circuit-breaker,
+admission, and rate controls; tools have per-tool admission and rate controls;
+all are surfaced through \texttt{observe resilience} and
+\texttt{rasn.resilience} & Remote-agent gateways are not yet guarded; limits are
+per-dependency rather than process-wide and request-count based rather than
+token/cost based \\
 \bottomrule
 \end{tabular}
 \end{table*}

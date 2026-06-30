@@ -2910,6 +2910,68 @@ Validation:
   available on the authoring host).
 - [ ] `rasn.unit_tests` run on the remote dev machines.
 
+## Phase 72: tool gateway admission and rate controls
+
+Status: `[~]`
+
+Goal: Close the next practical overload-isolation gap by applying the existing
+rDSN-aligned admission and rate engines to tool execution. Model providers already
+have failure/concurrency/throughput protection; tools now get explicit concurrency
+and throughput governors keyed by tool name, without changing replay or policy
+semantics.
+
+rDSN modules reused:
+
+- `admission_gate` / `admission_gate_registry`, including the `exp_delay`-backed
+  backpressure curve and RAII `admission_slot`, now shared by model and tool
+  gateways.
+- `rate_limiter` / `rate_limiter_registry`, with `dsn_now_ms` supplied by the
+  tool service as the token-bucket refill clock.
+- `perf_counter` through the existing `record_event` / `metrics_registry` choke
+  point for four tool-gateway counters.
+- `dsn_config` for `[rasn.tool]` admission/rate tunables.
+- `command_manager` for the expanded `rasn.resilience` command.
+
+Files:
+
+- `agent_services.h` / `agent_services.cpp`
+- `rasn_core.h` / `rasn_core.cpp`
+- `metrics.cpp`, `rate_limiter.h`, `config.ini`
+- `codepilot/codepilot_app.cpp`
+- `tests/rasn_unit_tests.cpp`
+- `README.md`, `docs/DESIGN.md`, `docs/report/main.tex`,
+  `docs/IMPLEMENTATION_PLAN.md`
+
+Work items:
+
+- [x] Replace the implicit all-tool execution serialization with a short provider
+  lock: `rasn_tool_agent_service` takes a shared provider reference under
+  `zlock`, then releases it before validation, policy, gates, and provider
+  execution.
+- [x] Add per-tool admission and rate helpers that run after replay lookup and
+  policy approval, so replay hits, replay-missing side-effect failures, and policy
+  denials never consume capacity.
+- [x] Coalesce admission backpressure and rate pacing into one wait and release
+  admission capacity with RAII on every exit path.
+- [x] Add tool admission/rate runtime events and `perf_counter` series:
+  `rasn_tool_admission_rejected_total`,
+  `rasn_tool_admission_delayed_total`, `rasn_tool_rate_limited_total`, and
+  `rasn_tool_rate_delayed_total`.
+- [x] Expose live per-tool in-flight/rate state through `rasn.resilience` and
+  CodePilot `observe resilience`.
+- [x] Add targeted concurrency coverage for the tool admission cap and extend the
+  ops-command assertion for tool sections.
+- [x] Update user docs, design notes, and the ACM-style technical report.
+
+Validation:
+
+- [x] Built `rasn.unit_tests` and `codepilot` targets with repo CMake 3.22.6.
+- [x] Ran `rasn.unit_tests` (`81` tests passed).
+- [x] Ran direct `codepilot selftest`.
+- [x] Ran `codepilot observe resilience` and confirmed model/tool sections.
+- [x] `git diff --check`.
+- [x] Report brace/bracket balance check (LaTeX toolchain not installed locally).
+
 ## Dependency order
 
 ```text
@@ -2984,6 +3046,7 @@ Phase 1 task model
   -> Phase 69 model gateway circuit breaker
   -> Phase 70 model gateway admission control
   -> Phase 71 model gateway rate limiter
+  -> Phase 72 tool gateway admission and rate controls
 ```
 
 Some phases can overlap after Phase 3, but the public message model and generic

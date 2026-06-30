@@ -18,7 +18,7 @@ The prototype is intentionally small and is organized around four building block
 | rDSN service graph | `agent_services.*`, `rasn.code.definition.h` | Defines rDSN-style micro-service roles for coordinator, model agent, tool agent, state service, workflow service, observability service, and CLI gateway; service mode exposes those roles as `serverlet` RPC services with `clientlet` callers and explicit `RPC_RASN_*` task codes. |
 | Runtime nucleus | `rasn_core.*`, `observability.*`, `schema_manifest.*` | Creates task IDs, trace IDs, structured JSONL runtime events, nondeterministic value capture, external-effect ledger entries, filesystem snapshots, replay lookup, failure records, schema/IDL/JSON manifests, generated C++/TypeScript/Python RPC clients, and observability query APIs. |
 | Runtime metrics | `metrics.*` | Exports cumulative event counters and task/model/tool latency percentiles through rDSN `perf_counter` counters (section `rasn`) and renders them as text, Prometheus, or JSON; exposed via `observe metrics` and the rDSN `command_manager` command `rasn.metrics`. |
-| Resilience | `circuit_breaker.*`, `admission_gate.*`, `rate_limiter.*` | Guards each model provider across the three classic dependency-protection dimensions: a consecutive-failure circuit breaker (closed/open/half-open) so a failing endpoint fails fast, an admission gate (concurrency bulkhead plus `exp_delay`-based backpressure) that protects a healthy-but-slow endpoint from overload, and a token-bucket rate limiter that paces calls under the endpoint's requests-per-minute quota; clocks/curves come from rDSN (`dsn_now_ms`, `exp_delay`), state is exported through `perf_counter` counters and the `rasn.resilience` command, and tuned via `[rasn.model] circuit_breaker_*` / admission / `rate_limit_*` keys. |
+| Resilience | `circuit_breaker.*`, `admission_gate.*`, `rate_limiter.*` | Guards model providers across the three classic dependency-protection dimensions: a consecutive-failure circuit breaker (closed/open/half-open), an admission gate (concurrency bulkhead plus `exp_delay`-based backpressure), and a token-bucket rate limiter. The same admission/rate engines also guard tool execution per tool name, so shell/filesystem/future remote tools cannot fan out unbounded. Clocks/curves come from rDSN (`dsn_now_ms`, `exp_delay`), state is exported through `perf_counter` counters and the `rasn.resilience` command, and tuning lives under `[rasn.model]` and `[rasn.tool]`. |
 | LLM provider layer | `llm_provider.*` | Provides a common `llm_provider` interface and adapters for simulator, Copilot-compatible, Ollama, llama.cpp, LM Studio, and generic OpenAI-compatible HTTP APIs. |
 | Tool provider layer | `agent_tools.*` | Defines the generic rASN tool-provider contract and registration factory used by the tool-agent service. |
 | Workflow graph | `workflow.*` | Parses a declarative task graph, validates dependencies, topologically orders nodes, and executes them through the selected provider. |
@@ -283,6 +283,29 @@ two counters (`rasn_model_rate_limited_total`, `rasn_model_rate_delayed_total`),
 and live per-provider rate/burst/available-tokens show up in `rasn.resilience`.
 Tuning lives under `[rasn.model] rate_limit_enabled`,
 `rate_limit_requests_per_min`, `rate_limit_burst`, and `rate_limit_max_wait_ms`.
+
+### Resilience: tool admission and rate controls
+
+Tools are also outbound dependencies: a coding agent can fan out many `read`,
+`search`, `shell`, or future remote-tool calls even when the model path is healthy.
+rASN now applies the same reusable resilience engines to the tool gateway, keyed by
+tool name. After replay lookup and policy approval, `rasn.tool.agent` reserves a
+per-tool admission slot, optionally takes a per-tool rate token, coalesces any
+admission backpressure and rate pacing into one delay, and then invokes the tool
+provider. Replayed calls and policy-denied side effects never consume capacity, and
+the `admission_slot` RAII guard releases the concurrency slot on every exit path.
+
+The tool provider pointer is held only long enough to take a shared reference, so
+the old provider-registration lock no longer serializes all tool execution.
+Instead, concurrency is explicit and observable through `[rasn.tool]`
+`max_concurrent_requests`, `soft_concurrent_requests`, `max_backpressure_ms`,
+`rate_limit_requests_per_min`, `rate_limit_burst`, and
+`rate_limit_max_wait_ms`. The rate limiter is disabled by default
+(`rate_limit_requests_per_min = 0`) and the admission defaults are generous enough
+for normal sequential CLI use. Rejections and delays are exported as
+`rasn_tool_admission_rejected_total`, `rasn_tool_admission_delayed_total`,
+`rasn_tool_rate_limited_total`, and `rasn_tool_rate_delayed_total`; live state is
+shown by `rasn.resilience` and `observe resilience`.
 
 ### Tool calling model
 
@@ -624,6 +647,14 @@ The most important sections are:
 | `[rasn.model] rate_limit_requests_per_min` | Sustained model request rate per provider in requests/minute (default `0` = unlimited / disabled). The token-bucket refill rate. |
 | `[rasn.model] rate_limit_burst` | Rate-limiter burst capacity in tokens (default `0` = about one second of the sustained rate, minimum 1). |
 | `[rasn.model] rate_limit_max_wait_ms` | Max milliseconds a request may be paced waiting for a token before it is rejected instead (default `1000`; `0` = reject immediately when the bucket is empty). Inspect live rate/burst/tokens with the `rasn.resilience` command. |
+| `[rasn.tool] admission_enabled` | Enables the per-tool admission gate (default `true`). Replayed tool results and policy-denied calls bypass the gate. |
+| `[rasn.tool] max_concurrent_requests` | Hard cap on concurrent in-flight tool invocations per tool name (default `16`; `0` = unlimited). Excess invocations fast-fail. |
+| `[rasn.tool] soft_concurrent_requests` | Per-tool in-flight level at which graceful backpressure begins (default `8`; `0` = no backpressure). |
+| `[rasn.tool] max_backpressure_ms` | Upper bound in milliseconds on graceful tool backpressure (default `100`). Inspect live in-flight depth with `rasn.resilience`. |
+| `[rasn.tool] rate_limit_enabled` | Enables the per-tool rate limiter (default `true`). Has no effect unless `rate_limit_requests_per_min` is non-zero. |
+| `[rasn.tool] rate_limit_requests_per_min` | Sustained invocation rate per tool name in requests/minute (default `0` = unlimited / disabled). |
+| `[rasn.tool] rate_limit_burst` | Per-tool rate-limiter burst capacity in tokens (default `0` = about one second of the sustained rate, minimum 1). |
+| `[rasn.tool] rate_limit_max_wait_ms` | Max milliseconds an invocation may be paced waiting for a token before it is rejected (default `1000`; `0` = reject immediately when the bucket is empty). |
 | `[rasn.service] host`, `<name>_host`, `<name>_port`, `<name>_uri` | rDSN service graph endpoints. `<name>_uri` takes precedence and supports resolver-backed values such as `dsn://cluster/rasn.coordinator`; otherwise rASN uses host/port. |
 | `[rasn.coordinator] max_retry_budget` | Caps per-request `retry_budget` for retryable model-agent dispatch. Tool capabilities are never retried by the coordinator. |
 | `[rasn.workflow] execution_lease_ms` | Time-to-live for durable workflow execution owner leases. Active duplicate starts are rejected until the owner finishes or the lease becomes stale. |
@@ -813,7 +844,7 @@ observe diagnose [trace] summarize failures and replay issues
 observe failures         query classified failure records
 observe replay <file>    load replay choices through rasn.observability
 observe metrics [format] dump runtime metrics (text|prometheus|json)
-observe resilience       dump model circuit-breaker, admission, and rate-limiter state
+observe resilience       dump model/tool gateway resilience state
 observe snapshot         summarize observability state
 skills                   list CodePilot skills
 skill <name> [task]      show or apply a skill prompt
@@ -1033,7 +1064,7 @@ hardening gaps remain:
 | SDK packaging | Generated C++/TypeScript/Python contracts and RPC-client source. | Packaged SDKs and concrete TypeScript/Python transports are not shipped. |
 | Evaluation evidence | Unit tests, self-tests, service smokes, schema smokes, report build, and a small eval harness. | Large benchmarks and user studies for debugging effectiveness remain future work. |
 | Observability metrics | Cumulative event counters and task/model/tool latency percentiles via rDSN `perf_counter`, exported as text/Prometheus/JSON through `observe metrics` and the `rasn.metrics` rDSN command. | No bundled scrape gateway, retention store, or prebuilt dashboards; percentiles rely on rDSN's periodic counter timers. |
-| Overload / dependency isolation | Per-provider model circuit breaker (closed/open/half-open) that fast-fails calls to a failing endpoint, a per-provider admission gate (concurrency bulkhead and `exp_delay`-based backpressure) that protects a healthy-but-slow endpoint from overload, and a per-provider token-bucket rate limiter that paces calls under the endpoint's requests-per-minute quota — the failure, concurrency, and throughput dimensions — all surfaced through `perf_counter` counters, `observe resilience`, and the `rasn.resilience` command. | Tool and remote-agent gateways are not breaker-, admission-, or rate-guarded yet; the limits are per-provider rather than a single process-wide budget; rate limiting governs request count but not token/cost budgets; in RPC-client mode the state lives on the serving node. |
+| Overload / dependency isolation | Model providers have the full failure/concurrency/throughput trio: per-provider circuit breaker, admission gate, and token-bucket rate limiter. Tool execution now has per-tool admission and rate controls using the same engines, with replay/policy bypasses and live state in `observe resilience` / `rasn.resilience`. | Remote-agent gateways are not breaker-, admission-, or rate-guarded yet; model/tool limits are per-dependency rather than a single process-wide budget; rate limiting governs request count but not token/cost budgets; in RPC-client mode the state lives on the serving node. |
 
 ## Troubleshooting
 

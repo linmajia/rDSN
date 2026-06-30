@@ -258,6 +258,42 @@ std::string format_model_rate_states(const std::vector<rate_limiter_registry::en
     return oss.str();
 }
 
+std::string format_tool_admission_states(const std::vector<admission_gate_registry::entry> &states)
+{
+    if (states.empty())
+    {
+        return "tool admission control: none engaged";
+    }
+    std::ostringstream oss;
+    oss << "tool admission control:";
+    for (size_t i = 0; i < states.size(); ++i)
+    {
+        const admission_gate_registry::entry &entry = states[i];
+        oss << "\n- tool=" << entry.key << " in_flight=" << entry.in_flight
+            << " max_concurrency=" << entry.max_concurrency
+            << " soft_concurrency=" << entry.soft_concurrency;
+    }
+    return oss.str();
+}
+
+std::string format_tool_rate_states(const std::vector<rate_limiter_registry::entry> &states)
+{
+    if (states.empty())
+    {
+        return "tool rate limiters: none engaged";
+    }
+    std::ostringstream oss;
+    oss << "tool rate limiters:";
+    for (size_t i = 0; i < states.size(); ++i)
+    {
+        const rate_limiter_registry::entry &entry = states[i];
+        oss << "\n- tool=" << entry.key << " requests_per_min=" << entry.requests_per_min
+            << " burst=" << entry.burst << " tokens=" << std::fixed << std::setprecision(2)
+            << entry.tokens;
+    }
+    return oss.str();
+}
+
 std::string descriptor_line(const std::string &label, const agent_descriptor &descriptor)
 {
     std::ostringstream oss;
@@ -423,6 +459,58 @@ rate_limit_config read_model_rate_config()
         "rate_limit_max_wait_ms",
         1000,
         "max ms a request may be paced waiting for a token before it is rejected (0 = reject immediately)");
+    return cfg;
+}
+
+admission_config read_tool_admission_config()
+{
+    admission_config cfg;
+    cfg.enabled = ::dsn_config_get_value_bool(
+        "rasn.tool",
+        "admission_enabled",
+        true,
+        "enable rASN tool-gateway admission control (concurrency bulkhead + backpressure)");
+    cfg.max_concurrency = read_config_u32(
+        "rasn.tool",
+        "max_concurrent_requests",
+        16,
+        "hard cap on concurrent in-flight tool invocations per tool name (0 = unlimited)");
+    cfg.soft_concurrency = read_config_u32(
+        "rasn.tool",
+        "soft_concurrent_requests",
+        8,
+        "in-flight level at which graceful tool admission backpressure begins (0 = no backpressure)");
+    cfg.max_backpressure_ms = read_config_u32(
+        "rasn.tool",
+        "max_backpressure_ms",
+        100,
+        "upper bound in ms on graceful tool admission backpressure delay");
+    return cfg;
+}
+
+rate_limit_config read_tool_rate_config()
+{
+    rate_limit_config cfg;
+    cfg.enabled = ::dsn_config_get_value_bool(
+        "rasn.tool",
+        "rate_limit_enabled",
+        true,
+        "enable rASN tool-gateway client-side rate limiter (token bucket)");
+    cfg.requests_per_min = read_config_u32(
+        "rasn.tool",
+        "rate_limit_requests_per_min",
+        0,
+        "sustained tool invocation rate per tool name in requests/minute (0 = unlimited)");
+    cfg.burst = read_config_u32(
+        "rasn.tool",
+        "rate_limit_burst",
+        0,
+        "tool rate-limiter burst capacity in tokens (0 = ~1s of the sustained rate)");
+    cfg.max_wait_ms = read_config_u32(
+        "rasn.tool",
+        "rate_limit_max_wait_ms",
+        1000,
+        "max ms a tool invocation may be paced waiting for a token before it is rejected");
     return cfg;
 }
 
@@ -913,18 +1001,112 @@ void rasn_tool_agent_service::set_tool_provider(std::unique_ptr<agent_tool_provi
 {
     dassert(tools != nullptr, "rASN tool provider cannot be null");
     ::dsn::service::zauto_lock guard(_tool_lock);
-    _tools = std::move(tools);
+    _tools = std::shared_ptr<agent_tool_provider>(std::move(tools));
     dinfo("installed rASN tool provider");
+}
+
+std::shared_ptr<agent_tool_provider> rasn_tool_agent_service::current_tool_provider() const
+{
+    ::dsn::service::zauto_lock guard(_tool_lock);
+    return _tools;
 }
 
 std::string rasn_tool_agent_service::describe_tools() const
 {
-    ::dsn::service::zauto_lock guard(_tool_lock);
-    if (_tools == nullptr)
+    const std::shared_ptr<agent_tool_provider> tools = current_tool_provider();
+    if (tools == nullptr)
     {
         return "no tool provider registered";
     }
-    return _tools->describe_tools();
+    return tools->describe_tools();
+}
+
+void rasn_tool_agent_service::ensure_tool_admission_config() const
+{
+    std::call_once(_tool_admission_config_once,
+                   [this] { _tool_admission.set_config(read_tool_admission_config()); });
+}
+
+void rasn_tool_agent_service::ensure_tool_rate_config() const
+{
+    std::call_once(_tool_rate_config_once,
+                   [this] { _tool_rate.set_config(read_tool_rate_config()); });
+}
+
+admission_slot rasn_tool_agent_service::tool_admission_admit(const std::string &tool,
+                                                             const agent_task &task,
+                                                             nucleus_runtime &runtime,
+                                                             tool_result *fast_fail) const
+{
+    ensure_tool_admission_config();
+    admission_gate &gate = _tool_admission.get(tool);
+    admission_slot slot = gate.try_admit();
+    if (!slot.admitted())
+    {
+        dwarn("rASN tool admission control rejected invocation for tool=%s; concurrency limit %u reached",
+              tool.c_str(),
+              static_cast<unsigned int>(slot.limit()));
+        runtime.record_tool_admission_rejected(task, tool, slot.in_flight(), slot.limit());
+        if (fast_fail != nullptr)
+        {
+            *fast_fail = rpc_error_tool_result("tool admission control rejected invocation for tool " + tool +
+                                               "; concurrency limit " + std::to_string(slot.limit()) + " reached");
+        }
+    }
+    return slot;
+}
+
+rate_decision rasn_tool_agent_service::tool_rate_acquire(const std::string &tool,
+                                                         const agent_task &task,
+                                                         nucleus_runtime &runtime,
+                                                         tool_result *fast_fail) const
+{
+    ensure_tool_rate_config();
+    rate_limiter &limiter = _tool_rate.get(tool);
+    const rate_decision decision = limiter.try_acquire(::dsn_now_ms());
+    if (!decision.allowed)
+    {
+        dwarn("rASN tool rate limiter rejected invocation for tool=%s; rate %u req/min exceeded",
+              tool.c_str(),
+              static_cast<unsigned int>(decision.limit_per_min));
+        runtime.record_tool_rate_limited(task, tool, decision.limit_per_min);
+        if (fast_fail != nullptr)
+        {
+            *fast_fail = rpc_error_tool_result("tool rate limiter rejected invocation for tool " + tool +
+                                               "; rate " + std::to_string(decision.limit_per_min) +
+                                               " req/min exceeded");
+        }
+    }
+    return decision;
+}
+
+void rasn_tool_agent_service::apply_tool_backpressure(const std::string &tool,
+                                                      const agent_task &task,
+                                                      nucleus_runtime &runtime,
+                                                      const admission_slot &slot,
+                                                      const rate_decision &rate) const
+{
+    const uint32_t admission_delay = slot.delay_ms();
+    const uint32_t rate_delay = rate.delay_ms;
+    if (admission_delay > 0)
+    {
+        runtime.record_tool_admission_delayed(task, tool, slot.in_flight(), admission_delay);
+    }
+    if (rate_delay > 0)
+    {
+        runtime.record_tool_rate_delayed(task, tool, rate_delay);
+    }
+    const uint32_t delay = (std::max)(admission_delay, rate_delay);
+    if (delay > 0)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+    }
+}
+
+std::string rasn_tool_agent_service::tool_resilience_report() const
+{
+    return format_tool_admission_states(_tool_admission.snapshot()) + "\n" +
+           format_tool_rate_states(_tool_rate.snapshot());
 }
 
 tool_result rasn_tool_agent_service::run_tool(const std::string &name,
@@ -933,8 +1115,6 @@ tool_result rasn_tool_agent_service::run_tool(const std::string &name,
                                               const agent_task &task,
                                               const std::vector<std::string> &policy_labels) const
 {
-    ::dsn::service::zauto_lock guard(_tool_lock);
-
     // Record tool latency at the point where every tool execution converges:
     // the CodePilot CLI path (rasn_service_graph::invoke -> coordinator), the
     // workflow facade (rasn_service_graph::run_tool), the RPC server path, and
@@ -953,7 +1133,8 @@ tool_result rasn_tool_agent_service::run_tool(const std::string &name,
         }
     } latency_recorder{tool_start_ms};
 
-    if (_tools == nullptr)
+    const std::shared_ptr<agent_tool_provider> tools = current_tool_provider();
+    if (tools == nullptr)
     {
         return rpc_error_tool_result("no tool provider registered");
     }
@@ -1019,8 +1200,28 @@ tool_result rasn_tool_agent_service::run_tool(const std::string &name,
           decision.side_effect.c_str(),
           decision.reason.c_str());
 
+    tool_result fast_fail;
+    admission_slot admission = tool_admission_admit(name, task, runtime, &fast_fail);
+    if (!admission.admitted())
+    {
+        record_external_effect_if_needed(runtime, task, side_effect, name, arguments, "admission_rejected");
+        runtime.record_tool_call(task, name, arguments, false, fast_fail.error);
+        runtime.record_failure(task, "tool", "admission_rejected", fast_fail.error, false, "rasn.tool.agent");
+        return fast_fail;
+    }
+
+    rate_decision rate = tool_rate_acquire(name, task, runtime, &fast_fail);
+    if (!rate.allowed)
+    {
+        record_external_effect_if_needed(runtime, task, side_effect, name, arguments, "rate_limited");
+        runtime.record_tool_call(task, name, arguments, false, fast_fail.error);
+        runtime.record_failure(task, "tool", "rate_limited", fast_fail.error, false, "rasn.tool.agent");
+        return fast_fail;
+    }
+    apply_tool_backpressure(name, task, runtime, admission, rate);
+
     const tool_result result = global_policy_manager().apply_tool_output_bounds(
-        name, task, _tools->run_with_policy_labels(name, args, policy_labels, runtime, task));
+        name, task, tools->run_with_policy_labels(name, args, policy_labels, runtime, task));
     record_external_effect_if_needed(
         runtime, task, side_effect, name, arguments, result.ok ? "committed.ok" : "committed.error");
     runtime.record_tool_call(task, name, arguments, result.ok, result.ok ? result.output : result.error);
@@ -1427,14 +1628,16 @@ void rasn_service_graph::register_ops_commands_once()
 
         ::dsn::register_command(
             "rasn.resilience",
-            "rasn.resilience - dump rASN model resilience state",
+            "rasn.resilience - dump rASN dependency resilience state",
             "rasn.resilience - list each model provider's circuit-breaker state "
             "(closed|open|half_open) with consecutive failure count, its "
             "admission-control state (in-flight vs concurrency cap), and its "
-            "rate-limiter state (requests/min, burst, available tokens)",
+            "rate-limiter state (requests/min, burst, available tokens), plus "
+            "tool admission/rate limiter state",
             [](const ::dsn::safe_vector<::dsn::safe_string> &args) -> ::dsn::safe_string {
                 (void)args;
-                const std::string out = global_rasn_services().model_resilience_report();
+                const std::string out = global_rasn_services().model_resilience_report() + "\n" +
+                                        global_rasn_services().tool_resilience_report();
                 return ::dsn::safe_string(out.c_str());
             });
         dinfo("registered rASN ops command: rasn.resilience");
@@ -1683,6 +1886,11 @@ std::string rasn_service_graph::model_resilience_report() const
     return format_model_breaker_states(model_breaker_states()) + "\n" +
            format_model_admission_states(model_admission_states()) + "\n" +
            format_model_rate_states(model_rate_states());
+}
+
+std::string rasn_service_graph::tool_resilience_report() const
+{
+    return _tool_agent.tool_resilience_report();
 }
 
 std::string rasn_service_graph::topology() const

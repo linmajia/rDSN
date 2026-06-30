@@ -1,12 +1,13 @@
 #pragma once
 
-// rASN client-side rate limiter for outbound dependencies (model providers).
+// rASN client-side rate limiter for outbound dependencies (model providers,
+// tool adapters, and future remote-agent gateways).
 //
 // This is the throughput-protection counterpart to circuit_breaker.h (failure
 // isolation) and admission_gate.h (concurrency bulkhead): together they form the
 // three classic dimensions of outbound-dependency protection. Hosted model APIs
-// enforce requests-per-minute / tokens-per-minute quotas; exceeding them yields
-// HTTP 429s, wasted retries, and -- on metered endpoints -- real cost. A
+// and remote tool adapters enforce requests-per-minute / tokens-per-minute
+// quotas; exceeding them yields 429s, wasted retries, and -- on metered endpoints -- real cost. A
 // token-bucket governor paces outbound calls to stay under a configured rate:
 // it admits immediately while tokens remain, delays briefly (reserving a token)
 // when the caller is slightly ahead of the rate, and fast-fails when the

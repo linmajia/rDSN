@@ -158,9 +158,25 @@ public:
     void record_model_rate_delayed(const agent_task &task,
                                    const std::string &provider,
                                    uint32_t delay_ms);
+    // Tool-gateway overload/quota events. These mirror the model-gateway
+    // admission/rate events but are keyed by tool name.
+    void record_tool_admission_rejected(const agent_task &task,
+                                       const std::string &tool,
+                                       uint32_t in_flight,
+                                       uint32_t limit);
+    void record_tool_admission_delayed(const agent_task &task,
+                                      const std::string &tool,
+                                      uint32_t in_flight,
+                                      uint32_t delay_ms);
+    void record_tool_rate_limited(const agent_task &task,
+                                  const std::string &tool,
+                                  uint32_t limit_per_min);
+    void record_tool_rate_delayed(const agent_task &task,
+                                  const std::string &tool,
+                                  uint32_t delay_ms);
     std::string resolve_nondeterminism(const agent_task &task,
-                                       const std::string &name,
-                                       const std::string &source,
+                                      const std::string &name,
+                                      const std::string &source,
                                        const std::function<std::string()> &generator);
     std::vector<runtime_event> events() const { return _log.snapshot(); }
 

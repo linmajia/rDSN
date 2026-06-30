@@ -21,12 +21,16 @@
 #include <dsn/tool-api/task.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
 #include <chrono>
 #include <climits>
+#include <condition_variable>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -103,6 +107,72 @@ public:
 
 private:
     uint32_t _sleep_ms;
+};
+
+class blocking_tool_provider : public agent_tool_provider
+{
+public:
+    std::string describe_tools() const override { return "blocking test tool provider"; }
+
+    tool_result run(const std::string &name,
+                    const std::vector<std::string> &args,
+                    nucleus_runtime &runtime,
+                    const agent_task &task) const override
+    {
+        (void)args;
+        (void)runtime;
+        (void)task;
+        {
+            std::unique_lock<std::mutex> guard(_lock);
+            ++_running;
+            _max_running = (std::max)(_max_running, _running);
+            _cv.notify_all();
+            while (!_released)
+            {
+                _cv.wait(guard);
+            }
+            --_running;
+        }
+        tool_result result;
+        result.ok = true;
+        result.output = name + ":unblocked";
+        return result;
+    }
+
+    bool wait_for_running(uint32_t target, uint32_t timeout_ms) const
+    {
+        const std::chrono::steady_clock::time_point deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        std::unique_lock<std::mutex> guard(_lock);
+        while (_running < target)
+        {
+            if (_cv.wait_until(guard, deadline) == std::cv_status::timeout)
+            {
+                return _running >= target;
+            }
+        }
+        return true;
+    }
+
+    void release_all() const
+    {
+        std::lock_guard<std::mutex> guard(_lock);
+        _released = true;
+        _cv.notify_all();
+    }
+
+    uint32_t max_running() const
+    {
+        std::lock_guard<std::mutex> guard(_lock);
+        return _max_running;
+    }
+
+private:
+    mutable std::mutex _lock;
+    mutable std::condition_variable _cv;
+    mutable uint32_t _running = 0;
+    mutable uint32_t _max_running = 0;
+    mutable bool _released = false;
 };
 
 std::string temp_file_path(const std::string &name)
@@ -592,6 +662,72 @@ TEST(rasn_agent_runtime, tool_invoke_reports_cancellation_requested_while_inflig
     ASSERT_TRUE(cancel.ok);
     EXPECT_FALSE(response.ok);
     EXPECT_EQ("request_cancelled", response.error.code);
+}
+
+TEST(rasn_tool_resilience, admission_guard_caps_concurrent_tool_invocations)
+{
+    rasn_tool_agent_service tool_agent;
+    blocking_tool_provider *provider = new blocking_tool_provider();
+    tool_agent.set_tool_provider(std::unique_ptr<agent_tool_provider>(provider));
+    nucleus_runtime runtime;
+
+    const uint32_t configured_cap = 16;
+    const uint32_t requests = configured_cap + 4;
+    std::vector<tool_result> results(requests);
+    std::vector<std::thread> threads;
+    threads.reserve(requests);
+    std::atomic<uint32_t> finished(0);
+    for (uint32_t i = 0; i < requests; ++i)
+    {
+        threads.push_back(std::thread([&, i]() {
+            agent_task task;
+            task.id = "tool-admission-" + std::to_string(i);
+            task.name = "unit.tool.admission";
+            task.input = ".";
+            results[i] = tool_agent.run_tool("list", std::vector<std::string>{"."}, runtime, task);
+            ++finished;
+        }));
+    }
+
+    const bool saturated = provider->wait_for_running(configured_cap, 5000);
+    for (int attempt = 0; attempt < 200 && finished.load() < requests - configured_cap; ++attempt)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    provider->release_all();
+    for (std::thread &thread : threads)
+    {
+        thread.join();
+    }
+
+    ASSERT_TRUE(saturated);
+    EXPECT_EQ(configured_cap, provider->max_running());
+    uint32_t ok = 0;
+    uint32_t rejected = 0;
+    for (const tool_result &result : results)
+    {
+        if (result.ok)
+        {
+            ++ok;
+        }
+        else if (result.error.find("tool admission control rejected") != std::string::npos)
+        {
+            ++rejected;
+        }
+    }
+    EXPECT_EQ(configured_cap, ok);
+    EXPECT_EQ(requests - configured_cap, rejected);
+
+    uint32_t rejection_events = 0;
+    for (const runtime_event &event : runtime.events())
+    {
+        if (event.kind == "tool.admission.rejected")
+        {
+            ++rejection_events;
+        }
+    }
+    EXPECT_EQ(requests - configured_cap, rejection_events);
+    EXPECT_NE(std::string::npos, tool_agent.tool_resilience_report().find("tool admission control"));
 }
 
 TEST(rasn_registry, tracks_heartbeat_leases_and_endpoint_refresh)
@@ -2051,6 +2187,8 @@ TEST(rasn_circuit_breaker, ops_command_reports_breaker_state)
     EXPECT_NE(std::string::npos, std::string(out.c_str()).find("model circuit breakers"));
     EXPECT_NE(std::string::npos, std::string(out.c_str()).find("model admission control"));
     EXPECT_NE(std::string::npos, std::string(out.c_str()).find("model rate limiters"));
+    EXPECT_NE(std::string::npos, std::string(out.c_str()).find("tool admission control"));
+    EXPECT_NE(std::string::npos, std::string(out.c_str()).find("tool rate limiters"));
 
     services.release();
 }

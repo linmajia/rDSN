@@ -504,6 +504,13 @@ Correctness and robustness requirements:
   through `shell_container_template` with `{command}`, `{raw_command}`,
   `{workspace}`, and `{raw_workspace}` placeholders. The default `local`
   executor preserves existing behavior.
+- Tool execution is guarded after replay and policy checks by per-tool admission
+  and rate controls. Replayed results and policy-denied side effects do not
+  consume tool capacity; admitted calls hold an RAII `admission_slot` while the
+  provider runs.
+- The tool provider registration lock is held only while taking a shared provider
+  reference. Actual execution concurrency is governed by `[rasn.tool]`, not by an
+  implicit mutex around all tools.
 - Every admitted, denied, replayed, or replay-missing side-effect tool call
   records an `external.effect` event with effect class, operation fingerprint,
   replay policy, and status.
@@ -821,6 +828,48 @@ rDSN design:
   `rate_limit_burst`, and `rate_limit_max_wait_ms` are read once through
   `dsn_config` with null-safe defaults.
 
+### 12.5 Tool gateway admission and rate controls
+
+The same overload dimensions apply to tools. A single model response can request a
+burst of `read`/`search` calls, or an application adapter can expose shell/network
+tools backed by local processes or remote services. Without an explicit governor,
+the tool gateway either serializes too much behind an implementation mutex or lets
+concurrent calls fan out without a product-level budget. rASN therefore reuses the
+existing admission and rate engines for tool execution, keyed by tool name.
+
+Responsibilities:
+
+- Bound simultaneous in-flight invocations per tool name, fast-failing excess load
+  with a normal failed `tool_result`.
+- Smooth bursts with the same `exp_delay`-backed admission curve used for model
+  providers and rDSN task queues.
+- Optionally pace a tool under an operator-defined requests-per-minute quota using
+  the shared token-bucket limiter.
+- Preserve replay and policy semantics: replay hits, replay-missing side-effect
+  failures, and policy denials occur before the gates and never consume tool
+  capacity.
+
+rDSN design:
+
+- `rasn_tool_agent_service` takes a shared pointer to the registered
+  `agent_tool_provider` under `zlock`, then releases the lock before validation,
+  policy, gates, and provider execution. The provider remains alive for the call,
+  but unrelated tools are no longer serialized by registration state.
+- `admission_gate_registry` and `rate_limiter_registry` are reused directly. Tool
+  admission reads `[rasn.tool] admission_enabled`, `max_concurrent_requests`,
+  `soft_concurrent_requests`, and `max_backpressure_ms`; tool rate limiting reads
+  `[rasn.tool] rate_limit_*`.
+- Backpressure and rate pacing are coalesced into a single sleep (the larger of
+  the two delays), matching the model gateway and avoiding additive over-delay.
+- `rasn_tool_admission_rejected_total`,
+  `rasn_tool_admission_delayed_total`, `rasn_tool_rate_limited_total`, and
+  `rasn_tool_rate_delayed_total` are emitted through `record_event` and rDSN
+  `perf_counter` counters. Live per-tool in-flight/rate state is shown by
+  `rasn.resilience` and CodePilot `observe resilience`.
+- The rate limiter is unlimited by default (`rate_limit_requests_per_min = 0`) and
+  the admission defaults are generous, so normal sequential CLI usage remains
+  unchanged while service-mode fan-out becomes explicit and observable.
+
 ### 13. Service-mode integration self-test
 
 The service-mode integration layer turns rASN correctness assumptions into a
@@ -1099,13 +1148,11 @@ remaining limitations are:
   periodic counter timers.
 - **Overload and dependency isolation:** the model gateway has a per-provider
   circuit breaker that fast-fails calls to a failing endpoint, a per-provider
-  admission gate (concurrency bulkhead plus `exp_delay`-based backpressure) that
-  protects a healthy-but-slow endpoint from overload, and a per-provider
-  token-bucket rate limiter that paces calls under the endpoint's published
-  requests-per-minute quota — the failure, concurrency, and throughput dimensions
-  of dependency protection — all surfaced through `perf_counter` metrics and the
-  `rasn.resilience` command. Remaining gaps: the tool and remote-agent gateways are
-  not yet breaker-, admission-, or rate-guarded; the limits are per-provider rather
-  than a single process-wide budget; rate limiting governs request count but not
-  token/cost budgets; and in RPC-client mode the resilience state lives on the
-  serving node rather than the client.
+  admission gate (concurrency bulkhead plus `exp_delay`-based backpressure), and a
+  per-provider token-bucket rate limiter. The tool gateway now reuses the
+  admission and rate engines per tool name, after replay and policy checks, so
+  tool fan-out is bounded and observable. Remaining gaps: remote-agent gateways are
+  not yet breaker-, admission-, or rate-guarded; the limits are per-dependency
+  rather than a single process-wide budget; rate limiting governs request count
+  but not token/cost budgets; and in RPC-client mode the resilience state lives on
+  the serving node rather than the client.
