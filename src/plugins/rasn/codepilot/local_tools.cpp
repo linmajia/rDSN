@@ -391,7 +391,7 @@ void drain_pipe(HANDLE read_pipe, std::string *output)
         }
 
         DWORD read = 0;
-        const DWORD to_read = std::min<DWORD>(available, static_cast<DWORD>(buffer.size()));
+        const DWORD to_read = (std::min)(available, static_cast<DWORD>(buffer.size()));
         if (!ReadFile(read_pipe, buffer.data(), to_read, &read, nullptr) || read == 0)
         {
             return;

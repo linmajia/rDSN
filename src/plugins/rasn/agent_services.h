@@ -65,6 +65,14 @@ private:
     // Lazily load [rasn.model] rate-limit tunables (null-safe; defaults before
     // rDSN config is loaded).
     void ensure_model_rate_config();
+    // Non-mutating breaker precheck: returns true and fills *fast_fail when the
+    // provider's breaker is open and still cooling down, so an open breaker
+    // fast-fails ahead of admission/rate rejection. Does not consume the half-open
+    // probe; the authoritative model_breaker_admit() runs after the other gates.
+    bool model_breaker_is_open(const std::string &provider,
+                               const agent_task &task,
+                               nucleus_runtime &runtime,
+                               llm_response *fast_fail);
     // Returns false and fills *fast_fail when the breaker for the active provider
     // is open and the request must be short-circuited without calling out.
     bool model_breaker_admit(const std::string &provider,
@@ -96,6 +104,11 @@ private:
                                      const agent_task &task,
                                      nucleus_runtime &runtime,
                                      llm_response *fast_fail);
+    // Return a rate-limiter token taken by model_rate_acquire() when the request is
+    // abandoned before reaching the provider (the breaker short-circuited it after
+    // the token was acquired). Keeps a breaker fast-fail from draining the quota. A
+    // no-op when the limiter is disabled/unlimited (no token was taken).
+    void model_rate_refund(const std::string &provider);
     // Apply (and record) the combined admission + rate-limiter backpressure delay,
     // if any. Called after admission, the rate limiter, and the breaker have all
     // admitted the request. Sleeps once for the larger of the two delays so the

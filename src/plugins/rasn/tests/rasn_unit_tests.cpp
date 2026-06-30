@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
+#include <climits>
 #include <fstream>
 #include <memory>
 #include <sstream>
@@ -1921,6 +1922,50 @@ TEST(rasn_circuit_breaker, half_open_admits_single_probe_then_recovers)
     EXPECT_EQ(0u, breaker.consecutive_failures());
 }
 
+TEST(rasn_circuit_breaker, is_open_precheck_is_nonmutating_and_respects_cooldown)
+{
+    breaker_config cfg;
+    cfg.failure_threshold = 1;
+    cfg.open_ms = 1000;
+    circuit_breaker breaker(cfg);
+
+    // A closed breaker is never reported open.
+    EXPECT_FALSE(breaker.is_open(0));
+
+    EXPECT_TRUE(breaker.report(false, 0)); // opens immediately (threshold 1)
+    EXPECT_EQ(breaker_state::open, breaker.state());
+
+    // While cooling down, the non-mutating precheck reports open...
+    EXPECT_TRUE(breaker.is_open(10));
+    EXPECT_TRUE(breaker.is_open(999));
+    // ...and repeated prechecks do not consume the one-shot half-open probe.
+    EXPECT_EQ(breaker_state::open, breaker.state());
+
+    // Once the cooldown elapses the breaker is ready to admit a probe, so the
+    // precheck no longer reports a hard-open state (the request should flow
+    // through the other gates and let allow() admit the probe).
+    EXPECT_FALSE(breaker.is_open(1000));
+    EXPECT_EQ(breaker_state::open, breaker.state()); // still not mutated by the precheck
+
+    // allow() (the authoritative, mutating check) still admits exactly one probe.
+    const breaker_decision probe = breaker.allow(1000);
+    EXPECT_TRUE(probe.allowed);
+    EXPECT_TRUE(probe.half_open_probe);
+    EXPECT_EQ(breaker_state::half_open, breaker.state());
+    // In half-open the precheck does not claim hard-open (allow() arbitrates).
+    EXPECT_FALSE(breaker.is_open(1000));
+}
+
+TEST(rasn_circuit_breaker, disabled_breaker_is_never_open)
+{
+    breaker_config cfg;
+    cfg.enabled = false;
+    cfg.failure_threshold = 1;
+    circuit_breaker breaker(cfg);
+    EXPECT_FALSE(breaker.report(false, 0));
+    EXPECT_FALSE(breaker.is_open(0));
+}
+
 TEST(rasn_circuit_breaker, half_open_probe_failure_reopens)
 {
     breaker_config cfg;
@@ -2098,6 +2143,31 @@ TEST(rasn_admission_gate, backpressure_is_zero_below_soft_then_grows_and_clamps)
     EXPECT_LE(delay_above_soft, 200u);          // clamped to max_backpressure_ms
 }
 
+TEST(rasn_admission_gate, oversized_backpressure_does_not_overflow)
+{
+    // A near-UINT32_MAX max_backpressure_ms (read_config_u32 admits up to
+    // UINT32_MAX) must not overflow the signed-int delay curve into a negative or
+    // garbage value: the resulting delay stays non-negative and bounded by an
+    // int-safe ceiling rather than wrapping.
+    admission_config cfg;
+    cfg.enabled = true;
+    cfg.max_concurrency = 10;
+    cfg.soft_concurrency = 2;
+    cfg.max_backpressure_ms = 0xFFFFFFFFu; // intentionally absurd / out of range
+    admission_gate gate(cfg);
+
+    std::vector<admission_slot> held;
+    for (int i = 0; i < 4; ++i)
+    {
+        admission_slot s = gate.try_admit();
+        EXPECT_TRUE(s.admitted());
+        // Must be a sane, non-wrapped delay (the int-safe peak bound is
+        // INT_MAX/10 ms); the key property is it is not a huge/garbage value.
+        EXPECT_LE(s.delay_ms(), static_cast<uint32_t>(INT_MAX) / 10u);
+        held.push_back(std::move(s));
+    }
+}
+
 TEST(rasn_admission_gate, disabled_gate_is_passthrough)
 {
     admission_config cfg;
@@ -2273,6 +2343,75 @@ TEST(rasn_rate_limiter, registry_isolates_limiters_per_key)
     EXPECT_EQ(1u, snapshot[0].burst);
     EXPECT_GE(snapshot[0].tokens, 1.0); // a is unspent
     EXPECT_LT(snapshot[1].tokens, 1.0); // b spent its token
+}
+
+TEST(rasn_rate_limiter, refund_restores_a_consumed_token)
+{
+    rate_limit_config cfg;
+    cfg.requests_per_min = 60; // 1000ms per token
+    cfg.burst = 2;
+    cfg.max_wait_ms = 0; // empty bucket rejects immediately
+    rate_limiter limiter(cfg);
+
+    EXPECT_TRUE(limiter.try_acquire(0).allowed);  // 2 -> 1
+    EXPECT_TRUE(limiter.try_acquire(0).allowed);  // 1 -> 0 (this request is short-circuited)
+    EXPECT_FALSE(limiter.try_acquire(0).allowed); // bucket empty
+
+    // The breaker short-circuited the second request after its token was taken;
+    // refund() returns that token so the fast-fail does not drain the quota.
+    limiter.refund();                             // 0 -> 1
+    EXPECT_TRUE(limiter.try_acquire(0).allowed);  // succeeds only because of the refund
+    EXPECT_FALSE(limiter.try_acquire(0).allowed); // and exactly one was restored, no more
+}
+
+TEST(rasn_rate_limiter, refund_never_exceeds_capacity)
+{
+    rate_limit_config cfg;
+    cfg.requests_per_min = 60;
+    cfg.burst = 2;
+    cfg.max_wait_ms = 0;
+    rate_limiter limiter(cfg);
+
+    // Refunds against an already-full bucket must clamp to burst capacity.
+    limiter.refund();
+    limiter.refund();
+    EXPECT_TRUE(limiter.try_acquire(0).allowed);
+    EXPECT_TRUE(limiter.try_acquire(0).allowed);
+    EXPECT_FALSE(limiter.try_acquire(0).allowed); // capacity respected: only 2
+
+    // Refund on a disabled/unlimited limiter is a harmless no-op (no token taken).
+    rate_limit_config off;
+    off.requests_per_min = 0; // unlimited => passthrough
+    rate_limiter passthrough(off);
+    passthrough.refund();
+    EXPECT_TRUE(passthrough.try_acquire(0).allowed);
+}
+
+TEST(rasn_rate_limiter, backward_clock_holds_high_water_mark_no_premature_refill)
+{
+    rate_limit_config cfg;
+    cfg.requests_per_min = 60; // 1000ms per token
+    cfg.burst = 1;
+    cfg.max_wait_ms = 0;
+    rate_limiter limiter(cfg);
+
+    // Establish the high-water baseline at t=100000 and drain the only token.
+    EXPECT_TRUE(limiter.try_acquire(100000).allowed);
+    EXPECT_FALSE(limiter.try_acquire(100000).allowed);
+
+    // Clock jumps far backward to t=10000. The baseline must be held at 100000,
+    // NOT moved back to 10000 -- otherwise a later reading would measure elapsed
+    // time from the stale 10000 baseline and refill prematurely.
+    EXPECT_FALSE(limiter.try_acquire(10000).allowed);
+
+    // Creep forward to t=11000: a full refill period past the (would-be) 10000
+    // baseline, so the unfixed code would hand out a token here. But 11000 is
+    // still below the real 100000 high-water mark, so no token may accrue yet.
+    EXPECT_FALSE(limiter.try_acquire(11000).allowed);
+
+    // Only once the clock advances a full period past the high-water mark
+    // (100000 + 1000) does a fresh token become available.
+    EXPECT_TRUE(limiter.try_acquire(101000).allowed);
 }
 
 } // namespace

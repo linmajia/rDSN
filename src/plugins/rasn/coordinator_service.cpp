@@ -13,7 +13,7 @@ namespace {
 
 uint32_t coordinator_max_retry_budget()
 {
-    return static_cast<uint32_t>(std::min<uint64_t>(
+    return static_cast<uint32_t>((std::min)(
         ::dsn_config_get_value_uint64(
             "rasn.coordinator", "max_retry_budget", 3, "maximum rASN coordinator retries for one request"),
         static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())));
@@ -140,7 +140,7 @@ agent_response coordinator_router::invoke_with_retries(
     const std::string &operation,
     const std::function<agent_response(uint32_t retry_attempt)> &invoke_once)
 {
-    const uint32_t retry_budget = std::min(request.retry_budget, coordinator_max_retry_budget());
+    const uint32_t retry_budget = (std::min)(request.retry_budget, coordinator_max_retry_budget());
     const bool retry_allowed = retry_budget > 0 && !is_tool_capability(request.capability);
     for (uint32_t attempt = 0;; ++attempt)
     {

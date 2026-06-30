@@ -74,6 +74,13 @@ public:
     // is an unconditional passthrough (allowed, no delay).
     rate_decision try_acquire(uint64_t now_ms);
 
+    // Return a token previously taken by an allowed try_acquire() whose request was
+    // abandoned before it reached the dependency (e.g. a later gate short-circuited
+    // it). Adds one token back, clamped to capacity, so a fast-failed request does
+    // not permanently drain the quota or delay the eventual recovery probe. A no-op
+    // when rate limiting is disabled or unlimited (try_acquire took no token then).
+    void refund();
+
     // Refill to now_ms and return the current token count without consuming one
     // (diagnostic / test helper).
     double tokens(uint64_t now_ms);

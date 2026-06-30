@@ -139,6 +139,23 @@ breaker_state circuit_breaker::state() const
     return _state;
 }
 
+bool circuit_breaker::is_open(uint64_t now_ms) const
+{
+    std::lock_guard<std::mutex> guard(_lock);
+    if (!_config.enabled || _state != breaker_state::open)
+    {
+        return false;
+    }
+    // Mirror allow()'s open-state cooldown test without mutating anything: the
+    // breaker short-circuits while open unless the cooldown has fully elapsed (at
+    // which point allow() would admit a half-open probe instead). The
+    // now_ms >= _opened_at_ms guard keeps a non-monotonic clock reading from
+    // reporting a premature recovery.
+    const bool cooldown_elapsed =
+        now_ms >= _opened_at_ms && (now_ms - _opened_at_ms) >= _config.open_ms;
+    return !cooldown_elapsed;
+}
+
 uint32_t circuit_breaker::consecutive_failures() const
 {
     std::lock_guard<std::mutex> guard(_lock);

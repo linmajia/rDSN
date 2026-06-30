@@ -93,7 +93,7 @@ std::string effective_request_timeout_sec(uint32_t request_timeout_ms)
         const uint64_t configured_ms = configured_sec > (std::numeric_limits<uint64_t>::max() / 1000)
                                            ? std::numeric_limits<uint64_t>::max()
                                            : configured_sec * 1000;
-        effective_ms = std::min(effective_ms, configured_ms);
+        effective_ms = (std::min)(effective_ms, configured_ms);
     }
     return seconds_from_milliseconds(effective_ms);
 }
@@ -857,8 +857,8 @@ void emit_llm_stream_chunks(const agent_task &task,
 {
     const size_t configured_chunk_bytes =
         static_cast<size_t>(llm_config_uint64("stream_chunk_bytes", 96, "model response stream chunk size"));
-    const size_t effective_chunk_bytes = chunk_bytes == 0 ? std::max<size_t>(1, configured_chunk_bytes)
-                                                         : std::max<size_t>(1, chunk_bytes);
+    const size_t effective_chunk_bytes = chunk_bytes == 0 ? (std::max)(static_cast<size_t>(1), configured_chunk_bytes)
+                                                         : (std::max)(static_cast<size_t>(1), chunk_bytes);
     if (text.empty())
     {
         return;

@@ -67,6 +67,13 @@ public:
     // true if this report transitioned the breaker into the open state.
     bool report(bool ok, uint64_t now_ms);
 
+    // Non-mutating: is the breaker currently open and still within its cooldown,
+    // so the next allow() would short-circuit without admitting a half-open probe?
+    // Lets a caller fast-fail a still-open breaker ahead of other gates without
+    // consuming the one-shot probe. Returns false once the cooldown has elapsed
+    // (allow() would then admit a probe) or when the breaker is disabled.
+    bool is_open(uint64_t now_ms) const;
+
     breaker_state state() const;
     uint32_t consecutive_failures() const;
     const breaker_config &config() const { return _config; }

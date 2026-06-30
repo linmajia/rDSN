@@ -717,13 +717,17 @@ rDSN design:
   (`include/dsn/utility/exp_delay.h`) — the same staged-delay mechanism rDSN uses
   to throttle its task queues — seeded so the delay ramps from zero at the soft
   threshold up to a configured ceiling. This keeps the overload policy consistent
-  with the host runtime instead of inventing a parallel one.
+  with the host runtime instead of inventing a parallel one. Because `exp_delay`
+  works entirely in signed `int`, the configured ceiling is clamped to an int-safe
+  bound before it scales the curve, so an out-of-range `max_backpressure_ms`
+  degrades to a large-but-valid delay instead of overflowing to a negative value.
 - It is wired into `rasn_llm_agent_service` alongside the breaker, and the gate is
-  evaluated *before* the breaker. Ordering matters: admitting first means a
-  rejected request never perturbs breaker state, and a request the breaker later
-  short-circuits still releases its admission slot through the RAII guard. The
-  bulkhead *reservation* runs first, but the graceful backpressure *delay* is
-  applied only after the breaker also admits — so a request the breaker
+  evaluated *before* the breaker's authoritative (probe-consuming) check — only the
+  non-mutating open-breaker precheck runs ahead of it. Ordering matters: admitting
+  first means a rejected request never perturbs breaker state, and a request the
+  breaker later short-circuits still releases its admission slot through the RAII
+  guard. The bulkhead *reservation* runs first, but the graceful backpressure
+  *delay* is applied only after the breaker also admits — so a request the breaker
   short-circuits neither sleeps nor holds its slot through a sleep. Both gates sit
   *after* the replay check, so replayed runs bypass admission entirely and stay
   deterministic.
@@ -772,17 +776,36 @@ rDSN design:
   than read from a clock. The caller passes `::dsn_now_ms()`, so token refill flows
   through rDSN's pluggable environment provider — making it deterministic under
   replay and unit-testable without a live service node, exactly like the breaker's
-  cooldown clock.
+  cooldown clock. Token refill is hardened against a non-monotonic injected clock: a
+  reading at or before the last refill timestamp never removes tokens *and* never
+  moves the refill baseline backward. Holding the baseline at its high-water mark
+  matters because moving it back would let a later-but-still-stale reading (one below
+  the original mark) measure a positive elapsed interval and refill prematurely;
+  refill resumes only once the clock advances past the mark.
 - It is wired into `rasn_llm_agent_service` beside the breaker and admission gate.
-  Ordering: admission *reserves* a slot, the rate limiter *acquires* a token, and
-  the breaker is consulted **last**, because the breaker consumes a one-shot
-  half-open probe that must be paired with a result report. Putting both
-  reject-capable gates (admission, rate) ahead of the breaker guarantees a request
-  they reject never strands a half-open probe. The pacing delay, like admission
-  backpressure, is applied only *after* the breaker also admits, and the two delays
-  are coalesced into a single wait (the larger of the two) so they never stack into
-  additive over-delay. All gates sit *after* the replay check, so replayed runs
-  bypass rate limiting and stay deterministic.
+  Ordering: a non-mutating **open-breaker precheck** runs *first*, so a request to a
+  dependency whose breaker is already open (and still cooling down) fast-fails ahead
+  of any admission or rate rejection — a broken dependency wins over an overload or
+  quota signal, and no admission slot or rate token is wasted on it. The precheck
+  only *reads* breaker state; it does not consume the one-shot half-open probe.
+  Otherwise admission *reserves* a slot, the rate limiter *acquires* a token, and the
+  authoritative (mutating) breaker check is consulted **last**, because that check
+  consumes a one-shot half-open probe that must be paired with a result report.
+  Putting both reject-capable gates (admission, rate) ahead of that authoritative
+  breaker check guarantees a request they reject never strands a half-open probe
+  (the precheck never admits a probe, so it is safe ahead of them). The pacing delay,
+  like admission backpressure, is applied only *after* the breaker also admits, and
+  the two delays are coalesced into a single wait (the larger of the two) so they
+  never stack into additive over-delay. All gates sit *after* the replay check, so
+  replayed runs bypass rate limiting and stay deterministic.
+- If the authoritative breaker check *does* short-circuit a request that has already
+  acquired a rate token — the half-open-probe-busy case, or a race where the breaker
+  opened between the precheck and the authoritative check — that token is **refunded**
+  before the fast-fail returns. A breaker short-circuit therefore never silently
+  drains the provider's quota or delays its eventual recovery probe. The admission
+  slot is returned the same way, by its RAII guard. The refund is a no-op when the
+  limiter is disabled or unlimited (no token was taken) and is clamped to burst
+  capacity so it can never inflate the bucket past its configured size.
 - The same `in_process()` predicate that exempts the simulator and other
   no-network providers from the breaker and admission control also exempts them
   here. The limiter is **disabled by default** (`requests_per_min = 0` = unlimited),

@@ -52,12 +52,15 @@ void rate_limiter::refill(uint64_t now_ms)
     }
     if (now_ms <= _last_refill_ms)
     {
-        // Non-monotonic or same-instant clock: never remove tokens, just advance.
-        _last_refill_ms = now_ms;
+        // Non-monotonic or same-instant clock: never remove tokens, and do NOT
+        // move the baseline backward. Moving it back would let a later-but-still-
+        // stale reading (one still below the original high-water mark) refill
+        // tokens prematurely. Hold the high-water mark instead; refill resumes
+        // only once the clock advances past it.
         return;
     }
     const double added = static_cast<double>(now_ms - _last_refill_ms) * tokens_per_ms();
-    _tokens = std::min(capacity(), _tokens + added);
+    _tokens = (std::min)(capacity(), _tokens + added);
     _last_refill_ms = now_ms;
 }
 
@@ -110,6 +113,21 @@ rate_decision rate_limiter::try_acquire(uint64_t now_ms)
     decision.delay_ms = 0;
     decision.tokens = _tokens;
     return decision;
+}
+
+void rate_limiter::refund()
+{
+    std::lock_guard<std::mutex> guard(_lock);
+    if (!_config.enabled || _config.requests_per_min == 0)
+    {
+        // Passthrough mode took no token, so there is nothing to give back.
+        return;
+    }
+    // Restore the single token taken by the corresponding try_acquire(). This is
+    // the inverse of the "_tokens -= 1.0" there; no refill is needed because the
+    // abandon happens in the same instant (the breaker short-circuits before any
+    // wait). Clamp to capacity so the bucket never exceeds its burst.
+    _tokens = (std::min)(capacity(), _tokens + 1.0);
 }
 
 double rate_limiter::tokens(uint64_t now_ms)

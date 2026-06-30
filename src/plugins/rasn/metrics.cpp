@@ -484,7 +484,7 @@ std::string metrics_snapshot::to_text() const
     std::string::size_type width = 0;
     for (const metric_sample &sample : samples)
     {
-        width = std::max(width, sample.name.size());
+        width = (std::max)(width, sample.name.size());
     }
 
     for (const metric_sample &sample : samples)

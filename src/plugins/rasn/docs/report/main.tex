@@ -1930,11 +1930,15 @@ The design reuses \rdsn rather than reinventing it in two ways. First, the
 backpressure curve is built from \rdsn's \texttt{exp\_delay} primitive
 (\texttt{include/dsn/utility/exp\_delay.h}), the same staged-delay mechanism the host
 uses to throttle its task queues, seeded so the delay ramps from zero at the soft
-threshold to the configured ceiling. Second, the gate reuses the breaker's
-\texttt{in\_process()} predicate to exempt no-network providers, and is wired into
-\texttt{rasn\_llm\_agent\_service} on the same convergence point as the breaker.
-Ordering is deliberate: the admission \emph{reservation} is evaluated \emph{before}
-the breaker (so a rejected request never perturbs breaker state) and \emph{after}
+threshold to the configured ceiling; because \texttt{exp\_delay} works entirely in
+signed \texttt{int}, the ceiling is clamped to an int-safe bound before it scales the
+curve, so an out-of-range \texttt{max\_backpressure\_ms} degrades to a
+large-but-valid delay rather than overflowing negative. Second, the gate reuses the
+breaker's \texttt{in\_process()} predicate to exempt no-network providers, and is
+wired into \texttt{rasn\_llm\_agent\_service} on the same convergence point as the
+breaker. Ordering is deliberate: the admission \emph{reservation} is evaluated
+\emph{before} the breaker's authoritative probe-consuming check (so a rejected
+request never perturbs breaker state) and \emph{after}
 the replay check (so replayed runs stay deterministic), while the graceful
 backpressure \emph{delay} is applied only after the breaker also admits --- so a
 request the breaker short-circuits neither sleeps nor holds its slot through a
@@ -1972,12 +1976,30 @@ pulls in no \rdsn or thrift types, and the current time is \emph{injected} as a
 millisecond value rather than read from a clock. The caller passes
 \texttt{::dsn\_now\_ms()}, so token refill flows through \rdsn's pluggable
 environment provider --- making it deterministic under replay and unit-testable
-without a live node, exactly as the breaker's cooldown clock is. It is wired into
+without a live node, exactly as the breaker's cooldown clock is. Refill is hardened
+against a non-monotonic injected clock: a reading at or before the last refill
+timestamp neither removes tokens nor moves the refill baseline backward, since
+moving it back would let a later-but-still-stale reading measure a positive interval
+and refill prematurely; the baseline holds at its high-water mark until the clock
+advances past it. It is wired into
 \texttt{rasn\_llm\_agent\_service} beside the other two gates. Ordering is again
-deliberate: admission reserves a slot and the rate limiter acquires a token first,
-and the breaker --- which consumes a one-shot half-open probe that must be paired
-with a result report --- is consulted \emph{last}, so a request that admission or
-the rate limiter rejects never strands a half-open probe. The pacing delay, like
+deliberate. A non-mutating open-breaker precheck runs \emph{first}: a request to a
+provider whose breaker is already open (and still cooling down) fast-fails ahead of
+any admission or rate rejection, so a broken dependency wins over an overload or
+quota signal without wasting an admission slot or rate token; the precheck only
+reads breaker state and never consumes the one-shot half-open probe. Otherwise
+admission reserves a slot and the rate limiter acquires a token first, and the
+breaker's authoritative check --- which consumes a one-shot half-open probe that
+must be paired with a result report --- is consulted \emph{last}, so a request that
+admission or the rate limiter rejects never strands a half-open probe. If the
+breaker's authoritative check does short-circuit a request that already acquired a
+rate token --- the half-open-probe-busy case, or a race where the breaker opened
+between the precheck and the authoritative check --- that token is \emph{refunded}
+before the fast-fail returns (and the admission slot is released by its RAII guard),
+so a breaker short-circuit never silently drains the provider's quota or delays its
+recovery probe; the refund is a no-op when the limiter is disabled and is clamped to
+burst capacity. The pacing
+delay, like
 admission backpressure, is applied only after the breaker admits, and the two
 delays are coalesced into a single wait (the larger of the two) so they never
 stack into additive over-delay. The same \texttt{in\_process()} predicate exempts

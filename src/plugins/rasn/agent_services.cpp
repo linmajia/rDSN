@@ -529,6 +529,35 @@ bool rasn_llm_agent_service::provider_needs_guards() const
     return _provider != nullptr && !_provider->in_process();
 }
 
+bool rasn_llm_agent_service::model_breaker_is_open(const std::string &provider,
+                                                   const agent_task &task,
+                                                   nucleus_runtime &runtime,
+                                                   llm_response *fast_fail)
+{
+    ensure_model_breaker_config();
+    circuit_breaker &breaker = _model_breakers.get(provider);
+    if (!breaker.is_open(::dsn_now_ms()))
+    {
+        return false;
+    }
+    // The breaker is open and still cooling down: the request will be
+    // short-circuited regardless of the other gates, so fast-fail it here -- ahead
+    // of admission and the rate limiter -- so an open breaker (broken dependency)
+    // wins over an admission/rate rejection (overload/quota) and does not waste an
+    // admission slot or rate token. This precheck is non-mutating and leaves the
+    // one-shot half-open probe intact for the authoritative model_breaker_admit()
+    // once the cooldown elapses and the request has passed the other gates.
+    dwarn("rASN model circuit breaker open for provider=%s; short-circuiting request before admission",
+          provider.c_str());
+    runtime.record_model_breaker_short_circuit(task, provider, to_string(breaker_state::open));
+    if (fast_fail != nullptr)
+    {
+        *fast_fail = rpc_error_response("model circuit breaker " + std::string(to_string(breaker_state::open)) +
+                                        " for provider " + provider + "; request short-circuited");
+    }
+    return true;
+}
+
 bool rasn_llm_agent_service::model_breaker_admit(const std::string &provider,
                                                  const agent_task &task,
                                                  nucleus_runtime &runtime,
@@ -631,6 +660,11 @@ rate_decision rasn_llm_agent_service::model_rate_acquire(const std::string &prov
     return decision;
 }
 
+void rasn_llm_agent_service::model_rate_refund(const std::string &provider)
+{
+    _model_rate.get(provider).refund();
+}
+
 void rasn_llm_agent_service::apply_model_backpressure(const std::string &provider,
                                                       const agent_task &task,
                                                       nucleus_runtime &runtime,
@@ -650,7 +684,7 @@ void rasn_llm_agent_service::apply_model_backpressure(const std::string &provide
     // Sleep once for the larger of the two delays: a single wait that is >= each
     // governor's requested delay satisfies both (concurrency smoothing and rate
     // pacing) without stacking them into additive over-delay.
-    const uint32_t delay = std::max(admission_delay, rate_delay);
+    const uint32_t delay = (std::max)(admission_delay, rate_delay);
     if (delay > 0)
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(delay));
@@ -696,7 +730,9 @@ llm_response rasn_llm_agent_service::complete(const agent_completion_request &re
     // admission bulkhead keeps a healthy endpoint from being overwhelmed, a
     // client-side rate limiter paces calls under the provider's quota, and a
     // circuit breaker fast-fails a failing endpoint before its own retry loop.
-    // Admission and the rate limiter reserve first (and may reject) so that the
+    // An already-open breaker is prechecked first (non-mutating) so a broken
+    // dependency fast-fails ahead of an admission/rate rejection. Otherwise
+    // admission and the rate limiter reserve first (and may reject) so that the
     // breaker -- which consumes a one-shot half-open probe -- is the last gate; a
     // request rejected by admission or the rate limiter therefore never wastes a
     // breaker probe. Their pacing delays are applied only after the breaker also
@@ -710,6 +746,10 @@ llm_response rasn_llm_agent_service::complete(const agent_completion_request &re
     if (guarded)
     {
         llm_response fast_fail;
+        if (model_breaker_is_open(provider_name, request.task, runtime, &fast_fail))
+        {
+            return fast_fail;
+        }
         admission = model_admission_admit(provider_name, request.task, runtime, &fast_fail);
         if (!admission.admitted())
         {
@@ -722,6 +762,11 @@ llm_response rasn_llm_agent_service::complete(const agent_completion_request &re
         }
         if (!model_breaker_admit(provider_name, request.task, runtime, &fast_fail))
         {
+            // The breaker short-circuited this request after the rate token was
+            // taken, so it will not reach the provider; refund the token so a
+            // breaker fast-fail does not drain the quota or delay the eventual
+            // recovery probe. The RAII admission slot releases itself on return.
+            model_rate_refund(provider_name);
             return fast_fail;
         }
         apply_model_backpressure(provider_name, request.task, runtime, admission, rate);
@@ -776,6 +821,11 @@ llm_response rasn_llm_agent_service::complete_streaming(const agent_completion_r
     if (guarded)
     {
         llm_response fast_fail;
+        // Open-breaker precheck wins over admission/rate rejection; see complete().
+        if (model_breaker_is_open(provider_name, request.task, runtime, &fast_fail))
+        {
+            return fast_fail;
+        }
         admission = model_admission_admit(provider_name, request.task, runtime, &fast_fail);
         if (!admission.admitted())
         {
@@ -788,6 +838,9 @@ llm_response rasn_llm_agent_service::complete_streaming(const agent_completion_r
         }
         if (!model_breaker_admit(provider_name, request.task, runtime, &fast_fail))
         {
+            // See complete(): refund the rate token taken above when the breaker
+            // short-circuits, so a fast-failed request does not drain the quota.
+            model_rate_refund(provider_name);
             return fast_fail;
         }
         apply_model_backpressure(provider_name, request.task, runtime, admission, rate);

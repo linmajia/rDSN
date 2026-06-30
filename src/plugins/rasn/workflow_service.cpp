@@ -41,8 +41,8 @@ std::string workflow_identity(const workflow_source &source)
 
 uint64_t workflow_execution_lease_ms()
 {
-    return std::max<uint64_t>(
-        1,
+    return (std::max)(
+        static_cast<uint64_t>(1),
         ::dsn_config_get_value_uint64(
             "rasn.workflow", "execution_lease_ms", 600000, "workflow execution ownership lease in milliseconds"));
 }
@@ -52,8 +52,8 @@ uint64_t workflow_execution_lease_renew_ms()
     const uint64_t lease_ms = workflow_execution_lease_ms();
     const uint64_t configured = ::dsn_config_get_value_uint64(
         "rasn.workflow", "execution_lease_renew_ms", 0, "workflow execution lease renewal interval in milliseconds");
-    const uint64_t requested = configured == 0 ? std::max<uint64_t>(1, lease_ms / 3) : configured;
-    return std::max<uint64_t>(1, std::min(requested, std::max<uint64_t>(1, lease_ms / 2)));
+    const uint64_t requested = configured == 0 ? (std::max)(static_cast<uint64_t>(1), lease_ms / 3) : configured;
+    return (std::max)(static_cast<uint64_t>(1), (std::min)(requested, (std::max)(static_cast<uint64_t>(1), lease_ms / 2)));
 }
 
 bool has_workflow_timer_context()
@@ -483,7 +483,7 @@ public:
                 uint64_t elapsed_ms = 0;
                 while (true)
                 {
-                    const uint64_t step_ms = std::min<uint64_t>(50, interval_ms - elapsed_ms);
+                    const uint64_t step_ms = (std::min)(static_cast<uint64_t>(50), interval_ms - elapsed_ms);
                     std::this_thread::sleep_for(std::chrono::milliseconds(step_ms));
                     {
                         ::dsn::service::zauto_lock guard(state->lock);
@@ -1207,8 +1207,8 @@ workflow_response workflow_store::cancel(const workflow_run_query &request)
     }
     {
         ::dsn::service::zauto_lock guard(_lock);
-        cancelled.sequence = std::max(_last_sequence, current.sequence) + 1;
-        _last_sequence = std::max(_last_sequence, cancelled.sequence);
+        cancelled.sequence = (std::max)(_last_sequence, current.sequence) + 1;
+        _last_sequence = (std::max)(_last_sequence, cancelled.sequence);
     }
 
     const state_response persisted = persist_to_state(cancelled, true, current.sequence);
@@ -1220,7 +1220,7 @@ workflow_response workflow_store::cancel(const workflow_run_query &request)
     {
         ::dsn::service::zauto_lock guard(_lock);
         _runs[cancelled.run_id] = cancelled;
-        _last_sequence = std::max(_last_sequence, cancelled.sequence);
+        _last_sequence = (std::max)(_last_sequence, cancelled.sequence);
     }
 
     workflow_response response;
@@ -1307,7 +1307,7 @@ workflow_response workflow_store::store_record(const workflow_run_record &record
     {
         ::dsn::service::zauto_lock guard(_lock);
         _runs[stored.run_id] = stored;
-        _last_sequence = std::max(_last_sequence, stored.sequence);
+        _last_sequence = (std::max)(_last_sequence, stored.sequence);
     }
 
     dinfo("stored rASN workflow run=%s status=%s sequence=%llu",
@@ -1345,7 +1345,7 @@ workflow_response workflow_store::store_record_if_current(const workflow_run_rec
     {
         ::dsn::service::zauto_lock guard(_lock);
         _runs[stored.run_id] = stored;
-        _last_sequence = std::max(_last_sequence, stored.sequence);
+        _last_sequence = (std::max)(_last_sequence, stored.sequence);
     }
 
     dinfo("stored rASN workflow run=%s status=%s sequence=%llu",
@@ -1392,7 +1392,7 @@ workflow_response workflow_store::recover_from_state()
         for (const workflow_run_record &run : recovered)
         {
             _runs[run.run_id] = run;
-            _last_sequence = std::max(_last_sequence, run.sequence);
+            _last_sequence = (std::max)(_last_sequence, run.sequence);
         }
     }
 
@@ -1426,7 +1426,7 @@ bool workflow_store::recover_run_from_state(const std::string &run_id, workflow_
     {
         ::dsn::service::zauto_lock guard(_lock);
         _runs[recovered.run_id] = recovered;
-        _last_sequence = std::max(_last_sequence, recovered.sequence);
+        _last_sequence = (std::max)(_last_sequence, recovered.sequence);
     }
 
     if (record != nullptr)

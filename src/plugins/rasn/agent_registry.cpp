@@ -84,7 +84,7 @@ std::vector<std::string> config_sections()
     }
 
     std::vector<std::string> result;
-    result.reserve(static_cast<size_t>(std::max(used_sections, 0)));
+    result.reserve(static_cast<size_t>((std::max)(used_sections, 0)));
     for (int i = 0; i < used_sections; ++i)
     {
         if (sections[i] != nullptr)

@@ -704,7 +704,7 @@ state_response state_store::put(const state_put_request &request)
             return error_response(journal_error);
         }
 
-        _last_sequence = std::max(_last_sequence, stored.sequence);
+        _last_sequence = (std::max)(_last_sequence, stored.sequence);
         _records[stored.key] = stored;
         last_sequence = _last_sequence;
     }
@@ -933,7 +933,7 @@ state_response state_store::recover(const state_checkpoint_request &request)
                 return error_response(decode_error);
             }
             recovered[record.key] = record;
-            last_sequence = std::max(last_sequence, record.sequence);
+            last_sequence = (std::max)(last_sequence, record.sequence);
         }
     }
     else if (!::dsn::utils::filesystem::file_exists(journal_path))
@@ -974,7 +974,7 @@ state_response state_store::recover(const state_checkpoint_request &request)
                 return error_response(decode_error);
             }
             recovered[record.key] = record;
-            last_sequence = std::max(last_sequence, record.sequence);
+            last_sequence = (std::max)(last_sequence, record.sequence);
         }
     }
 

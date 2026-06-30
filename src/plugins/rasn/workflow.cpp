@@ -1279,22 +1279,22 @@ std::string workflow_graph::describe_plan() const
         uint64_t parent_latency = 0;
         for (const std::string &dep : node.depends_on)
         {
-            stage = std::max(stage, stage_by_id[dep] + 1);
-            parent_latency = std::max(parent_latency, critical_latency_by_id[dep]);
+            stage = (std::max)(stage, stage_by_id[dep] + 1);
+            parent_latency = (std::max)(parent_latency, critical_latency_by_id[dep]);
         }
         stage_by_id[node.id] = stage;
         stage_nodes[stage].push_back(node.id);
         critical_latency_by_id[node.id] = parent_latency + effective_latency(node);
-        critical_latency = std::max(critical_latency, critical_latency_by_id[node.id]);
+        critical_latency = (std::max)(critical_latency, critical_latency_by_id[node.id]);
         total_cost += effective_cost(node);
-        min_reliability = std::min(min_reliability, effective_reliability(node));
+        min_reliability = (std::min)(min_reliability, effective_reliability(node));
     }
 
     size_t max_parallelism = 0;
     for (std::map<uint32_t, std::vector<std::string> >::value_type &stage : stage_nodes)
     {
         std::sort(stage.second.begin(), stage.second.end());
-        max_parallelism = std::max(max_parallelism, stage.second.size());
+        max_parallelism = (std::max)(max_parallelism, stage.second.size());
     }
 
     oss << "Optimization plan: stages=" << stage_nodes.size()

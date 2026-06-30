@@ -12,6 +12,7 @@
 #include <dsn/utility/exp_delay.h>
 
 #include <algorithm>
+#include <climits>
 #include <vector>
 
 namespace dsn {
@@ -31,7 +32,13 @@ uint32_t backpressure_delay_ms(uint32_t in_flight, const admission_config &cfg)
     }
 
     std::vector<int> delays(DELAY_COUNT, 0);
-    const int peak = static_cast<int>(cfg.max_backpressure_ms);
+    // exp_delay operates entirely in signed int. Clamp the configured peak to a
+    // bound where scaling it by the s_default_delay shape (max factor 10) cannot
+    // overflow int, so an out-of-range config value (read_config_u32 admits up to
+    // UINT32_MAX) degrades to a large-but-valid delay instead of narrowing to a
+    // negative/garbage value and corrupting the curve.
+    static const uint32_t k_max_peak_ms = static_cast<uint32_t>(INT_MAX) / 10;
+    const int peak = static_cast<int>((std::min)(cfg.max_backpressure_ms, k_max_peak_ms));
     for (int i = 0; i < DELAY_COUNT; ++i)
     {
         // s_default_delay peaks at 10ms; rescale so the last point equals the
@@ -46,7 +53,7 @@ uint32_t backpressure_delay_ms(uint32_t in_flight, const admission_config &cfg)
     {
         return 0;
     }
-    return static_cast<uint32_t>(std::min<int>(ms, static_cast<int>(cfg.max_backpressure_ms)));
+    return static_cast<uint32_t>((std::min)(ms, peak));
 }
 
 } // namespace
