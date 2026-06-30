@@ -146,8 +146,8 @@ This report makes the following contributions:
   cancellation, and workflow leases.
   \item We describe the current \rasn architecture and implementation on top of
   \rdsn, including service-mode RPCs, state recovery, workflow execution,
-  observability, provider adapters, policy-bounded tools, and lifecycle
-  hardening.
+  observability with \rdsn \texttt{perf\_counter} metrics, provider adapters,
+  policy-bounded tools, and lifecycle hardening.
   \item We present \codepilot as an application case study and explain how a
   coding CLI can be implemented as an adapter over generic agent services.
   \item We define an experimental design for future evaluation, including
@@ -259,8 +259,8 @@ clients & Product packaging and transport implementations remain future SDK
 work \\
 Explicit nondeterminism & Trace events, simulator choices, replay-load hooks,
 model/tool result replay, scheduler-order checks, filesystem snapshots,
-external-effect ledger entries, trace ids & Full external-environment
-virtualization remains future work \\
+external-effect ledger entries, environment-provider time and randomness, trace
+ids & Full external-environment virtualization remains future work \\
 State boundary & \texttt{rasn.state}, CAS, checkpoints, journals, leases,
 artifact/snapshot indexes, optional local replica mirror and NFS import &
 Backing store is not quorum-replicated \\
@@ -272,6 +272,11 @@ orchestration remains future deployment work \\
 Iterative hardening & Unit tests, self-tests, service smoke, documented phases,
 report updates, \codepilot evaluation harness & User-study evaluation remains
 future empirical work \\
+Operational observability & Structured JSONL traces, failure classification,
+diagnosis helpers, and \rdsn \texttt{perf\_counter} metrics (counters and
+latency percentiles) exported as text/Prometheus/JSON via \texttt{observe
+metrics} and a \texttt{command\_manager} command & No bundled scrape gateway,
+retention store, or dashboards \\
 \bottomrule
 \end{tabular}
 \end{table*}
@@ -396,6 +401,15 @@ request records provider, model, prompt/context metadata, timeout budget, and
 result; the simulator additionally records the selected pseudo-random output;
 workflow execution records the node order and terminal state; and state records
 capture durable decisions such as leases and cancellations.
+
+In-process timing and randomness are themselves drawn from rDSN's pluggable
+environment provider (\texttt{dsn\_now\_ms} and \texttt{dsn\_random64}, the same
+primitive rDSN uses to mint RPC trace ids) rather than from private
+wall-clock-seeded generators. Because that provider is an overridable rDSN
+component whose thread-local generator can be seeded by tooling, emulator and
+replay tools can virtualize or reproduce these inputs without changing \rasn
+code. This makes time and randomness first-class, controllable environment
+inputs instead of hidden sources of divergence.
 
 This choice reflects a practical research hypothesis: robust agent systems do
 not require every execution to be deterministic, but they do require
@@ -760,7 +774,9 @@ result, \texttt{rasn.tool.agent} fails closed instead of repeating a write or
 shell command. Side-effecting tool intents also record
 \texttt{external.effect} events that carry effect class, operation, stable
 fingerprint, replay policy, and status for commits, policy denials, replay hits,
-and replay misses. Full replay would still require stronger virtualization for
+and replay misses. In-process timing and randomness already draw from rDSN's
+pluggable environment provider, so the remaining virtualization gap is the
+external environment. Full replay would still require stronger virtualization for
 external environments, but the current model now gives non-file effects an
 auditable runtime ledger instead of only a transcript. The current model
 therefore advances replay for concrete model, tool, scheduler, local-file, and
@@ -1076,6 +1092,17 @@ summaries, replay loads, and snapshots. Snapshot metadata is persisted through
 the state service, giving operators a durable index of trace file, event count,
 failure count, and last sequence.
 
+Beyond per-run traces, \rasn aggregates quantitative runtime metrics through
+\rdsn's existing \texttt{perf\_counter} subsystem rather than a parallel metrics
+stack. A process-global registry maintains cumulative counters per runtime event
+kind, lazily created per-failure-class counters, and task, model, and tool
+latency percentile counters, all in the \texttt{rasn} counter section. The same
+snapshot is rendered as an aligned text table, Prometheus exposition format, or
+JSON, and is reachable both through the \codepilot \texttt{observe metrics}
+command and through a \texttt{rasn.metrics} command registered with \rdsn's
+\texttt{command\_manager} so a running deployment answers over the local or
+remote \rdsn CLI.
+
 \section{Implementation Details}
 
 \subsection{Code Organization}
@@ -1096,6 +1123,7 @@ src/plugins/rasn/
   workflow_service.{h,cpp}
   policy_manager.{h,cpp}
   observability.{h,cpp}
+  metrics.{h,cpp}
   llm_provider.{h,cpp}
   agent_tools.{h,cpp}
   codepilot/
@@ -1104,9 +1132,15 @@ src/plugins/rasn/
   docs/report/
 \end{lstlisting}
 
-\texttt{CMakeLists.txt} integrates the plugin and unit tests into the \rdsn
-build. The implementation is intentionally header-heavy for message
-serialization helpers and uses \cpp service classes for runtime behavior.
+The build is organized so that rASN is a reusable platform rather than a
+single application binary. The engine sources in \texttt{src/plugins/rasn/}
+compile into a \texttt{rasn} static library, and both the \codepilot
+executable (\texttt{codepilot/}, including \texttt{codepilot/main.cpp}) and the
+\texttt{rasn.unit\_tests} executable link that library instead of recompiling
+the engine. \texttt{CMakeLists.txt} integrates the library, the application,
+and the unit tests into the \rdsn build. The implementation is intentionally
+header-heavy for message serialization helpers and uses \cpp service classes
+for runtime behavior.
 
 Table~\ref{tab:file-responsibilities} maps the main implementation files to
 their responsibilities. This table is also useful for future maintainers because
@@ -1130,6 +1164,7 @@ Files & Layer & Responsibility \\
 \texttt{workflow/workflow\_service} & Service & Workflow parser, optimizer, executor, leases, resume/cancel \\
 \texttt{policy\_manager/redaction} & Policy & Tool classification, gating, redaction, artifact indexing \\
 \texttt{observability} & Service & Events, failures, snapshots, replay metadata \\
+\texttt{metrics} & Observability & Perf-counter metric registry and text/Prometheus/JSON rendering \\
 \texttt{llm\_provider/model\_agent} & Provider & Simulator and HTTP-compatible model adapters \\
 \texttt{agent\_tools} & Provider API & Generic tool provider interface \\
 \texttt{codepilot/*} & Application & CLI commands, local tools, skills, provider configuration \\
@@ -1155,11 +1190,22 @@ runtime. The important integration points are:
   serialization.
   \item \texttt{dsn\_config\_get\_value\_*} for provider, policy, lease,
   timeout, endpoint, and persistence settings.
+  \item \texttt{dsn\_now\_ms}/\texttt{dsn\_random64} (the pluggable
+  \texttt{env\_provider} for time and randomness) for runtime timing, latency
+  measurement, and identifier/sampling randomness, so these nondeterministic
+  inputs are virtualizable and seedable for deterministic replay rather than
+  drawn from private wall-clock-seeded generators.
   \item \texttt{dsn::service::zlock} for shared state in stores and runtimes.
   \item \texttt{dsn::tasking::enqueue\_timer} for registry heartbeats, lease
   sweeps, delayed workflow recovery, and workflow lease renewal.
   \item \texttt{dsn::utils::filesystem} for checkpoints, temporary files,
   artifact paths, and cross-platform file operations.
+  \item \texttt{perf\_counter} (the C \texttt{dsn\_perf\_counter\_*} API backed by
+  \texttt{simple\_perf\_counter}) for cumulative runtime counters and task,
+  model, and tool latency percentiles in the \texttt{rasn} counter section.
+  \item \texttt{command\_manager} (\texttt{register\_command}/\texttt{run\_command})
+  to expose the \texttt{rasn.metrics} operational command over the \rdsn local
+  and remote CLI.
 \end{itemize}
 
 The implementation currently still has same-process globals for convenience,
@@ -1729,6 +1775,36 @@ mutating state. This separation follows the same principle as distributed-system
 logs and checkpoints: recovery state should be minimal and well-structured,
 whereas diagnostic traces can be richer and larger.
 
+\subsection{Runtime Metrics}
+
+Structured traces explain a single run; aggregate metrics make a fleet
+operable. \texttt{metrics.*} adds a process-global \texttt{metrics\_registry}
+backed by \rdsn \texttt{perf\_counter} counters in the \texttt{rasn} section,
+reusing the same counter infrastructure \rdsn ships for its own services. The
+single choke point \texttt{nucleus\_runtime::record\_event} increments a
+cumulative \texttt{COUNTER\_TYPE\_NUMBER} counter for each event kind (Prometheus
+\texttt{\_total} convention) and a lazily created counter for each failure class,
+so adding a new event kind needs no new call site. Task and model latencies are
+paired inside the runtime by task id --- model calls finalize their timing on
+both success and failure, so failed-call latency is recorded rather than lost ---
+and tool latency is timed at \texttt{rasn\_tool\_agent\_service::run\_tool}, the
+point where the CLI, workflow, RPC-server, and direct-call tool paths converge;
+all three feed \texttt{COUNTER\_TYPE\_NUMBER\_PERCENTILES} counters whose
+p50/p95/p99/p999 are computed by \rdsn's counter timers.
+
+Two design choices keep this safe to embed everywhere. First, perf-counter
+creation asserts a current \rdsn service node, so creation is guarded by a
+node-context check and every update is null and lock protected; the metric path
+degrades to a no-op (never a crash) in inline, CLI, and node-less contexts, and
+\texttt{[rasn.metrics] enabled = false} disables it entirely. Second, the metric
+data types and the three renderers (text, Prometheus exposition format, and JSON)
+live in a dependency-light translation unit (\texttt{metrics\_format.cpp}) with no
+\rdsn includes, so they are unit tested in isolation from the counter backend. A
+snapshot is reachable through \codepilot's \texttt{observe metrics
+[text|prometheus|json]} and, in service mode, through a \texttt{rasn.metrics}
+command registered once with \rdsn's \texttt{command\_manager} and answered over
+the local or remote \rdsn CLI.
+
 \subsection{Testing and Validation}
 
 The current unit suite covers message validation, endpoint metadata, registry
@@ -1736,9 +1812,11 @@ leases, coordinator retries, policy classification, artifact state writes,
 observability snapshot state writes, service-graph lifecycle, workflow parsing,
 workflow cancellation, restart-safe cancel recovery, cancel persistence failure
 reporting, budget propagation, resume, state checkpoint/recovery, conditional
-writes, workflow execution leases, lease renewal, cancellation tombstones, and
-state-recovery error propagation. The CodePilot tool tests cover provider-side
-default-deny write/shell policy and atomic file replacement. Direct
+writes, workflow execution leases, lease renewal, cancellation tombstones,
+state-recovery error propagation, metric label sanitization, metric snapshot
+rendering, cumulative counter deltas from runtime events, per-failure-class
+counters, and the \texttt{rasn.metrics} command. The CodePilot tool tests cover
+provider-side default-deny write/shell policy and atomic file replacement. Direct
 \codepilot self-tests
 exercise model health, generic model invocation, tool description, state
 put/get/checkpoint, workflow compile/run/resume/cancel, and observability
@@ -1773,7 +1851,7 @@ Group & Purpose \\
 \texttt{state} & Put, get, query, checkpoint/recover smoke \\
 \texttt{registry} & Inspect descriptors and capability routing \\
 \texttt{agentctl} & Describe, heartbeat, query, cancel agent requests \\
-\texttt{observe} & Events, failures, timelines, snapshots, replay \\
+\texttt{observe} & Events, failures, timelines, snapshots, replay, runtime metrics \\
 \texttt{schema} & Text, JSON, IDL, C++ contracts/clients, TypeScript, and Python export \\
 \texttt{eval} & Built-in and external-CLI benchmark harness \\
 \texttt{selftest} & End-to-end direct/service regression workload \\
@@ -2100,6 +2178,11 @@ SDK packaging & Generated C++/TypeScript/Python contracts and RPC-client source
 Evaluation evidence & Unit tests, self-tests, service smokes, schema smokes,
 report build, and a small eval harness & Large benchmarks and user studies for
 debugging effectiveness remain future work \\
+Observability metrics & Cumulative event counters and task/model/tool latency
+percentiles over \rdsn \texttt{perf\_counter}, exported as text, Prometheus, and
+JSON via \texttt{observe metrics} and the \texttt{rasn.metrics} command & No
+bundled scrape gateway, retention store, or prebuilt dashboards; latency
+percentiles depend on \rdsn's periodic counter timers \\
 \bottomrule
 \end{tabular}
 \end{table*}

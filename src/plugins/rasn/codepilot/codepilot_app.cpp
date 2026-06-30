@@ -2,6 +2,7 @@
 
 #include "../agent_clients.h"
 #include "../agent_registry.h"
+#include "../metrics.h"
 #include "../observability.h"
 #include "../policy_manager.h"
 #include "../schema_manifest.h"
@@ -1730,7 +1731,7 @@ int codepilot_cli::run_observe(const std::vector<std::string> &args)
 {
     if (args.empty())
     {
-        std::cout << "usage: observe <events|failures|timeline|diagnose|replay|snapshot> ...\n";
+        std::cout << "usage: observe <events|failures|timeline|diagnose|replay|metrics|snapshot> ...\n";
         return 1;
     }
 
@@ -1742,6 +1743,30 @@ int codepilot_cli::run_observe(const std::vector<std::string> &args)
             return 1;
         }
         return enable_replay(args[1]);
+    }
+
+    if (args[0] == "metrics")
+    {
+        const std::string format = args.size() > 1 ? args[1] : "text";
+        const metrics_snapshot snapshot = _services.runtime_metrics();
+        if (format == "prometheus" || format == "prom")
+        {
+            std::cout << snapshot.to_prometheus();
+        }
+        else if (format == "json")
+        {
+            std::cout << snapshot.to_json() << "\n";
+        }
+        else if (format == "text")
+        {
+            std::cout << snapshot.to_text();
+        }
+        else
+        {
+            std::cout << "usage: observe metrics [text|prometheus|json]\n";
+            return 1;
+        }
+        return 0;
     }
 
     observability_response response;
@@ -2153,6 +2178,7 @@ void codepilot_cli::print_help() const
               << "  observe diagnose [trace] summarize failures and replay issues\n"
               << "  observe failures         query classified failure records\n"
               << "  observe replay <file>    load replay choices through rasn.observability\n"
+              << "  observe metrics [format] dump runtime metrics (text|prometheus|json)\n"
               << "  observe snapshot         summarize observability state\n"
               << "  skills                   list built-in skills\n"
               << "  skill <name> [task]      show or apply a skill prompt\n"

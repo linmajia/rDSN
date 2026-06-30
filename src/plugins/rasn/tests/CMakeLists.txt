@@ -8,23 +8,12 @@ else()
     include("${DSN_ROOT}/bin/dsn.cmake")
 endif()
 
+# The rASN engine is linked from the rasn static library, so the unit-test
+# executable only compiles the test sources plus the CodePilot local-tools
+# component it exercises directly (codepilot/local_tools.cpp, which is part of
+# the CodePilot executable rather than the engine library).
 set(RASN_UNIT_TEST_SUPPORT_SRC
-    "${CMAKE_CURRENT_SOURCE_DIR}/../agent_clients.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../agent_registry.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../agent_runtime.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../agent_tools.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../agent_services.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../coordinator_service.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../codepilot/local_tools.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../llm_provider.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../observability.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../policy_manager.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../rasn_core.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../redaction.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../schema_manifest.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../state_service.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../workflow.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../workflow_service.cpp")
+    "${CMAKE_CURRENT_SOURCE_DIR}/../codepilot/local_tools.cpp")
 
 set(MY_PROJ_NAME rasn.unit_tests)
 
@@ -38,11 +27,10 @@ set(MY_PROJ_INC_PATH
     ${GTEST_INCLUDE_DIR}
     "${CMAKE_CURRENT_SOURCE_DIR}/..")
 
-set(MY_PROJ_LIBS gtest)
-
-if (UNIX)
-    set(MY_PROJ_LIBS ${MY_PROJ_LIBS} pthread)
-endif()
+# gtest plus the rasn static library. The platform thread library that gtest
+# needs is linked automatically by rDSN (CMAKE_THREAD_LIBS_INIT, carried in
+# DSN_SYSTEM_LIBS and appended after these libs), so pthread is not listed here.
+set(MY_PROJ_LIBS gtest rasn)
 
 set(MY_PROJ_LIB_PATH "")
 

@@ -1,14 +1,15 @@
 #include "rasn_core.h"
 
+#include "metrics.h"
 #include "redaction.h"
 
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <fstream>
 #include <iomanip>
-#include <random>
 #include <sstream>
 
 namespace dsn {
@@ -135,12 +136,12 @@ std::string now_utc_string()
 
 std::string make_trace_id()
 {
-    static std::mt19937_64 rng(
-        static_cast<unsigned long long>(std::chrono::high_resolution_clock::now().time_since_epoch().count()));
-    std::uniform_int_distribution<unsigned long long> dist;
-
+    // Draw the identifier from rDSN's pluggable environment provider
+    // (dsn_random64) rather than a private wall-clock-seeded RNG. This matches
+    // how rDSN itself mints RPC trace ids and lets replay/emulator tooling seed
+    // or virtualize the value for deterministic runs.
     std::ostringstream oss;
-    oss << "rasn-" << std::hex << dist(rng);
+    oss << "rasn-" << std::hex << ::dsn_random64(0, 0xffffffffffffffffULL);
     return oss.str();
 }
 
@@ -519,16 +520,41 @@ bool nucleus_runtime::enable_replay(const std::string &path, std::string *error)
 
 void nucleus_runtime::begin_task(const agent_task &task)
 {
+    {
+        ::dsn::service::zauto_lock guard(_timing_lock);
+        _task_start_ms[task.id] = ::dsn_now_ms();
+    }
     record(task, "task.begin", task.name, task.input);
 }
 
 void nucleus_runtime::finish_task(const agent_task &task, const std::string &status)
 {
     record(task, "task.finish", task.name, status);
+    uint64_t start_ms = 0;
+    bool found = false;
+    {
+        ::dsn::service::zauto_lock guard(_timing_lock);
+        std::map<std::string, uint64_t>::iterator it = _task_start_ms.find(task.id);
+        if (it != _task_start_ms.end())
+        {
+            start_ms = it->second;
+            found = true;
+            _task_start_ms.erase(it);
+        }
+    }
+    if (found)
+    {
+        const uint64_t now_ms = ::dsn_now_ms();
+        metrics_registry::instance().observe_task_latency_ms(now_ms >= start_ms ? now_ms - start_ms : 0);
+    }
 }
 
 void nucleus_runtime::record_llm_request(const agent_task &task, const std::string &provider, const std::string &model)
 {
+    {
+        ::dsn::service::zauto_lock guard(_timing_lock);
+        _llm_start_ms[task.id + "\x1f" + provider] = ::dsn_now_ms();
+    }
     record(task, "llm.request", provider, model);
 }
 
@@ -537,6 +563,33 @@ void nucleus_runtime::record_llm_response(const agent_task &task,
                                           const std::string &response)
 {
     record(task, "llm.response", provider, response);
+    finalize_llm_timing(task, provider);
+}
+
+void nucleus_runtime::record_llm_failure(const agent_task &task, const std::string &provider)
+{
+    finalize_llm_timing(task, provider);
+}
+
+void nucleus_runtime::finalize_llm_timing(const agent_task &task, const std::string &provider)
+{
+    uint64_t start_ms = 0;
+    bool found = false;
+    {
+        ::dsn::service::zauto_lock guard(_timing_lock);
+        std::map<std::string, uint64_t>::iterator it = _llm_start_ms.find(task.id + "\x1f" + provider);
+        if (it != _llm_start_ms.end())
+        {
+            start_ms = it->second;
+            found = true;
+            _llm_start_ms.erase(it);
+        }
+    }
+    if (found)
+    {
+        const uint64_t now_ms = ::dsn_now_ms();
+        metrics_registry::instance().observe_llm_latency_ms(now_ms >= start_ms ? now_ms - start_ms : 0);
+    }
 }
 
 void nucleus_runtime::record_llm_response_chunk(const agent_task &task,
@@ -838,6 +891,7 @@ void nucleus_runtime::record_event(const agent_task &task,
     event.retryable = retryable;
     event.retry_attempt = retry_attempt;
     _log.append(event);
+    metrics_registry::instance().on_event(kind, failure_class);
 }
 
 } // namespace rasn

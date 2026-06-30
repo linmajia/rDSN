@@ -17,12 +17,13 @@ The prototype is intentionally small and is organized around four building block
 | --- | --- | --- |
 | rDSN service graph | `agent_services.*`, `rasn.code.definition.h` | Defines rDSN-style micro-service roles for coordinator, model agent, tool agent, state service, workflow service, observability service, and CLI gateway; service mode exposes those roles as `serverlet` RPC services with `clientlet` callers and explicit `RPC_RASN_*` task codes. |
 | Runtime nucleus | `rasn_core.*`, `observability.*`, `schema_manifest.*` | Creates task IDs, trace IDs, structured JSONL runtime events, nondeterministic value capture, external-effect ledger entries, filesystem snapshots, replay lookup, failure records, schema/IDL/JSON manifests, generated C++/TypeScript/Python RPC clients, and observability query APIs. |
+| Runtime metrics | `metrics.*` | Exports cumulative event counters and task/model/tool latency percentiles through rDSN `perf_counter` counters (section `rasn`) and renders them as text, Prometheus, or JSON; exposed via `observe metrics` and the rDSN `command_manager` command `rasn.metrics`. |
 | LLM provider layer | `llm_provider.*` | Provides a common `llm_provider` interface and adapters for simulator, Copilot-compatible, Ollama, llama.cpp, LM Studio, and generic OpenAI-compatible HTTP APIs. |
 | Tool provider layer | `agent_tools.*` | Defines the generic rASN tool-provider contract and registration factory used by the tool-agent service. |
 | Workflow graph | `workflow.*` | Parses a declarative task graph, validates dependencies, topologically orders nodes, and executes them through the selected provider. |
 | CodePilot tools | `codepilot/local_tools.*` | Implements and registers the CodePilot application tool provider: project inspection tools, read/search, and opt-in shell/write execution. |
 | CodePilot skills | `codepilot/skills.*` | Provides reusable coding-agent skill prompts for rDSN plugin work, code review, build debugging, feature planning, and documentation. |
-| CodePilot app | `codepilot/codepilot_app.*`, `main.cpp` | Exposes one-shot and interactive coding-agent commands as an adapter that builds generic `agent_request` messages and routes them through the rASN coordinator. |
+| CodePilot app | `codepilot/codepilot_app.*`, `codepilot/main.cpp` | Exposes one-shot and interactive coding-agent commands as an adapter that builds generic `agent_request` messages and routes them through the rASN coordinator. |
 
 ### rDSN micro-service model
 
@@ -138,7 +139,7 @@ replay.load
 replay.miss
 ```
 
-If `[rasn.runtime] trace_file` is configured or the CLI `trace <file>` command is used, events are appended as JSON lines. Simulator randomness is recorded as a `nondeterminism` event and can be reused later with `replay <trace-jsonl>` or `observe replay <trace-jsonl>`. Model and tool results are also replay-aware: when a replay trace contains recorded `llm.response` events for the provider, `rasn.llm.agent` returns those responses in provider order instead of contacting the provider; when it contains a matching `tool.ok` or `tool.error` event, `rasn.tool.agent` returns that recorded result instead of invoking the provider again. Workflow execution records `workflow.node.start`/`workflow.node.finish` transitions, and replay mode checks recorded node-start order before executing a node. If replay mode is active and a side-effecting tool has no recorded result, the runtime returns an explicit replay error rather than re-running a write or shell command.
+If `[rasn.runtime] trace_file` is configured or the CLI `trace <file>` command is used, events are appended as JSON lines. Simulator randomness is recorded as a `nondeterminism` event and can be reused later with `replay <trace-jsonl>` or `observe replay <trace-jsonl>`. Model and tool results are also replay-aware: when a replay trace contains recorded `llm.response` events for the provider, `rasn.llm.agent` returns those responses in provider order instead of contacting the provider; when it contains a matching `tool.ok` or `tool.error` event, `rasn.tool.agent` returns that recorded result instead of invoking the provider again. Workflow execution records `workflow.node.start`/`workflow.node.finish` transitions, and replay mode checks recorded node-start order before executing a node. If replay mode is active and a side-effecting tool has no recorded result, the runtime returns an explicit replay error rather than re-running a write or shell command. Trace identifiers and the simulator's pseudo-random choices are drawn from rDSN's pluggable environment provider (`dsn_random64`, the same primitive rDSN uses to mint RPC trace IDs), so emulator and replay tooling can seed or virtualize time and randomness instead of relying on private wall-clock-seeded generators.
 
 CodePilot read/list/search tools also record `filesystem.snapshot` events with
 stable path fingerprints. During replay, the tool boundary checks those
@@ -154,6 +155,7 @@ codepilot.exe observe events nondeterminism
 codepilot.exe observe failures
 codepilot.exe observe timeline
 codepilot.exe observe diagnose
+codepilot.exe observe metrics
 codepilot.exe observe snapshot
 ```
 
@@ -168,6 +170,37 @@ index record through the rASN state service boundary. In service mode this flows
 through `rasn.state` RPC, giving operators a durable pointer to the trace file,
 event count, failure count, and last observed sequence without coupling
 observability to an in-process state store.
+
+### Runtime metrics
+
+The nucleus also exports quantitative runtime metrics through rDSN's own
+`perf_counter` subsystem (section `rasn`), reusing the same counter
+infrastructure that rDSN ships for its core services rather than inventing a
+parallel metrics path. `nucleus_runtime::record_event` is the single choke point
+that increments cumulative counters per event kind (Prometheus `_total`
+convention, e.g. `rasn_tasks_begin_total`, `rasn_llm_requests_total`,
+`rasn_tool_error_total`, `rasn_failures_total`), with a per-failure-class counter
+created lazily for each distinct classification. Task, model, and tool wall-clock
+latencies are recorded into `COUNTER_TYPE_NUMBER_PERCENTILES` counters
+(`rasn_task_latency_ms`, `rasn_llm_latency_ms`, `rasn_tool_latency_ms`) whose
+p50/p95/p99/p999 are computed by rDSN's counter timers.
+
+Metrics are exposed two ways:
+
+```bat
+codepilot.exe observe metrics             :: aligned text table
+codepilot.exe observe metrics prometheus  :: Prometheus text exposition format
+codepilot.exe observe metrics json        :: compact JSON document
+```
+
+In service mode the same snapshot is also registered with rDSN's
+`command_manager`, so a running deployment answers `rasn.metrics [text|prometheus|json]`
+over the rDSN local/remote CLI alongside the built-in rDSN commands. The
+Prometheus output can be scraped directly or relayed to any metrics backend.
+Metric collection is controlled by `[rasn.metrics] enabled` (default `true`);
+when disabled, every counter update becomes a no-op. Counter updates are
+null/thread safe and degrade to no-ops when the process has no rDSN service node,
+so the same code path is safe in inline, CLI, and service modes.
 
 ### Tool calling model
 
@@ -508,6 +541,7 @@ The most important sections are:
 | `[rasn.state.replica] enabled/directory/recover` | Optional local mirror for state checkpoints and journals. When enabled, writes fail explicitly if the mirror cannot be updated, and recovery can seed missing primary state from the replica directory. |
 | `[rasn.runtime] trace_file` | JSONL file for runtime traces. |
 | `[rasn.runtime] temp_dir` | Optional temporary directory for request bodies and curl config files. Empty or `.` uses the OS temp directory under `rasn-provider`. |
+| `[rasn.metrics] enabled` | Enables rDSN `perf_counter`-backed runtime metrics (event counters and task/model/tool latency percentiles in section `rasn`). Default `true`; `false` makes every counter update a no-op. Surface them with `observe metrics [text|prometheus|json]` or the `rasn.metrics` rDSN command. |
 | `[rasn.rpc] timeout_ms` | Default timeout for rASN RPC client calls. |
 | `[rasn.agent.<id>] agent_id/role/app_name/host/port/endpoint_uri/version/health/capabilities/side_effect_class` | Optional static registry descriptors loaded by `rasn.registry` on startup. `uri` is accepted as an alias for `endpoint_uri`. |
 | `[rasn.policy] allow_shell` | Set to `true` to enable the `shell` local tool. |
@@ -685,6 +719,7 @@ schema [text|json|idl|cpp|clients-cpp|ts|clients-ts|py|clients-py] print/export 
 observe diagnose [trace] summarize failures and replay issues
 observe failures         query classified failure records
 observe replay <file>    load replay choices through rasn.observability
+observe metrics [format] dump runtime metrics (text|prometheus|json)
 observe snapshot         summarize observability state
 skills                   list CodePilot skills
 skill <name> [task]      show or apply a skill prompt
@@ -903,6 +938,7 @@ hardening gaps remain:
 | Credentials | `token_ref` handles for environment variables, files, and commands, plus deterministic redaction. | No vault-backed or OS-backed credential provider integration. |
 | SDK packaging | Generated C++/TypeScript/Python contracts and RPC-client source. | Packaged SDKs and concrete TypeScript/Python transports are not shipped. |
 | Evaluation evidence | Unit tests, self-tests, service smokes, schema smokes, report build, and a small eval harness. | Large benchmarks and user studies for debugging effectiveness remain future work. |
+| Observability metrics | Cumulative event counters and task/model/tool latency percentiles via rDSN `perf_counter`, exported as text/Prometheus/JSON through `observe metrics` and the `rasn.metrics` rDSN command. | No bundled scrape gateway, retention store, or prebuilt dashboards; percentiles rely on rDSN's periodic counter timers. |
 
 ## Troubleshooting
 
@@ -914,4 +950,5 @@ hardening gaps remain:
 | Copilot/OpenAI-compatible authentication fails | Store credentials in `token_env` or trusted `token_command`; do not place token values in `config.ini` or trace files. |
 | Write or shell tools are denied | This is the safe default. Set `[rasn.policy] allow_write = true` or `allow_shell = true` only for trusted local tests. If approval is required, confirm the prompt or use `tool --yes ...` for direct scripted invocations. |
 | Replay output does not match expectations | Use `observe events nondeterminism`, `observe timeline`, and `observe diagnose` to inspect replay loads and replay misses. |
+| Runtime metrics read as zero | Counters are cumulative and created lazily on first matching event; latency percentiles are computed by rDSN counter timers, so they populate after the first timer interval. Confirm `[rasn.metrics] enabled = true`. |
 | State recovery misses recent writes | Check `[rasn.state] journal_file`; recovery replays the journal after loading the compact checkpoint. |

@@ -72,6 +72,7 @@ public:
     void finish_task(const agent_task &task, const std::string &status);
     void record_llm_request(const agent_task &task, const std::string &provider, const std::string &model);
     void record_llm_response(const agent_task &task, const std::string &provider, const std::string &response);
+    void record_llm_failure(const agent_task &task, const std::string &provider);
     void record_llm_response_chunk(const agent_task &task,
                                    const std::string &provider,
                                    size_t chunk_index,
@@ -145,9 +146,13 @@ private:
                       const std::string &failure_source,
                       bool retryable,
                       uint32_t retry_attempt);
+    void finalize_llm_timing(const agent_task &task, const std::string &provider);
 
     std::string _trace_id;
     event_log _log;
+    std::map<std::string, uint64_t> _task_start_ms;
+    std::map<std::string, uint64_t> _llm_start_ms;
+    mutable ::dsn::service::zlock _timing_lock;
 };
 
 std::string now_utc_string();

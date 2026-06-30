@@ -4,6 +4,7 @@
 #include "agent_runtime.h"
 #include "agent_tools.h"
 #include "llm_provider.h"
+#include "metrics.h"
 #include "rasn.code.definition.h"
 #include "state_service.h"
 #include "workflow_service.h"
@@ -146,6 +147,7 @@ public:
     observability_response query_failures(const observability_query_request &request) const;
     observability_response load_replay(const replay_load_request &request);
     observability_response observability_snapshot() const;
+    metrics_snapshot runtime_metrics() const;
 
 private:
     friend class rasn_llm_agent_rpc_service;
@@ -157,6 +159,7 @@ private:
     void unregister_agents_from_registry_rpc();
     void start_registry_heartbeat_timer();
     void cancel_registry_heartbeat_timer();
+    void register_ops_commands_once();
     void start_unlocked();
     void stop_unlocked();
 

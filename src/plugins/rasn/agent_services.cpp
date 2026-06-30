@@ -3,15 +3,18 @@
 #include "agent_clients.h"
 #include "agent_registry.h"
 #include "coordinator_service.h"
+#include "metrics.h"
 #include "policy_manager.h"
 #include "redaction.h"
 #include "state_service.h"
 #include "workflow_service.h"
 
 #include <dsn/cpp/utils.h>
+#include <dsn/tool-api/command.h>
 
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <thread>
 #include <utility>
@@ -502,6 +505,25 @@ tool_result rasn_tool_agent_service::run_tool(const std::string &name,
                                               const std::vector<std::string> &policy_labels) const
 {
     ::dsn::service::zauto_lock guard(_tool_lock);
+
+    // Record tool latency at the point where every tool execution converges:
+    // the CodePilot CLI path (rasn_service_graph::invoke -> coordinator), the
+    // workflow facade (rasn_service_graph::run_tool), the RPC server path, and
+    // direct callers all reach this method. Measuring here -- rather than at a
+    // single higher-level facade -- ensures the primary CLI path is counted, and
+    // an RAII recorder covers every early return (no provider, validation,
+    // replay hit, replay miss, policy denial, success).
+    const uint64_t tool_start_ms = ::dsn_now_ms();
+    struct tool_latency_recorder
+    {
+        uint64_t start_ms;
+        ~tool_latency_recorder()
+        {
+            const uint64_t now_ms = ::dsn_now_ms();
+            metrics_registry::instance().observe_tool_latency_ms(now_ms >= start_ms ? now_ms - start_ms : 0);
+        }
+    } latency_recorder{tool_start_ms};
+
     if (_tools == nullptr)
     {
         return rpc_error_tool_result("no tool provider registered");
@@ -936,6 +958,44 @@ void rasn_service_graph::start_unlocked()
     }
     register_agents_with_registry_rpc();
     start_registry_heartbeat_timer();
+    register_ops_commands_once();
+}
+
+void rasn_service_graph::register_ops_commands_once()
+{
+    metrics_registry::instance().ensure_core_counters();
+
+    static std::once_flag once;
+    std::call_once(once, [] {
+        ::dsn::register_command(
+            "rasn.metrics",
+            "rasn.metrics - dump rASN runtime metrics",
+            "rasn.metrics [text|prometheus|json] - dump rASN runtime metrics in the "
+            "requested format (default text)",
+            [](const ::dsn::safe_vector<::dsn::safe_string> &args) -> ::dsn::safe_string {
+                std::string format = "text";
+                if (!args.empty())
+                {
+                    format = std::string(args[0].c_str());
+                }
+                const metrics_snapshot snap = metrics_registry::instance().snapshot();
+                std::string out;
+                if (format == "prometheus" || format == "prom")
+                {
+                    out = snap.to_prometheus();
+                }
+                else if (format == "json")
+                {
+                    out = snap.to_json();
+                }
+                else
+                {
+                    out = snap.to_text();
+                }
+                return ::dsn::safe_string(out.c_str());
+            });
+        dinfo("registered rASN ops command: rasn.metrics");
+    });
 }
 
 void rasn_service_graph::stop_unlocked()
@@ -1363,6 +1423,7 @@ tool_result rasn_service_graph::run_tool(const std::string &name,
     generic_tool.task = task;
     agent_request generic_request = make_tool_agent_request(generic_tool, _runtime.trace_id());
     generic_request.timeout_ms = timeout_ms;
+    tool_result result;
     if (_rpc_clients_enabled)
     {
         rasn_agent_client client(_coordinator_address);
@@ -1371,12 +1432,21 @@ tool_result rasn_service_graph::run_tool(const std::string &name,
         std::tie(err, response) = client.invoke_sync(generic_request, request_rpc_timeout(generic_request));
         if (err != ::dsn::ERR_OK)
         {
-            return rpc_error_tool_result(std::string("RPC_RASN_AGENT_INVOKE coordinator failed: ") + err.to_string());
+            result = rpc_error_tool_result(std::string("RPC_RASN_AGENT_INVOKE coordinator failed: ") + err.to_string());
         }
-        return make_tool_result_from_agent(response);
+        else
+        {
+            result = make_tool_result_from_agent(response);
+        }
     }
-
-    return make_tool_result_from_agent(_coordinator.invoke(generic_request, _runtime));
+    else
+    {
+        result = make_tool_result_from_agent(_coordinator.invoke(generic_request, _runtime));
+    }
+    // Tool latency is recorded in rasn_tool_agent_service::run_tool(), the point
+    // where this facade, the CodePilot CLI path, and the RPC server path all
+    // converge, so it is intentionally not observed again here.
+    return result;
 }
 
 agent_response rasn_service_graph::invoke(const agent_request &request)
@@ -1742,6 +1812,11 @@ observability_response rasn_service_graph::observability_snapshot() const
         events.error = "failed to index observability snapshot in state: " + indexed.error;
     }
     return events;
+}
+
+metrics_snapshot rasn_service_graph::runtime_metrics() const
+{
+    return metrics_registry::instance().snapshot();
 }
 
 rasn_service_graph &global_rasn_services()

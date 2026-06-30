@@ -2602,6 +2602,118 @@ Validation:
 - [x] WSL report compile with `build.sh`; `main.pdf` generated successfully.
 - [x] `git diff --check`.
 
+## Phase 67: runtime metrics and operational command surface
+
+Status: `[~]`
+
+Goal: Close the observability metrics gap by exporting quantitative runtime
+metrics through rDSN's existing `perf_counter` subsystem and exposing them
+through both the CodePilot CLI and the rDSN `command_manager`, without adding a
+parallel metrics stack or a bundled scrape gateway.
+
+rDSN modules reused:
+
+- `perf_counter` (`include/dsn/c/api_utilities.h`, `simple_perf_counter`):
+  cumulative counters and latency percentiles computed by rDSN's counter timers.
+- `command_manager` (`include/dsn/tool-api/command.h`): expose a live
+  `rasn.metrics` command over the rDSN local/remote CLI.
+
+Files:
+
+- `metrics.h`
+- `metrics.cpp`
+- `rasn_core.*`
+- `agent_services.*`
+- `codepilot/codepilot_app.cpp`
+- `config.ini`
+- `tests/CMakeLists.txt`
+- `tests/rasn_unit_tests.cpp`
+- `README.md`
+- `docs/DESIGN.md`
+- `docs/report/main.tex`
+- `docs/IMPLEMENTATION_PLAN.md`
+
+Work items:
+
+- [x] Add a `metrics_registry` process-global facade over rDSN perf counters in
+  the `rasn` section: cumulative `COUNTER_TYPE_NUMBER` series per runtime event
+  kind plus lazily created per-failure-class counters, and
+  `COUNTER_TYPE_NUMBER_PERCENTILES` latency series for task, model, and tool.
+- [x] Keep metric data types and formatting (`metrics.h`, `metrics.cpp`)
+  free of rDSN dependencies so they compile and unit test in isolation; render
+  snapshots as text, Prometheus exposition format, and JSON.
+- [x] Guard counter creation with a node-context check and make every update
+  null/thread safe so the metric path is a no-op (never a crash) in inline, CLI,
+  and node-less contexts; gate the whole subsystem on `[rasn.metrics] enabled`.
+- [x] Increment counters at the single `nucleus_runtime::record_event` choke
+  point; pair task/model latency inside the runtime and time tool latency in
+  `rasn_service_graph::run_tool`.
+- [x] Register a `rasn.metrics [text|prometheus|json]` command with
+  `command_manager` once per process from `rasn_service_graph::start_unlocked`,
+  and add `observe metrics [text|prometheus|json]` to CodePilot.
+- [x] Add regression coverage for label sanitization, the three renderers,
+  snapshot series presence, cumulative counter deltas from runtime events,
+  per-failure-class counters, and the `rasn.metrics` command output.
+
+Validation:
+
+- [x] Local `-fsyntax-only` for the dependency-light metric translation units.
+- [x] Local standalone run of the formatter check harness.
+- [ ] Plugin build on a supported toolchain (thrift/boost externals are not
+  available on the authoring host).
+- [ ] `rasn.unit_tests` run on the remote dev machines.
+
+## Phase 68: deterministic environment-input boundary
+
+Status: `[~]`
+
+Goal: Route rASN's in-process nondeterministic environment inputs — wall-clock
+timing and randomness — through rDSN's pluggable environment provider so replay
+and emulator tooling can virtualize or seed them, strengthening the platform's
+deterministic-replay guarantee instead of relying on private, wall-clock-seeded
+generators.
+
+rDSN modules reused:
+
+- `dsn_now_ms`/`dsn_now_ns` (`include/dsn/c/api_layer1.h`, backed by
+  `env_provider::now_ns`) for runtime timing and latency measurement.
+- `dsn_random64` (`include/dsn/c/api_layer1.h`, backed by `env_provider::random64`,
+  whose thread-local generator tooling can seed via
+  `set_thread_local_random_seed`) for identifier and sampling randomness. This is
+  the same primitive rDSN itself uses to mint RPC trace ids.
+
+Files:
+
+- `rasn_core.cpp`
+- `policy_manager.cpp`
+- `llm_provider.cpp`
+- `docs/DESIGN.md`
+- `docs/report/main.tex`
+- `docs/IMPLEMENTATION_PLAN.md`
+
+Work items:
+
+- [x] Replace the private `std::mt19937_64` trace-id generator in `make_trace_id`
+  with `dsn_random64`, matching how rDSN mints RPC trace ids.
+- [x] Replace `std::rand()` in the policy manager's artifact spill suffix with
+  `dsn_random64`.
+- [x] Draw the simulator provider's first-run pseudo-random choice from
+  `dsn_random64` (still captured through `resolve_nondeterminism` so recorded
+  traces replay exactly), removing the wall-clock `std::time` seed.
+- [x] Keep purely-local, non-behavioral filename nonces (temporary paths) and
+  human-readable wall-clock timestamps on the standard library, where env-provider
+  virtualization adds no replay value.
+- [x] Tidy includes after the migration (`rasn_core.cpp` drops `<chrono>`/`<random>`
+  and adds `<ctime>`; `llm_provider.cpp` drops `<ctime>`/`<random>`).
+
+Validation:
+
+- [x] Local `-fsyntax-only` check that `dsn_random64` resolves and the call sites
+  type-check against the real rDSN C API header.
+- [ ] Plugin build on a supported toolchain (thrift/boost externals are not
+  available on the authoring host).
+- [ ] `rasn.unit_tests` run on the remote dev machines.
+
 ## Dependency order
 
 ```text
@@ -2671,6 +2783,7 @@ Phase 1 task model
   -> Phase 64 generated C++ RPC clients
   -> Phase 65 model credential handles
   -> Phase 66 product-readiness limitation closure
+  -> Phase 67 runtime metrics and operational command surface
 ```
 
 Some phases can overlap after Phase 3, but the public message model and generic

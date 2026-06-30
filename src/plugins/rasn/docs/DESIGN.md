@@ -54,6 +54,7 @@ rasn.coordinator  <---->  rasn.registry
         +---- state/checkpoint ----> rasn.state
         +---- policy checks -------> rasn.policy
         +---- trace/failure -------> rasn.observability
+        +---- counters/latency ----> perf_counter (rasn.metrics)
         |
         +---- workflow execution --> rasn.workflow
 ```
@@ -256,6 +257,9 @@ Current CLI surfaces:
   for built-in coordinator/model/tool agents.
 - `workflow nodes <run-id>` reads node-level workflow state persisted by
   `rasn.workflow`.
+- `observe metrics [text|prometheus|json]` dumps the perf-counter metrics
+  snapshot; service deployments answer the same data over the rDSN
+  `command_manager` command `rasn.metrics`.
 
 These commands are intentionally simple text output for now. A future version
 should expose the same data as stable JSON for external tooling.
@@ -572,6 +576,9 @@ Correctness and robustness requirements:
 - Snapshot index metadata is written through the service graph so RPC mode uses
   `rasn.state` rather than a hidden local state-store dependency.
 - Nondeterministic decisions record enough input metadata to explain replay.
+- In-process timing and randomness are drawn from rDSN's pluggable environment
+  provider (`dsn_now_ms`/`dsn_random64`), so replay and emulator tooling can seed
+  or virtualize them; private wall-clock-seeded generators are avoided.
 - Model responses can be replayed from prior `llm.response` events in provider
   order before the model provider is called.
 - Tool calls record their arguments and result, and replay mode can return a
@@ -586,6 +593,49 @@ Correctness and robustness requirements:
   are not re-run while replay mode is active unless a recorded result matches.
 - Internal invariant violations use `dassert`; recoverable failures return
   structured errors.
+
+### 12.1 Runtime metrics
+
+Structured trace events make a single run explainable; aggregate metrics make a
+fleet operable. rASN therefore reuses rDSN's existing `perf_counter` subsystem
+rather than introducing a separate metrics stack.
+
+Responsibilities:
+
+- Maintain cumulative counters per runtime event kind (Prometheus `_total`
+  convention) and lazily created per-failure-class counters.
+- Maintain task, model, and tool wall-clock latency distributions.
+- Expose a point-in-time snapshot renderable as text, Prometheus exposition
+  format, or JSON.
+
+rDSN design:
+
+- `metrics_registry` is a process-global facade over rDSN perf counters created
+  in the `rasn` section. Cumulative series use `COUNTER_TYPE_NUMBER`; latency
+  series use `COUNTER_TYPE_NUMBER_PERCENTILES`, so p50/p95/p99/p999 are computed
+  by rDSN's own counter timers instead of bespoke histogram code.
+- `nucleus_runtime::record_event` is the single choke point that increments
+  counters, so every existing and future event kind is covered without touching
+  call sites. Task and model latencies are paired inside the runtime; tool
+  latency is timed in `rasn_service_graph::run_tool`.
+- The service graph registers a `rasn.metrics` command with rDSN's
+  `command_manager`, so a running deployment answers
+  `rasn.metrics [text|prometheus|json]` over the same local/remote CLI as
+  built-in rDSN commands. CodePilot exposes the same snapshot through
+  `observe metrics`.
+
+Correctness and robustness requirements:
+
+- Counter creation asserts an rDSN service node; creation is guarded by a
+  node-context check and all updates are null/thread safe, so metric code is a
+  no-op (never a crash) in inline, CLI, and node-less contexts.
+- `[rasn.metrics] enabled = false` disables all updates without removing call
+  sites.
+- The command is registered once per process via `std::call_once`, avoiding the
+  duplicate-registration assertion in `command_manager`.
+- Metric formatting is dependency-light and pure (it lives alongside the
+  perf-counter backend in `metrics.cpp` but uses no rDSN headers), so it is unit
+  tested independent of the perf-counter backend.
 
 ### 13. Service-mode integration self-test
 
@@ -773,6 +823,11 @@ rDSN design:
 
 - Packaging remains source-tree local: `config.ini` is copied beside the built
   executable by CMake, and examples are stored under `examples/`.
+- rASN builds as a reusable `rasn` static library containing the engine, while
+  CodePilot (`codepilot/`, including `codepilot/main.cpp`) and the
+  `rasn.unit_tests` binary are thin executables that link it. This keeps the
+  platform reusable by other applications and avoids recompiling the engine per
+  consumer.
 - The CLI is an adapter over generic rASN APIs and should not introduce hidden
   direct provider/tool paths.
 - `codepilot eval` runs built-in or file-backed task suites and can invoke an
@@ -812,6 +867,7 @@ Application adapters must not own:
 | `agent_services.*` | Split into generic runtime, registry, coordinator, model agent, tool agent, and clients. |
 | `rasn.code.definition.h` | Add generic RPC task codes and keep specialized compatibility codes during migration. |
 | `rasn_core.*` | Become observability/replay foundation, backed by state service later. |
+| `metrics.*` | Aggregate runtime metrics over rDSN `perf_counter`; surfaced via `observe metrics` and the `rasn.metrics` command. |
 | `workflow.*` | Promote to workflow graph plus compiler/executor service. |
 | `llm_provider.*` | Remain provider adapters behind generic model gateway. |
 | `agent_tools.h` | Become generic tool provider interface; CodePilot tools stay in `codepilot/`. |
@@ -834,8 +890,11 @@ remaining limitations are:
   policy.
 - **Replay fidelity:** replay covers model responses, matching tool results,
   workflow scheduling, filesystem snapshots, and side-effect intent records via
-  `external.effect`; it does not virtualize arbitrary external services, clocks,
-  network state, process environments, or provider-side nondeterminism.
+  `external.effect`, and in-process timing and randomness flow through rDSN's
+  pluggable environment provider (`dsn_now_ms`/`dsn_random64`) so tooling can
+  virtualize or seed them; it does not yet virtualize arbitrary external
+  services, OS-level clocks, network state, process environments, or
+  provider-side nondeterminism.
 - **Deployment validation:** service-mode RPC, URI/host endpoint configuration,
   registry heartbeats, and active lease cleanup are implemented, but
   multi-process and cluster deployment tests remain limited.
@@ -849,3 +908,8 @@ remaining limitations are:
   smokes, report builds, and a small evaluation harness exist, but large
   benchmark suites and user studies for debugging effectiveness are still
   future work.
+- **Observability metrics:** runtime counters and task/model/tool latency
+  percentiles are exported through rDSN `perf_counter` and rendered as
+  text/Prometheus/JSON, but rASN does not bundle a scrape gateway, a retention
+  store, or prebuilt dashboards, and latency percentiles depend on rDSN's
+  periodic counter timers.

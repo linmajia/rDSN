@@ -5,6 +5,7 @@
 #include "../agent_services.h"
 #include "../coordinator_service.h"
 #include "../codepilot/local_tools.h"
+#include "../metrics.h"
 #include "../policy_manager.h"
 #include "../redaction.h"
 #include "../state_service.h"
@@ -13,6 +14,8 @@
 #include "../workflow_service.h"
 
 #include <dsn/cpp/utils.h>
+#include <dsn/tool-api/command.h>
+#include <dsn/tool-api/task.h>
 #include <gtest/gtest.h>
 
 #include <cstdio>
@@ -1689,6 +1692,180 @@ TEST(rasn_policy, replays_recorded_side_effect_tool_results_without_execution)
     EXPECT_TRUE(saw_replay_miss_effect);
 
     std::remove(trace_path.c_str());
+}
+
+TEST(rasn_metrics_format, sanitize_metric_label_produces_prometheus_safe_tokens)
+{
+    EXPECT_EQ("tool_timeout", sanitize_metric_label("tool.timeout"));
+    EXPECT_EQ("schema_violation", sanitize_metric_label("schema violation"));
+    EXPECT_EQ("a_b_c", sanitize_metric_label("a/b-c"));
+    EXPECT_EQ("unknown", sanitize_metric_label(""));
+    EXPECT_EQ("_5xx", sanitize_metric_label("5xx"));
+    EXPECT_EQ("already_ok_1", sanitize_metric_label("already_ok_1"));
+}
+
+TEST(rasn_metrics_format, snapshot_accessors_and_text_rendering)
+{
+    metrics_snapshot snapshot;
+    snapshot.enabled = true;
+
+    metric_sample counter;
+    counter.name = "rasn_tasks_begin_total";
+    counter.help = "agent tasks started";
+    counter.is_latency = false;
+    counter.value = 7;
+    snapshot.samples.push_back(counter);
+
+    metric_sample latency;
+    latency.name = "rasn_task_latency_ms";
+    latency.help = "agent task wall-clock latency in milliseconds";
+    latency.is_latency = true;
+    latency.p50 = 1.0;
+    latency.p95 = 2.5;
+    latency.p99 = 3.0;
+    latency.p999 = 4.0;
+    snapshot.samples.push_back(latency);
+
+    ASSERT_NE(nullptr, snapshot.find("rasn_tasks_begin_total"));
+    EXPECT_EQ(nullptr, snapshot.find("does_not_exist"));
+    EXPECT_EQ(7u, snapshot.counter("rasn_tasks_begin_total"));
+    EXPECT_EQ(0u, snapshot.counter("does_not_exist"));
+
+    const std::string text = snapshot.to_text();
+    EXPECT_NE(std::string::npos, text.find("rasn metrics (enabled=true)"));
+    EXPECT_NE(std::string::npos, text.find("rasn_tasks_begin_total"));
+    EXPECT_NE(std::string::npos, text.find("  7"));
+    EXPECT_NE(std::string::npos, text.find("p50=1ms"));
+    EXPECT_NE(std::string::npos, text.find("p95=2.5ms"));
+}
+
+TEST(rasn_metrics_format, prometheus_and_json_rendering)
+{
+    metrics_snapshot snapshot;
+    snapshot.enabled = false;
+
+    metric_sample counter;
+    counter.name = "rasn_failures_total";
+    counter.help = "classified failures";
+    counter.value = 3;
+    snapshot.samples.push_back(counter);
+
+    metric_sample latency;
+    latency.name = "rasn_llm_latency_ms";
+    latency.help = "model completion latency in milliseconds";
+    latency.is_latency = true;
+    latency.p50 = 10.0;
+    latency.p99 = 42.0;
+    snapshot.samples.push_back(latency);
+
+    const std::string prom = snapshot.to_prometheus();
+    EXPECT_NE(std::string::npos, prom.find("# HELP rasn_failures_total classified failures"));
+    EXPECT_NE(std::string::npos, prom.find("# TYPE rasn_failures_total counter"));
+    EXPECT_NE(std::string::npos, prom.find("rasn_failures_total 3"));
+    EXPECT_NE(std::string::npos, prom.find("# TYPE rasn_llm_latency_ms summary"));
+    EXPECT_NE(std::string::npos, prom.find("rasn_llm_latency_ms{quantile=\"0.5\"} 10"));
+    EXPECT_NE(std::string::npos, prom.find("rasn_llm_latency_ms{quantile=\"0.99\"} 42"));
+
+    const std::string json = snapshot.to_json();
+    EXPECT_NE(std::string::npos, json.find("\"enabled\":false"));
+    EXPECT_NE(std::string::npos, json.find("\"name\":\"rasn_failures_total\""));
+    EXPECT_NE(std::string::npos, json.find("\"type\":\"counter\""));
+    EXPECT_NE(std::string::npos, json.find("\"value\":3"));
+    EXPECT_NE(std::string::npos, json.find("\"type\":\"latency_ms\""));
+    EXPECT_NE(std::string::npos, json.find("\"p99\":42"));
+}
+
+TEST(rasn_metrics_registry, snapshot_exposes_core_and_latency_series)
+{
+    // Bind this thread to an rDSN service node so perf counters are live
+    // (enable_default_app_mimic installs the mimic node on first access).
+    (void)::dsn::task::get_current_node();
+
+    metrics_registry::instance().ensure_core_counters();
+    const metrics_snapshot snapshot = metrics_registry::instance().snapshot();
+
+    // Core cumulative counters are always present.
+    EXPECT_NE(nullptr, snapshot.find("rasn_tasks_begin_total"));
+    EXPECT_NE(nullptr, snapshot.find("rasn_tasks_finish_total"));
+    EXPECT_NE(nullptr, snapshot.find("rasn_llm_requests_total"));
+    EXPECT_NE(nullptr, snapshot.find("rasn_tool_ok_total"));
+    EXPECT_NE(nullptr, snapshot.find("rasn_failures_total"));
+
+    // Latency series are present and flagged as latency samples.
+    const metric_sample *task_latency = snapshot.find("rasn_task_latency_ms");
+    const metric_sample *llm_latency = snapshot.find("rasn_llm_latency_ms");
+    const metric_sample *tool_latency = snapshot.find("rasn_tool_latency_ms");
+    ASSERT_NE(nullptr, task_latency);
+    ASSERT_NE(nullptr, llm_latency);
+    ASSERT_NE(nullptr, tool_latency);
+    EXPECT_TRUE(task_latency->is_latency);
+    EXPECT_TRUE(llm_latency->is_latency);
+    EXPECT_TRUE(tool_latency->is_latency);
+}
+
+TEST(rasn_metrics_registry, runtime_events_increment_cumulative_counters)
+{
+    (void)::dsn::task::get_current_node();
+
+    metrics_registry &registry = metrics_registry::instance();
+    registry.ensure_core_counters();
+
+    const uint64_t begin_before = registry.snapshot().counter("rasn_tasks_begin_total");
+    const uint64_t finish_before = registry.snapshot().counter("rasn_tasks_finish_total");
+
+    nucleus_runtime runtime;
+    agent_task task;
+    task.id = "metrics-counter-task";
+    task.name = "unit.metrics";
+    task.input = "noop";
+    runtime.begin_task(task);
+    runtime.finish_task(task, "ok");
+
+    const uint64_t begin_after = registry.snapshot().counter("rasn_tasks_begin_total");
+    const uint64_t finish_after = registry.snapshot().counter("rasn_tasks_finish_total");
+
+    EXPECT_EQ(begin_before + 1, begin_after);
+    EXPECT_EQ(finish_before + 1, finish_after);
+
+    // Observing a latency value must never crash, even though percentiles are
+    // computed asynchronously by rDSN counter timers.
+    registry.observe_task_latency_ms(5);
+    registry.observe_llm_latency_ms(5);
+    registry.observe_tool_latency_ms(5);
+}
+
+TEST(rasn_metrics_registry, failure_events_create_per_class_counters)
+{
+    (void)::dsn::task::get_current_node();
+
+    metrics_registry &registry = metrics_registry::instance();
+    registry.on_event("failure", "tool.timeout");
+    registry.on_event("failure", "tool.timeout");
+
+    const metrics_snapshot snapshot = registry.snapshot();
+    const metric_sample *per_class = snapshot.find("rasn_failures_class_tool_timeout_total");
+    ASSERT_NE(nullptr, per_class);
+    EXPECT_GE(per_class->value, 2u);
+}
+
+TEST(rasn_metrics_registry, ops_command_dumps_metrics_in_requested_format)
+{
+    rasn_service_graph services;
+    services.acquire();
+
+    ::dsn::safe_string text_out;
+    ASSERT_TRUE(::dsn::run_command("rasn.metrics text", text_out));
+    EXPECT_NE(std::string::npos, std::string(text_out.c_str()).find("rasn metrics (enabled="));
+
+    ::dsn::safe_string prom_out;
+    ASSERT_TRUE(::dsn::run_command("rasn.metrics prometheus", prom_out));
+    EXPECT_NE(std::string::npos, std::string(prom_out.c_str()).find("# TYPE rasn_tasks_begin_total counter"));
+
+    ::dsn::safe_string json_out;
+    ASSERT_TRUE(::dsn::run_command("rasn.metrics json", json_out));
+    EXPECT_NE(std::string::npos, std::string(json_out.c_str()).find("\"metrics\":["));
+
+    services.release();
 }
 
 } // namespace

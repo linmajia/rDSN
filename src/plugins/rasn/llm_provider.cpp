@@ -8,15 +8,12 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
-#include <chrono>
-#include <ctime>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <limits>
 #include <memory>
-#include <random>
 #include <sstream>
 #include <vector>
 
@@ -198,7 +195,7 @@ std::string temp_path(const std::string &prefix, const std::string &extension)
     std::ostringstream oss;
     oss << prefix << "-"
         << process_id_string() << "-"
-        << std::chrono::high_resolution_clock::now().time_since_epoch().count() << "-"
+        << ::dsn_now_ns() << "-"
         << counter.fetch_add(1) << extension;
     return ::dsn::utils::filesystem::path_combine(provider_temp_dir(), oss.str());
 }
@@ -626,9 +623,10 @@ public:
             "The safest next step is to produce a minimal implementation, run a targeted build, and keep the event log enabled."};
 
         const std::string choice = runtime.resolve_nondeterminism(task, "simulator.response", "local-random", []() {
-            static std::mt19937 rng(static_cast<unsigned int>(std::time(nullptr)));
-            std::uniform_int_distribution<int> dist(0, 3);
-            return std::to_string(dist(rng));
+            // The captured value replays exactly; draw the first-run sample from
+            // rDSN's environment-provider RNG (dsn_random64) so it is
+            // virtualizable under emulator/replay tooling too.
+            return std::to_string(::dsn_random64(0, 3));
         });
 
         int index = std::atoi(choice.c_str());
@@ -694,6 +692,34 @@ public:
         task.name = "llm." + _provider_name;
         task.input = request.user_prompt;
         runtime.record_llm_request(task, _provider_name, _model);
+
+        // Guarantee the per-request LLM timing slot opened above is finalized on
+        // every exit. The success path calls mark_recorded() after recording the
+        // response; any other return (the early failure paths below, or an
+        // exception) records failed-call latency and clears the slot instead of
+        // leaking a stale process-global timing entry.
+        class llm_timing_guard
+        {
+        public:
+            llm_timing_guard(nucleus_runtime &runtime, const agent_task &task, const std::string &provider)
+                : _runtime(runtime), _task(task), _provider(provider), _recorded(false)
+            {
+            }
+            void mark_recorded() { _recorded = true; }
+            ~llm_timing_guard()
+            {
+                if (!_recorded)
+                {
+                    _runtime.record_llm_failure(_task, _provider);
+                }
+            }
+
+        private:
+            nucleus_runtime &_runtime;
+            const agent_task &_task;
+            std::string _provider;
+            bool _recorded;
+        } timing_guard(runtime, task, _provider_name);
 
         std::string payload;
         if (_payload_format == "ollama.generate")
@@ -780,6 +806,7 @@ public:
         response.ok = true;
         response.text = trim(text);
         runtime.record_llm_response(task, _provider_name, response.text);
+        timing_guard.mark_recorded();
         return response;
     }
 

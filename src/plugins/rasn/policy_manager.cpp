@@ -163,8 +163,11 @@ std::string current_process_id()
 
 std::string spill_suffix()
 {
+    // Use rDSN's environment-provider RNG (dsn_random64) so the suffix is
+    // virtualizable under deterministic-replay tooling, instead of the
+    // process-global std::rand() generator.
     std::ostringstream oss;
-    oss << current_process_id() << "-" << std::rand();
+    oss << current_process_id() << "-" << std::hex << ::dsn_random64(0, 0xffffffffffffffffULL);
     return oss.str();
 }
 
