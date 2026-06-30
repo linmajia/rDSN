@@ -1910,10 +1910,13 @@ uses to throttle its task queues, seeded so the delay ramps from zero at the sof
 threshold to the configured ceiling. Second, the gate reuses the breaker's
 \texttt{in\_process()} predicate to exempt no-network providers, and is wired into
 \texttt{rasn\_llm\_agent\_service} on the same convergence point as the breaker.
-Ordering is deliberate: admission is evaluated \emph{before} the breaker (so a
-rejected request never perturbs breaker state) and \emph{after} the replay check (so
-replayed runs stay deterministic), and an RAII \texttt{admission\_slot} releases
-capacity on every exit, including an early breaker short-circuit. With the generous
+Ordering is deliberate: the admission \emph{reservation} is evaluated \emph{before}
+the breaker (so a rejected request never perturbs breaker state) and \emph{after}
+the replay check (so replayed runs stay deterministic), while the graceful
+backpressure \emph{delay} is applied only after the breaker also admits --- so a
+request the breaker short-circuits neither sleeps nor holds its slot through a
+sleep. An RAII \texttt{admission\_slot} releases capacity on every exit, including
+an early breaker short-circuit. With the generous
 defaults, sequential single-agent CLI use (in-flight $\approx 1$) never delays or
 rejects; the gate engages only under the concurrent fan-out of service mode.
 Rejections and backpressure delays are exported as

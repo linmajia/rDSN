@@ -322,16 +322,30 @@ state_response service_graph_observability_state_writer(const state_record &reco
     return global_rasn_services().put_state(record);
 }
 
+// Read a [section] key as a uint32_t, clamping out-of-range values to UINT32_MAX
+// instead of silently wrapping. dsn_config returns uint64_t; a value above
+// UINT32_MAX would otherwise truncate on the narrowing cast -- e.g. 2^32 -> 0,
+// which for a concurrency cap means "unlimited" and would disable the bulkhead.
+// An explicit 0 is preserved (0 keeps its documented meaning).
+uint32_t read_config_u32(const char *section,
+                         const char *key,
+                         uint32_t default_value,
+                         const char *dsptr)
+{
+    const uint64_t raw = ::dsn_config_get_value_uint64(section, key, default_value, dsptr);
+    return raw > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(raw);
+}
+
 breaker_config read_model_breaker_config()
 {
     breaker_config cfg;
     cfg.enabled = ::dsn_config_get_value_bool(
         "rasn.model", "circuit_breaker_enabled", true, "enable the rASN model-gateway circuit breaker");
-    cfg.failure_threshold = static_cast<uint32_t>(::dsn_config_get_value_uint64(
+    cfg.failure_threshold = read_config_u32(
         "rasn.model",
         "circuit_breaker_failure_threshold",
         5,
-        "consecutive model-provider failures before the circuit breaker opens"));
+        "consecutive model-provider failures before the circuit breaker opens");
     cfg.open_ms = ::dsn_config_get_value_uint64(
         "rasn.model",
         "circuit_breaker_open_ms",
@@ -348,21 +362,21 @@ admission_config read_model_admission_config()
         "admission_enabled",
         true,
         "enable rASN model-gateway admission control (concurrency bulkhead + backpressure)");
-    cfg.max_concurrency = static_cast<uint32_t>(::dsn_config_get_value_uint64(
+    cfg.max_concurrency = read_config_u32(
         "rasn.model",
         "max_concurrent_requests",
         32,
-        "hard cap on concurrent in-flight model requests per provider (0 = unlimited)"));
-    cfg.soft_concurrency = static_cast<uint32_t>(::dsn_config_get_value_uint64(
+        "hard cap on concurrent in-flight model requests per provider (0 = unlimited)");
+    cfg.soft_concurrency = read_config_u32(
         "rasn.model",
         "soft_concurrent_requests",
         16,
-        "in-flight level at which graceful admission backpressure begins (0 = no backpressure)"));
-    cfg.max_backpressure_ms = static_cast<uint32_t>(::dsn_config_get_value_uint64(
+        "in-flight level at which graceful admission backpressure begins (0 = no backpressure)");
+    cfg.max_backpressure_ms = read_config_u32(
         "rasn.model",
         "max_backpressure_ms",
         200,
-        "upper bound in ms on the graceful admission backpressure delay"));
+        "upper bound in ms on the graceful admission backpressure delay");
     return cfg;
 }
 
@@ -530,14 +544,25 @@ admission_slot rasn_llm_agent_service::model_admission_admit(const std::string &
             *fast_fail = rpc_error_response("model admission control rejected request for provider " + provider +
                                             "; concurrency limit " + std::to_string(slot.limit()) + " reached");
         }
-        return slot;
     }
-    if (slot.delay_ms() > 0)
-    {
-        runtime.record_model_admission_delayed(task, provider, slot.in_flight(), slot.delay_ms());
-        std::this_thread::sleep_for(std::chrono::milliseconds(slot.delay_ms()));
-    }
+    // The graceful backpressure delay carried by the slot is intentionally NOT
+    // applied here. The caller applies it via apply_model_admission_backpressure()
+    // only after the circuit breaker has also admitted the request, so a request
+    // the breaker short-circuits neither sleeps nor holds its slot through a sleep.
     return slot;
+}
+
+void rasn_llm_agent_service::apply_model_admission_backpressure(const std::string &provider,
+                                                                const agent_task &task,
+                                                                nucleus_runtime &runtime,
+                                                                const admission_slot &slot)
+{
+    if (slot.delay_ms() == 0)
+    {
+        return;
+    }
+    runtime.record_model_admission_delayed(task, provider, slot.in_flight(), slot.delay_ms());
+    std::this_thread::sleep_for(std::chrono::milliseconds(slot.delay_ms()));
 }
 
 std::vector<admission_gate_registry::entry> rasn_llm_agent_service::model_admission_states() const
@@ -571,11 +596,13 @@ llm_response rasn_llm_agent_service::complete(const agent_completion_request &re
     }
 
     // Guard network providers with overload + failure protection: an admission
-    // bulkhead (with graceful backpressure) keeps a healthy endpoint from being
-    // overwhelmed, and a circuit breaker fast-fails a failing endpoint before its
-    // own retry loop. Admission runs first so a request the breaker would
-    // short-circuit never wastes a breaker probe; the admission slot releases when
-    // it leaves scope, covering the whole provider call.
+    // bulkhead keeps a healthy endpoint from being overwhelmed, and a circuit
+    // breaker fast-fails a failing endpoint before its own retry loop. Admission
+    // reserves a slot first so a request the breaker would short-circuit never
+    // wastes a breaker probe; but its graceful backpressure delay is applied only
+    // after the breaker also admits, so a short-circuited request neither sleeps
+    // nor holds its slot through a sleep. The RAII slot releases on scope exit,
+    // covering the whole provider call otherwise.
     const std::string provider_name = _provider->name();
     const bool guarded = provider_needs_guards();
     admission_slot admission;
@@ -591,6 +618,7 @@ llm_response rasn_llm_agent_service::complete(const agent_completion_request &re
         {
             return fast_fail;
         }
+        apply_model_admission_backpressure(provider_name, request.task, runtime, admission);
     }
 
     const llm_response response = redact_llm_response(_provider->complete(redact_llm_request(llm), runtime));
@@ -650,6 +678,7 @@ llm_response rasn_llm_agent_service::complete_streaming(const agent_completion_r
         {
             return fast_fail;
         }
+        apply_model_admission_backpressure(provider_name, request.task, runtime, admission);
     }
 
     const llm_response response =

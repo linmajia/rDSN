@@ -69,13 +69,21 @@ private:
                               nucleus_runtime &runtime,
                               bool ok);
     // Acquire an admission slot for the active provider. The returned slot
-    // reserves capacity until destroyed; on rejection slot.admitted() is false
-    // and *fast_fail is filled. Records rejection/backpressure metrics and
-    // applies the backpressure delay before returning an admitted slot.
+    // reserves capacity until destroyed; on rejection slot.admitted() is false and
+    // *fast_fail is filled (recording the rejection metric). The slot's graceful
+    // backpressure delay is NOT applied here -- call
+    // apply_model_admission_backpressure() once the breaker has also admitted the
+    // request, so a short-circuited request never sleeps.
     admission_slot model_admission_admit(const std::string &provider,
                                          const agent_task &task,
                                          nucleus_runtime &runtime,
                                          llm_response *fast_fail);
+    // Apply (and record) the slot's graceful backpressure delay, if any. Called
+    // after both admission and the breaker have admitted the request.
+    void apply_model_admission_backpressure(const std::string &provider,
+                                            const agent_task &task,
+                                            nucleus_runtime &runtime,
+                                            const admission_slot &slot);
     // True when the active provider should be guarded by overload/failure
     // protection (network-backed providers only; in-process providers are
     // exempt). Shared by the circuit breaker and admission control.

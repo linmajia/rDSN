@@ -721,9 +721,12 @@ rDSN design:
 - It is wired into `rasn_llm_agent_service` alongside the breaker, and the gate is
   evaluated *before* the breaker. Ordering matters: admitting first means a
   rejected request never perturbs breaker state, and a request the breaker later
-  short-circuits still releases its admission slot through the RAII guard. Both
-  gates sit *after* the replay check, so replayed runs bypass admission entirely
-  and stay deterministic.
+  short-circuits still releases its admission slot through the RAII guard. The
+  bulkhead *reservation* runs first, but the graceful backpressure *delay* is
+  applied only after the breaker also admits — so a request the breaker
+  short-circuits neither sleeps nor holds its slot through a sleep. Both gates sit
+  *after* the replay check, so replayed runs bypass admission entirely and stay
+  deterministic.
 - The same `in_process()` predicate that exempts the simulator and other
   no-network providers from the breaker also exempts them from admission control,
   so single-agent CLI runs and deterministic tests are unaffected. With the default
