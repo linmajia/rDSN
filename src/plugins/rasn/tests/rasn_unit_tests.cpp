@@ -9,6 +9,7 @@
 #include "../codepilot/local_tools.h"
 #include "../metrics.h"
 #include "../policy_manager.h"
+#include "../rate_limiter.h"
 #include "../redaction.h"
 #include "../state_service.h"
 #include "../schema_manifest.h"
@@ -2004,6 +2005,7 @@ TEST(rasn_circuit_breaker, ops_command_reports_breaker_state)
     ASSERT_TRUE(::dsn::run_command("rasn.resilience", out));
     EXPECT_NE(std::string::npos, std::string(out.c_str()).find("model circuit breakers"));
     EXPECT_NE(std::string::npos, std::string(out.c_str()).find("model admission control"));
+    EXPECT_NE(std::string::npos, std::string(out.c_str()).find("model rate limiters"));
 
     services.release();
 }
@@ -2132,6 +2134,145 @@ TEST(rasn_admission_gate, registry_isolates_gates_per_key)
         EXPECT_EQ(5u, entry.max_concurrency);
         EXPECT_EQ(3u, entry.soft_concurrency);
     }
+}
+
+TEST(rasn_rate_limiter, disabled_or_unlimited_is_passthrough)
+{
+    // requests_per_min == 0 means unlimited: every request passes with no delay.
+    rate_limit_config unlimited;
+    unlimited.enabled = true;
+    unlimited.requests_per_min = 0;
+    rate_limiter open(unlimited);
+    for (int i = 0; i < 100; ++i)
+    {
+        const rate_decision d = open.try_acquire(static_cast<uint64_t>(i));
+        EXPECT_TRUE(d.allowed);
+        EXPECT_EQ(0u, d.delay_ms);
+    }
+
+    // enabled == false is also a passthrough even when a rate is configured.
+    rate_limit_config off;
+    off.enabled = false;
+    off.requests_per_min = 60;
+    off.burst = 1;
+    rate_limiter disabled(off);
+    for (int i = 0; i < 10; ++i)
+    {
+        const rate_decision d = disabled.try_acquire(0);
+        EXPECT_TRUE(d.allowed);
+        EXPECT_EQ(0u, d.delay_ms);
+    }
+}
+
+TEST(rasn_rate_limiter, bucket_starts_full_then_paces_to_the_sustained_rate)
+{
+    rate_limit_config cfg;
+    cfg.requests_per_min = 60; // 1 token/sec => 1000ms per token
+    cfg.burst = 5;
+    cfg.max_wait_ms = 100000; // large: prefer delaying over rejecting
+    rate_limiter limiter(cfg);
+
+    // The burst is available immediately at t=0 with no delay.
+    for (int i = 0; i < 5; ++i)
+    {
+        const rate_decision d = limiter.try_acquire(0);
+        EXPECT_TRUE(d.allowed);
+        EXPECT_EQ(0u, d.delay_ms);
+    }
+    // The next request must wait ~1 refill period; the one after that ~2.
+    const rate_decision sixth = limiter.try_acquire(0);
+    EXPECT_TRUE(sixth.allowed);
+    EXPECT_EQ(1000u, sixth.delay_ms);
+    const rate_decision seventh = limiter.try_acquire(0);
+    EXPECT_TRUE(seventh.allowed);
+    EXPECT_EQ(2000u, seventh.delay_ms);
+}
+
+TEST(rasn_rate_limiter, rejects_when_projected_wait_exceeds_max_wait)
+{
+    rate_limit_config cfg;
+    cfg.requests_per_min = 60; // 1000ms per token
+    cfg.burst = 1;
+    cfg.max_wait_ms = 500; // shorter than one refill period
+    rate_limiter limiter(cfg);
+
+    EXPECT_TRUE(limiter.try_acquire(0).allowed); // spends the single burst token
+    const rate_decision rejected = limiter.try_acquire(0);
+    EXPECT_FALSE(rejected.allowed); // 1000ms wait > 500ms cap => reject, no delay
+    EXPECT_EQ(0u, rejected.delay_ms);
+}
+
+TEST(rasn_rate_limiter, tokens_refill_over_time)
+{
+    rate_limit_config cfg;
+    cfg.requests_per_min = 60; // 1000ms per token
+    cfg.burst = 1;
+    cfg.max_wait_ms = 0; // never delay: empty bucket rejects immediately
+    rate_limiter limiter(cfg);
+
+    EXPECT_TRUE(limiter.try_acquire(0).allowed);
+    EXPECT_FALSE(limiter.try_acquire(0).allowed); // empty, cannot wait
+    // After one refill period a fresh token is available.
+    const rate_decision after = limiter.try_acquire(1000);
+    EXPECT_TRUE(after.allowed);
+    EXPECT_EQ(0u, after.delay_ms);
+}
+
+TEST(rasn_rate_limiter, non_monotonic_clock_never_adds_tokens)
+{
+    rate_limit_config cfg;
+    cfg.requests_per_min = 60;
+    cfg.burst = 5;
+    cfg.max_wait_ms = 0;
+    rate_limiter limiter(cfg);
+
+    for (int i = 0; i < 5; ++i)
+    {
+        EXPECT_TRUE(limiter.try_acquire(10000).allowed);
+    }
+    // Time going backwards must not refill the bucket.
+    EXPECT_FALSE(limiter.try_acquire(5000).allowed);
+}
+
+TEST(rasn_rate_limiter, default_burst_is_about_one_second_of_rate)
+{
+    rate_limit_config cfg;
+    cfg.requests_per_min = 600; // 10 tokens/sec => default burst 10
+    cfg.burst = 0;
+    cfg.max_wait_ms = 0;
+    rate_limiter limiter(cfg);
+
+    int admitted = 0;
+    for (int i = 0; i < 100; ++i)
+    {
+        if (limiter.try_acquire(0).allowed)
+        {
+            ++admitted;
+        }
+    }
+    EXPECT_EQ(10, admitted);
+}
+
+TEST(rasn_rate_limiter, registry_isolates_limiters_per_key)
+{
+    rate_limit_config cfg;
+    cfg.requests_per_min = 60;
+    cfg.burst = 1;
+    cfg.max_wait_ms = 0;
+    rate_limiter_registry registry(cfg);
+
+    // Spend provider b's only token; leave a untouched.
+    EXPECT_TRUE(registry.get("b").try_acquire(0).allowed);
+    registry.get("a");
+
+    const std::vector<rate_limiter_registry::entry> snapshot = registry.snapshot();
+    ASSERT_EQ(2u, snapshot.size());
+    EXPECT_EQ("a", snapshot[0].key); // ordered by key
+    EXPECT_EQ("b", snapshot[1].key);
+    EXPECT_EQ(60u, snapshot[0].requests_per_min);
+    EXPECT_EQ(1u, snapshot[0].burst);
+    EXPECT_GE(snapshot[0].tokens, 1.0); // a is unspent
+    EXPECT_LT(snapshot[1].tokens, 1.0); // b spent its token
 }
 
 } // namespace

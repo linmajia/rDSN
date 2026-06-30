@@ -740,6 +740,64 @@ rDSN design:
   `soft_concurrent_requests`, and `max_backpressure_ms` are read once through
   `dsn_config` with null-safe defaults.
 
+### 12.4 Model rate limiter
+
+The breaker reacts to a *broken* dependency and admission control protects a
+*healthy* one from concurrency overload; the rate limiter governs the third
+classic dimension — *throughput*. Hosted model APIs publish requests-per-minute
+and tokens-per-minute quotas, and exceeding them does not slow the provider down
+gracefully: it returns HTTP 429s that burn the retry budget, and on metered
+endpoints it costs money. A concurrency bulkhead does not prevent this — a single
+caller making rapid sequential requests stays at in-flight ≈ 1 yet can still blow
+through a per-minute quota. rASN therefore fronts each model provider with a
+client-side **token-bucket rate limiter**, the throughput counterpart to the
+breaker (failure) and admission gate (concurrency) on the same gateway.
+
+Responsibilities:
+
+- Pace outbound calls to a configured sustained rate (requests/minute). The bucket
+  starts full, so an idle dependency can still absorb a burst up to its capacity.
+- When a caller is slightly ahead of the rate, apply a short *pacing* delay
+  (reserving the next token) instead of failing — smoothing traffic to the quota.
+- When the projected wait would exceed a bound (`rate_limit_max_wait_ms`), reject
+  the request fast with a normal `llm_response{ok=false}` rather than blocking a
+  worker for a long time. Setting the bound to zero turns the limiter into a pure
+  reject-when-over-rate gate.
+
+rDSN design:
+
+- The engine (`rate_limiter` / `rate_limiter_registry`) is dependency-light like
+  the breaker, the admission gate, and `metrics.h`: the header pulls in no rDSN or
+  thrift types, and the current time is *injected* as a millisecond value rather
+  than read from a clock. The caller passes `::dsn_now_ms()`, so token refill flows
+  through rDSN's pluggable environment provider — making it deterministic under
+  replay and unit-testable without a live service node, exactly like the breaker's
+  cooldown clock.
+- It is wired into `rasn_llm_agent_service` beside the breaker and admission gate.
+  Ordering: admission *reserves* a slot, the rate limiter *acquires* a token, and
+  the breaker is consulted **last**, because the breaker consumes a one-shot
+  half-open probe that must be paired with a result report. Putting both
+  reject-capable gates (admission, rate) ahead of the breaker guarantees a request
+  they reject never strands a half-open probe. The pacing delay, like admission
+  backpressure, is applied only *after* the breaker also admits, and the two delays
+  are coalesced into a single wait (the larger of the two) so they never stack into
+  additive over-delay. All gates sit *after* the replay check, so replayed runs
+  bypass rate limiting and stay deterministic.
+- The same `in_process()` predicate that exempts the simulator and other
+  no-network providers from the breaker and admission control also exempts them
+  here. The limiter is **disabled by default** (`requests_per_min = 0` = unlimited),
+  so existing single-agent CLI runs and deterministic tests are byte-for-byte
+  unchanged; an operator opts in by setting a rate when pointing rASN at a metered
+  endpoint.
+- Two `perf_counter` series — `rasn_model_rate_limited_total` (rejected) and
+  `rasn_model_rate_delayed_total` (paced) — flow through the same `record_event`
+  choke point as every other metric. Per-provider rate, burst, and available
+  tokens are surfaced in the `rasn.resilience` command and the model provider
+  summary.
+- `[rasn.model] rate_limit_enabled`, `rate_limit_requests_per_min`,
+  `rate_limit_burst`, and `rate_limit_max_wait_ms` are read once through
+  `dsn_config` with null-safe defaults.
+
 ### 13. Service-mode integration self-test
 
 The service-mode integration layer turns rASN correctness assumptions into a
@@ -1017,11 +1075,14 @@ remaining limitations are:
   store, or prebuilt dashboards, and latency percentiles depend on rDSN's
   periodic counter timers.
 - **Overload and dependency isolation:** the model gateway has a per-provider
-  circuit breaker that fast-fails calls to a failing endpoint and a per-provider
+  circuit breaker that fast-fails calls to a failing endpoint, a per-provider
   admission gate (concurrency bulkhead plus `exp_delay`-based backpressure) that
-  protects a healthy-but-slow endpoint from overload, both surfaced through
-  `perf_counter` metrics and the `rasn.resilience` command. Remaining gaps: the
-  tool and remote-agent gateways are not yet breaker- or admission-guarded; the
-  cap is per-provider rather than a single process-wide concurrency budget; and in
-  RPC-client mode the breaker and admission state live on the serving node rather
-  than the client.
+  protects a healthy-but-slow endpoint from overload, and a per-provider
+  token-bucket rate limiter that paces calls under the endpoint's published
+  requests-per-minute quota — the failure, concurrency, and throughput dimensions
+  of dependency protection — all surfaced through `perf_counter` metrics and the
+  `rasn.resilience` command. Remaining gaps: the tool and remote-agent gateways are
+  not yet breaker-, admission-, or rate-guarded; the limits are per-provider rather
+  than a single process-wide budget; rate limiting governs request count but not
+  token/cost budgets; and in RPC-client mode the resilience state lives on the
+  serving node rather than the client.

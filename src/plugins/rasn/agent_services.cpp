@@ -12,7 +12,9 @@
 #include <dsn/cpp/utils.h>
 #include <dsn/tool-api/command.h>
 
+#include <algorithm>
 #include <chrono>
+#include <iomanip>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -238,6 +240,24 @@ std::string format_model_admission_states(const std::vector<admission_gate_regis
     return oss.str();
 }
 
+std::string format_model_rate_states(const std::vector<rate_limiter_registry::entry> &states)
+{
+    if (states.empty())
+    {
+        return "model rate limiters: none engaged";
+    }
+    std::ostringstream oss;
+    oss << "model rate limiters:";
+    for (size_t i = 0; i < states.size(); ++i)
+    {
+        const rate_limiter_registry::entry &entry = states[i];
+        oss << "\n- provider=" << entry.key << " requests_per_min=" << entry.requests_per_min
+            << " burst=" << entry.burst << " tokens=" << std::fixed << std::setprecision(2)
+            << entry.tokens;
+    }
+    return oss.str();
+}
+
 std::string descriptor_line(const std::string &label, const agent_descriptor &descriptor)
 {
     std::ostringstream oss;
@@ -380,6 +400,32 @@ admission_config read_model_admission_config()
     return cfg;
 }
 
+rate_limit_config read_model_rate_config()
+{
+    rate_limit_config cfg;
+    cfg.enabled = ::dsn_config_get_value_bool(
+        "rasn.model",
+        "rate_limit_enabled",
+        true,
+        "enable the rASN model-gateway client-side rate limiter (token bucket)");
+    cfg.requests_per_min = read_config_u32(
+        "rasn.model",
+        "rate_limit_requests_per_min",
+        0,
+        "sustained model request rate per provider in requests/minute (0 = unlimited)");
+    cfg.burst = read_config_u32(
+        "rasn.model",
+        "rate_limit_burst",
+        0,
+        "rate-limiter burst capacity in tokens (0 = ~1s of the sustained rate)");
+    cfg.max_wait_ms = read_config_u32(
+        "rasn.model",
+        "rate_limit_max_wait_ms",
+        1000,
+        "max ms a request may be paced waiting for a token before it is rejected (0 = reject immediately)");
+    return cfg;
+}
+
 } // namespace
 
 rasn_llm_agent_service::rasn_llm_agent_service()
@@ -464,6 +510,12 @@ void rasn_llm_agent_service::ensure_model_admission_config()
                    [this] { _model_admission.set_config(read_model_admission_config()); });
 }
 
+void rasn_llm_agent_service::ensure_model_rate_config()
+{
+    std::call_once(_model_rate_config_once,
+                   [this] { _model_rate.set_config(read_model_rate_config()); });
+}
+
 bool rasn_llm_agent_service::provider_needs_guards() const
 {
     // Overload and failure protection only matter for providers that perform
@@ -546,28 +598,73 @@ admission_slot rasn_llm_agent_service::model_admission_admit(const std::string &
         }
     }
     // The graceful backpressure delay carried by the slot is intentionally NOT
-    // applied here. The caller applies it via apply_model_admission_backpressure()
-    // only after the circuit breaker has also admitted the request, so a request
-    // the breaker short-circuits neither sleeps nor holds its slot through a sleep.
+    // applied here. The caller applies it via apply_model_backpressure() only
+    // after the rate limiter and circuit breaker have also admitted the request,
+    // so a request the breaker short-circuits neither sleeps nor holds its slot
+    // through a sleep.
     return slot;
 }
 
-void rasn_llm_agent_service::apply_model_admission_backpressure(const std::string &provider,
-                                                                const agent_task &task,
-                                                                nucleus_runtime &runtime,
-                                                                const admission_slot &slot)
+rate_decision rasn_llm_agent_service::model_rate_acquire(const std::string &provider,
+                                                         const agent_task &task,
+                                                         nucleus_runtime &runtime,
+                                                         llm_response *fast_fail)
 {
-    if (slot.delay_ms() == 0)
+    ensure_model_rate_config();
+    rate_limiter &limiter = _model_rate.get(provider);
+    const rate_decision decision = limiter.try_acquire(::dsn_now_ms());
+    if (!decision.allowed)
     {
-        return;
+        dwarn("rASN model rate limiter rejected request for provider=%s; rate %u req/min exceeded",
+              provider.c_str(),
+              static_cast<unsigned int>(decision.limit_per_min));
+        runtime.record_model_rate_limited(task, provider, decision.limit_per_min);
+        if (fast_fail != nullptr)
+        {
+            *fast_fail = rpc_error_response("model rate limiter rejected request for provider " + provider +
+                                            "; rate " + std::to_string(decision.limit_per_min) +
+                                            " req/min exceeded");
+        }
     }
-    runtime.record_model_admission_delayed(task, provider, slot.in_flight(), slot.delay_ms());
-    std::this_thread::sleep_for(std::chrono::milliseconds(slot.delay_ms()));
+    // Like admission, the pacing delay carried by the decision is NOT applied
+    // here; apply_model_backpressure() applies it after the breaker also admits.
+    return decision;
+}
+
+void rasn_llm_agent_service::apply_model_backpressure(const std::string &provider,
+                                                      const agent_task &task,
+                                                      nucleus_runtime &runtime,
+                                                      const admission_slot &slot,
+                                                      const rate_decision &rate)
+{
+    const uint32_t admission_delay = slot.delay_ms();
+    const uint32_t rate_delay = rate.delay_ms;
+    if (admission_delay > 0)
+    {
+        runtime.record_model_admission_delayed(task, provider, slot.in_flight(), admission_delay);
+    }
+    if (rate_delay > 0)
+    {
+        runtime.record_model_rate_delayed(task, provider, rate_delay);
+    }
+    // Sleep once for the larger of the two delays: a single wait that is >= each
+    // governor's requested delay satisfies both (concurrency smoothing and rate
+    // pacing) without stacking them into additive over-delay.
+    const uint32_t delay = std::max(admission_delay, rate_delay);
+    if (delay > 0)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+    }
 }
 
 std::vector<admission_gate_registry::entry> rasn_llm_agent_service::model_admission_states() const
 {
     return _model_admission.snapshot();
+}
+
+std::vector<rate_limiter_registry::entry> rasn_llm_agent_service::model_rate_states() const
+{
+    return _model_rate.snapshot();
 }
 
 llm_response rasn_llm_agent_service::complete(const agent_completion_request &request, nucleus_runtime &runtime)
@@ -595,17 +692,21 @@ llm_response rasn_llm_agent_service::complete(const agent_completion_request &re
         return response;
     }
 
-    // Guard network providers with overload + failure protection: an admission
-    // bulkhead keeps a healthy endpoint from being overwhelmed, and a circuit
-    // breaker fast-fails a failing endpoint before its own retry loop. Admission
-    // reserves a slot first so a request the breaker would short-circuit never
-    // wastes a breaker probe; but its graceful backpressure delay is applied only
-    // after the breaker also admits, so a short-circuited request neither sleeps
-    // nor holds its slot through a sleep. The RAII slot releases on scope exit,
-    // covering the whole provider call otherwise.
+    // Guard network providers with overload, rate, and failure protection: an
+    // admission bulkhead keeps a healthy endpoint from being overwhelmed, a
+    // client-side rate limiter paces calls under the provider's quota, and a
+    // circuit breaker fast-fails a failing endpoint before its own retry loop.
+    // Admission and the rate limiter reserve first (and may reject) so that the
+    // breaker -- which consumes a one-shot half-open probe -- is the last gate; a
+    // request rejected by admission or the rate limiter therefore never wastes a
+    // breaker probe. Their pacing delays are applied only after the breaker also
+    // admits, so a short-circuited request neither sleeps nor holds its admission
+    // slot through a sleep. The RAII slot releases on scope exit, covering the
+    // whole provider call otherwise.
     const std::string provider_name = _provider->name();
     const bool guarded = provider_needs_guards();
     admission_slot admission;
+    rate_decision rate;
     if (guarded)
     {
         llm_response fast_fail;
@@ -614,11 +715,16 @@ llm_response rasn_llm_agent_service::complete(const agent_completion_request &re
         {
             return fast_fail;
         }
+        rate = model_rate_acquire(provider_name, request.task, runtime, &fast_fail);
+        if (!rate.allowed)
+        {
+            return fast_fail;
+        }
         if (!model_breaker_admit(provider_name, request.task, runtime, &fast_fail))
         {
             return fast_fail;
         }
-        apply_model_admission_backpressure(provider_name, request.task, runtime, admission);
+        apply_model_backpressure(provider_name, request.task, runtime, admission, rate);
     }
 
     const llm_response response = redact_llm_response(_provider->complete(redact_llm_request(llm), runtime));
@@ -666,6 +772,7 @@ llm_response rasn_llm_agent_service::complete_streaming(const agent_completion_r
     const std::string provider_name = _provider->name();
     const bool guarded = provider_needs_guards();
     admission_slot admission;
+    rate_decision rate;
     if (guarded)
     {
         llm_response fast_fail;
@@ -674,11 +781,16 @@ llm_response rasn_llm_agent_service::complete_streaming(const agent_completion_r
         {
             return fast_fail;
         }
+        rate = model_rate_acquire(provider_name, request.task, runtime, &fast_fail);
+        if (!rate.allowed)
+        {
+            return fast_fail;
+        }
         if (!model_breaker_admit(provider_name, request.task, runtime, &fast_fail))
         {
             return fast_fail;
         }
-        apply_model_admission_backpressure(provider_name, request.task, runtime, admission);
+        apply_model_backpressure(provider_name, request.task, runtime, admission, rate);
     }
 
     const llm_response response =
@@ -1264,8 +1376,9 @@ void rasn_service_graph::register_ops_commands_once()
             "rasn.resilience",
             "rasn.resilience - dump rASN model resilience state",
             "rasn.resilience - list each model provider's circuit-breaker state "
-            "(closed|open|half_open) with consecutive failure count, and its "
-            "admission-control state (in-flight vs concurrency cap)",
+            "(closed|open|half_open) with consecutive failure count, its "
+            "admission-control state (in-flight vs concurrency cap), and its "
+            "rate-limiter state (requests/min, burst, available tokens)",
             [](const ::dsn::safe_vector<::dsn::safe_string> &args) -> ::dsn::safe_string {
                 (void)args;
                 const std::string out = global_rasn_services().model_resilience_report();
@@ -1489,6 +1602,11 @@ std::string rasn_service_graph::provider_summary() const
     {
         summary += "\n" + format_model_admission_states(admission);
     }
+    const std::vector<rate_limiter_registry::entry> rate = model_rate_states();
+    if (!rate.empty())
+    {
+        summary += "\n" + format_model_rate_states(rate);
+    }
     return summary;
 }
 
@@ -1502,10 +1620,16 @@ std::vector<admission_gate_registry::entry> rasn_service_graph::model_admission_
     return _llm_agent.model_admission_states();
 }
 
+std::vector<rate_limiter_registry::entry> rasn_service_graph::model_rate_states() const
+{
+    return _llm_agent.model_rate_states();
+}
+
 std::string rasn_service_graph::model_resilience_report() const
 {
     return format_model_breaker_states(model_breaker_states()) + "\n" +
-           format_model_admission_states(model_admission_states());
+           format_model_admission_states(model_admission_states()) + "\n" +
+           format_model_rate_states(model_rate_states());
 }
 
 std::string rasn_service_graph::topology() const

@@ -148,6 +148,16 @@ public:
                                         const std::string &provider,
                                         uint32_t in_flight,
                                         uint32_t delay_ms);
+    // Rate-limiting events for an outbound dependency.
+    // record_model_rate_limited() is emitted when the client-side token-bucket
+    // rate limiter rejects a request; record_model_rate_delayed() when it paces
+    // one with a backpressure delay. Both trace and increment the matching metrics.
+    void record_model_rate_limited(const agent_task &task,
+                                   const std::string &provider,
+                                   uint32_t limit_per_min);
+    void record_model_rate_delayed(const agent_task &task,
+                                   const std::string &provider,
+                                   uint32_t delay_ms);
     std::string resolve_nondeterminism(const agent_task &task,
                                        const std::string &name,
                                        const std::string &source,

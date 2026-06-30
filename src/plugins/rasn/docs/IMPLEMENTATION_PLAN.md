@@ -2840,6 +2840,76 @@ Validation:
   available on the authoring host).
 - [ ] `rasn.unit_tests` run on the remote dev machines.
 
+## Phase 71: model gateway rate limiter
+
+Status: `[~]`
+
+Goal: Govern outbound model *throughput* — the third classic dependency-protection
+dimension beside Phase 69's circuit breaker (failure) and Phase 70's admission
+control (concurrency). Hosted model APIs publish requests-per-minute quotas, and
+exceeding them returns HTTP 429s that burn the retry budget and (on metered
+endpoints) cost money; a concurrency bulkhead does not prevent this because a
+single sequential caller stays at in-flight ≈ 1 yet can still exceed a per-minute
+quota. A per-provider token-bucket rate limiter paces calls under the quota,
+delaying briefly when slightly ahead and fast-failing when the projected wait
+would exceed a bound. This adds the throughput axis the "overload / dependency
+isolation" limitation still lacked.
+
+rDSN modules reused:
+
+- `dsn_now_ms` (env-provider clock) injected as the bucket's refill clock, so
+  token accrual is deterministic under replay and seedable — the same reuse as the
+  breaker's cooldown clock; the engine reads no clock of its own.
+- `perf_counter` (`include/dsn/c/api_utilities.h`) for the two rate-limit counters,
+  reusing the existing `metrics_registry` choke point.
+- `dsn_config` (`include/dsn/c/api_layer1.h`) for null-safe `[rasn.model]`
+  rate-limit tunables.
+- `command_manager` (`include/dsn/tool-api/command.h`) — the rate-limiter state is
+  surfaced through the existing `rasn.resilience` command alongside the breaker and
+  admission gate.
+
+Files:
+
+- `rate_limiter.h` / `rate_limiter.cpp` (new)
+- `metrics.cpp`, `rasn_core.h` / `rasn_core.cpp`
+- `agent_services.h` / `agent_services.cpp`
+- `codepilot/codepilot_app.cpp`, `config.ini`
+- `tests/rasn_unit_tests.cpp`
+- `docs/DESIGN.md`, `README.md`, `docs/report/main.tex`,
+  `docs/IMPLEMENTATION_PLAN.md`
+
+Work items:
+
+- [x] Add a dependency-light `rate_limiter` / `rate_limiter_registry` engine: a
+  per-provider token bucket whose time is injected as a millisecond value; decision
+  is allow / allow-with-pacing-delay (reserving the next token) / reject when the
+  wait would exceed `max_wait_ms`. The header stays rDSN-free.
+- [x] Add `rasn_model_rate_limited_total` and `rasn_model_rate_delayed_total`
+  `perf_counter` series routed through `record_event`, plus runtime
+  `record_model_rate_*` methods.
+- [x] Wire the limiter into `rasn_llm_agent_service::complete` /
+  `complete_streaming` after admission and *before* the breaker (so a rate-rejected
+  request never strands a half-open probe) and *after* the replay check; coalesce
+  the admission backpressure and rate pacing into a single wait (the larger of the
+  two) applied only after the breaker also admits; share the `in_process()`
+  exemption.
+- [x] Read `[rasn.model] rate_limit_*` once via `dsn_config` (clamped through
+  `read_config_u32`); surface live per-provider rate/burst/tokens through the
+  `rasn.resilience` command, CodePilot `observe resilience`, and `provider_summary`.
+- [x] Add unit tests covering disabled/unlimited passthrough, full-bucket burst then
+  pacing to the sustained rate, rejection past `max_wait_ms`, refill over time,
+  non-monotonic-clock guard, default burst sizing, and registry isolation/ordered
+  snapshots; extend the ops-command test to assert the rate-limiter section.
+
+Validation:
+
+- [x] Compile-and-run the rate-limiter engine standalone (all assertions pass) and
+  `-fsyntax-only` `metrics.cpp` and `rate_limiter.cpp` against the real rDSN
+  headers; counter enum/array/map alignment verified (23/23/23).
+- [ ] Plugin build on a supported toolchain (thrift/boost externals are not
+  available on the authoring host).
+- [ ] `rasn.unit_tests` run on the remote dev machines.
+
 ## Dependency order
 
 ```text
@@ -2913,6 +2983,7 @@ Phase 1 task model
   -> Phase 68 deterministic environment-input boundary
   -> Phase 69 model gateway circuit breaker
   -> Phase 70 model gateway admission control
+  -> Phase 71 model gateway rate limiter
 ```
 
 Some phases can overlap after Phase 3, but the public message model and generic

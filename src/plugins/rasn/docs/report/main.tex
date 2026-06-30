@@ -279,11 +279,14 @@ metrics} and a \texttt{command\_manager} command & No bundled scrape gateway,
 retention store, or dashboards \\
 Resilience & Bounded coordinator retry, request deadlines, a per-provider
 model circuit breaker (closed/open/half-open) that fast-fails failing endpoints,
-and a per-provider admission gate (concurrency bulkhead plus \texttt{exp\_delay}
-backpressure) that protects healthy-but-slow endpoints, surfaced through
-\texttt{perf\_counter} metrics and a \texttt{rasn.resilience} command & Tool and
-remote-agent gateways are not yet guarded; the cap is per-provider rather than a
-single process-wide budget \\
+a per-provider admission gate (concurrency bulkhead plus \texttt{exp\_delay}
+backpressure) that protects healthy-but-slow endpoints, and a per-provider
+token-bucket rate limiter that paces calls under the endpoint's
+requests-per-minute quota --- the failure, concurrency, and throughput dimensions
+--- surfaced through \texttt{perf\_counter} metrics and a \texttt{rasn.resilience}
+command & Tool and remote-agent gateways are not yet guarded; the limits are
+per-provider rather than a single process-wide budget, and govern request count
+rather than token/cost budgets \\
 \bottomrule
 \end{tabular}
 \end{table*}
@@ -1143,6 +1146,21 @@ fan-out of service mode. Rejections and backpressure delays are reported through
 same two-counter pattern as the breaker, and live in-flight depth appears in the
 \texttt{rasn.resilience} command.
 
+A breaker covers failure and admission control covers concurrency; the third
+dimension, throughput, is covered by a per-provider token-bucket rate limiter
+(\texttt{rate\_limiter.*}). Hosted model APIs enforce requests-per-minute quotas,
+and a concurrency bulkhead does not bound them --- one sequential caller stays at
+in-flight $\approx 1$ yet can still exceed a per-minute limit and trigger HTTP~429s
+that waste the retry budget. The limiter paces calls under the configured rate,
+delaying a request briefly (reserving the next token) when slightly ahead and
+fast-failing when the wait would exceed a bound. Like the breaker it draws its
+refill clock from \texttt{dsn\_now\_ms}, so it is replay-deterministic; it sits
+beside the other two gates (acquiring before the breaker so a rate rejection never
+strands a half-open probe), shares the \texttt{in\_process()} exemption, and is
+disabled by default so existing behavior is unchanged. Its two counters follow the
+same pattern, and live per-provider rate, burst, and tokens appear in the
+\texttt{rasn.resilience} command.
+
 \section{Implementation Details}
 
 \subsection{Code Organization}
@@ -1166,6 +1184,7 @@ src/plugins/rasn/
   metrics.{h,cpp}
   circuit_breaker.{h,cpp}
   admission_gate.{h,cpp}
+  rate_limiter.{h,cpp}
   llm_provider.{h,cpp}
   agent_tools.{h,cpp}
   codepilot/
@@ -1209,6 +1228,7 @@ Files & Layer & Responsibility \\
 \texttt{metrics} & Observability & Perf-counter metric registry and text/Prometheus/JSON rendering \\
 \texttt{circuit\_breaker} & Resilience & Per-provider model circuit breaker (closed/open/half-open) \\
 \texttt{admission\_gate} & Resilience & Per-provider concurrency bulkhead and \texttt{exp\_delay} backpressure \\
+\texttt{rate\_limiter} & Resilience & Per-provider token-bucket rate limiter (requests/minute pacing) \\
 \texttt{llm\_provider/model\_agent} & Provider & Simulator and HTTP-compatible model adapters \\
 \texttt{agent\_tools} & Provider API & Generic tool provider interface \\
 \texttt{codepilot/*} & Application & CLI commands, local tools, skills, provider configuration \\
@@ -1253,6 +1273,9 @@ runtime. The important integration points are:
   \item \texttt{exp\_delay} (\texttt{include/dsn/utility/exp\_delay.h}), \rdsn's
   staged admission-control delay, reused as the model gateway's backpressure curve
   so overload throttling matches the host runtime's own task-queue policy.
+  \item \texttt{dsn\_now\_ms} (the env-provider clock) injected into the model
+  circuit breaker and token-bucket rate limiter, so cooldown and token refill are
+  deterministic under replay and seedable rather than reading a private wall clock.
 \end{itemize}
 
 The implementation currently still has same-process globals for convenience,
@@ -1925,6 +1948,48 @@ Rejections and backpressure delays are exported as
 \texttt{record\_event} choke point, and live per-provider in-flight depth is shown by
 the \texttt{rasn.resilience} command. The cap is per-provider; a single
 process-wide concurrency budget is noted as future work.
+
+\subsection{Model Rate Limiter}
+
+The breaker reacts to a \emph{broken} provider and admission control protects a
+\emph{healthy} one from concurrency overload; the rate limiter governs the third
+classic dimension, \emph{throughput}. Hosted model APIs publish
+requests-per-minute and tokens-per-minute quotas, and exceeding them does not
+degrade gracefully: the endpoint returns HTTP~429s that burn the retry budget
+and, on metered services, cost money. A concurrency bulkhead does not prevent
+this, because a single caller issuing rapid sequential requests stays at
+in-flight $\approx 1$ yet can still exceed a per-minute quota.
+\texttt{rate\_limiter.*} therefore fronts each provider with a token-bucket
+governor: the bucket starts full (absorbing an initial burst up to its capacity),
+refills at the configured sustained rate, and on each call either admits
+immediately, \emph{paces} the request with a short delay that reserves the next
+token, or --- when the projected wait would exceed
+\texttt{[rasn.model] rate\_limit\_max\_wait\_ms} --- rejects it with a normal failed
+\texttt{llm\_response} instead of blocking a worker.
+
+The engine is dependency-light like the breaker and admission gate: its header
+pulls in no \rdsn or thrift types, and the current time is \emph{injected} as a
+millisecond value rather than read from a clock. The caller passes
+\texttt{::dsn\_now\_ms()}, so token refill flows through \rdsn's pluggable
+environment provider --- making it deterministic under replay and unit-testable
+without a live node, exactly as the breaker's cooldown clock is. It is wired into
+\texttt{rasn\_llm\_agent\_service} beside the other two gates. Ordering is again
+deliberate: admission reserves a slot and the rate limiter acquires a token first,
+and the breaker --- which consumes a one-shot half-open probe that must be paired
+with a result report --- is consulted \emph{last}, so a request that admission or
+the rate limiter rejects never strands a half-open probe. The pacing delay, like
+admission backpressure, is applied only after the breaker admits, and the two
+delays are coalesced into a single wait (the larger of the two) so they never
+stack into additive over-delay. The same \texttt{in\_process()} predicate exempts
+no-network providers. The limiter is disabled by default
+(\texttt{rate\_limit\_requests\_per\_min}~$=0$ means unlimited), so existing
+single-agent CLI and deterministic test behavior is unchanged; an operator opts in
+when pointing \rasn at a metered endpoint. Rejections and pacing delays are
+exported as \texttt{rasn\_model\_rate\_limited\_total} and
+\texttt{rasn\_model\_rate\_delayed\_total} through the same \texttt{record\_event}
+choke point, and live per-provider rate, burst, and available tokens are shown by
+the \texttt{rasn.resilience} command. Rate limiting governs request count;
+token/cost budgets and a process-wide budget are noted as future work.
 
 \subsection{Testing and Validation}
 

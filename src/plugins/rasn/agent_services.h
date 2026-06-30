@@ -6,6 +6,7 @@
 #include "admission_gate.h"
 #include "circuit_breaker.h"
 #include "llm_provider.h"
+#include "rate_limiter.h"
 #include "metrics.h"
 #include "rasn.code.definition.h"
 #include "state_service.h"
@@ -50,6 +51,10 @@ public:
     // commands and the model gateway summary).
     std::vector<admission_gate_registry::entry> model_admission_states() const;
 
+    // Point-in-time view of every model-provider rate limiter (for ops commands
+    // and the model gateway summary).
+    std::vector<rate_limiter_registry::entry> model_rate_states() const;
+
 private:
     // Lazily load [rasn.model] circuit-breaker tunables (config reads are
     // null-safe and return defaults before rDSN config is loaded).
@@ -57,6 +62,9 @@ private:
     // Lazily load [rasn.model] admission-control tunables (null-safe; defaults
     // before rDSN config is loaded).
     void ensure_model_admission_config();
+    // Lazily load [rasn.model] rate-limit tunables (null-safe; defaults before
+    // rDSN config is loaded).
+    void ensure_model_rate_config();
     // Returns false and fills *fast_fail when the breaker for the active provider
     // is open and the request must be short-circuited without calling out.
     bool model_breaker_admit(const std::string &provider,
@@ -71,22 +79,35 @@ private:
     // Acquire an admission slot for the active provider. The returned slot
     // reserves capacity until destroyed; on rejection slot.admitted() is false and
     // *fast_fail is filled (recording the rejection metric). The slot's graceful
-    // backpressure delay is NOT applied here -- call
-    // apply_model_admission_backpressure() once the breaker has also admitted the
-    // request, so a short-circuited request never sleeps.
+    // backpressure delay is NOT applied here -- call apply_model_backpressure()
+    // once the rate limiter and breaker have also admitted the request, so a
+    // short-circuited request never sleeps.
     admission_slot model_admission_admit(const std::string &provider,
                                          const agent_task &task,
                                          nucleus_runtime &runtime,
                                          llm_response *fast_fail);
-    // Apply (and record) the slot's graceful backpressure delay, if any. Called
-    // after both admission and the breaker have admitted the request.
-    void apply_model_admission_backpressure(const std::string &provider,
-                                            const agent_task &task,
-                                            nucleus_runtime &runtime,
-                                            const admission_slot &slot);
+    // Acquire a rate-limiter token for the active provider. On rejection the
+    // returned decision has allowed() false and *fast_fail is filled (recording
+    // the rejection metric). The decision's pacing delay is NOT applied here --
+    // it is applied by apply_model_backpressure() once the breaker has also
+    // admitted the request. Rate acquisition precedes the breaker so a
+    // rate-rejected request never consumes a half-open breaker probe.
+    rate_decision model_rate_acquire(const std::string &provider,
+                                     const agent_task &task,
+                                     nucleus_runtime &runtime,
+                                     llm_response *fast_fail);
+    // Apply (and record) the combined admission + rate-limiter backpressure delay,
+    // if any. Called after admission, the rate limiter, and the breaker have all
+    // admitted the request. Sleeps once for the larger of the two delays so the
+    // two governors never stack into additive over-delay.
+    void apply_model_backpressure(const std::string &provider,
+                                  const agent_task &task,
+                                  nucleus_runtime &runtime,
+                                  const admission_slot &slot,
+                                  const rate_decision &rate);
     // True when the active provider should be guarded by overload/failure
     // protection (network-backed providers only; in-process providers are
-    // exempt). Shared by the circuit breaker and admission control.
+    // exempt). Shared by the circuit breaker, admission control, and rate limiter.
     bool provider_needs_guards() const;
 
     std::unique_ptr<llm_provider> _provider;
@@ -94,6 +115,8 @@ private:
     std::once_flag _model_breaker_config_once;
     admission_gate_registry _model_admission;
     std::once_flag _model_admission_config_once;
+    rate_limiter_registry _model_rate;
+    std::once_flag _model_rate_config_once;
 };
 
 class rasn_tool_agent_service : public agent_runtime
@@ -163,9 +186,11 @@ public:
     std::vector<circuit_breaker_registry::entry> model_breaker_states() const;
     // Per-provider model admission-control states (for ops commands / summaries).
     std::vector<admission_gate_registry::entry> model_admission_states() const;
-    // Human-readable per-provider resilience report covering circuit breakers and
-    // admission control (shared by the `rasn.resilience` command and CodePilot's
-    // `observe resilience`).
+    // Per-provider model rate-limiter states (for ops commands / summaries).
+    std::vector<rate_limiter_registry::entry> model_rate_states() const;
+    // Human-readable per-provider resilience report covering circuit breakers,
+    // admission control, and rate limiting (shared by the `rasn.resilience`
+    // command and CodePilot's `observe resilience`).
     std::string model_resilience_report() const;
     std::string topology() const;
     std::string tools_summary() const;

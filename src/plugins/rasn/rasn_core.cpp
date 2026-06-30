@@ -884,6 +884,36 @@ void nucleus_runtime::record_model_admission_delayed(const agent_task &task,
                  0);
 }
 
+void nucleus_runtime::record_model_rate_limited(const agent_task &task,
+                                                const std::string &provider,
+                                                uint32_t limit_per_min)
+{
+    record_event(task,
+                 "model.rate.limited",
+                 provider,
+                 "requests_per_min=" + std::to_string(limit_per_min),
+                 "",
+                 "",
+                 "",
+                 false,
+                 0);
+}
+
+void nucleus_runtime::record_model_rate_delayed(const agent_task &task,
+                                                const std::string &provider,
+                                                uint32_t delay_ms)
+{
+    record_event(task,
+                 "model.rate.delayed",
+                 provider,
+                 "delay_ms=" + std::to_string(delay_ms),
+                 "",
+                 "",
+                 "",
+                 false,
+                 0);
+}
+
 std::string nucleus_runtime::resolve_nondeterminism(const agent_task &task,
                                                     const std::string &name,
                                                     const std::string &source,

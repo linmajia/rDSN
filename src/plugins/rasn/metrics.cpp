@@ -112,6 +112,8 @@ enum core_counter
     CC_MODEL_BREAKER_SHORT_CIRCUIT,
     CC_MODEL_ADMISSION_REJECTED,
     CC_MODEL_ADMISSION_DELAYED,
+    CC_MODEL_RATE_LIMITED,
+    CC_MODEL_RATE_DELAYED,
     CC_COUNT
 };
 
@@ -143,6 +145,12 @@ const counter_def k_core_counters[CC_COUNT] = {
     {"rasn_model_admission_delayed_total",
      "model.admission.delayed",
      "model requests delayed by admission-control backpressure"},
+    {"rasn_model_rate_limited_total",
+     "model.rate.limited",
+     "model requests rejected by the client-side rate limiter"},
+    {"rasn_model_rate_delayed_total",
+     "model.rate.delayed",
+     "model requests delayed (paced) by the client-side rate limiter"},
 };
 
 enum latency_counter
@@ -183,6 +191,8 @@ const std::unordered_map<std::string, int> &kind_to_core_counter()
         {"model.breaker.short_circuit", CC_MODEL_BREAKER_SHORT_CIRCUIT},
         {"model.admission.rejected", CC_MODEL_ADMISSION_REJECTED},
         {"model.admission.delayed", CC_MODEL_ADMISSION_DELAYED},
+        {"model.rate.limited", CC_MODEL_RATE_LIMITED},
+        {"model.rate.delayed", CC_MODEL_RATE_DELAYED},
     };
     return m;
 }
