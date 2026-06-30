@@ -3,6 +3,7 @@
 #include "agent_messages.h"
 #include "agent_runtime.h"
 #include "agent_tools.h"
+#include "circuit_breaker.h"
 #include "llm_provider.h"
 #include "metrics.h"
 #include "rasn.code.definition.h"
@@ -15,6 +16,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -39,8 +41,31 @@ public:
     agent_response invoke(const agent_request &request, nucleus_runtime &runtime);
     std::string summary(const nucleus_runtime &runtime) const;
 
+    // Point-in-time view of every model-provider circuit breaker (for ops
+    // commands and the model gateway summary).
+    std::vector<circuit_breaker_registry::entry> model_breaker_states() const;
+
 private:
+    // Lazily load [rasn.model] circuit-breaker tunables (config reads are
+    // null-safe and return defaults before rDSN config is loaded).
+    void ensure_model_breaker_config();
+    // Returns false and fills *fast_fail when the breaker for the active provider
+    // is open and the request must be short-circuited without calling out.
+    bool model_breaker_admit(const std::string &provider,
+                             const agent_task &task,
+                             nucleus_runtime &runtime,
+                             llm_response *fast_fail);
+    // Report the outcome of an admitted call back to the provider's breaker.
+    void model_breaker_report(const std::string &provider,
+                              const agent_task &task,
+                              nucleus_runtime &runtime,
+                              bool ok);
+    // True when the active provider should be guarded by a breaker (remote only).
+    bool model_breaker_engaged() const;
+
     std::unique_ptr<llm_provider> _provider;
+    circuit_breaker_registry _model_breakers;
+    std::once_flag _model_breaker_config_once;
 };
 
 class rasn_tool_agent_service : public agent_runtime
@@ -106,6 +131,11 @@ public:
     model_gateway_response model_provider() const;
     model_gateway_response model_health() const;
     std::string provider_summary() const;
+    // Per-provider model circuit-breaker states (for ops commands / summaries).
+    std::vector<circuit_breaker_registry::entry> model_breaker_states() const;
+    // Human-readable per-provider circuit-breaker report (shared by the
+    // `rasn.resilience` command and CodePilot's `observe resilience`).
+    std::string model_breaker_report() const;
     std::string topology() const;
     std::string tools_summary() const;
     void set_tool_provider(std::unique_ptr<agent_tool_provider> tools);

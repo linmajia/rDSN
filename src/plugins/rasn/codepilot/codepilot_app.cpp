@@ -1731,7 +1731,7 @@ int codepilot_cli::run_observe(const std::vector<std::string> &args)
 {
     if (args.empty())
     {
-        std::cout << "usage: observe <events|failures|timeline|diagnose|replay|metrics|snapshot> ...\n";
+        std::cout << "usage: observe <events|failures|timeline|diagnose|replay|metrics|resilience|snapshot> ...\n";
         return 1;
     }
 
@@ -1766,6 +1766,12 @@ int codepilot_cli::run_observe(const std::vector<std::string> &args)
             std::cout << "usage: observe metrics [text|prometheus|json]\n";
             return 1;
         }
+        return 0;
+    }
+
+    if (args[0] == "resilience")
+    {
+        std::cout << _services.model_breaker_report();
         return 0;
     }
 
@@ -2179,6 +2185,7 @@ void codepilot_cli::print_help() const
               << "  observe failures         query classified failure records\n"
               << "  observe replay <file>    load replay choices through rasn.observability\n"
               << "  observe metrics [format] dump runtime metrics (text|prometheus|json)\n"
+              << "  observe resilience       dump model circuit-breaker state\n"
               << "  observe snapshot         summarize observability state\n"
               << "  skills                   list built-in skills\n"
               << "  skill <name> [task]      show or apply a skill prompt\n"

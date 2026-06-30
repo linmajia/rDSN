@@ -126,6 +126,16 @@ public:
                       const std::string &operation,
                       uint32_t retry_attempt,
                       const std::string &reason);
+    // Circuit-breaker lifecycle for an outbound dependency (e.g. a model
+    // provider). record_model_breaker_open() is emitted when a breaker trips;
+    // record_model_breaker_short_circuit() when a request is fast-failed because
+    // a breaker is open. Both trace and increment the matching rasn metrics.
+    void record_model_breaker_open(const agent_task &task,
+                                   const std::string &provider,
+                                   uint32_t consecutive_failures);
+    void record_model_breaker_short_circuit(const agent_task &task,
+                                            const std::string &provider,
+                                            const std::string &breaker_state);
     std::string resolve_nondeterminism(const agent_task &task,
                                        const std::string &name,
                                        const std::string &source,

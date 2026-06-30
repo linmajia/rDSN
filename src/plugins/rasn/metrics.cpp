@@ -108,6 +108,8 @@ enum core_counter
     CC_REPLAYS,
     CC_REPLAY_LOADS,
     CC_FAILURES,
+    CC_MODEL_BREAKER_OPEN,
+    CC_MODEL_BREAKER_SHORT_CIRCUIT,
     CC_COUNT
 };
 
@@ -129,6 +131,10 @@ const counter_def k_core_counters[CC_COUNT] = {
     {"rasn_replays_total", "replays", "events served from a replay trace"},
     {"rasn_replay_loads_total", "replay.loads", "replay traces loaded"},
     {"rasn_failures_total", "failures", "classified failures"},
+    {"rasn_model_breaker_open_total", "model.breaker.open", "model provider circuit-breaker open transitions"},
+    {"rasn_model_breaker_short_circuit_total",
+     "model.breaker.short_circuit",
+     "model requests short-circuited by an open circuit breaker"},
 };
 
 enum latency_counter
@@ -165,6 +171,8 @@ const std::unordered_map<std::string, int> &kind_to_core_counter()
         {"replay", CC_REPLAYS},
         {"replay.load", CC_REPLAY_LOADS},
         {"failure", CC_FAILURES},
+        {"model.breaker.open", CC_MODEL_BREAKER_OPEN},
+        {"model.breaker.short_circuit", CC_MODEL_BREAKER_SHORT_CIRCUIT},
     };
     return m;
 }

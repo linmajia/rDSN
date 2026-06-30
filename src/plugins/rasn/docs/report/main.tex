@@ -277,6 +277,11 @@ diagnosis helpers, and \rdsn \texttt{perf\_counter} metrics (counters and
 latency percentiles) exported as text/Prometheus/JSON via \texttt{observe
 metrics} and a \texttt{command\_manager} command & No bundled scrape gateway,
 retention store, or dashboards \\
+Resilience & Bounded coordinator retry, request deadlines, and a per-provider
+model circuit breaker (closed/open/half-open) that fast-fails failing endpoints,
+surfaced through \texttt{perf\_counter} metrics and a \texttt{rasn.resilience}
+command & Tool and remote-agent gateways are not breaker-guarded; no global
+concurrency cap yet \\
 \bottomrule
 \end{tabular}
 \end{table*}
@@ -1103,6 +1108,21 @@ command and through a \texttt{rasn.metrics} command registered with \rdsn's
 \texttt{command\_manager} so a running deployment answers over the local or
 remote \rdsn CLI.
 
+Metrics make a degrading dependency visible; a circuit breaker makes the runtime
+react to it. The model gateway wraps each provider in a per-provider
+consecutive-failure circuit breaker (\texttt{circuit\_breaker.*}): after a
+configurable number of consecutive failures it opens and short-circuits requests
+for a cooldown, then admits a single half-open probe that either closes or
+reopens it. The breaker fast-fails a call to a dead or hanging endpoint
+\emph{before} the provider's own retry loop, so latency and budget are not wasted
+on it. It draws its clock from \texttt{dsn\_now\_ms} (the same pluggable
+\texttt{env\_provider} used elsewhere), so breaker timing is deterministic under
+replay and replayed runs and local/simulator providers bypass it entirely.
+Breaker activity flows through the same \texttt{record\_event} choke point as
+every other metric, and live per-provider state is reachable through \codepilot's
+\texttt{observe resilience} and a \texttt{rasn.resilience} \texttt{command\_manager}
+command.
+
 \section{Implementation Details}
 
 \subsection{Code Organization}
@@ -1124,6 +1144,7 @@ src/plugins/rasn/
   policy_manager.{h,cpp}
   observability.{h,cpp}
   metrics.{h,cpp}
+  circuit_breaker.{h,cpp}
   llm_provider.{h,cpp}
   agent_tools.{h,cpp}
   codepilot/
@@ -1165,6 +1186,7 @@ Files & Layer & Responsibility \\
 \texttt{policy\_manager/redaction} & Policy & Tool classification, gating, redaction, artifact indexing \\
 \texttt{observability} & Service & Events, failures, snapshots, replay metadata \\
 \texttt{metrics} & Observability & Perf-counter metric registry and text/Prometheus/JSON rendering \\
+\texttt{circuit\_breaker} & Resilience & Per-provider model circuit breaker (closed/open/half-open) \\
 \texttt{llm\_provider/model\_agent} & Provider & Simulator and HTTP-compatible model adapters \\
 \texttt{agent\_tools} & Provider API & Generic tool provider interface \\
 \texttt{codepilot/*} & Application & CLI commands, local tools, skills, provider configuration \\
@@ -1204,8 +1226,8 @@ runtime. The important integration points are:
   \texttt{simple\_perf\_counter}) for cumulative runtime counters and task,
   model, and tool latency percentiles in the \texttt{rasn} counter section.
   \item \texttt{command\_manager} (\texttt{register\_command}/\texttt{run\_command})
-  to expose the \texttt{rasn.metrics} operational command over the \rdsn local
-  and remote CLI.
+  to expose the \texttt{rasn.metrics} and \texttt{rasn.resilience} operational
+  commands over the \rdsn local and remote CLI.
 \end{itemize}
 
 The implementation currently still has same-process globals for convenience,
@@ -1788,7 +1810,9 @@ so adding a new event kind needs no new call site. Task and model latencies are
 paired inside the runtime by task id --- model calls finalize their timing on
 both success and failure, so failed-call latency is recorded rather than lost ---
 and tool latency is timed at \texttt{rasn\_tool\_agent\_service::run\_tool}, the
-point where the CLI, workflow, RPC-server, and direct-call tool paths converge;
+point where the CLI, workflow, RPC-server, and direct-call tool paths converge
+(an RPC-client transport failure that never reaches the tool agent is the one
+exception, and is timed at the service-graph facade instead);
 all three feed \texttt{COUNTER\_TYPE\_NUMBER\_PERCENTILES} counters whose
 p50/p95/p99/p999 are computed by \rdsn's counter timers.
 
@@ -1804,6 +1828,36 @@ snapshot is reachable through \codepilot's \texttt{observe metrics
 [text|prometheus|json]} and, in service mode, through a \texttt{rasn.metrics}
 command registered once with \rdsn's \texttt{command\_manager} and answered over
 the local or remote \rdsn CLI.
+
+\subsection{Model Circuit Breaker}
+
+Metrics make a degrading model endpoint observable; the model gateway also reacts
+to one. \texttt{circuit\_breaker.*} provides a small, dependency-light engine: a
+per-key consecutive-failure breaker with three states (closed, open, half-open)
+and a single half-open probe. \texttt{rasn\_llm\_agent\_service} keeps one breaker
+per provider and consults it in both \texttt{complete} and
+\texttt{complete\_streaming}, at the point where every model path converges on the
+provider call. After \texttt{[rasn.model] circuit\_breaker\_failure\_threshold}
+consecutive failures the breaker opens and short-circuits requests for
+\texttt{circuit\_breaker\_open\_ms}; it then admits one probe that closes the
+breaker on success or reopens it on failure. A short-circuited request returns a
+normal failed \texttt{llm\_response} carrying the breaker state, so the fast-fail
+happens before the provider's own retry loop runs.
+
+The engine mirrors the metrics layer's two design choices. First, it includes no
+\rdsn headers and the caller injects the clock as a \texttt{uint64\_t now\_ms}
+(\texttt{dsn\_now\_ms}); because that clock is routed through the pluggable
+\texttt{env\_provider}, breaker timing is deterministic under replay and the
+engine is unit-tested without a live node. Replayed runs and local/in-process
+providers (the deterministic simulator) bypass the breaker, so existing behavior
+and tests are unchanged. Second, breaker activity is reported through the same
+\texttt{record\_event} choke point as every other metric, adding two counters
+(\texttt{rasn\_model\_breaker\_open\_total},
+\texttt{rasn\_model\_breaker\_short\_circuit\_total}); live per-provider state is
+reachable through \codepilot's \texttt{observe resilience} and a
+\texttt{rasn.resilience} command registered with \rdsn's
+\texttt{command\_manager}. Tool and remote-agent gateways are not yet
+breaker-guarded, which is noted as future work.
 
 \subsection{Testing and Validation}
 

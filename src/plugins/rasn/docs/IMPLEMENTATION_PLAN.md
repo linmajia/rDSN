@@ -2714,6 +2714,64 @@ Validation:
   available on the authoring host).
 - [ ] `rasn.unit_tests` run on the remote dev machines.
 
+## Phase 69: model gateway circuit breaker
+
+Status: `[~]`
+
+Goal: Make the platform react to a degrading model endpoint instead of merely
+observing it. A consecutive-failure circuit breaker in the model gateway lets a
+failing or hanging provider fail fast — before its own retry loop runs — so
+latency and budget are not wasted on a dead dependency, closing the
+"overload / dependency isolation" gap in the limitations table.
+
+rDSN modules reused:
+
+- `dsn_now_ms` (`include/dsn/c/api_layer1.h`, backed by `env_provider::now_ns`) as
+  the breaker clock, so breaker timing is deterministic under replay and seedable
+  by emulator tooling — the breaker stores no private clock.
+- `perf_counter` (`include/dsn/c/api_utilities.h`) for the two breaker counters,
+  reusing the existing `metrics_registry` choke point.
+- `dsn_config` (`include/dsn/c/api_layer1.h`) for null-safe `[rasn.model]`
+  tunables.
+- `command_manager` (`include/dsn/tool-api/command.h`) for the `rasn.resilience`
+  ops command.
+
+Files:
+
+- `circuit_breaker.h` / `circuit_breaker.cpp` (new)
+- `metrics.cpp`, `rasn_core.h` / `rasn_core.cpp`
+- `agent_services.h` / `agent_services.cpp`
+- `codepilot/codepilot_app.cpp`, `config.ini`
+- `tests/rasn_unit_tests.cpp`
+- `docs/DESIGN.md`, `README.md`, `docs/report/main.tex`,
+  `docs/IMPLEMENTATION_PLAN.md`
+
+Work items:
+
+- [x] Add a dependency-light `circuit_breaker` / `circuit_breaker_registry` engine
+  (closed/open/half-open, single half-open probe) with the clock injected as a
+  `uint64_t now_ms`, mirroring `metrics.h`'s node-independent design.
+- [x] Add `rasn_model_breaker_open_total` and
+  `rasn_model_breaker_short_circuit_total` `perf_counter` series routed through
+  `record_event`, plus runtime `record_model_breaker_*` methods.
+- [x] Wire the breaker into `rasn_llm_agent_service::complete` /
+  `complete_streaming` after the replay check and before the provider call;
+  bypass local/simulator providers so existing behavior is unchanged.
+- [x] Read `[rasn.model] circuit_breaker_*` once via `dsn_config`; expose state
+  through the `rasn.resilience` command and CodePilot `observe resilience`, and
+  append breaker state to `provider_summary`.
+- [x] Add unit tests covering open/short-circuit, half-open probe recovery and
+  reopen, success reset, disabled mode, registry isolation, and the ops command.
+
+Validation:
+
+- [x] Compile-and-run the breaker state machine standalone (all assertions pass)
+  and `-fsyntax-only` `metrics.cpp` against the real rDSN headers; enum/array/map
+  alignment verified.
+- [ ] Plugin build on a supported toolchain (thrift/boost externals are not
+  available on the authoring host).
+- [ ] `rasn.unit_tests` run on the remote dev machines.
+
 ## Dependency order
 
 ```text
@@ -2784,6 +2842,8 @@ Phase 1 task model
   -> Phase 65 model credential handles
   -> Phase 66 product-readiness limitation closure
   -> Phase 67 runtime metrics and operational command surface
+  -> Phase 68 deterministic environment-input boundary
+  -> Phase 69 model gateway circuit breaker
 ```
 
 Some phases can overlap after Phase 3, but the public message model and generic

@@ -18,6 +18,7 @@ The prototype is intentionally small and is organized around four building block
 | rDSN service graph | `agent_services.*`, `rasn.code.definition.h` | Defines rDSN-style micro-service roles for coordinator, model agent, tool agent, state service, workflow service, observability service, and CLI gateway; service mode exposes those roles as `serverlet` RPC services with `clientlet` callers and explicit `RPC_RASN_*` task codes. |
 | Runtime nucleus | `rasn_core.*`, `observability.*`, `schema_manifest.*` | Creates task IDs, trace IDs, structured JSONL runtime events, nondeterministic value capture, external-effect ledger entries, filesystem snapshots, replay lookup, failure records, schema/IDL/JSON manifests, generated C++/TypeScript/Python RPC clients, and observability query APIs. |
 | Runtime metrics | `metrics.*` | Exports cumulative event counters and task/model/tool latency percentiles through rDSN `perf_counter` counters (section `rasn`) and renders them as text, Prometheus, or JSON; exposed via `observe metrics` and the rDSN `command_manager` command `rasn.metrics`. |
+| Resilience | `circuit_breaker.*` | Guards each model provider with a consecutive-failure circuit breaker (closed/open/half-open) so a failing endpoint fails fast; clock comes from rDSN's env provider (`dsn_now_ms`), state is exported through `perf_counter` counters and the `rasn.resilience` command, and tuned via `[rasn.model] circuit_breaker_*`. |
 | LLM provider layer | `llm_provider.*` | Provides a common `llm_provider` interface and adapters for simulator, Copilot-compatible, Ollama, llama.cpp, LM Studio, and generic OpenAI-compatible HTTP APIs. |
 | Tool provider layer | `agent_tools.*` | Defines the generic rASN tool-provider contract and registration factory used by the tool-agent service. |
 | Workflow graph | `workflow.*` | Parses a declarative task graph, validates dependencies, topologically orders nodes, and executes them through the selected provider. |
@@ -201,6 +202,26 @@ Metric collection is controlled by `[rasn.metrics] enabled` (default `true`);
 when disabled, every counter update becomes a no-op. Counter updates are
 null/thread safe and degrade to no-ops when the process has no rDSN service node,
 so the same code path is safe in inline, CLI, and service modes.
+
+### Resilience: model circuit breaker
+
+Counters make a degrading endpoint visible; a circuit breaker makes the runtime
+react to it. The model gateway wraps each provider in a per-provider circuit
+breaker so a failing or hanging endpoint fails fast instead of driving the
+provider's retry loop on every call. After `circuit_breaker_failure_threshold`
+consecutive failures the breaker *opens* and short-circuits requests for
+`circuit_breaker_open_ms`; it then admits a single half-open probe, closing on
+success or reopening on failure. Short-circuited calls return a normal failed
+`llm_response` carrying the breaker state.
+
+The breaker engine takes its clock from `::dsn_now_ms()` (routed through rDSN's
+pluggable environment provider), so it is deterministic under replay; replayed
+runs and local/simulator providers bypass it entirely, leaving existing behavior
+unchanged. Breaker activity flows through the same `record_event` choke point as
+every other metric via two counters (`rasn_model_breaker_open_total`,
+`rasn_model_breaker_short_circuit_total`), and a running deployment can dump live
+per-provider state through the rDSN command `rasn.resilience`. Tuning lives under
+`[rasn.model] circuit_breaker_*` and defaults to enabled.
 
 ### Tool calling model
 
@@ -531,6 +552,9 @@ The most important sections are:
 | `[rasn.model] token_env` | One environment variable or comma-separated fallback list containing bearer tokens. |
 | `[rasn.model] token_command` | Optional command that prints a token at runtime. Used only if token env vars are unset. Treat this as trusted local configuration. |
 | `[rasn.model] connect_timeout_sec/request_timeout_sec` | Curl connect and request bounds for network providers. |
+| `[rasn.model] circuit_breaker_enabled` | Enables the per-provider model circuit breaker (default `true`). When `false`, every model request is admitted regardless of recent failures. |
+| `[rasn.model] circuit_breaker_failure_threshold` | Consecutive model-call failures that open the breaker (default `5`). |
+| `[rasn.model] circuit_breaker_open_ms` | Cooldown in milliseconds before an open breaker admits a single half-open probe (default `30000`). Inspect live state with the `rasn.resilience` command. |
 | `[rasn.service] host`, `<name>_host`, `<name>_port`, `<name>_uri` | rDSN service graph endpoints. `<name>_uri` takes precedence and supports resolver-backed values such as `dsn://cluster/rasn.coordinator`; otherwise rASN uses host/port. |
 | `[rasn.coordinator] max_retry_budget` | Caps per-request `retry_budget` for retryable model-agent dispatch. Tool capabilities are never retried by the coordinator. |
 | `[rasn.workflow] execution_lease_ms` | Time-to-live for durable workflow execution owner leases. Active duplicate starts are rejected until the owner finishes or the lease becomes stale. |
@@ -720,6 +744,7 @@ observe diagnose [trace] summarize failures and replay issues
 observe failures         query classified failure records
 observe replay <file>    load replay choices through rasn.observability
 observe metrics [format] dump runtime metrics (text|prometheus|json)
+observe resilience       dump model circuit-breaker state
 observe snapshot         summarize observability state
 skills                   list CodePilot skills
 skill <name> [task]      show or apply a skill prompt
@@ -939,6 +964,7 @@ hardening gaps remain:
 | SDK packaging | Generated C++/TypeScript/Python contracts and RPC-client source. | Packaged SDKs and concrete TypeScript/Python transports are not shipped. |
 | Evaluation evidence | Unit tests, self-tests, service smokes, schema smokes, report build, and a small eval harness. | Large benchmarks and user studies for debugging effectiveness remain future work. |
 | Observability metrics | Cumulative event counters and task/model/tool latency percentiles via rDSN `perf_counter`, exported as text/Prometheus/JSON through `observe metrics` and the `rasn.metrics` rDSN command. | No bundled scrape gateway, retention store, or prebuilt dashboards; percentiles rely on rDSN's periodic counter timers. |
+| Overload / dependency isolation | Per-provider model circuit breaker (closed/open/half-open) that fast-fails calls to a failing endpoint, surfaced through `perf_counter` counters, `observe resilience`, and the `rasn.resilience` command. | Tool and remote-agent gateways are not breaker-guarded yet; no global concurrency cap; in RPC-client mode the breaker lives on the serving node. |
 
 ## Troubleshooting
 

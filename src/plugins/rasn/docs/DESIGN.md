@@ -617,7 +617,10 @@ rDSN design:
 - `nucleus_runtime::record_event` is the single choke point that increments
   counters, so every existing and future event kind is covered without touching
   call sites. Task and model latencies are paired inside the runtime; tool
-  latency is timed in `rasn_service_graph::run_tool`.
+  latency is timed in `rasn_tool_agent_service::run_tool`, the point where the
+  CLI, workflow, RPC-server, and direct-call tool paths converge, with an
+  RPC-client transport failure that never reaches the tool agent timed at the
+  `rasn_service_graph::run_tool` facade instead.
 - The service graph registers a `rasn.metrics` command with rDSN's
   `command_manager`, so a running deployment answers
   `rasn.metrics [text|prometheus|json]` over the same local/remote CLI as
@@ -636,6 +639,48 @@ Correctness and robustness requirements:
 - Metric formatting is dependency-light and pure (it lives alongside the
   perf-counter backend in `metrics.cpp` but uses no rDSN headers), so it is unit
   tested independent of the perf-counter backend.
+
+### 12.2 Model circuit breaker
+
+Counters and latency percentiles make a degrading model endpoint *visible*; a
+circuit breaker makes the runtime *react* to it. Without one, every request keeps
+driving the provider's internal retry loop, so a dead or hanging endpoint turns
+into piled-up latency and wasted budget. rASN therefore guards the model gateway
+with a per-provider circuit breaker.
+
+Responsibilities:
+
+- Track consecutive failures per model provider and, once a threshold is crossed,
+  *open* the breaker so subsequent requests fail fast instead of calling the
+  endpoint.
+- After a cooldown, admit exactly one *half-open* probe; a successful probe closes
+  the breaker, a failed probe reopens it with a fresh cooldown.
+- Short-circuited requests return a normal `llm_response{ok=false}` carrying the
+  breaker state, so callers and the coordinator handle it like any other failure.
+
+rDSN design:
+
+- The breaker engine (`circuit_breaker` / `circuit_breaker_registry`) is
+  intentionally dependency-light, like `metrics.h`: it pulls in no rDSN headers
+  and the caller injects the clock as `::dsn_now_ms()`. Because that clock is
+  routed through rDSN's pluggable environment provider, breaker timing is
+  deterministic under replay and the engine is unit-testable without a live node.
+- It is wired into `rasn_llm_agent_service`, where both `complete()` and
+  `complete_streaming()` converge on the provider call. The gate sits *after* the
+  replay check and *before* the provider, so replayed runs bypass it entirely and
+  the provider's own retry loop is skipped when the breaker is open.
+- Local/in-process providers (the deterministic simulator) report
+  `describe().local == true` and bypass the breaker, so simulator-backed runs and
+  tests keep their existing behavior.
+- Two `perf_counter` series — `rasn_model_breaker_open_total` and
+  `rasn_model_breaker_short_circuit_total` — flow through the same
+  `record_event` choke point as every other metric, so breaker activity shows up
+  in `rasn.metrics` and `observe metrics` with no extra plumbing.
+- `[rasn.model] circuit_breaker_enabled`, `circuit_breaker_failure_threshold`,
+  and `circuit_breaker_open_ms` are read once through `dsn_config` (null-safe
+  defaults), and a `rasn.resilience` command registered with `command_manager`
+  dumps each provider's live breaker state next to the existing `rasn.metrics`
+  command.
 
 ### 13. Service-mode integration self-test
 
@@ -913,3 +958,9 @@ remaining limitations are:
   text/Prometheus/JSON, but rASN does not bundle a scrape gateway, a retention
   store, or prebuilt dashboards, and latency percentiles depend on rDSN's
   periodic counter timers.
+- **Overload and dependency isolation:** the model gateway has a per-provider
+  circuit breaker that fast-fails calls to a failing endpoint, surfaced through
+  `perf_counter` metrics and the `rasn.resilience` command. Tool and
+  remote-agent gateways are not yet breaker-guarded, there is no global
+  concurrency cap or admission queue, and in RPC-client mode the breaker state
+  lives on the serving node rather than the client.

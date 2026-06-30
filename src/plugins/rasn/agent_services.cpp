@@ -203,6 +203,23 @@ std::string model_gateway_summary(const model_gateway_response &response, const 
     return oss.str();
 }
 
+std::string format_model_breaker_states(const std::vector<circuit_breaker_registry::entry> &states)
+{
+    if (states.empty())
+    {
+        return "model circuit breakers: none engaged";
+    }
+    std::ostringstream oss;
+    oss << "model circuit breakers:";
+    for (size_t i = 0; i < states.size(); ++i)
+    {
+        const circuit_breaker_registry::entry &entry = states[i];
+        oss << "\n- provider=" << entry.key << " state=" << to_string(entry.state)
+            << " consecutive_failures=" << entry.consecutive_failures;
+    }
+    return oss.str();
+}
+
 std::string descriptor_line(const std::string &label, const agent_descriptor &descriptor)
 {
     std::ostringstream oss;
@@ -287,6 +304,24 @@ state_response service_graph_observability_state_writer(const state_record &reco
     return global_rasn_services().put_state(record);
 }
 
+breaker_config read_model_breaker_config()
+{
+    breaker_config cfg;
+    cfg.enabled = ::dsn_config_get_value_bool(
+        "rasn.model", "circuit_breaker_enabled", true, "enable the rASN model-gateway circuit breaker");
+    cfg.failure_threshold = static_cast<uint32_t>(::dsn_config_get_value_uint64(
+        "rasn.model",
+        "circuit_breaker_failure_threshold",
+        5,
+        "consecutive model-provider failures before the circuit breaker opens"));
+    cfg.open_ms = ::dsn_config_get_value_uint64(
+        "rasn.model",
+        "circuit_breaker_open_ms",
+        30000,
+        "cooldown in ms before an open model circuit breaker admits a half-open probe");
+    return cfg;
+}
+
 } // namespace
 
 rasn_llm_agent_service::rasn_llm_agent_service()
@@ -359,6 +394,69 @@ model_gateway_response rasn_llm_agent_service::model_health() const
     return response;
 }
 
+void rasn_llm_agent_service::ensure_model_breaker_config()
+{
+    std::call_once(_model_breaker_config_once,
+                   [this] { _model_breakers.set_config(read_model_breaker_config()); });
+}
+
+bool rasn_llm_agent_service::model_breaker_engaged() const
+{
+    // Circuit breaking only matters for remote providers whose endpoints can
+    // fail or hang. Local/in-process providers (such as the deterministic
+    // simulator) never trip a breaker, so they bypass it entirely and keep
+    // existing behavior unchanged.
+    return _provider != nullptr && !_provider->describe().local;
+}
+
+bool rasn_llm_agent_service::model_breaker_admit(const std::string &provider,
+                                                 const agent_task &task,
+                                                 nucleus_runtime &runtime,
+                                                 llm_response *fast_fail)
+{
+    ensure_model_breaker_config();
+    circuit_breaker &breaker = _model_breakers.get(provider);
+    const breaker_decision decision = breaker.allow(::dsn_now_ms());
+    if (decision.half_open_probe)
+    {
+        dinfo("rASN model circuit breaker half-open: admitting probe for provider=%s", provider.c_str());
+    }
+    if (decision.allowed)
+    {
+        return true;
+    }
+    dwarn("rASN model circuit breaker %s for provider=%s; short-circuiting request",
+          to_string(decision.state),
+          provider.c_str());
+    runtime.record_model_breaker_short_circuit(task, provider, to_string(decision.state));
+    if (fast_fail != nullptr)
+    {
+        *fast_fail = rpc_error_response("model circuit breaker " + std::string(to_string(decision.state)) +
+                                        " for provider " + provider + "; request short-circuited");
+    }
+    return false;
+}
+
+void rasn_llm_agent_service::model_breaker_report(const std::string &provider,
+                                                  const agent_task &task,
+                                                  nucleus_runtime &runtime,
+                                                  bool ok)
+{
+    circuit_breaker &breaker = _model_breakers.get(provider);
+    if (breaker.report(ok, ::dsn_now_ms()))
+    {
+        dwarn("rASN model circuit breaker opened for provider=%s after %u consecutive failures",
+              provider.c_str(),
+              static_cast<unsigned int>(breaker.consecutive_failures()));
+        runtime.record_model_breaker_open(task, provider, breaker.consecutive_failures());
+    }
+}
+
+std::vector<circuit_breaker_registry::entry> rasn_llm_agent_service::model_breaker_states() const
+{
+    return _model_breakers.snapshot();
+}
+
 llm_response rasn_llm_agent_service::complete(const agent_completion_request &request, nucleus_runtime &runtime)
 {
     const agent_request generic_request = make_model_agent_request(request, runtime.trace_id());
@@ -383,7 +481,25 @@ llm_response rasn_llm_agent_service::complete(const agent_completion_request &re
         response.text = replayed_response;
         return response;
     }
+
+    // Guard remote providers with a circuit breaker so a failing endpoint fails
+    // fast (before the provider's own retry loop) instead of piling up latency.
+    const std::string provider_name = _provider->name();
+    const bool guarded = model_breaker_engaged();
+    if (guarded)
+    {
+        llm_response fast_fail;
+        if (!model_breaker_admit(provider_name, request.task, runtime, &fast_fail))
+        {
+            return fast_fail;
+        }
+    }
+
     const llm_response response = redact_llm_response(_provider->complete(redact_llm_request(llm), runtime));
+    if (guarded)
+    {
+        model_breaker_report(provider_name, request.task, runtime, response.ok);
+    }
     const agent_response generic_response = make_agent_response_from_llm(generic_request, response);
     if (!validate_agent_response(generic_response, &validation_error))
     {
@@ -421,8 +537,23 @@ llm_response rasn_llm_agent_service::complete_streaming(const agent_completion_r
         return response;
     }
 
+    const std::string provider_name = _provider->name();
+    const bool guarded = model_breaker_engaged();
+    if (guarded)
+    {
+        llm_response fast_fail;
+        if (!model_breaker_admit(provider_name, request.task, runtime, &fast_fail))
+        {
+            return fast_fail;
+        }
+    }
+
     const llm_response response =
         redact_llm_response(_provider->complete_streaming(redact_llm_request(llm), runtime, on_chunk));
+    if (guarded)
+    {
+        model_breaker_report(provider_name, request.task, runtime, response.ok);
+    }
     const agent_response generic_response = make_agent_response_from_llm(generic_request, response);
     if (!validate_agent_response(generic_response, &validation_error))
     {
@@ -995,6 +1126,18 @@ void rasn_service_graph::register_ops_commands_once()
                 return ::dsn::safe_string(out.c_str());
             });
         dinfo("registered rASN ops command: rasn.metrics");
+
+        ::dsn::register_command(
+            "rasn.resilience",
+            "rasn.resilience - dump rASN model circuit-breaker state",
+            "rasn.resilience - list each model provider's circuit-breaker state "
+            "(closed|open|half_open) and consecutive failure count",
+            [](const ::dsn::safe_vector<::dsn::safe_string> &args) -> ::dsn::safe_string {
+                (void)args;
+                const std::string out = global_rasn_services().model_breaker_report();
+                return ::dsn::safe_string(out.c_str());
+            });
+        dinfo("registered rASN ops command: rasn.resilience");
     });
 }
 
@@ -1201,7 +1344,23 @@ model_gateway_response rasn_service_graph::model_health() const
 
 std::string rasn_service_graph::provider_summary() const
 {
-    return model_gateway_summary(model_provider(), _runtime);
+    std::string summary = model_gateway_summary(model_provider(), _runtime);
+    const std::vector<circuit_breaker_registry::entry> breakers = model_breaker_states();
+    if (!breakers.empty())
+    {
+        summary += "\n" + format_model_breaker_states(breakers);
+    }
+    return summary;
+}
+
+std::vector<circuit_breaker_registry::entry> rasn_service_graph::model_breaker_states() const
+{
+    return _llm_agent.model_breaker_states();
+}
+
+std::string rasn_service_graph::model_breaker_report() const
+{
+    return format_model_breaker_states(model_breaker_states());
 }
 
 std::string rasn_service_graph::topology() const
@@ -1429,9 +1588,20 @@ tool_result rasn_service_graph::run_tool(const std::string &name,
         rasn_agent_client client(_coordinator_address);
         ::dsn::error_code err;
         agent_response response;
+        const uint64_t rpc_start_ms = ::dsn_now_ms();
         std::tie(err, response) = client.invoke_sync(generic_request, request_rpc_timeout(generic_request));
         if (err != ::dsn::ERR_OK)
         {
+            // The RPC failed in transport/routing before reaching the tool agent,
+            // so rasn_tool_agent_service::run_tool() never recorded a latency
+            // sample for it. Record the failed-call latency here so the metric
+            // also covers RPC failures that never reach the agent. The success
+            // path is intentionally not recorded here -- it reaches the tool
+            // agent, which records it, and double-counting would skew the
+            // percentiles.
+            const uint64_t rpc_now_ms = ::dsn_now_ms();
+            metrics_registry::instance().observe_tool_latency_ms(rpc_now_ms >= rpc_start_ms ? rpc_now_ms - rpc_start_ms
+                                                                                            : 0);
             result = rpc_error_tool_result(std::string("RPC_RASN_AGENT_INVOKE coordinator failed: ") + err.to_string());
         }
         else
@@ -1443,9 +1613,11 @@ tool_result rasn_service_graph::run_tool(const std::string &name,
     {
         result = make_tool_result_from_agent(_coordinator.invoke(generic_request, _runtime));
     }
-    // Tool latency is recorded in rasn_tool_agent_service::run_tool(), the point
-    // where this facade, the CodePilot CLI path, and the RPC server path all
-    // converge, so it is intentionally not observed again here.
+    // On the success and in-process paths, tool latency is recorded in
+    // rasn_tool_agent_service::run_tool(), the point where this facade, the
+    // CodePilot CLI path, and the RPC server path all converge. The only case
+    // that does not reach that method is an RPC-client transport/routing failure,
+    // which is recorded explicitly above.
     return result;
 }
 

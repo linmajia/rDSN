@@ -830,6 +830,28 @@ void nucleus_runtime::record_retry(const agent_task &task,
     record_event(task, "retry", operation, reason, "", "", "", true, retry_attempt);
 }
 
+void nucleus_runtime::record_model_breaker_open(const agent_task &task,
+                                                const std::string &provider,
+                                                uint32_t consecutive_failures)
+{
+    record_event(task,
+                 "model.breaker.open",
+                 provider,
+                 "consecutive_failures=" + std::to_string(consecutive_failures),
+                 "",
+                 "",
+                 "",
+                 false,
+                 0);
+}
+
+void nucleus_runtime::record_model_breaker_short_circuit(const agent_task &task,
+                                                         const std::string &provider,
+                                                         const std::string &breaker_state)
+{
+    record_event(task, "model.breaker.short_circuit", provider, breaker_state, "", "", "", false, 0);
+}
+
 std::string nucleus_runtime::resolve_nondeterminism(const agent_task &task,
                                                     const std::string &name,
                                                     const std::string &source,

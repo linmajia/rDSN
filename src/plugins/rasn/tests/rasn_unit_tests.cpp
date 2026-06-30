@@ -3,6 +3,7 @@
 #include "../agent_registry.h"
 #include "../agent_runtime.h"
 #include "../agent_services.h"
+#include "../circuit_breaker.h"
 #include "../coordinator_service.h"
 #include "../codepilot/local_tools.h"
 #include "../metrics.h"
@@ -1864,6 +1865,143 @@ TEST(rasn_metrics_registry, ops_command_dumps_metrics_in_requested_format)
     ::dsn::safe_string json_out;
     ASSERT_TRUE(::dsn::run_command("rasn.metrics json", json_out));
     EXPECT_NE(std::string::npos, std::string(json_out.c_str()).find("\"metrics\":["));
+
+    services.release();
+}
+
+TEST(rasn_circuit_breaker, opens_after_consecutive_failures_and_short_circuits)
+{
+    breaker_config cfg;
+    cfg.failure_threshold = 3;
+    cfg.open_ms = 1000;
+    circuit_breaker breaker(cfg);
+
+    // Two failures keep the breaker closed.
+    EXPECT_TRUE(breaker.allow(0).allowed);
+    EXPECT_FALSE(breaker.report(false, 0));
+    EXPECT_TRUE(breaker.allow(0).allowed);
+    EXPECT_FALSE(breaker.report(false, 0));
+    EXPECT_EQ(breaker_state::closed, breaker.state());
+
+    // The third consecutive failure trips it; report() signals the transition.
+    EXPECT_TRUE(breaker.allow(0).allowed);
+    EXPECT_TRUE(breaker.report(false, 0));
+    EXPECT_EQ(breaker_state::open, breaker.state());
+
+    // Within the cooldown, requests are short-circuited.
+    const breaker_decision blocked = breaker.allow(500);
+    EXPECT_FALSE(blocked.allowed);
+    EXPECT_EQ(breaker_state::open, blocked.state);
+}
+
+TEST(rasn_circuit_breaker, half_open_admits_single_probe_then_recovers)
+{
+    breaker_config cfg;
+    cfg.failure_threshold = 1;
+    cfg.open_ms = 1000;
+    circuit_breaker breaker(cfg);
+
+    EXPECT_TRUE(breaker.report(false, 0)); // opens immediately (threshold 1)
+    EXPECT_EQ(breaker_state::open, breaker.state());
+
+    // After the cooldown, exactly one probe is admitted.
+    const breaker_decision probe = breaker.allow(1000);
+    EXPECT_TRUE(probe.allowed);
+    EXPECT_TRUE(probe.half_open_probe);
+    EXPECT_EQ(breaker_state::half_open, breaker.state());
+
+    // A concurrent request while the probe is outstanding is denied.
+    EXPECT_FALSE(breaker.allow(1000).allowed);
+
+    // A successful probe closes the breaker and clears the failure count.
+    EXPECT_FALSE(breaker.report(true, 1000));
+    EXPECT_EQ(breaker_state::closed, breaker.state());
+    EXPECT_EQ(0u, breaker.consecutive_failures());
+}
+
+TEST(rasn_circuit_breaker, half_open_probe_failure_reopens)
+{
+    breaker_config cfg;
+    cfg.failure_threshold = 1;
+    cfg.open_ms = 100;
+    circuit_breaker breaker(cfg);
+
+    EXPECT_TRUE(breaker.report(false, 0));
+    const breaker_decision probe = breaker.allow(100);
+    EXPECT_TRUE(probe.allowed);
+    EXPECT_TRUE(probe.half_open_probe);
+
+    // A failed probe reopens the breaker and restarts the cooldown.
+    EXPECT_TRUE(breaker.report(false, 100));
+    EXPECT_EQ(breaker_state::open, breaker.state());
+    EXPECT_FALSE(breaker.allow(150).allowed);
+    EXPECT_TRUE(breaker.allow(200).allowed);
+}
+
+TEST(rasn_circuit_breaker, success_resets_consecutive_failures)
+{
+    breaker_config cfg;
+    cfg.failure_threshold = 3;
+    cfg.open_ms = 1000;
+    circuit_breaker breaker(cfg);
+
+    breaker.report(false, 0);
+    breaker.report(false, 0);
+    EXPECT_EQ(2u, breaker.consecutive_failures());
+    breaker.report(true, 0);
+    EXPECT_EQ(0u, breaker.consecutive_failures());
+
+    // Two more failures must not open it because the count was reset.
+    breaker.report(false, 0);
+    breaker.report(false, 0);
+    EXPECT_EQ(breaker_state::closed, breaker.state());
+}
+
+TEST(rasn_circuit_breaker, disabled_breaker_always_allows)
+{
+    breaker_config cfg;
+    cfg.enabled = false;
+    cfg.failure_threshold = 1;
+    circuit_breaker breaker(cfg);
+
+    EXPECT_TRUE(breaker.allow(0).allowed);
+    EXPECT_FALSE(breaker.report(false, 0));
+    EXPECT_TRUE(breaker.allow(0).allowed);
+    EXPECT_EQ(breaker_state::closed, breaker.state());
+}
+
+TEST(rasn_circuit_breaker, registry_isolates_breakers_per_key)
+{
+    breaker_config cfg;
+    cfg.failure_threshold = 1;
+    cfg.open_ms = 1000;
+    circuit_breaker_registry registry(cfg);
+
+    circuit_breaker &a = registry.get("provider.a");
+    circuit_breaker &b = registry.get("provider.b");
+    EXPECT_TRUE(a.report(false, 0)); // opens a only
+    EXPECT_EQ(breaker_state::open, a.state());
+    EXPECT_EQ(breaker_state::closed, b.state());
+
+    // The same key always returns the same breaker instance.
+    EXPECT_EQ(&a, &registry.get("provider.a"));
+
+    const std::vector<circuit_breaker_registry::entry> snapshot = registry.snapshot();
+    ASSERT_EQ(2u, snapshot.size());
+    EXPECT_EQ("provider.a", snapshot[0].key);
+    EXPECT_EQ(breaker_state::open, snapshot[0].state);
+    EXPECT_EQ("provider.b", snapshot[1].key);
+    EXPECT_EQ(breaker_state::closed, snapshot[1].state);
+}
+
+TEST(rasn_circuit_breaker, ops_command_reports_breaker_state)
+{
+    rasn_service_graph services;
+    services.acquire();
+
+    ::dsn::safe_string out;
+    ASSERT_TRUE(::dsn::run_command("rasn.resilience", out));
+    EXPECT_NE(std::string::npos, std::string(out.c_str()).find("model circuit breakers"));
 
     services.release();
 }
