@@ -1,0 +1,851 @@
+# rASN generic multi-agent system design
+
+This document describes the target architecture for Robust Agent System Nucleus
+(rASN) as a generic rDSN-native multi-agent runtime. CodePilot is only one
+application built on top of this runtime.
+
+## Design goals
+
+- Model every agent as a distributed service component with explicit lifecycle,
+  identity, capability, configuration, RPC boundary, state ownership, and
+  observability.
+- Use rDSN public C/C++ APIs from `include/dsn/c` and `include/dsn/cpp` instead
+  of ad-hoc runtime infrastructure.
+- Make nondeterminism explicit: LLM calls, tool side effects, scheduling
+  decisions, retries, and failure handling must be traceable and replay-aware.
+- Prefer typed request/response schemas and rDSN serialization over string
+  envelopes.
+- Keep CodePilot-specific concepts, prompts, skills, and local tools outside the
+  generic rASN core.
+
+## rDSN API and example basis
+
+rASN should follow these existing rDSN patterns:
+
+| Area | rDSN API or example | rASN use |
+| --- | --- | --- |
+| Service lifecycle | `dsn::service_app` | Each long-running component is an app role with `start` and `stop`. |
+| RPC server | `dsn::serverlet<T>` and `dsn::rpc_replier<T>` | Agent services expose typed handlers. |
+| RPC client | `dsn::clientlet`, `dsn::rpc::call`, `wait_and_unwrap` | Coordinator and applications call agents through generated-style clients. |
+| Task codes | `DEFINE_TASK_CODE_RPC` | Every cross-component operation has an explicit task code. |
+| Serialization | `binary_writer`, `binary_reader`, `marshall`, `unmarshall` | All generic messages are typed and versioned. |
+| Configuration | `dsn_config_get_value_*` | Ports, policies, budgets, timeouts, persistence paths, and provider settings are config-driven. |
+| Logging/assertions | `dinfo`, `dwarn`, `derror`, `dassert` | Runtime behavior and invariant violations are visible. |
+| Locks | `dsn::service::zlock`, `zauto_lock` | Shared service state is protected using rDSN locks. |
+| Filesystem | `dsn::utils::filesystem::*` | Checkpoints, traces, temp payloads, and workflow files use rDSN utilities. |
+| Timers/tasks | `dsn::tasking::enqueue_timer` | Heartbeats, leases, retries, and background maintenance. |
+| Echo sample | `src/plugins/apps.echo` | Minimal service_app/serverlet/clientlet/task-code pattern. |
+| SKV sample | `src/plugins/apps.skv` | Stateful service, locks, checkpoints, and recovery. |
+| Deployment sample | `src/plugins_ext/rDSN.dist.deployment` | Multi-RPC service and richer app wrapper pattern. |
+
+## Component graph
+
+```text
+application adapters
+  CodePilot, future agents/CLIs/services
+        |
+        v
+rasn.coordinator  <---->  rasn.registry
+        |
+        +---- capability route ----> rasn.model.agent
+        +---- capability route ----> rasn.tool.agent
+        +---- capability route ----> custom agent services
+        |
+        +---- state/checkpoint ----> rasn.state
+        +---- policy checks -------> rasn.policy
+        +---- trace/failure -------> rasn.observability
+        |
+        +---- workflow execution --> rasn.workflow
+```
+
+`rasn_service_graph` is the shared in-process boundary for direct mode and the
+client facade for service mode. rDSN app wrappers that use it retain the graph on
+startup and release it on shutdown; the graph stops local agents, injected state
+writers, and maintenance timers only after the last lifecycle owner releases it.
+Application adapters such as CodePilot may configure providers during
+construction, but command execution is responsible for retaining the graph; this
+keeps construction side-effect free and preserves rDSN app startup ordering.
+Service-mode command adapters probe critical dependencies before executing, and
+workflow startup recovery is delayed until state RPC is ready, so concurrent app
+startup does not surface as user-visible command failures.
+
+## Core components
+
+### 1. Agent runtime
+
+The agent runtime is the common base for service-like agents.
+
+Responsibilities:
+
+- Own agent identity: `agent_id`, role name, app name, address, instance index,
+  and version.
+- Own lifecycle: initialize config, start providers, register RPC handlers, stop
+  cleanly, and release resources.
+- Expose capabilities: task types, tools, models, side-effect classes, cost
+  hints, latency hints, and reliability hints.
+- Apply common validation, logging, tracing, timeout defaults, and result
+  normalization.
+
+rDSN design:
+
+- Service implementations are wrapped by `dsn::service_app` roles.
+- RPC-facing agents inherit from `dsn::serverlet<T>`.
+- Client wrappers inherit from `dsn::clientlet`.
+- Common mutable state uses `dsn::service::zlock`.
+- Agent config is read from sections such as `[rasn.agent.<role>]`.
+- Service-mode smoke runs in one rDSN process by default. Static external
+  descriptors can be loaded from `[rasn.agent.*]`, and service clients can be
+  pointed at per-service host/port or `dsn://...` URI endpoints through
+  `[rasn.service]`. Built-in agents use registry RPCs plus a rDSN timer task for
+  best-effort dynamic registration and heartbeat leases. Inline mode keeps a
+  same-process service graph for local prototyping; service mode can route
+  through explicit RPC endpoints and generated clients so application adapters do
+  not need to depend on concrete in-process stores or providers.
+
+Correctness and robustness requirements:
+
+- `start` is idempotent and validates required config before serving requests.
+- `stop` is idempotent and unregisters RPC handlers.
+- Every request gets a request id, trace id, timeout budget, and deterministic
+  error if rejected before execution.
+- A request timeout budget of `0` means "use `[rasn.rpc] timeout_ms`"; a
+  nonzero request or workflow-node budget becomes the client-side rDSN RPC
+  deadline for service-mode dispatch.
+- Agents must not silently ignore malformed requests.
+
+### 2. Agent registry
+
+The registry records which agents exist and which capabilities they provide.
+
+Responsibilities:
+
+- Register/unregister agent descriptors.
+- Query agents by capability, role, address, health, cost, and policy labels.
+- Provide stable routing metadata to the coordinator.
+- Support static config registration from `[rasn.agent.*]`, then dynamic
+  registration and heartbeat-based leases.
+
+rDSN design:
+
+- `rasn.registry` is a `service_app` with a `serverlet`.
+- Registry state is protected by `zlock`.
+- Initial entries come from `dsn_config_get_all_sections` over
+  `[rasn.agent.*]`.
+- Static entries are loaded from `[rasn.agent.*]` sections at registry startup.
+- Agent descriptors carry either host/port or `endpoint_uri`; the coordinator
+  prefers URI routing and falls back to IPv4 host/port routing.
+- Built-in agents register with `rasn.registry` through typed RPCs when service
+  clients are enabled. `LPC_RASN_REGISTRY_HEARTBEAT_TIMER` sends periodic
+  heartbeats, and lease-tracked entries are filtered from healthy queries once
+  their heartbeat age exceeds `[rasn.registry] lease_ms`.
+- `LPC_RASN_REGISTRY_LEASE_SWEEP_TIMER` runs inside the registry service app and
+  actively removes expired lease-tracked entries. Static descriptors are not
+  lease-tracked and are not removed by sweeps.
+- Dynamic updates use typed register/unregister/heartbeat RPCs.
+- Direct CLI mode also loads static entries before built-in agents register, so
+  `registry` and `agentctl` see the same configured agents without requiring the
+  full service graph.
+
+Correctness and robustness requirements:
+
+- Duplicate agent ids are rejected unless the descriptor version is newer and
+  the update is explicit.
+- Expired or unhealthy entries are not returned for routing unless requested for
+  diagnosis.
+- Capability matching is exact by default; fuzzy matching is an explicit policy.
+
+### 3. Task and message model
+
+The task model is the generic protocol shared by all agents.
+
+Responsibilities:
+
+- Define `agent_request`, `agent_response`, `agent_error`,
+  `agent_capability`, `agent_descriptor`, `agent_context`, and
+  `agent_artifact`.
+- Represent parent/child task relationships and workflow node ids.
+- Carry timeout, retry, policy, budget, trace, and replay metadata.
+- Preserve deterministic error information across RPC boundaries.
+
+rDSN design:
+
+- Messages live in generic rASN headers, not CodePilot files.
+- Each struct has `marshall` and `unmarshall` functions.
+- Message fields include a schema version for forward compatibility.
+- RPC handlers use typed structs directly.
+- `schema_manifest.*` exposes a runtime catalog of core message contracts for
+  inspection, JSON export, IDL export, C++/TypeScript/Python SDK-stub
+  generation, generated C++/TypeScript/Python RPC-client wrappers, and
+  regression tests.
+- The RPC operation manifest enumerates service, task-code, request, and
+  response types for agent, registry, state, workflow, model, and observability
+  calls. `codepilot schema clients-cpp`, `clients-ts`, and `clients-py` turn that
+  manifest into source-level client wrappers instead of relying only on
+  hand-written C++ clients.
+
+Correctness and robustness requirements:
+
+- All required fields are validated at service boundaries.
+- Unknown enum/string values are preserved when safe and rejected when unsafe.
+- Responses carry either success payload or structured error, never ambiguous
+  partial success.
+- The schema manifest lists the core runtime, registry, tool, policy, workflow,
+  state, and observability contracts exposed by the CLI, including nested
+  records referenced by top-level requests and responses. The exported JSON/IDL
+  forms give external tooling a stable integration surface, while
+  `codepilot schema cpp`, `codepilot schema ts`, and `codepilot schema py`
+  generate self-contained C++, TypeScript, and Python contract stubs, while
+  `clients-cpp`, `clients-ts`, and `clients-py` generate executable
+  transport-backed clients for external agents, tools, and test harnesses.
+
+### 4. Message/RPC layer
+
+The message layer defines the typed RPC surface for generic agents.
+
+Responsibilities:
+
+- Provide common RPCs for describe, invoke, cancel, heartbeat, and query.
+- Provide generated-style client wrappers for synchronous and asynchronous use.
+- Hide address and timeout details from application adapters.
+
+rDSN design:
+
+- Task codes are defined in `rasn.code.definition.h` with
+  `DEFINE_TASK_CODE_RPC`.
+- Handlers are registered with `serverlet::register_async_rpc_handler`.
+- Clients call through `dsn::rpc::call` and `wait_and_unwrap`.
+
+Correctness and robustness requirements:
+
+- Every call has a configured timeout.
+- Generic `agent_request.timeout_ms` overrides the global timeout for registry,
+  coordinator, and routed agent invocations. This is a client deadline; it
+  bounds the caller wait time. For HTTP model providers, it is also propagated
+  through the compatibility completion request into `llm_request.timeout_ms` and
+  applied as curl `max-time`, capped by `[rasn.model] request_timeout_sec`.
+  Arbitrary local provider work still requires cooperative cancellation.
+- Built-in agents maintain bounded in-flight request tracking keyed by
+  `agent_request.request_id`. `RPC_RASN_AGENT_CANCEL` records a cancellation
+  tombstone for matching work, makes later duplicate starts fail as
+  `request_cancelled`, and converts a cancelled in-flight result into a
+  structured cancellation failure once the provider/tool returns.
+  Tombstone trimming never evicts a cancellation while the corresponding request
+  is still in flight, preserving terminal cancellation under cancel storms.
+- RPC errors are converted into `agent_error` with rDSN error code and operation
+  metadata.
+- Retry is explicit and bounded. `agent_request.retry_budget` allows retryable
+  model-agent dispatch failures to be attempted again through the coordinator,
+  capped by `[rasn.coordinator] max_retry_budget`; retry events and retryable
+  failures are written into the runtime trace. Tool capabilities are excluded
+  from coordinator retries because a timed-out tool RPC may already have executed
+  side effects.
+- Handler registration/unregistration is paired and logged.
+- A cancel for an unknown request returns `cancel_not_found` rather than being
+  silently ignored.
+
+### 4.1 Operator-facing inspection
+
+rASN should expose enough runtime information for developers to treat agents as
+service components rather than hidden prompt calls.
+
+Current CLI surfaces:
+
+- `registry list|get|query` inspects registered agents and capability routing
+  metadata. In service mode it reads the live `rasn.registry` RPC surface.
+- `agentctl describe|heartbeat|query|cancel` exercises generic agent control RPCs
+  for built-in coordinator/model/tool agents.
+- `workflow nodes <run-id>` reads node-level workflow state persisted by
+  `rasn.workflow`.
+
+These commands are intentionally simple text output for now. A future version
+should expose the same data as stable JSON for external tooling.
+
+### 5. Coordinator and orchestrator
+
+The coordinator routes tasks and drives multi-agent execution.
+
+Responsibilities:
+
+- Accept application requests and workflow execution requests.
+- Query the registry for candidate agents.
+- Apply policy, choose routes, dispatch requests, and merge outputs.
+- Track task state transitions and emit trace events.
+- Drive dependency execution for workflows.
+
+rDSN design:
+
+- `rasn.coordinator` is a `service_app` with typed RPC handlers.
+- It uses registry, policy, state, observer, and agent clients.
+- It should not call concrete model/tool implementation classes directly after
+  migration.
+
+Correctness and robustness requirements:
+
+- Routing is deterministic for the same registry snapshot and policy settings
+  unless a configured nondeterministic strategy is recorded in the trace.
+- Dependency failures are propagated with explicit failure class and blocked
+  downstream nodes.
+- Repeated client retries are bounded by request budget and idempotency flags.
+
+### 6. Workflow graph
+
+The workflow graph is the declarative execution model.
+
+Responsibilities:
+
+- Represent tasks, dependencies, inputs, outputs, capabilities, policies, and
+  artifacts.
+- Validate graph structure: no cycles, missing nodes, invalid dependencies, or
+  unsupported capability references.
+- Provide a stable executable order for deterministic replay.
+
+rDSN design:
+
+- Parser can remain a library initially.
+- Validated workflow specs are submitted to `rasn.workflow`.
+- File access uses `dsn::utils::filesystem`.
+
+Correctness and robustness requirements:
+
+- Invalid workflow specs fail before any side effect.
+- Node ids are unique and stable.
+- Text and JSON workflow specs normalize into the same `workflow_node` model, so
+  CLI-friendly files and tool-generated structured files share validation,
+  optimization, replay, and execution semantics.
+- Graph validation reports obvious errors before execution, including duplicate
+  node ids, unsupported actions, invalid state keys, malformed numeric hints, and
+  dependency cycles.
+
+### 7. Workflow compiler and executor
+
+The compiler turns declarative workflows into executable multi-agent plans.
+
+Responsibilities:
+
+- Bind workflow nodes to required capabilities.
+- Annotate nodes with budgets, retries, state keys, and trace ids.
+- Parse both the compact text workflow language and structured JSON workflow
+  specs with the same validation rules.
+- Optimize for latency, cost, and reliability when policy allows.
+- Execute ready nodes and persist progress.
+
+rDSN design:
+
+- `rasn.workflow` is a `service_app`.
+- Execution state is stored through `rasn.state`; in service mode workflow
+  persistence uses the state client/server boundary instead of directly touching
+  the in-process store.
+- Execution uses coordinator RPC rather than direct provider calls.
+- `RPC_RASN_WORKFLOW_START` runs on `THREAD_POOL_RASN_WORKFLOW` so synchronous
+  workflow execution does not occupy the default RPC pool while it calls
+  coordinator/model/tool RPCs.
+
+Correctness and robustness requirements:
+
+- Compilation is deterministic for a given workflow, registry snapshot, and
+  policy.
+- Optimizations must preserve declared dependencies and side-effect ordering.
+- Execution persists whole-run start/end records and latest per-node state.
+- Whole-run, per-node, resume, and lease state operations route through the
+  service graph state APIs. This keeps inline and service paths behaviorally
+  aligned while letting rDSN RPC mode exercise `rasn.state` independently.
+- Workflow execution owns `workflow-lease/<run-id>` before dispatching nodes.
+  Leases are written through conditional `rasn.state` operations, reject active
+  duplicate execution, and can be taken over after
+  `[rasn.workflow] execution_lease_ms`.
+- Active workflow owners renew their lease while nodes are running. In service
+  context renewal uses an rDSN timer task (`LPC_RASN_WORKFLOW_LEASE_RENEW_TIMER`);
+  inline/direct execution uses the same conditional state update loop from a
+  local renewal thread so the CLI path has the same ownership semantics.
+- Whole-run records are recoverable from `rasn.state` on workflow-service startup
+  when state has already been recovered, and on demand when `workflow query` or
+  `workflow cancel` misses the in-memory run table. Recovery distinguishes a
+  missing workflow key from state-service failures; non-missing-key errors are
+  returned to the caller rather than converted into `workflow run not found`.
+- `workflow resume <file> <run-id>` reloads completed per-node records from
+  `rasn.state`, seeds dependency outputs, marks skipped nodes as `resumed`, and
+  executes only incomplete downstream nodes through the normal rDSN workflow
+  service path.
+- Dependency failures mark dependent nodes as `blocked`.
+- Cancellation is cooperative, terminal, and durable: the `cancelled` transition
+  is written through a conditional `rasn.state` update, and the cancel request
+  fails explicitly if that state write fails or races with a newer terminal run
+  record.
+- Agent-level cancellation is also cooperative: server-side preemption of
+  already-running provider or tool work remains a planned reliability feature.
+
+### 8. State and checkpoint store
+
+The state store owns durable runtime state.
+
+Responsibilities:
+
+- Store task state, workflow state, intermediate outputs, artifacts, replay
+  values, and checkpoints.
+- Provide snapshot, recover, query, and garbage-collection operations.
+- Separate secret references from persisted task data.
+
+rDSN design:
+
+- `rasn.state` follows the SKV pattern: service app, serverlet, `zlock`,
+  checkpoint directory, recovery on start.
+- Mutations can be unconditional, create-only, or expected-sequence checked.
+  The conditional path is exposed as `RPC_RASN_STATE_PUT_CONDITIONAL` and is used
+  by workflow ownership leases.
+- If `[rasn.state] recover_on_start` is configured, service startup recovers that
+  explicit path and fails on recovery errors. If it is empty, startup
+  auto-recovers the configured default checkpoint/journal when one exists and
+  skips recovery on first boot.
+- Optional `[rasn.state.nfs]` settings let recovery first pull checkpoint files
+  from an existing `dsn.tools.nfs` source when local state is absent. This reuses
+  rDSN's NFS module for remote state seeding without making the default local
+  checkpoint path depend on a network service.
+- Optional `[rasn.state.replica]` settings mirror checkpoint and journal files to
+  a local replica directory. When enabled, state writes fail explicitly if the
+  mirror cannot be updated, and recovery can seed missing primary checkpoint or
+  journal files from the replica before attempting NFS import.
+- Files and directories use `dsn::utils::filesystem`.
+- Future replicated mode can follow `replicated_service_app_type_1`.
+
+Correctness and robustness requirements:
+
+- Writes are atomic at the logical operation level.
+- Checkpoints include schema version and last committed event sequence.
+- Replica mirrors are write-through rather than best-effort; mirror failures are
+  surfaced to the caller instead of being silently ignored.
+- Recovery validates checkpoint integrity and refuses corrupt state unless
+  configured for best-effort diagnosis.
+
+### 9. Model gateway
+
+The model gateway is the generic LLM/model agent.
+
+Responsibilities:
+
+- Expose model invocation as an agent capability.
+- Support simulator, Copilot-compatible, Ollama, llama.cpp, LM Studio, and
+  OpenAI-compatible providers.
+- Record nondeterminism, prompts, sanitized metadata, token source, and errors.
+- Expose a provider-neutral streaming callback surface and record emitted chunks.
+- Keep credentials outside source files and traces.
+
+rDSN design:
+
+- Current `rasn.llm.agent` becomes a `model_agent` implementation of the generic
+  runtime.
+- Provider settings come from `[rasn.model.*]` or `[rasn.llm]`.
+- Credentials are referenced by `token_ref` handles (`env:`, `file:`, or
+  `cmd:`) or by legacy environment-variable names, not stored as literal config
+  values. Provider descriptors expose only safe handles such as
+  `cmd:<configured>`, never token values or command output.
+- `llm_provider::complete_streaming` is the generic streaming API. Providers that
+  do not implement native streaming inherit a default implementation that chunks
+  the completed response; providers with native streaming can emit chunks through
+  the same callback. Every chunk is redacted and recorded as
+  `llm.response.chunk`.
+
+Correctness and robustness requirements:
+
+- Token material is never logged, traced, or placed in persisted source files.
+- Explicit credential handles that cannot produce a token fail before an HTTP
+  request is issued.
+- Provider failures include HTTP/process exit status when available.
+- Simulator output is replayable through recorded nondeterministic choices.
+- Streaming callbacks must not bypass redaction or trace capture.
+
+### 10. Tool gateway
+
+The tool gateway is the generic side-effect boundary.
+
+Responsibilities:
+
+- Expose local or remote tools as agent capabilities.
+- Validate arguments and policy before execution.
+- Expose structured tool descriptors with side-effect classes and argument
+  schemas for orchestration and UI surfaces.
+- Classify tools by side-effect level: read-only, workspace write, shell,
+  network, secret access.
+- Return structured output, error, and artifact references.
+
+rDSN design:
+
+- Current `agent_tool_provider` remains the provider interface but moves behind a
+  generic `tool_agent`.
+- CodePilot local tools remain under `codepilot`.
+- `describe_tool_schemas()` exposes descriptors; text descriptions are derived
+  from the same structured source.
+- Tool policy comes from `rasn.policy` and rDSN config.
+
+Correctness and robustness requirements:
+
+- Side-effect tools are denied by default.
+- The CodePilot provider re-checks policy locally as defense in depth; direct
+  provider calls should not bypass default-deny write/shell gates.
+- `[rasn.policy] workspace_root` can scope local tool targets to a repository or
+  workspace after rDSN filesystem absolute/normalized path resolution.
+- `[rasn.policy] require_write_approval` and `require_shell_approval` require a
+  `human_approved:<side-effect>` policy label before enabled write or shell
+  operations can run. CodePilot obtains that label through an interactive prompt
+  or the explicit `tool --yes` direct-command flag.
+- `[rasn.policy] shell_allowed_commands` optionally restricts shell execution to
+  named executables and rejects shell metacharacters while the allowlist is
+  active.
+- `[rasn.policy] shell_working_directory` or `workspace_root` can force shell
+  commands to start from a known working directory, reducing accidental
+  execution outside the target repository.
+- `[rasn.policy] shell_timeout_ms` bounds shell command runtime; on Windows the
+  shell process is launched with explicit stdout/stderr pipes and terminated when
+  the deadline expires.
+- `[rasn.policy] shell_executor=container` routes an approved shell command
+  through `shell_container_template` with `{command}`, `{raw_command}`,
+  `{workspace}`, and `{raw_workspace}` placeholders. The default `local`
+  executor preserves existing behavior.
+- Every admitted, denied, replayed, or replay-missing side-effect tool call
+  records an `external.effect` event with effect class, operation fingerprint,
+  replay policy, and status.
+- File mutation tools write temporary files and replace targets with rDSN
+  filesystem rename helpers instead of truncating targets in place.
+- Tool results are size-bounded and can spill to artifact files; artifact
+  metadata is indexed through the state service boundary.
+- Tool result previews and spilled artifact payloads are redacted before storage
+  so a read/search/shell response does not persist obvious credential material.
+- Shell execution must be explicit, logged, policy-checked, and timeout-bound.
+
+### 11. Policy and safety manager
+
+The policy manager decides what is allowed.
+
+Responsibilities:
+
+- Enforce capability permissions, side-effect gates, budgets, retry limits,
+  secret-source rules, and network/provider allow lists.
+- Provide policy decisions to coordinator, model gateway, and tool gateway.
+- Explain denials in structured form.
+
+rDSN design:
+
+- `rasn.policy` is a service app when dynamic policy is needed; initially it can
+  be a config-backed library.
+- Reads policy from `[rasn.policy]`, `[rasn.tool.policy.*]`, and
+  `[rasn.model.policy.*]`.
+- Uses a service-graph-backed state writer for artifact metadata so RPC mode
+  routes oversized tool-output references through `rasn.state`.
+- Uses rDSN logging for deny/audit events.
+
+Correctness and robustness requirements:
+
+- Default policy is deny for side effects and secrets.
+- Policy decisions are deterministic for a request and config snapshot.
+- Secrets are represented by references only, never by values.
+- `[rasn.policy] redaction_enabled`, `redact_env_names`,
+  `redact_literal_values`, and `redact_min_secret_length` define a deterministic
+  redaction configuration used by runtime tracing, tool artifact spilling, and
+  model-provider boundaries.
+
+### 12. Observability, replay, and failure manager
+
+This component makes runtime behavior diagnosable.
+
+Responsibilities:
+
+- Emit structured events for task lifecycle, routing, RPC calls, provider calls,
+  tool calls, retries, failures, nondeterminism, checkpoints, and replay.
+- Classify failures: validation, policy, timeout, provider, tool, RPC, state,
+  dependency, and internal invariant failure.
+- Provide replay hooks and trace queries.
+
+rDSN design:
+
+- `rasn.observability` is a service app over `nucleus_runtime` with
+  `serverlet`/`clientlet` query APIs for events, failures, snapshots, and replay
+  loading.
+- Uses rDSN logging for live diagnosis, JSONL for append-only trace events, and
+  the state service for durable snapshot index records.
+- Records `filesystem.snapshot` fingerprints for CodePilot read/list/search
+  tools and checks them during replay to expose workspace drift before stale
+  file context is reused.
+- Uses rDSN locks around event buffers.
+
+Correctness and robustness requirements:
+
+- Trace events are append-only and sequence-numbered.
+- Snapshot index metadata is written through the service graph so RPC mode uses
+  `rasn.state` rather than a hidden local state-store dependency.
+- Nondeterministic decisions record enough input metadata to explain replay.
+- Model responses can be replayed from prior `llm.response` events in provider
+  order before the model provider is called.
+- Tool calls record their arguments and result, and replay mode can return a
+  matching recorded `tool.ok`/`tool.error` result without re-invoking the tool.
+- Side-effecting tool intents also record `external.effect` ledger events, so
+  non-file effects have a stable audit/replay surface even when they are denied
+  or replay fails closed.
+- Workflow execution records `workflow.node.start` and `workflow.node.finish`
+  events; replay mode validates recorded node-start order before executing a
+  node so scheduler drift is surfaced before model/tool side effects run.
+- Missing side-effect tool replay values fail closed; write and shell commands
+  are not re-run while replay mode is active unless a recorded result matches.
+- Internal invariant violations use `dassert`; recoverable failures return
+  structured errors.
+
+### 13. Service-mode integration self-test
+
+The service-mode integration layer turns rASN correctness assumptions into a
+repeatable runtime check.
+
+Responsibilities:
+
+- Exercise model, tool, state, workflow, registry, and observability calls through
+  the same `rasn_service_graph` used by applications.
+- Run inline in direct CLI mode and through typed rDSN RPC when the full app graph
+  is active.
+- Provide a small service config that starts the rDSN apps and runs the self-test
+  as the `rasn.codepilot` gateway app.
+
+rDSN design:
+
+- `codepilot selftest` remains an application command, but it uses only generic
+  rASN service APIs.
+- In service mode, `rasn.coordinator` enables RPC clients before `rasn.codepilot`
+  executes, so self-test calls cross `RPC_RASN_*` task codes.
+- Shared graph lifecycle uses reference-counted app ownership, so stopping one
+  service wrapper cannot prematurely tear down sibling services.
+- CodePilot command execution uses scoped lifecycle ownership rather than eager
+  constructor startup, so service-mode app construction does not start the graph
+  before configured RPC clients and app owners are ready.
+- The service-mode gateway performs non-mutating readiness probes across state,
+  registry, coordinator, model health, tool, workflow validation, and
+  observability before dispatching commands, and returns per-boundary errors
+  when startup is incomplete.
+- The smoke config lives under `examples/` and should not replace production
+  config.
+
+Correctness and robustness requirements:
+
+- Every failed step reports the component boundary that failed.
+- State/checkpoint checks must use namespaced keys.
+- The self-test must not require a real network model provider; simulator is the
+  default.
+- Lifecycle checks must prove the graph remains started until the final owner
+  releases it.
+- Adapter construction must be side-effect light: installing a tool provider
+  must not start the graph.
+
+### 14. Provider adapter profiles
+
+Provider adapters are profile-driven wrappers around a common HTTP transport.
+
+Responsibilities:
+
+- Provide first-class profiles for simulator, GitHub Copilot-compatible,
+  Ollama, llama.cpp, LM Studio, and generic OpenAI-compatible APIs.
+- Keep provider-specific endpoints, payload formats, headers, token environment
+  fallbacks, and timeout settings in config.
+- Avoid leaking tokens through process command lines, logs, traces, or source
+  files.
+
+rDSN design:
+
+- Provider metadata is exposed through `rasn.llm.agent` and
+  `RPC_RASN_MODEL_*`.
+- `[rasn.model]` is the canonical config section; `[rasn.llm]` remains a
+  compatibility alias.
+- Provider-specific keys such as `copilot_endpoint`, `ollama_model`,
+  `llama_cpp_endpoint`, and `lmstudio_model` override shared defaults.
+- Temporary provider request and curl config files are created under an OS temp
+  `rasn-provider` directory by default. A non-empty `[rasn.runtime] temp_dir`
+  can override this for controlled test environments.
+
+Correctness and robustness requirements:
+
+- Network providers use bounded connect/request timeouts.
+- Token lookup supports environment-variable lists and token commands.
+- Local providers are marked local; remote providers are explicit.
+- Prompts, context entries, provider responses, runtime events, and tool outputs
+  pass through the shared redaction boundary before they are persisted or handed
+  to providers. The boundary removes configured exact secret values, bearer
+  tokens, and common key/value fields such as `password` and `api_key`.
+- Bearer tokens are not written under the project tree by default; future
+  hardening should remove token materialization entirely, add restrictive file
+  permissions where portable, or integrate an OS/secret-vault credential handle.
+
+### 15. Durable state journal
+
+The state subsystem is a memory store plus append-only durability layer.
+
+Responsibilities:
+
+- Append every committed state mutation to a journal before making it visible in
+  memory.
+- Write compact checkpoints atomically and remove covered journal entries.
+- Recover from checkpoint plus journal, or from journal alone if a checkpoint has
+  not yet been created.
+
+rDSN design:
+
+- State records remain guarded by `dsn::service::zlock`.
+- Checkpoint paths are config-driven under `[rasn.state]`; journal writes use a
+  single configured/default journal so explicit checkpoints and default
+  checkpoints share one recovery stream.
+- Remote checkpoint import uses `dsn::file::copy_remote_files` from
+  `dsn.tools.nfs`, waits with a bounded timeout, stages files locally, then moves
+  them into the configured recovery paths before normal validation and replay.
+- Filesystem operations use `dsn::utils::filesystem`.
+
+Correctness and robustness requirements:
+
+- A state write fails explicitly if the journal cannot be appended.
+- Conditional state writes compare against the currently visible sequence while
+  holding the store lock, then append the committed record to the journal before
+  publishing it.
+- Recovery validates headers, schema versions, namespaces, and encoding before
+  swapping in recovered state.
+- Checkpoint compaction is serialized with writes.
+
+### 16. Workflow optimizer
+
+The workflow compiler estimates and explains execution tradeoffs.
+
+Responsibilities:
+
+- Parse optional `cost_hint`, `latency_ms`, and `reliability` node metadata.
+- Order ready nodes deterministically by latency, cost, and reliability penalty.
+- Report stages, maximum parallelism, critical-path latency, cost units, and
+  minimum reliability in compiled plans.
+
+rDSN design:
+
+- Optimization remains deterministic and local to `workflow_graph`.
+- Execution still uses coordinator/model/tool services; optimization never
+  bypasses policy or dependency checks.
+- Future provider selection can reuse the same node annotations.
+
+Correctness and robustness requirements:
+
+- Dependencies and side-effect order are preserved.
+- Hints are validated before execution; invalid hints cause no side effects.
+- Compiled plans explain optimizer decisions in stable text form.
+
+### 17. Observability diagnosis tooling
+
+Observability includes human-facing diagnosis helpers in addition to raw queries.
+
+Responsibilities:
+
+- Render trace timelines from ordered runtime events.
+- Summarize event kinds, failures, retries, replay misses, and nondeterministic
+  points.
+- Provide next-step recommendations for replay gaps and failure triage.
+
+rDSN design:
+
+- `rasn.observability` continues to expose typed event/failure/snapshot RPCs.
+- Formatting helpers live with the generic observability component.
+- CodePilot only exposes those helpers through CLI commands.
+
+Correctness and robustness requirements:
+
+- Diagnosis is derived from structured event fields, not log text scraping.
+- Trace filtering is explicit by trace id.
+- Missing replay values are surfaced as failures, never silently ignored.
+- Recorded model responses are reused before contacting providers when replay is
+  enabled.
+- Missing side-effect tool replay values fail closed so replay does not
+  accidentally repeat writes or shell commands.
+- Workflow scheduler replay mismatches are reported as `replay.miss` failures
+  before dispatching the mismatched node.
+- Filesystem snapshot mismatches are reported as `replay.miss` failures before
+  read/list/search tools consume changed local files.
+
+### 18. CLI UX, packaging, and tutorials
+
+The application layer should make robust-agent concepts easy to exercise without
+requiring users to understand every internal service.
+
+Responsibilities:
+
+- Keep command help aligned with implemented features.
+- Provide tutorial workflows for generic, state/checkpoint, optimizer, and
+  service-mode RPC scenarios.
+- Document build, PATH, provider, state, trace, replay, and troubleshooting
+  steps in one place.
+
+rDSN design:
+
+- Packaging remains source-tree local: `config.ini` is copied beside the built
+  executable by CMake, and examples are stored under `examples/`.
+- The CLI is an adapter over generic rASN APIs and should not introduce hidden
+  direct provider/tool paths.
+- `codepilot eval` runs built-in or file-backed task suites and can invoke an
+  external CLI command template with `{prompt}` for comparison experiments.
+
+Correctness and robustness requirements:
+
+- Tutorial examples must run with the simulator by default.
+- Provider examples must reference token variables or commands, never literal
+  secrets.
+- Service-mode examples should be explicit that the rDSN runtime remains running
+  after the smoke command completes.
+
+## Application adapter rule
+
+Application adapters such as CodePilot may provide:
+
+- User interface and CLI commands.
+- Application-specific skills and prompts.
+- Application-specific local or remote tool providers.
+- Application-specific config defaults.
+
+Application adapters must not own:
+
+- Generic task schema.
+- Generic agent lifecycle.
+- Generic registry.
+- Generic orchestration.
+- Generic policy/failure semantics.
+- Generic state/checkpoint format.
+
+## Current prototype mapping
+
+| Existing file | Target direction |
+| --- | --- |
+| `agent_messages.h` | Replace narrow LLM/tool messages with generic task/message schema. |
+| `agent_services.*` | Split into generic runtime, registry, coordinator, model agent, tool agent, and clients. |
+| `rasn.code.definition.h` | Add generic RPC task codes and keep specialized compatibility codes during migration. |
+| `rasn_core.*` | Become observability/replay foundation, backed by state service later. |
+| `workflow.*` | Promote to workflow graph plus compiler/executor service. |
+| `llm_provider.*` | Remain provider adapters behind generic model gateway. |
+| `agent_tools.h` | Become generic tool provider interface; CodePilot tools stay in `codepilot/`. |
+| `codepilot/*` | Application adapter using generic rASN APIs. |
+
+## Current product limitations
+
+rASN is now usable as a prototype nucleus for building and testing robust agent
+systems, but it should not be described as a production-complete platform. The
+remaining limitations are:
+
+- **State availability:** the state service has checkpoints, journals,
+  conditional writes, workflow leases, optional local replica mirroring, and
+  optional rDSN NFS import, but it is not quorum-replicated and does not yet use
+  an external HA database or replicated SKV backend.
+- **Tool isolation:** local tools are default-deny, policy-gated,
+  approval-gated, allowlist-aware, workspace-rooted, timeout-bound, and can be
+  routed through a configured container command wrapper. rASN still lacks a
+  hardened container orchestrator with image, mount, network, and lifecycle
+  policy.
+- **Replay fidelity:** replay covers model responses, matching tool results,
+  workflow scheduling, filesystem snapshots, and side-effect intent records via
+  `external.effect`; it does not virtualize arbitrary external services, clocks,
+  network state, process environments, or provider-side nondeterminism.
+- **Deployment validation:** service-mode RPC, URI/host endpoint configuration,
+  registry heartbeats, and active lease cleanup are implemented, but
+  multi-process and cluster deployment tests remain limited.
+- **Credential storage:** model credentials can be referenced with `env:`,
+  `file:`, and `cmd:` handles and are protected by redaction, but vault-backed
+  or OS-backed secret providers are not integrated.
+- **SDK packaging:** C++/TypeScript/Python contracts and RPC-client source can be
+  generated, but packaged SDKs and concrete TypeScript/Python transports remain
+  product work.
+- **Evaluation evidence:** unit tests, self-tests, service smokes, schema
+  smokes, report builds, and a small evaluation harness exist, but large
+  benchmark suites and user studies for debugging effectiveness are still
+  future work.

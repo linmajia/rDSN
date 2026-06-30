@@ -4,6 +4,7 @@ add_subdirectory(tools.emulator)
 add_subdirectory(dist.uri.resolver)
 add_subdirectory(apps.echo)
 add_subdirectory(apps.skv)
+add_subdirectory(rasn)
 
 if(BUILD_CSHARP)
     add_subdirectory(apps.echo.csharp)

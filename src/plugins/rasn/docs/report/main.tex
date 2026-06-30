@@ -1,0 +1,2156 @@
+\documentclass[manuscript,screen,review]{acmart}
+
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{xspace}
+
+\settopmatter{printacmref=false}
+\setcopyright{none}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+
+\newcommand{\rasn}{rASN\xspace}
+\newcommand{\rdsn}{rDSN\xspace}
+\newcommand{\codepilot}{CodePilot\xspace}
+\newcommand{\cpp}{C\nolinebreak\hspace{-.05em}\raisebox{.4ex}{\tiny\bf ++}\xspace}
+
+\lstdefinestyle{rasnstyle}{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  frame=single,
+  keepspaces=true,
+  showstringspaces=false
+}
+\lstset{style=rasnstyle}
+
+\title{Robust Agent System Nucleus: A Distributed-Systems-Inspired Runtime for Robust AI Agent Systems}
+
+\author{rASN Project}
+\affiliation{%
+  \institution{Robust Agent System Nucleus Prototype}
+  \city{Beijing}
+  \country{China}}
+\email{technical-report@rasn.local}
+
+\begin{abstract}
+Modern AI agents can solve complex software-engineering tasks, but their
+execution behavior is often difficult to reproduce, diagnose, and control.
+Failures are frequently attributed to model quality, while the surrounding
+runtime exposes weak abstractions for nondeterminism, hidden dependencies,
+state, workflow execution, and observability. This report presents the design
+and current implementation of Robust Agent System Nucleus (\rasn), a prototype
+\cpp framework for building robust agent systems using principles from robust
+distributed systems and systems tooling. \rasn is built on top of Robust
+Distributed System Nucleus (\rdsn), reusing its service-app model, typed RPC
+task codes, serverlet/clientlet abstractions, configuration, timers, locks, and
+logging. \rasn models agents as explicit service components, represents agent
+work as versioned task messages, records nondeterministic choices as runtime
+events, persists state through a named state service, and compiles declarative
+workflows into executable agent graphs. The first application is \codepilot, a
+coding CLI inspired by contemporary coding agents. \codepilot routes model and
+tool operations through the generic \rasn coordinator, supports simulator and
+HTTP-compatible LLM providers, gates local side effects through policy, and can
+run either inline or as a typed \rdsn service graph. We describe the
+architecture, implementation, expected evaluation methodology, threats to
+validity, and open research/product directions. The current report is intended
+both as a technical artifact for the prototype and as a living research report
+that should be updated as \rasn and \codepilot evolve.
+\end{abstract}
+
+\begin{CCSXML}
+<ccs2012>
+ <concept>
+  <concept_id>10011007.10011006.10011008</concept_id>
+  <concept_desc>Software and its engineering~Software architectures</concept_desc>
+  <concept_significance>500</concept_significance>
+ </concept>
+ <concept>
+  <concept_id>10010520.10010521.10010537</concept_id>
+  <concept_desc>Computer systems organization~Distributed architectures</concept_desc>
+  <concept_significance>500</concept_significance>
+ </concept>
+ <concept>
+  <concept_id>10002951.10003260.10003261</concept_id>
+  <concept_desc>Information systems~Data management systems</concept_desc>
+  <concept_significance>300</concept_significance>
+ </concept>
+</ccs2012>
+\end{CCSXML}
+
+\ccsdesc[500]{Software and its engineering~Software architectures}
+\ccsdesc[500]{Computer systems organization~Distributed architectures}
+\ccsdesc[300]{Information systems~Data management systems}
+
+\keywords{AI agents, distributed systems, runtime systems, observability, replay, workflow orchestration, coding agents}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+
+AI agent systems increasingly combine large language models (LLMs), tool
+execution, persistent context, and multi-step orchestration to automate
+software-engineering tasks. Coding assistants such as Codex-style command-line
+interfaces, GitHub Copilot CLI, Claude Code, OpenCode, and similar systems
+demonstrate that LLM-driven agents can perform useful task-level work. However,
+their runtime behavior often remains fragile. A single user request can involve
+multiple model calls, tool calls, filesystem effects, hidden provider
+configuration, retries, timeouts, and state updates. When the result is wrong,
+slow, expensive, or unsafe, operators often lack a structured execution model
+that explains what happened and how to reproduce it.
+
+This report argues that many robustness problems in agent systems should be
+treated as systems problems rather than only as model problems. From this
+perspective, an agent application resembles a distributed service system: it
+contains multiple components with explicit identities, independent failure
+modes, asynchronous boundaries, state ownership, service discovery, request
+deadlines, retry policies, side effects, and observability requirements.
+Distributed systems research and infrastructure have long studied how to expose
+these concerns through runtime abstractions and operational tooling. Robust
+Distributed System Nucleus (\rdsn)~\cite{rdsn} is one such framework: it provides a
+microkernel-style foundation for building robust distributed services with
+pluggable service applications, typed RPC, local runtimes, configuration,
+logging, task execution, and stateful components.
+
+Robust Agent System Nucleus (\rasn) explores the hypothesis that an agent
+runtime can become more reliable and diagnosable by reusing these distributed
+systems principles. The current \rasn prototype is a \cpp plugin under the
+\rdsn source tree. It defines an agent service graph consisting of a registry,
+coordinator, model agent, tool agent, state service, workflow service,
+observability service, and application gateway. Each component can execute
+inline for local prototyping or as a \rdsn service app exposing typed RPC
+handlers. The runtime records nondeterministic model and simulator decisions,
+captures failure events, stores workflow state and leases through a namespaced
+state service, and supports replay-oriented diagnosis.
+
+The first application on top of \rasn is \codepilot, a coding CLI. \codepilot
+implements provider selection, local tools, reusable coding skills, workflow
+commands, state inspection, registry inspection, observability commands, and
+self-tests. Importantly, \codepilot does not call a model or local tool
+directly. It converts user intents into generic \texttt{agent\_request}
+messages and routes them through the \rasn coordinator. This separation keeps
+coding-agent features outside the generic runtime and allows future
+applications to reuse the same service graph. Tool providers expose structured
+descriptors with side-effect classes and argument schemas, so orchestration and
+UI layers can inspect tool surfaces from typed metadata instead of scraping a
+prose-only command list.
+
+This report makes the following contributions:
+
+\begin{itemize}
+  \item We formulate a design philosophy for robust agent runtimes based on
+  distributed service principles: explicit component boundaries, typed
+  messages, durable state, observable nondeterminism, bounded retries,
+  cancellation, and workflow leases.
+  \item We describe the current \rasn architecture and implementation on top of
+  \rdsn, including service-mode RPCs, state recovery, workflow execution,
+  observability, provider adapters, policy-bounded tools, and lifecycle
+  hardening.
+  \item We present \codepilot as an application case study and explain how a
+  coding CLI can be implemented as an adapter over generic agent services.
+  \item We define an experimental design for future evaluation, including
+  environment setup, metrics, workloads, and comparison targets. This section is
+  intentionally forward-looking because \rasn is still a prototype.
+  \item We discuss threats to validity, practicality, generality,
+  extensibility, and the remaining work required to turn \rasn into a solid
+  product-quality platform.
+\end{itemize}
+
+\section{Background and Motivation}
+
+\subsection{Robust Distributed System Nucleus}
+
+\rdsn was designed to accelerate the construction of robust distributed
+systems. Its microkernel architecture separates applications, distributed
+frameworks, DevOps tooling, and local runtime providers. Developers structure
+logic as service applications, define RPC task codes, register server-side
+handlers, create client wrappers, and use shared runtime services such as
+configuration, logging, task scheduling, and filesystem utilities. The \rasn
+prototype follows patterns from existing \rdsn applications such as echo-style
+RPC services and stateful key-value services.
+
+The important design lesson for \rasn is that robust behavior is not an
+afterthought. It emerges from explicit runtime boundaries. Service identities
+are named; RPC operations are typed; state is owned by a service; timers and
+background tasks are explicit; configuration is visible; failures are returned
+as structured errors; and operational tests can start the entire service graph
+with a configuration file. These are precisely the properties that many agent
+systems lack.
+
+\subsection{AI Agent Runtime Problems}
+
+An AI agent system combines deterministic code with nondeterministic model
+calls and side-effecting tools. Four classes of problems recur in practice:
+
+\begin{enumerate}
+  \item \textbf{Uncontrolled nondeterminism.} Model sampling, provider
+  responses, tool output, retry timing, and dynamic context can change between
+  executions. Without a runtime log, reproduction is weak.
+  \item \textbf{Hidden dependencies.} Agents often depend on environment
+  variables, provider credentials, local files, shell commands, vector stores,
+  and external services. Failure boundaries are not first-class.
+  \item \textbf{Weak state management.} Conversation state, workflow progress,
+  tool artifacts, and checkpoints may be kept in memory or ad hoc files.
+  Recovery semantics are unclear.
+  \item \textbf{Limited observability and control.} Operators need to inspect
+  routes, failures, retries, deadlines, cancellation, and state. Many current
+  tools expose only a transcript.
+\end{enumerate}
+
+\rasn treats these as runtime design requirements. The goal is not to replace
+LLM research, but to provide a systems substrate in which model behavior,
+tooling, state, and orchestration can be made explicit and testable.
+
+\subsection{Coding Agents as a First Application}
+
+Coding CLIs are an appropriate first application because they stress several
+runtime concerns simultaneously. They need LLM provider adapters, local project
+inspection, filesystem read/search tools, optional write and shell tools,
+workflow decomposition, user-facing status, and robust diagnostics when a build
+or tool call fails. They also require conservative policy defaults: reads are
+safe, writes and shell commands must be opt-in, and large outputs need
+bounded artifact handling.
+
+\section{Design Philosophy}
+
+\rasn is guided by six design principles.
+The principles are not merely presentation choices; they are constraints that
+shape where state is stored, where errors are surfaced, and which parts of the
+system are allowed to perform side effects. The main design decision is to move
+agent robustness concerns out of prompts and into runtime-visible mechanisms.
+For example, cancellation is represented as request/runtime state, not as an
+instruction to the model; workflow progress is represented as state records, not
+as a transcript paragraph; and model/tool calls are represented as typed tasks,
+not as free-form strings interpreted differently by each application.
+
+This philosophy follows the same engineering pattern as \rdsn. \rdsn does not
+make a distributed system robust by providing a single monolithic library; it
+provides service lifecycle, RPC, task codes, configuration, failure handling,
+and tooling so applications can build robust protocols. \rasn applies the same
+idea to agent systems. It provides a nucleus of runtime abstractions---agents,
+capabilities, workflows, state, policy, and observability---while leaving
+domain-specific prompts and interfaces to applications such as \codepilot.
+
+\subsection{Principle-to-Mechanism Mapping}
+
+Table~\ref{tab:principle-mechanism} maps each principle to concrete mechanisms
+in the current prototype. This mapping is useful because it makes the design
+falsifiable: if a mechanism is absent, the corresponding principle is not yet
+implemented.
+
+\begin{table*}[t]
+\caption{Design principles and concrete mechanisms.}
+\label{tab:principle-mechanism}
+\centering
+\begin{tabular}{p{0.18\textwidth}p{0.36\textwidth}p{0.34\textwidth}}
+\toprule
+Principle & Mechanisms & Current limitations \\
+\midrule
+Service components & \rdsn service apps, serverlets/clientlets, descriptors,
+capabilities, health, readiness probes, URI/host endpoint configuration,
+generated client surfaces & Inline mode keeps a same-process fallback for local
+prototyping; multi-process deployment testing remains future work \\
+Typed messages & Versioned structs, binary serialization, schema validation,
+structured errors, runtime schema manifest, JSON/IDL export, generated
+C++/TypeScript/Python contract stubs, generated C++/TypeScript/Python RPC
+clients & Product packaging and transport implementations remain future SDK
+work \\
+Explicit nondeterminism & Trace events, simulator choices, replay-load hooks,
+model/tool result replay, scheduler-order checks, filesystem snapshots,
+external-effect ledger entries, trace ids & Full external-environment
+virtualization remains future work \\
+State boundary & \texttt{rasn.state}, CAS, checkpoints, journals, leases,
+artifact/snapshot indexes, optional local replica mirror and NFS import &
+Backing store is not quorum-replicated \\
+Policy boundaries & Tool classification, workspace-root sandbox, opt-in
+writes/shell, human-approval labels, shell command allowlists, bounded output,
+artifact spill, redaction boundary, model credential handles, shell timeout/job
+containment, configurable container command wrapper & Hardened container
+orchestration remains future deployment work \\
+Iterative hardening & Unit tests, self-tests, service smoke, documented phases,
+report updates, \codepilot evaluation harness & User-study evaluation remains
+future empirical work \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{Agents as Service Components}
+
+Each agent is modeled as a service component with identity, lifecycle,
+capabilities, health, configuration, and endpoint metadata. The built-in graph
+contains:
+
+\begin{table}[t]
+\caption{\rasn service roles in the current prototype.}
+\label{tab:roles}
+\centering
+\begin{tabular}{ll}
+\toprule
+Role & Responsibility \\
+\midrule
+\texttt{rasn.registry} & Agent descriptors and capability lookup \\
+\texttt{rasn.coordinator} & Routing, retries, and orchestration boundary \\
+\texttt{rasn.llm.agent} & LLM provider isolation and model gateway \\
+\texttt{rasn.tool.agent} & Local tool isolation and policy enforcement \\
+\texttt{rasn.state} & Namespaced state, checkpoint, journal, CAS \\
+\texttt{rasn.workflow} & Workflow validation, compilation, execution \\
+\texttt{rasn.observability} & Event, failure, replay, and snapshot queries \\
+\texttt{rasn.codepilot} & Coding CLI gateway application \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The same services can execute inline or through \rdsn RPC. Inline mode supports
+fast local development; service mode exercises typed RPC task codes and service
+lifecycle behavior.
+
+The service-component view also defines a boundary of accountability. A model
+agent is accountable for provider health, provider configuration, request
+timeouts, and response normalization; it is not accountable for deciding whether
+a shell command is safe. A tool agent is accountable for executing local tools
+under policy; it is not accountable for choosing which workflow node should run
+next. A workflow service is accountable for dependency ordering, state
+transitions, and lease ownership; it is not accountable for parsing CodePilot's
+interactive commands. These boundaries make it possible to replace one module
+without changing the others. For instance, a future replicated state service can
+replace the local state store if it preserves put/get/query/checkpoint/CAS
+semantics.
+
+This differs from a common coding-agent architecture in which a CLI owns the
+prompt loop, tool list, conversation memory, local filesystem mutations, and
+provider calls in one process. Such an architecture is easy to prototype but
+hard to debug after failures because the key decisions are implicit in the
+transcript. \rasn deliberately pays more upfront engineering cost to obtain
+separate lifecycle, routing, state, policy, and observability surfaces.
+
+\subsection{Typed Messages Rather Than String Envelopes}
+
+The public runtime protocol centers on versioned request, response, descriptor,
+and error structures. These messages carry request IDs, trace IDs, workflow IDs,
+capability names, inputs, context entries, timeout budgets, retry budgets,
+policy labels, and replay mode. All top-level messages are serialized through
+\rdsn binary readers and writers. The design avoids burying routing or state
+semantics inside prompt text.
+
+Typed messages provide three robustness benefits. First, they make validation
+local: a missing capability or unsupported schema version can be rejected before
+any provider observes the request. Second, they make cross-component evolution
+explicit: a new field must either have a backward-compatible default or be
+guarded by a schema-version check. Third, they give observability a stable
+schema. A trace viewer can search for \texttt{request\_id}, \texttt{trace\_id},
+or \texttt{capability} without understanding the natural-language prompt.
+
+The prototype also exposes a runtime schema manifest. The manifest lists the
+current fields, types, requiredness, version, and purpose for core contracts
+such as \texttt{agent\_request}, \texttt{agent\_response},
+\texttt{policy\_request}, \texttt{model\_provider\_descriptor},
+\texttt{runtime\_event}, \texttt{state\_record}, and \texttt{workflow\_node}.
+CodePilot exposes this catalog through
+\texttt{codepilot schema}. The same manifest can now be exported as JSON
+(\texttt{codepilot schema json}), as a compact rASN IDL
+(\texttt{codepilot schema idl}), as a self-contained generated C++ contract
+header (\texttt{codepilot schema cpp}), as TypeScript interfaces
+(\texttt{codepilot schema ts}), or as Python dataclasses
+(\texttt{codepilot schema py}). A separate RPC operation manifest enumerates
+service names, task codes, request types, and response types, and
+\texttt{codepilot schema clients-cpp}, \texttt{clients-ts}, and
+\texttt{clients-py} emit executable client wrappers for agent, registry, state,
+workflow, model, and observability RPCs. The C++ client output uses \rdsn
+\texttt{clientlet}; the TypeScript and Python outputs target a small transport
+interface so a host application can provide HTTP, local IPC, or \rdsn-backed
+bridges. These generators cover core agent, registry, tool, policy,
+observability, state, and workflow records, including nested types referenced by
+top-level requests. Unit tests check that the manifest contains these contracts,
+that generated C++, TypeScript, and Python surfaces include typed vectors/lists
+and schema-version fields, and that generated client surfaces include
+representative state, workflow, and observability task codes. This narrows the
+SDK gap to product packaging and concrete multi-language transports rather than
+schema or client surface generation.
+
+\rasn intentionally does not use a generic JSON blob as the core runtime
+envelope. JSON is convenient for provider APIs and configuration, but it is too
+weak as an internal systems boundary because required fields, versioning,
+timeouts, side-effect labels, and error categories become conventions rather
+than compiler-visible interfaces. The prototype still uses strings for payloads
+where the value is inherently provider-specific, but routing and control data
+are kept in typed fields.
+
+\subsection{Nondeterminism as Runtime Data}
+
+\rasn records runtime events such as \texttt{task.begin},
+\texttt{llm.request}, \texttt{llm.response}, \texttt{nondeterminism},
+\texttt{failure}, \texttt{retry}, and \texttt{task.finish}. The simulator
+provider records its random choice as a named nondeterministic value. Replay can
+load a prior trace and reuse recorded nondeterministic values. This is not yet a
+complete deterministic replay system, but it establishes a first-class place
+for nondeterminism in the runtime model.
+
+The design distinguishes several sources of nondeterminism: model sampling,
+provider availability, tool output that depends on the local environment,
+workflow scheduling among simultaneously ready nodes, retry timing, and external
+state recovery. \rasn does not try to eliminate these sources. Instead, it
+captures enough information to make them inspectable. For example, a model
+request records provider, model, prompt/context metadata, timeout budget, and
+result; the simulator additionally records the selected pseudo-random output;
+workflow execution records the node order and terminal state; and state records
+capture durable decisions such as leases and cancellations.
+
+This choice reflects a practical research hypothesis: robust agent systems do
+not require every execution to be deterministic, but they do require
+nondeterministic decisions to be named, logged, and, when possible, replayable.
+The current prototype therefore treats replay as an incremental capability. The
+first milestone is trace-guided diagnosis; later milestones can add
+deterministic provider simulation, cached model responses, and scheduler replay.
+
+\subsection{State Behind an Explicit Service Boundary}
+
+Workflow runs, workflow node status, leases, observability snapshots, and
+oversized tool-output metadata are written through the state service boundary.
+The state service supports namespaced keys, checkpoint files, append-only
+journals, recovery, and conditional writes. This design prevents hidden
+in-process state writes from bypassing service-mode behavior.
+
+State is divided into two categories. \emph{Coordination state} affects future
+runtime decisions: workflow run records, node records, and leases determine
+whether work can resume, cancel, or complete. \emph{Diagnostic state} improves
+operator visibility: artifact indexes and observability snapshots point to
+larger files or traces. Both categories cross \texttt{rasn.state}, but they have
+different correctness requirements. Coordination state uses sequence checks when
+overwrites could violate ownership or terminal-state invariants; diagnostic
+state can often be append-like or best-effort as long as errors are visible.
+
+The state boundary is also a preparation point for production. The current store
+is local and simple, but all higher-level modules depend on the state-service
+interface rather than a concrete map. This means future work can substitute a
+replicated key-value store, a database-backed store, or an \rdsn SKV-backed
+store while preserving the workflow and policy modules' contracts.
+
+\subsection{Safety Through Policy and Boundaries}
+
+The tool agent evaluates every CodePilot tool invocation through a policy
+manager. Read-only operations are allowed only for existing paths; write and
+shell operations are disabled by default; network-class operations are also
+explicitly gated. Tool output is bounded, and oversized output is spilled to an
+artifact file with metadata stored in state. These mechanisms are intentionally
+simple but demonstrate the runtime shape needed for stronger policy engines.
+
+The policy philosophy is conservative: observation should be easy, mutation
+should be explicit, and unbounded effects should be converted into bounded
+runtime artifacts. This is why read/list/search are treated differently from
+write/replace/shell. It is also why a large tool response is not simply pushed
+into the next model prompt. The runtime creates a bounded preview and a durable
+artifact reference, giving the user and future tools a place to inspect the full
+output without losing control of prompt size.
+
+The current policy manager is not a process sandbox. It is a policy boundary:
+all local side effects pass through a single module where repository scoping,
+approval gates, command allowlists, secret redaction, and audit logging can be
+centralized. The design therefore favors a small set of explicit tools over a
+single unrestricted shell primitive.
+
+\subsection{Product Readiness as Iterative Hardening}
+
+The prototype has evolved through many hardening rounds. Recent examples
+include reference-counted service-graph lifecycle, lazy \codepilot graph
+ownership, full service readiness probes, workflow execution leases, lease
+renewal, state-bound artifact writes, cooperative agent cancellation,
+cancellation tombstone retention, state-recovery error propagation, and
+restart-safe workflow cancellation. This
+iterative pattern is important: each refinement turns a previously implicit
+assumption into an explicit runtime invariant and test.
+
+The hardening process follows a repeating pattern:
+
+\begin{enumerate}
+  \item identify an implicit assumption, such as ``state lookup failure means the
+  workflow is missing'';
+  \item turn the assumption into a named invariant, such as error transparency;
+  \item move the invariant into a runtime boundary, such as state recovery or
+  workflow cancellation;
+  \item add a regression test or self-test path; and
+  \item update the design documentation and this report.
+\end{enumerate}
+
+This process is part of the research contribution. It treats robustness as an
+engineering discipline for agent runtimes, not as a property that emerges only
+from using a stronger model. The prototype is still incomplete, but its history
+shows how distributed-systems-style hardening can be applied incrementally to an
+agent platform.
+
+\section{Runtime Model and Robustness Invariants}
+
+\rasn treats an agent system as a set of typed, stateful service components that
+communicate through explicit requests and persist important runtime decisions.
+This section defines the current prototype's runtime entities and the invariants
+that guide the implementation. The model is intentionally practical rather than
+fully formal: each entity below corresponds to concrete \cpp structs, RPC task
+codes, state records, or log events in the implementation.
+
+\subsection{Failure Model}
+
+The current runtime model assumes crash-stop and omission-style failures at
+component boundaries rather than Byzantine behavior. A provider may time out,
+return malformed data, or report an API error. A tool may fail, produce bounded
+or oversized output, or be denied by policy. A service-mode RPC may fail because
+the endpoint is not ready, the task times out, or serialization rejects the
+message. The state service may report a missing key, a conditional-write
+conflict, or a persistence/recovery error. The registry may contain stale dynamic
+descriptors until heartbeat leases expire and sweeps run.
+
+These failures are represented explicitly. \rasn avoids three patterns that make
+agent systems difficult to debug: treating infrastructure failures as empty
+model output, treating state errors as missing state, and treating side-effect
+timeouts as safe-to-retry failures. The coordinator, workflow service, and
+CodePilot readiness checks all propagate boundary-specific errors so the caller
+can distinguish a provider failure from a registry failure, state conflict, or
+policy denial.
+
+\subsection{Consistency Model}
+
+\rasn does not currently provide distributed consensus or replicated state. Its
+consistency model is therefore scoped to a single state-service instance, but it
+still matters because many robustness bugs are local race bugs. Within the state
+store, each successful write receives a monotonic sequence number. Conditional
+puts compare the caller's expected sequence with the current record sequence.
+Workflow leases and terminal workflow transitions rely on this compare-and-set
+discipline.
+
+The model can be summarized as follows:
+
+\begin{itemize}
+  \item reads observe the latest record in the local state-service instance;
+  \item unconditional writes replace the record and advance the sequence;
+  \item create-only writes succeed only when the key is absent;
+  \item check-sequence writes succeed only when the current sequence matches the
+  expected sequence;
+  \item checkpoints, journals, local replica mirrors, and NFS imports are recovery
+  artifacts, not consensus protocols; and
+  \item service-mode callers should treat state errors as hard errors unless the
+  error is the explicit missing-key response for the requested key.
+\end{itemize}
+
+This is intentionally weaker than a production replicated store, but it is
+strong enough to model ownership, terminal-state protection, restart-safe query,
+restart-safe cancellation, and operator recovery from a secondary local copy. The
+report's evaluation plan therefore separates ``runtime invariant correctness''
+from future ``replicated storage availability.''
+
+\subsection{Identity and Correlation}
+
+Robustness depends on stable identifiers. \rasn uses distinct identifiers for
+different purposes: \texttt{request\_id} for duplicate detection and
+cancellation, \texttt{trace\_id} for event correlation, \texttt{task\_id} for
+logical work, \texttt{run\_id} for workflow executions, \texttt{node\_id} for
+workflow tasks, \texttt{agent\_id} for service instances, and state keys for
+durable records. Keeping these identifiers separate avoids a common failure mode
+in agent systems where conversation ids, tool-call ids, and workflow ids are
+interchangeably embedded in text.
+
+The identifiers form a hierarchy during workflow execution: a workflow run owns
+node ids; each node dispatches model/tool requests with request ids; all these
+requests share or derive trace context; state records preserve run and node ids;
+observability events preserve trace ids and task ids. This makes it possible to
+answer questions such as ``which provider call produced this node output?'' or
+``which state record made this cancellation terminal?'' without reconstructing
+causality from natural language.
+
+\subsection{Runtime Entities}
+
+\begin{description}
+  \item[Agent descriptor.] A descriptor names an agent instance, role, app name,
+  endpoint, health state, version, supported capabilities, and optional lease
+  metadata. Descriptors are stored in the registry and are the unit of routing.
+  \item[Capability.] A capability is a typed operation exposed by an agent, such
+  as \texttt{model.complete}, \texttt{tool.run}, or a workflow-facing service
+  operation. Capabilities include side-effect class, cost hint, latency hint,
+  reliability hint, and policy labels.
+  \item[Agent request.] A request carries a schema version, request id, trace id,
+  task id, target capability, serialized input, context entries, timeout budget,
+  retry budget, policy labels, and replay mode. The request id is the unit of
+  duplicate detection and cooperative cancellation.
+  \item[Agent response.] A response carries success/failure, output text,
+  structured error code/message, retryability, trace id, and runtime metadata.
+  Late responses for cancelled work are rewritten to a cancellation failure.
+  \item[State record.] A state record is a namespaced key, kind, scope, value,
+  and sequence. The sequence is monotonic within the state store and is used by
+  conditional writes for leases and workflow terminal transitions.
+  \item[Workflow run.] A workflow run has a run id, workflow identity, source
+  name, status, compiled plan, result or error, execution owner, lease record,
+  and sequence. Node-level records store per-task progress and outputs.
+  \item[Runtime event.] An event has a sequence number, timestamp, trace id,
+  component, kind, message, and details. Events record nondeterministic choices,
+  model/tool calls, retries, failures, and workflow transitions.
+\end{description}
+
+\subsection{State Namespace}
+
+Table~\ref{tab:state-namespace} lists the durable namespaces currently used by
+\rasn. The table is important because it shows which decisions are intended to
+survive process boundaries and therefore must not be hidden in in-memory helper
+objects.
+
+\begin{table}[t]
+\caption{Primary \rasn state namespaces.}
+\label{tab:state-namespace}
+\centering
+\begin{tabular}{lll}
+\toprule
+Key pattern & Kind & Purpose \\
+\midrule
+\texttt{workflow/<run>} & \texttt{workflow} & Whole-run status and plan \\
+\texttt{workflow-node/<run>/<node>} & \texttt{workflow.node} & Node progress/output \\
+\texttt{workflow-lease/<run>} & \texttt{workflow.lease} & Execution ownership \\
+\texttt{artifact/<id>} & \texttt{artifact.index} & Oversized tool output index \\
+\texttt{observability/<id>} & \texttt{observability.snapshot} & Trace snapshot index \\
+\texttt{selftest/<id>} & \texttt{selftest} & Self-test state smoke records \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{State Record Lifecycle}
+
+State records follow a small lifecycle. They are created by module-specific
+writers, validated by the state service, assigned a sequence, optionally written
+to the journal, and made visible to reads/queries. Checkpointing snapshots the
+current map; recovery loads checkpoint records and replays journal records to
+reconstruct the map. Workflow records add a higher-level lifecycle on top of
+this generic record lifecycle: \texttt{running} records can be replaced by
+terminal records only when the writer still owns the expected sequence, and
+lease records can be updated only by the current owner sequence.
+
+This lifecycle is the bridge between an in-process prototype and a future
+distributed implementation. The exact persistence backend can change, but the
+logical operations are stable: create, compare-and-set update, prefix query,
+checkpoint, and recover. The rest of \rasn is written against these operations
+rather than against file paths or local maps.
+
+\subsection{Correctness Invariants}
+
+The current prototype enforces the following invariants. They are weaker than a
+fully replicated production system, but they are concrete enough to test.
+
+\begin{description}
+  \item[I1: Schema discipline.] RPC handlers reject unsupported schema versions
+  and missing required identifiers before invoking providers or tools.
+  \item[I2: Explicit service ownership.] Service graph startup/shutdown is
+  reference counted; one app wrapper cannot stop shared services while another
+  wrapper or direct command still owns the graph.
+  \item[I3: Capability-routed execution.] Application requests are routed by
+  capability descriptors rather than by prompt text or CLI-specific branching in
+  the coordinator.
+  \item[I4: Side-effect-aware retry.] The coordinator may retry retryable model
+  failures within a bounded budget, but it does not retry tool invocations.
+  \item[I5: State boundary preservation.] Workflow records, node records, lease
+  records, artifact indexes, and observability snapshots are written through
+  \texttt{rasn.state}; service mode and direct mode share the same facade.
+  \item[I6: Lease-protected workflow execution.] A workflow run must own a
+  non-expired execution lease before dispatching nodes. Active owners renew the
+  lease; duplicate active execution is rejected; stale ownership can be taken
+  over only after expiration.
+  \item[I7: Terminal workflow state.] Completed, failed, and cancelled workflow
+  states are terminal. A final completion write cannot overwrite a newer
+  cancellation record because terminal writes use conditional state sequences.
+  \item[I8: Cancellation retention.] Agent cancellation tombstones are retained
+  while the corresponding request is still in flight, even when the bounded
+  tombstone set is under pressure.
+  \item[I9: Error transparency.] State lookup and state-write failures are
+  returned as explicit errors, not converted into success-shaped missing-key or
+  best-effort results.
+  \item[I10: Bounded local effects.] Local tool output is bounded; oversized
+  output is moved to artifacts and indexed in state. Write/shell capabilities
+  are opt-in.
+\end{description}
+
+\subsection{Invariant Enforcement}
+
+Table~\ref{tab:invariant-enforcement} shows how selected invariants are enforced
+in the implementation. This is more precise than saying that the system is
+``robust'': each row identifies the runtime mechanism and the type of regression
+that would violate it.
+
+\begin{table*}[t]
+\caption{Selected invariants, enforcement mechanisms, and regression signals.}
+\label{tab:invariant-enforcement}
+\centering
+\begin{tabular}{p{0.18\textwidth}p{0.39\textwidth}p{0.31\textwidth}}
+\toprule
+Invariant & Enforcement mechanism & Regression signal \\
+\midrule
+Schema discipline & Version checks and required-field validation in request,
+state, workflow, and RPC handlers & Malformed input reaches provider/tool code \\
+Side-effect-aware retry & Coordinator retries only retryable model failures and
+never retries \texttt{tool.*} & Tool invocation repeated after timeout/failure \\
+Lease ownership & Workflow start creates or takes over lease with state CAS;
+renewal updates expected lease sequence & Duplicate active run executes nodes \\
+Terminal cancellation & Cancel writes terminal state with expected sequence;
+completion writes use original running sequence & Cancelled run becomes completed \\
+Cancellation retention & Runtime tombstone trimming skips in-flight request ids
+& Late cancelled request returns success \\
+Error transparency & Recovery and cancel paths propagate non-missing state
+errors & State outage reported as missing workflow \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{Request Lifecycle}
+
+The normal model/tool request path follows the lifecycle below. Each step maps
+to the service graph, coordinator, registry, or target-agent runtime.
+
+\begin{lstlisting}
+1. Application builds typed agent_request.
+2. Service graph selects direct call or rDSN clientlet call.
+3. Coordinator validates schema and capability.
+4. Coordinator queries registry for a healthy descriptor.
+5. Coordinator records route decision in the runtime trace.
+6. Target agent begins request lifecycle:
+   a. reject duplicate request id;
+   b. add request id to in-flight set;
+   c. check cancellation tombstone;
+   d. call provider/tool with timeout budget.
+7. Provider/tool returns result or structured failure.
+8. Runtime converts late cancelled result to request_cancelled.
+9. Coordinator records retry/failure/finish events and returns response.
+\end{lstlisting}
+
+The lifecycle deliberately separates routing, execution, and cancellation. This
+is the distributed-systems lesson carried into \rasn: each boundary has a clear
+owner and a clear failure mode, which makes it possible to debug and harden one
+boundary at a time.
+
+\subsection{Timeout, Retry, and Cancellation Semantics}
+
+Timeouts, retries, and cancellation are related but not equivalent. A timeout is
+a budget attached to a request or workflow node; in service mode it becomes an
+\rdsn client-side deadline and in provider mode it is propagated to provider
+configuration where possible. A retry is a coordinator decision after a
+retryable model failure; it consumes retry budget and records a retry event. A
+cancellation is a caller decision that marks a request or workflow run as no
+longer desired; it must prevent a later successful result from being surfaced.
+
+\rasn deliberately avoids conflating these mechanisms. A timed-out tool is not
+retried because it may already have performed a side effect. A cancelled
+provider call is not forcibly killed by the current prototype, but the runtime
+records the cancellation and rewrites the eventual response. A workflow cancel
+is durable: it writes the \texttt{cancelled} state through \texttt{rasn.state}
+and therefore survives process restart. This separation gives the runtime
+well-defined behavior even when the underlying provider or shell command is not
+preemptible.
+
+\subsection{Replay and Diagnosis Semantics}
+
+Replay in the current system is best understood as incremental deterministic
+re-execution plus trace-guided diagnosis rather than full process replay. A
+replay load can read prior trace events and expose nondeterministic choices,
+provider calls, workflow transitions, state decisions, and tool outcomes. The
+runtime can reuse simulator choices, recorded \texttt{llm.response} events in
+provider order, and matching recorded \texttt{tool.ok} or \texttt{tool.error}
+events. Workflow execution also records \texttt{workflow.node.start} and
+\texttt{workflow.node.finish} transitions. During replay, the executor checks
+the recorded node-start order before dispatching a node; a mismatch is reported
+as a \texttt{replay.miss} failure before any model or tool side effect occurs.
+CodePilot file tools record \texttt{filesystem.snapshot} events for
+read/list/search targets. Replay checks those path fingerprints before a file
+tool consumes current workspace state, surfacing filesystem drift rather than
+silently reusing stale file context.
+When replay mode is active and a side-effecting tool has no matching recorded
+result, \texttt{rasn.tool.agent} fails closed instead of repeating a write or
+shell command. Side-effecting tool intents also record
+\texttt{external.effect} events that carry effect class, operation, stable
+fingerprint, replay policy, and status for commits, policy denials, replay hits,
+and replay misses. Full replay would still require stronger virtualization for
+external environments, but the current model now gives non-file effects an
+auditable runtime ledger instead of only a transcript. The current model
+therefore advances replay for concrete model, tool, scheduler, local-file, and
+external-effect-intent decisions while leaving broader environment virtualization
+as a future hardening target.
+
+\subsection{Workflow State Machine}
+
+Workflow execution is the most complete example of the runtime model because it
+combines compilation, routing, state, leases, and observability. A run moves
+through the states in Figure~\ref{fig:workflow-state-machine}.
+
+\begin{figure}[t]
+\centering
+\begin{lstlisting}
+new
+  | validate + compile + acquire lease
+  v
+running
+  | all nodes ok         | node/tool/model error
+  v                      v
+completed              failed
+  ^
+  |
+cancel requested or observed between nodes
+  |
+cancelled
+\end{lstlisting}
+\caption{Workflow run state machine. Terminal states are \texttt{completed},
+\texttt{failed}, and \texttt{cancelled}; terminal transitions are persisted
+through \texttt{rasn.state}.}
+\Description{A text diagram showing workflow states new, running, completed,
+failed, and cancelled, with validation and lease acquisition before running and
+terminal transitions persisted through state.}
+\label{fig:workflow-state-machine}
+\end{figure}
+
+The implementation does not assume that the workflow process that receives a
+cancel or query request is the same process that originally started the run.
+Both operations can recover \texttt{workflow/<run-id>} from state. This makes
+workflow management restart-safe even before the state store itself is replaced
+by a replicated backend.
+
+Each transition in Figure~\ref{fig:workflow-state-machine} has a concrete
+guard:
+
+\begin{description}
+  \item[\texttt{new} to \texttt{running}.] The workflow source parses, the graph
+  is acyclic, resume/source identity checks pass, and the service acquires the
+  execution lease.
+  \item[\texttt{running} to \texttt{completed}.] All executable nodes complete,
+  no cancellation is observed, and the terminal write matches the running
+  record's expected sequence.
+  \item[\texttt{running} to \texttt{failed}.] A node fails or a required runtime
+  boundary returns a non-retryable error; dependent nodes become blocked.
+  \item[\texttt{running} to \texttt{cancelled}.] A cancel request writes a
+  terminal record, or execution observes the cancelled record between nodes.
+  \item[Restart recovery.] Query, cancel, and resume may recover the run record
+  from state when it is absent from memory. Non-missing state errors abort the
+  operation.
+\end{description}
+
+The workflow state machine is therefore not merely conceptual. It determines
+which state writes require compare-and-set, which errors are safe to retry, and
+which CLI commands can be implemented after a restart.
+
+\section{Architecture}
+
+Figure~\ref{fig:architecture} summarizes the current architecture.
+
+\begin{figure}[t]
+\centering
+\begin{lstlisting}
+CodePilot / future applications
+        |
+        v
+rasn_service_graph
+        |
+        +--> rasn.coordinator <----> rasn.registry
+        |          |
+        |          +--> rasn.llm.agent  --> LLM providers
+        |          +--> rasn.tool.agent --> tool providers/policy
+        |
+        +--> rasn.workflow ----> rasn.state
+        +--> rasn.observability -> rasn.state snapshots
+\end{lstlisting}
+\caption{High-level \rasn service graph. Direct mode calls these components
+in-process; service mode routes through typed \rdsn RPC task codes.}
+\Description{A layered architecture where CodePilot and future applications
+call a rASN service graph, which routes to coordinator, registry, model agent,
+tool agent, workflow service, state service, and observability service.}
+\label{fig:architecture}
+\end{figure}
+
+\subsection{Service Graph and Lifecycle}
+
+\texttt{rasn\_service\_graph} is the facade used by applications. It owns the
+in-process service implementations and the addresses of service-mode RPC
+endpoints. It provides operations such as \texttt{complete},
+\texttt{run\_tool}, \texttt{invoke}, \texttt{put\_state},
+\texttt{start\_workflow}, and \texttt{query\_events}.
+
+The graph has reference-counted lifecycle ownership. Each \rdsn app wrapper
+that depends on it acquires a lifecycle reference during startup and releases
+it during shutdown. Direct \codepilot commands acquire a command-scoped
+reference. This prevents one app wrapper from stopping shared services while
+other services are still active. Startup and shutdown work is performed outside
+the lifecycle lock to avoid lock-held RPC registration and deadlock-prone waits.
+
+\subsection{RPC Surface}
+
+\rasn defines explicit \rdsn task codes for generic agent control and for each
+service family:
+
+\begin{itemize}
+  \item Generic agent-control RPCs for describe, invoke, cancel, heartbeat, and
+  query.
+  \item Registry RPCs for register, unregister, heartbeat, query, and list.
+  \item State RPCs for put, conditional put, get, query, checkpoint, and
+  recovery.
+  \item Workflow RPCs for validate, compile, start, query, and cancel.
+  \item Model gateway RPCs for provider description, provider selection, and
+  health.
+  \item Observability RPCs for events, failures, replay loading, and snapshots.
+\end{itemize}
+
+Service-mode \codepilot waits for all required service surfaces to respond
+before dispatching a command. The readiness gate probes state, registry,
+coordinator, model-agent identity, model health, tool-agent identity, workflow
+validation, and observability. Failures name the specific service boundary.
+
+\subsection{Execution Modes}
+
+\rasn supports two execution modes that intentionally share the same logical
+module interfaces.
+
+\begin{description}
+  \item[Direct mode.] \codepilot or a test owns a command-scoped
+  \texttt{rasn\_service\_graph} reference. Service calls are in-process C++
+  calls, but they still pass through the same graph facade, policy checks,
+  runtime validation, state writers, and observability hooks.
+  \item[Service mode.] \rdsn starts service apps for registry, coordinator,
+  model agent, tool agent, state, workflow, observability, and CodePilot. Calls
+  cross typed \rdsn RPCs using clientlets and serverlets. This mode exercises
+  serialization, timeout propagation, startup ordering, readiness probes, and
+  per-service failure visibility.
+\end{description}
+
+The design goal is not to maintain two implementations. Direct mode is a fast
+developer path; service mode is the distributed-systems path. Bugs found in one
+mode should usually be fixed in the shared service graph or module store rather
+than by adding mode-specific branches.
+
+\subsection{Module Contracts}
+
+Table~\ref{tab:module-contracts} summarizes each module's contract. The most
+important column is state ownership: it identifies which runtime facts the
+module is allowed to mutate directly and which facts must cross a service
+boundary.
+
+\begin{table*}[t]
+\caption{\rasn module contracts.}
+\label{tab:module-contracts}
+\centering
+\small
+\begin{tabular}{p{0.13\textwidth}p{0.19\textwidth}p{0.25\textwidth}p{0.29\textwidth}}
+\toprule
+Module & Inputs & Owned state & Outputs/failures \\
+\midrule
+Runtime & Agent requests, config & Lifecycle, in-flight ids, tombstones & Responses, trace events \\
+Registry & Descriptors, heartbeats & Descriptor table, lease timestamps & Capability matches, stale lease removal \\
+Coordinator & Capability requests & Route decisions, retry counters & Agent responses, retry/failure events \\
+Model agent & Completion requests & Provider selection, health & Text responses, provider errors \\
+Tool agent & Tool requests & Tool provider config & Tool output, policy/tool errors \\
+Policy & Tool metadata, config & Artifact indexes through state & Allow/deny, spill metadata \\
+State & State put/get/query & Records, sequence, checkpoint, journal & CAS success/conflict, recovery errors \\
+Workflow & Workflow source/query & Runs, nodes, leases through state & Plans, run records, terminal status \\
+Observability & Runtime events, queries & Event buffer, snapshot indexes & Events, failures, diagnostics \\
+CodePilot & CLI commands/config & Session-local command context & User output, structured errors \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{Control Flow}
+
+The following control-flow sketches describe the two most common paths. First,
+an interactive CodePilot prompt becomes a model request:
+
+\begin{lstlisting}
+codepilot prompt
+  -> build agent_completion_request
+  -> rasn_service_graph.complete()
+  -> coordinator.invoke(capability=model.complete)
+  -> registry.query(model.complete)
+  -> model agent invoke
+  -> selected llm_provider.complete()
+  -> response + trace events
+\end{lstlisting}
+
+Second, a declarative workflow run becomes a sequence of state-backed node
+executions:
+
+\begin{lstlisting}
+workflow start file
+  -> validate/compile workflow_graph
+  -> acquire workflow-lease/<run-id> by conditional put
+  -> persist workflow/<run-id> = running
+  -> for each ready node:
+       persist workflow-node/<run>/<node> = running
+       dispatch model/tool through coordinator
+       persist workflow-node/<run>/<node> = completed/failed
+  -> conditional terminal write to workflow/<run-id>
+  -> release lease
+\end{lstlisting}
+
+These flows expose where failures can be observed: registry lookup failures,
+provider failures, policy denials, state conflicts, lease ownership failures,
+and terminal state persistence failures are separate error classes rather than a
+single CLI failure string.
+
+\subsection{Module Decomposition and Ownership}
+
+\rasn is decomposed so that each module owns one class of runtime state and
+exposes that state through typed operations rather than shared global variables
+or prompt conventions.
+
+\begin{description}
+  \item[Task and message model.] The schema layer defines versioned requests,
+  responses, errors, descriptors, metadata entries, model messages, tool
+  requests, workflow records, state records, and observability events. This
+  layer is intentionally passive: it validates shape and serializes through
+  \rdsn binary readers/writers, but it does not make routing or policy
+  decisions.
+  \item[Agent runtime.] The runtime owns lifecycle state, identity, capability
+  descriptors, request validation, trace emission, deadline defaults, and
+  cooperative cancellation tracking for service-like agents.
+  \item[Registry.] The registry owns the mapping from capabilities to live
+  descriptors. It separates static configured agents from dynamic agents that
+  must refresh heartbeat leases.
+  \item[Coordinator.] The coordinator owns capability routing, retry decisions,
+  side-effect-aware dispatch, and route observability. It is the point where
+  application-level requests become agent invocations.
+  \item[Model agent.] The model agent isolates LLM provider configuration and
+  provider health from the rest of the runtime. It exposes model completion as a
+  normal capability, whether the backing provider is a simulator, cloud API, or
+  local HTTP-compatible server.
+  \item[Tool agent and policy.] The tool agent owns local side-effect execution.
+  The policy manager classifies operations, blocks unsafe defaults, bounds
+  output, and records oversized artifact metadata through the state service.
+  \item[State service.] The state service owns durable runtime records:
+  checkpoints, journals, workflow run state, node state, leases, artifact
+  indexes, and observability snapshot indexes.
+  \item[Workflow service.] The workflow service owns declarative workflow
+  validation, graph compilation, execution leases, per-node progress,
+  cancellation, and resume.
+  \item[Observability.] The observability module owns runtime event capture,
+  failure summaries, replay metadata, snapshots, and diagnostic queries.
+  \item[Applications.] \codepilot and future applications own user interface,
+  prompts, domain-specific skills, and command syntax. They call \rasn services
+  instead of embedding runtime state machines in the CLI.
+\end{description}
+
+\subsection{Registry and Routing}
+
+The registry stores agent descriptors containing agent ID, role, app name,
+host/port or URI endpoint, version, health, and capabilities. Static external
+agents can be configured with \texttt{[rasn.agent.*]} sections. Built-in agents
+can dynamically register and send periodic heartbeats in service mode. Registry
+leases are swept by a timer so stale dynamic descriptors are removed while
+static descriptors remain available.
+
+The coordinator resolves a request capability to an agent descriptor, records
+the route decision, and invokes the selected agent. Model-agent failures can be
+retried when they are marked retryable and the request carries a bounded retry
+budget. Tool capabilities are not retried because a timed-out tool invocation
+may already have performed side effects.
+
+\subsection{State, Checkpoints, and Leases}
+
+The state service provides a small key-value store with namespaced keys,
+sequence numbers, checkpoints, append-only journals, and conditional put. It is
+not intended as a production replicated database in the current prototype.
+Instead, it defines the boundary through which runtime state flows. Workflow
+execution uses conditional writes to acquire and update
+\texttt{workflow-lease/<run-id>} records. Active workflow owners renew leases
+while nodes execute. Stale leases can be taken over after the configured lease
+TTL. The workflow service now distinguishes missing state keys from state
+lookup failures during run recovery.
+
+\subsection{Workflow Runtime}
+
+The workflow subsystem parses a lightweight declarative workflow language into
+a graph. Nodes represent model or tool tasks with dependencies, policy labels,
+execution budgets, retry budgets, latency hints, cost hints, reliability hints,
+and optional state keys. The compiler validates dependencies and rejects cycles.
+An optimizer orders ready nodes by score and reports stages, maximum
+parallelism, critical-path latency, cost, and minimum reliability. Execution
+persists whole-run and per-node state. Resume mode loads completed node outputs
+from state and executes incomplete downstream nodes.
+
+Workflow cancellation is cooperative. A cancel request marks the run cancelled,
+remaining nodes are persisted as cancelled, and final completion cannot
+overwrite a cancelled run. Agent-level cancellation is also cooperative:
+currently it tracks in-flight request IDs and converts late results into
+\texttt{request\_cancelled}; it does not yet forcibly terminate arbitrary
+provider or shell work.
+
+\subsection{Observability}
+
+\rasn's runtime log records events as JSON lines when tracing is configured.
+The observability service can query events, failures, timelines, diagnostic
+summaries, replay loads, and snapshots. Snapshot metadata is persisted through
+the state service, giving operators a durable index of trace file, event count,
+failure count, and last sequence.
+
+\section{Implementation Details}
+
+\subsection{Code Organization}
+
+The \rasn source tree is organized as a \rdsn plugin:
+
+\begin{lstlisting}
+src/plugins/rasn/
+  agent_types.h
+  agent_messages.h
+  agent_runtime.{h,cpp}
+  agent_registry.{h,cpp}
+  agent_clients.{h,cpp}
+  coordinator_service.{h,cpp}
+  agent_services.{h,cpp}
+  state_service.{h,cpp}
+  workflow.{h,cpp}
+  workflow_service.{h,cpp}
+  policy_manager.{h,cpp}
+  observability.{h,cpp}
+  llm_provider.{h,cpp}
+  agent_tools.{h,cpp}
+  codepilot/
+  tests/
+  examples/
+  docs/report/
+\end{lstlisting}
+
+\texttt{CMakeLists.txt} integrates the plugin and unit tests into the \rdsn
+build. The implementation is intentionally header-heavy for message
+serialization helpers and uses \cpp service classes for runtime behavior.
+
+Table~\ref{tab:file-responsibilities} maps the main implementation files to
+their responsibilities. This table is also useful for future maintainers because
+it distinguishes reusable nucleus code from the CodePilot application layer.
+
+\begin{table*}[t]
+\caption{Main source files and responsibilities.}
+\label{tab:file-responsibilities}
+\centering
+\begin{tabular}{lll}
+\toprule
+Files & Layer & Responsibility \\
+\midrule
+\texttt{agent\_types/messages} & Core schema & Versioned descriptors, requests, responses, serialization \\
+\texttt{agent\_runtime} & Core runtime & Agent lifecycle, validation, traces, cancellation \\
+\texttt{agent\_registry} & Service & Descriptor table, heartbeat leases, sweeps \\
+\texttt{coordinator\_service} & Service & Capability routing, bounded retry, dispatch \\
+\texttt{agent\_clients} & RPC client & Typed clientlet wrappers and deadlines \\
+\texttt{agent\_services} & Composition & Service graph, app wrappers, direct/RPC switching \\
+\texttt{state\_service} & Service & Key-value state, CAS, checkpoints, journals, recovery \\
+\texttt{workflow/workflow\_service} & Service & Workflow parser, optimizer, executor, leases, resume/cancel \\
+\texttt{policy\_manager/redaction} & Policy & Tool classification, gating, redaction, artifact indexing \\
+\texttt{observability} & Service & Events, failures, snapshots, replay metadata \\
+\texttt{llm\_provider/model\_agent} & Provider & Simulator and HTTP-compatible model adapters \\
+\texttt{agent\_tools} & Provider API & Generic tool provider interface \\
+\texttt{codepilot/*} & Application & CLI commands, local tools, skills, provider configuration \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{rDSN Integration Points}
+
+\rasn intentionally reuses rDSN mechanisms instead of implementing a parallel
+runtime. The important integration points are:
+
+\begin{itemize}
+  \item \texttt{dsn::service\_app} for long-lived roles such as
+  \texttt{rasn.workflow}, \texttt{rasn.state}, and \texttt{rasn.codepilot}.
+  \item \texttt{dsn::serverlet<T>} and \texttt{dsn::rpc\_replier<T>} for typed
+  RPC handlers.
+  \item \texttt{dsn::clientlet} wrappers for synchronous service-mode calls with
+  propagated timeout budgets.
+  \item \texttt{DEFINE\_TASK\_CODE\_RPC} task codes for every service boundary
+  and control operation.
+  \item \texttt{binary\_writer} and \texttt{binary\_reader} for message
+  serialization.
+  \item \texttt{dsn\_config\_get\_value\_*} for provider, policy, lease,
+  timeout, endpoint, and persistence settings.
+  \item \texttt{dsn::service::zlock} for shared state in stores and runtimes.
+  \item \texttt{dsn::tasking::enqueue\_timer} for registry heartbeats, lease
+  sweeps, delayed workflow recovery, and workflow lease renewal.
+  \item \texttt{dsn::utils::filesystem} for checkpoints, temporary files,
+  artifact paths, and cross-platform file operations.
+\end{itemize}
+
+The implementation currently still has same-process globals for convenience,
+but service-mode calls deliberately cross \rdsn client/server boundaries where
+possible. This is a stepping stone toward deployment as independently hosted
+services.
+
+\subsection{Task and Message Schema}
+
+\texttt{agent\_types.h} and \texttt{agent\_messages.h} define the common data
+model shared by the runtime, service wrappers, and applications. Important
+records include agent descriptors, capabilities, requests, responses, errors,
+completion requests, tool requests, trace metadata, and key-value metadata
+entries. Each top-level structure carries \texttt{schema\_version}; validation
+rejects unsupported versions and missing required identifiers before a request
+can reach model or tool code.
+
+The schema is deliberately explicit. A model call is not just a prompt string:
+it carries a task id, trace id, request id, capability name, policy labels,
+timeout budget, retry budget, context entries, and replay mode. Likewise, a tool
+call is a typed request with a tool name and argument vector rather than shell
+text hidden inside a prompt. The implementation provides \rdsn
+\texttt{marshall}/\texttt{unmarshall} functions for these records, allowing the
+same messages to be used in direct in-process mode and in service-mode RPC.
+
+Table~\ref{tab:request-fields} shows why these fields are part of the runtime
+protocol rather than application-level annotations.
+
+\begin{table}[t]
+\caption{Selected request fields and their runtime role.}
+\label{tab:request-fields}
+\centering
+\begin{tabular}{ll}
+\toprule
+Field & Runtime role \\
+\midrule
+\texttt{request\_id} & Duplicate detection and cancellation key \\
+\texttt{trace\_id} & Correlates model, tool, state, and workflow events \\
+\texttt{capability} & Registry lookup and coordinator routing key \\
+\texttt{timeout\_ms} & Client RPC deadline and provider budget \\
+\texttt{retry\_budget} & Bounded model retry control \\
+\texttt{policy\_labels} & Tool/model policy context \\
+\texttt{replay\_mode} & Hook for trace-guided replay \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Validation is intentionally performed before side effects. For example, an
+unsupported schema version, empty capability, missing request id, or malformed
+tool request is rejected by the runtime/coordinator rather than reaching a
+provider. This rule is what lets tests assert deterministic failure strings for
+bad inputs and prevents providers from becoming implicit validators.
+
+\texttt{schema\_manifest.*} now derives multiple integration artifacts from the
+same descriptor table. The text output is documentation, the JSON output is
+suited for dashboards or code generators, the IDL output is a compact
+language-neutral contract, the C++ output is a generated SDK header, the C++ RPC
+client output is a generated \rdsn \texttt{clientlet} layer, the TypeScript
+output is a set of exported interfaces, the TypeScript RPC-client output is a
+transport-backed client class layer, the Python output is a dataclass module,
+and the Python RPC-client output is a transport-backed client class layer. The
+C++ data-contract generator maps rASN scalar types to
+\texttt{std::string}, \texttt{bool}, \texttt{std::uint32\_t}, and
+\texttt{std::uint64\_t}; the TypeScript generator maps them to
+\texttt{string}, \texttt{boolean}, and \texttt{number}; and the Python generator
+maps them to \texttt{str}, \texttt{bool}, and \texttt{int}. Repeated fields are
+mapped to \texttt{std::vector<T>}, \texttt{T[]}, or \texttt{List[T]}; Python
+uses \texttt{field(default\_factory=list)} so generated dataclasses do not share
+mutable defaults. Because the generators are manifest-driven, adding a field to
+a runtime contract also changes all exported formats and the regression test can
+detect missing nested records before an external integration relies on an
+incomplete SDK surface. The RPC-client generators are operation-manifest driven:
+C++ methods call the matching \texttt{RPC\_RASN\_*} task code, preserve
+timeout/thread/partition parameters, and return
+\texttt{std::pair<error\_code,T>} like the hand-written clients; TypeScript and
+Python methods call a host-supplied transport with the same task-code constant
+and typed request/response pair. The
+executable handles \texttt{schema} as a direct fast path before starting the
+\rdsn runtime, so redirected schema artifacts are not polluted by service
+startup or shutdown logs.
+
+\subsection{Service Graph and RPC Wiring}
+
+\texttt{agent\_services.*} contains the shared service graph and the rDSN
+service-app wrappers. \texttt{rasn\_service\_graph} is the facade used by
+\codepilot and tests. In direct mode it calls in-process service objects; in
+service mode it creates typed \rdsn clientlets for registry, coordinator, model,
+tool, state, workflow, and observability endpoints. The graph also installs
+state writers for policy and observability modules so artifact and snapshot
+indexes cross the same state boundary in both modes.
+
+Service wrappers use \texttt{dsn::service\_app} for lifecycle and
+\texttt{dsn::serverlet<T>} for RPC handlers. Each handler is intentionally thin:
+it decodes a typed request, calls the corresponding store/runtime method, and
+replies with a typed response. This keeps most correctness logic outside the RPC
+boilerplate while still exercising rDSN task codes, serialization, thread pools,
+and client timeouts.
+
+The service graph enforces startup discipline through readiness checks. The
+current readiness algorithm is:
+
+\begin{lstlisting}
+for each required service boundary:
+  send a cheap typed probe with a short deadline
+  if probe fails:
+    return "service <name> not ready: <cause>"
+dispatch user command only after all probes pass
+\end{lstlisting}
+
+The probes are intentionally semantic rather than just socket-level checks:
+state must answer a prefix query, registry must list/query, the model agent must
+describe itself and report health, workflow must validate an empty-safe probe,
+and observability must answer a query. This catches miswired service graphs that
+would pass a port-open test but fail at the first real command.
+
+\subsection{Agent Runtime}
+
+\texttt{agent\_runtime} is the base class for built-in service agents. It owns
+the descriptor, capabilities, lifecycle state, validation, rejection, default
+timeouts, trace emission, and request cancellation tracking. Capabilities carry
+task type, side-effect class, cost hint, latency hint, reliability hint, and
+policy labels. The runtime uses these descriptors to answer describe/query RPCs
+and to make registry entries meaningful to the coordinator.
+
+The cancellation tracker maintains an in-flight request set and a bounded set of
+cancellation tombstones. A duplicate request id is rejected while work is active;
+a cancellation marks the id; and a provider result that arrives after
+cancellation is converted into a structured \texttt{request\_cancelled}
+response. Tombstone trimming skips still-in-flight requests so cancellation
+remains terminal under cancel storms. This invariant is covered by a unit test
+that keeps one request active while forcing more than 1024 other cancellations.
+
+The runtime's local request state machine is:
+
+\begin{lstlisting}
+absent
+  -> begin_request(request_id)
+in_flight
+  -> cancel_request(request_id)
+cancelled_in_flight
+  -> finish_request(request_id)
+cancelled_tombstone
+  -> trim only after request is no longer in flight
+\end{lstlisting}
+
+This state machine does not pretend to preempt arbitrary provider code. Instead,
+it provides a reliable semantic contract at the agent boundary: once the runtime
+acknowledges cancellation for a known in-flight id, the caller will not later see
+that request as successful.
+
+\subsection{Registry and Coordinator}
+
+\texttt{agent\_registry.*} implements descriptor registration, unregister,
+heartbeat, list, and capability query. Static descriptors come from
+configuration; dynamic descriptors are refreshed by heartbeat RPCs and include a
+lease timestamp. A sweep timer removes expired dynamic entries but leaves static
+entries intact. This mirrors distributed-service membership: a configured
+external service remains addressable, while a service discovered through
+heartbeat must prove liveness.
+
+\texttt{coordinator\_service.*} is the routing boundary. It receives generic
+agent requests, resolves the requested capability through the registry, records
+the route decision in the runtime trace, and invokes the selected agent through
+the service graph. Retry is intentionally conservative. Only retryable model
+failures are retried, retry count is capped by configuration, and tool
+capabilities are not retried because a timed-out tool may already have changed
+local state.
+
+Registry query results are filtered by role, health, capability, and lease
+freshness. The current prototype uses simple first-match routing after filtering;
+future versions can replace this with cost/latency/reliability-aware placement
+without changing the request schema. Coordinator retry follows this policy:
+
+\begin{lstlisting}
+attempt = 0
+while true:
+  route = registry.query(capability)
+  response = invoke(route, request)
+  if response.ok: return response
+  if capability is tool.*: return response
+  if not response.retryable: return response
+  if attempt >= min(request.retry_budget, config.max_retry_budget):
+    return response
+  record retry event
+  attempt += 1
+\end{lstlisting}
+
+Separating registry filtering from retry policy matters for diagnosability. A
+failure can be attributed to no matching capability, an unhealthy/stale agent, an
+RPC timeout, a provider-level retryable error, or a non-retryable tool/policy
+failure.
+
+\subsection{Model Agent and Provider Adapters}
+
+The LLM provider interface is:
+
+\begin{lstlisting}[language=C++]
+class llm_provider {
+public:
+  virtual std::string name() const = 0;
+  virtual std::string model() const = 0;
+  virtual model_provider_descriptor describe() const = 0;
+  virtual llm_response complete(const llm_request&,
+                                nucleus_runtime&) = 0;
+  virtual llm_response complete_streaming(
+      const llm_request&, nucleus_runtime&,
+      const llm_stream_callback& on_chunk);
+};
+\end{lstlisting}
+
+The prototype includes a local simulator and curl-based HTTP providers for
+OpenAI-compatible, Copilot-compatible, Ollama, llama.cpp, and LM Studio style
+endpoints. Request budgets are propagated into curl \texttt{max-time} and
+capped by provider configuration. Tokens now flow through explicit
+\texttt{token\_ref} credential handles: \texttt{env:} references environment
+variables, \texttt{file:} reads a local secret file, and \texttt{cmd:} invokes a
+command at request time. Legacy \texttt{token\_env} and
+\texttt{token\_command} settings remain as compatibility paths. Provider
+descriptors expose handles rather than token values or command output, and
+command-backed handles are summarized as \texttt{cmd:<configured>}. Production
+deployments should still replace the lightweight curl layer with provider SDKs
+or a hardened HTTP client.
+
+\texttt{model\_agent.*} adapts the provider interface to the generic agent RPC
+surface. Provider selection and health are exposed as explicit model-gateway
+operations rather than hidden in CLI configuration. The simulator provider is
+important for testing: it can return random-looking local output without network
+access, and its choices are recorded as nondeterministic runtime events so replay
+experiments have a concrete hook.
+
+The provider interface now includes a provider-neutral streaming method. Native
+streaming providers can call the supplied callback as chunks arrive. Providers
+without native streaming inherit a default implementation that chunks the final
+completion, which gives applications a stable streaming API even when the
+underlying provider does not yet expose incremental delivery. Each emitted chunk
+is redacted and recorded as an \texttt{llm.response.chunk} event before the
+application sees it. This makes streaming observable and replay-diagnosable
+instead of a UI-only side channel.
+
+The HTTP provider layer currently uses curl as a portability-first adapter. It
+constructs provider-specific request bodies, applies configured headers, writes
+temporary response files, bounds request duration, and parses a small set of
+common response shapes. Supported deployment styles include:
+
+\begin{description}
+  \item[Copilot-compatible.] A configured endpoint and token source compatible
+  with GitHub Copilot-style chat completion APIs.
+  \item[OpenAI-compatible.] Generic chat-completion endpoints used by many cloud
+  and proxy providers.
+  \item[Ollama.] Local HTTP serving with a model name and localhost endpoint.
+  \item[llama.cpp.] Local server mode for self-hosted model experiments.
+  \item[LM Studio.] Local OpenAI-compatible server mode for desktop model
+  serving.
+  \item[Simulator.] Offline provider that avoids network dependencies and
+  records nondeterministic choices.
+\end{description}
+
+Provider health is represented as runtime data, not just logs. CodePilot can ask
+the model gateway for provider name, model, locality, and health before issuing
+an expensive request. This makes provider misconfiguration a readiness failure
+instead of a mysterious model-call failure later in a workflow.
+
+\subsection{Tool Agent and Policy Manager}
+
+\texttt{agent\_tools.*} and \texttt{codepilot/local\_tools.*} implement local
+tool execution behind the generic \texttt{tool.run} capability. The current tool
+provider supports listing, reading, searching, writing, replacing, and shell
+execution. The \texttt{policy\_manager} classifies each operation by capability
+and side-effect class. Read operations require existing targets; write, replace,
+shell, and network-like operations are disabled unless configuration enables
+them. Phase 48 adds defense-in-depth by enforcing the same policy inside the
+CodePilot provider itself, so direct provider calls cannot bypass the
+\texttt{rasn.tool.agent} gate. Phase 49 adds an optional
+\texttt{workspace\_root} sandbox: when configured, read/write/search/list and
+replace targets are resolved through rDSN absolute/normalized path helpers and
+must remain inside the configured root. Phase 50 adds explicit approval labels:
+when \texttt{require\_write\_approval} or
+\texttt{require\_shell\_approval} is enabled, CodePilot must attach
+\texttt{human\_approved:write} or \texttt{human\_approved:shell} before an
+enabled side-effect tool is admitted. Phase 52 adds shell command sandbox
+controls: an optional executable allowlist denies shell metacharacters and
+requires the first command token to match an allowed executable, while a shell
+working-directory wrapper starts commands inside \texttt{workspace\_root} or an
+explicit \texttt{shell\_working\_directory}. Tool output is bounded; oversized
+output is spilled to an artifact file, and a compact artifact index is written
+through \texttt{rasn.state}. A later hardening step adds a configurable shell
+executor: \texttt{shell\_executor=container} wraps an approved command through
+\texttt{shell\_container\_template}, whose placeholders describe the quoted
+command and workspace path. The default executor remains local for compatibility.
+
+This design separates three concerns that are often conflated in prompt-centric
+agents: the model decides that a tool is needed, the coordinator routes to an
+agent that can perform it, and the policy layer decides whether the particular
+side effect is permitted. The current policy engine is intentionally simple, but
+the boundary now carries both static configuration decisions and explicit human
+approval decisions, leaving room for richer allowlists and audit rules.
+For side-effecting tools, the runtime also writes an \texttt{external.effect}
+ledger event for policy denials, committed results, replay hits, and replay
+misses. This gives operators an effect-level audit stream independent of the
+bounded tool-output preview.
+
+Tool execution returns a structured \texttt{tool\_result} with success, output,
+and error. Read-like tools are designed for bounded context construction:
+\texttt{read} accepts a maximum byte count, \texttt{search} returns matching
+lines rather than whole files, and directory listing avoids recursive traversal
+unless a future tool explicitly adds it. Write-like tools are disabled by
+default because they cross from observation into mutation. When enabled, write
+and replace use a temporary file followed by
+\texttt{dsn::utils::filesystem::rename\_path} instead of truncating the target
+in place. This leverages rDSN filesystem helpers and avoids partially written
+target files when a flush or replacement fails. Their outputs still pass through
+the same policy and artifact handling paths.
+
+Shell execution has an additional preemption boundary. The configuration key
+\texttt{[rasn.policy] shell\_timeout\_ms} bounds command runtime; the Windows
+implementation launches the command through native process APIs with explicit
+stdout/stderr pipes and calls process termination when the deadline expires.
+This does not replace container isolation, but it prevents an approved shell
+tool from becoming an unbounded local process. The container executor hook adds
+a deployment integration point for Docker, containerd, or a site-specific
+sandbox wrapper, but rASN intentionally leaves image policy, mount policy, and
+container lifecycle enforcement to future product work.
+
+The artifact spill path is a concrete example of service-bound policy. A large
+tool result is not silently truncated into the model prompt. Instead, the tool
+returns a bounded preview, writes the full payload under an artifact directory,
+and stores metadata in \texttt{rasn.state}. This preserves operator visibility
+and gives future workflows a durable handle to the data without overloading the
+prompt.
+
+\subsection{Secret Redaction Boundary}
+
+\rasn now treats secret redaction as a shared runtime boundary rather than as a
+set of ad hoc string filters in individual tools. The implementation adds a
+\texttt{redaction} module configured through \texttt{[rasn.policy]} and the
+older \texttt{[rasn.codepilot.tools]} compatibility section. The policy can be
+disabled for controlled experiments, but it is enabled by default. It combines
+three deterministic mechanisms: exact-value replacement for configured literals,
+exact-value replacement for the current values of configured token environment
+variables, and syntactic redaction of common credential forms such as bearer
+tokens, \texttt{password=...}, \texttt{api\_key: ...}, and JSON key/value
+pairs.
+
+The redaction boundary is applied before data reaches persistent or
+cross-boundary surfaces. \texttt{event\_log::append} redacts event values before
+they are stored in memory or written to JSONL traces. The policy manager redacts
+tool output and error text before bounded previews are returned or oversized
+payloads are spilled to artifact files. The model service and workflow executor
+redact prompts, context entries, provider responses, and provider errors before
+invoking providers or recording their outputs. Replay paths also redact values
+loaded from older traces before returning them to callers, so replay cannot
+re-introduce previously captured credential material.
+
+This mechanism is intentionally deterministic and testable: for a fixed config
+snapshot, the same text redacts to the same output, preserving trace comparison
+and replay debugging. It is not a substitute for a production secret vault,
+process isolation, memory-safe credential handles, or provider SDKs that avoid
+temporary token materialization. It does, however, close the immediate prototype
+gap in which a read/search/shell result, user prompt, model response, or replay
+trace could accidentally persist obvious credential material.
+
+\subsection{State Service}
+
+\texttt{state\_store} validates schema versions and namespaced keys, assigns
+monotonic sequence numbers, and supports:
+
+\begin{itemize}
+  \item unconditional put,
+  \item create-only put,
+  \item check-sequence put,
+  \item key lookup,
+  \item prefix query,
+  \item checkpoint,
+  \item journal recovery.
+\end{itemize}
+
+The workflow subsystem uses check-sequence writes to avoid stale lease updates
+and completion races. Policy and observability components write metadata
+through injectable state writers that are set to service-graph writers during
+graph startup. Checkpoints are written atomically through temporary files and
+can be accompanied by append-only journals. The recovery path can optionally
+import checkpoint or journal files through rDSN NFS settings before replaying
+local state, preserving the same validation logic for local and imported state.
+It can also mirror checkpoint and journal files to a local replica directory
+through \texttt{[rasn.state.replica]}. The mirror is write-through: if it is
+enabled and cannot be updated, the state operation fails explicitly rather than
+silently losing the secondary recovery artifact. Recovery can seed missing
+primary files from the local replica before attempting NFS import.
+
+The store is small but intentionally strict. A key must be namespaced as
+\texttt{scope/id}; raw secret and credential kinds are rejected because the
+state service should store secret references rather than secret values. A
+create-only write fails if the key already exists. A check-sequence write fails
+unless the stored sequence equals the caller's expected sequence. These two
+operations are enough to express the current workflow lease and terminal-state
+rules.
+
+Checkpoint/recovery is implemented as follows:
+
+\begin{lstlisting}
+checkpoint:
+  acquire state lock
+  copy current records and last sequence
+  write temp checkpoint file
+  rename temp file into place
+
+recover:
+  optionally seed checkpoint/journal from local replica
+  optionally import checkpoint/journal through rDSN NFS
+  validate checkpoint records
+  replay journal records
+  rebuild key-value map and last sequence
+\end{lstlisting}
+
+The prototype is not a quorum-replicated store, so it does not provide
+linearizable recovery across failures. Its value is that it forces all important
+runtime state to cross a narrow API and now offers local mirror and NFS seeding
+paths for operator recovery. Replacing the backing store with SKV or another
+replicated service becomes an implementation substitution rather than an
+architectural rewrite.
+
+\subsection{Workflow Compiler and Execution Service}
+
+\texttt{workflow.*} implements declarative workflow parsing and the in-memory
+graph executor. A workflow node has an id, action, prompt or tool command,
+dependency list, capability, policy labels, timeout budget, retry budget,
+latency estimate, cost hint, reliability hint, and optional state key. The
+compiler accepts both the compact line-oriented format and structured JSON
+workflow specs; both normalize into the same \texttt{workflow\_node} model.
+Parsing normalizes metadata, rejects cycles, and builds dependency stages. The optimizer
+does not change semantics; it reports a deterministic plan with stage count,
+ready-set ordering, maximum parallelism, critical-path latency, cost, and
+minimum reliability so operators can inspect tradeoffs before execution.
+
+The current workflow language is intentionally compact. A representative node is:
+
+\begin{lstlisting}
+task inspect tool "list ." capability tool.run
+  policy read_only budget_ms 5000 latency_ms 50
+  cost_hint 1 reliability 98 state unit/inspect
+\end{lstlisting}
+
+The same node can be produced by JSON:
+
+\begin{lstlisting}
+{
+  "nodes": [{
+    "id": "inspect",
+    "action": "tool",
+    "prompt": "list .",
+    "capability": "tool.run",
+    "policy_labels": ["read_only"],
+    "budget_ms": 5000,
+    "latency_hint_ms": 50,
+    "cost_hint": 1,
+    "reliability_hint": 98,
+    "state_key": "unit/inspect"
+  }]
+}
+\end{lstlisting}
+
+Model nodes use \texttt{ask}; tool nodes use \texttt{tool}; dependencies are
+declared with \texttt{after} in text specs or \texttt{depends\_on} in JSON
+specs. JSON support is intentionally strict: malformed types, unsupported
+actions, invalid numeric ranges, duplicate ids, invalid state keys, and cycles
+fail before any model or tool side effect. The compiler builds a directed
+acyclic graph and then computes execution stages. If a node fails, dependent
+nodes are marked \texttt{blocked} rather than executed with missing inputs. If a
+completed node is available during resume, its output is injected into downstream
+context so later model calls can reuse prior work.
+
+The workflow service lifts the graph executor into a durable service. Starting a
+run validates and compiles the source, acquires the run lease through a
+conditional state write, persists the whole-run \texttt{running} record,
+executes nodes through coordinator/model/tool boundaries, persists per-node
+progress, and writes a terminal run record. Long-running nodes renew their lease
+through an rDSN timer in service mode or a small local renewal thread in direct
+mode. Duplicate active starts are rejected; stale leases can be taken over after
+the configured TTL.
+
+Resume and cancellation are also state-backed. Resume reloads completed node
+records, seeds dependency outputs, marks skipped nodes as \texttt{resumed}, and
+executes only incomplete downstream nodes. On startup, the workflow app
+schedules delayed recovery after state readiness instead of synchronously
+querying state during concurrent \rdsn app startup. On-demand query recovery
+loads \texttt{workflow/<run-id>} when the run is not in memory. Phase 46
+hardened this path: a genuine \texttt{state key not found} is treated as an
+absent run, but any other state failure is propagated. Phase 47 extends the same
+semantics to cancellation: \texttt{workflow cancel} recovers a missing
+in-memory run from \texttt{rasn.state}, writes the \texttt{cancelled} transition
+with a conditional state update, and reports the state error if that durable
+transition fails.
+
+The durable execution path is:
+
+\begin{lstlisting}
+start(request):
+  normalize run id and workflow identity
+  recover existing run if needed
+  reject duplicate non-resume run
+  recover node state for resume run
+  acquire execution lease with create-only/CAS state write
+  persist run = running
+  start lease renewal
+  execute graph:
+    before each node: check cancellation
+    persist node = running
+    dispatch ask/tool through shared provider boundary
+    persist node = completed/failed/blocked/cancelled
+  stop lease renewal
+  if cancelled record exists:
+    release lease as cancelled
+    return cancelled
+  persist terminal record with expected running sequence
+  release lease as completed/failed
+\end{lstlisting}
+
+The conditional terminal write is essential. Without it, a workflow that was
+cancelled while a long-running node was still executing could later overwrite the
+cancelled state with a completed state. The implementation prevents that by
+requiring the terminal completion write to match the sequence of the running
+record it started from.
+
+\subsection{Observability and Replay Support}
+
+\texttt{observability.*} provides event queries, failure queries, replay loads,
+diagnostic summaries, timelines, and snapshots. Runtime events are structured
+records with sequence number, timestamp, trace id, event kind, component, task
+id, message, and key-value details. The observability store can answer bounded
+queries for interactive use and can persist snapshot indexes through
+\texttt{rasn.state}. Snapshot records include trace file, event count, failure
+count, and last sequence, giving operators a compact durable pointer into the
+larger event stream.
+
+Replay support is intentionally incremental but architecturally important. The
+simulator records nondeterministic choices, provider calls record request and
+response events, workflow execution records node transitions, and state records
+capture durable decisions. Model calls now contribute executable replay data:
+prior \texttt{llm.response} events can satisfy provider calls in recorded order.
+Tool calls do the same for matching \texttt{tool.ok} and \texttt{tool.error}
+events, while missing side-effecting tool results produce an explicit replay
+failure rather than repeating the effect. Workflow starts are now executable
+replay data as well: the runtime consumes recorded
+\texttt{workflow.node.start} events in order and rejects a run whose scheduler
+chooses a different next node. File-tool snapshots are also executable replay
+data: CodePilot records a \texttt{filesystem.snapshot} event for each
+read/list/search target and compares the current fingerprint against the
+recorded one before reading local files during replay. A future deterministic
+replay engine can combine these artifacts with stronger external-effect
+virtualization; the current implementation already gives debugging tools a
+stable schema instead of requiring transcript scraping.
+
+The event taxonomy currently includes task lifecycle events, LLM request/response
+events, LLM response chunk events, tool request/response events,
+nondeterministic choices, retry events, failure events, workflow transitions,
+external-effect ledger events, and snapshot events. Query APIs support
+bounded event scans, failure-only scans, timelines, diagnostic summaries, replay
+loading from trace files, and snapshot persistence. The cursor returned by a
+query is the last observed sequence, which lets CLI commands and future UIs build
+incremental views.
+
+Observability is intentionally separate from state. State records are compact
+facts used for recovery and coordination; observability events are an append-like
+history used for diagnosis. A workflow run can be recovered from state without
+reading the event log, and a diagnosis can inspect the event log without
+mutating state. This separation follows the same principle as distributed-system
+logs and checkpoints: recovery state should be minimal and well-structured,
+whereas diagnostic traces can be richer and larger.
+
+\subsection{Testing and Validation}
+
+The current unit suite covers message validation, endpoint metadata, registry
+leases, coordinator retries, policy classification, artifact state writes,
+observability snapshot state writes, service-graph lifecycle, workflow parsing,
+workflow cancellation, restart-safe cancel recovery, cancel persistence failure
+reporting, budget propagation, resume, state checkpoint/recovery, conditional
+writes, workflow execution leases, lease renewal, cancellation tombstones, and
+state-recovery error propagation. The CodePilot tool tests cover provider-side
+default-deny write/shell policy and atomic file replacement. Direct
+\codepilot self-tests
+exercise model health, generic model invocation, tool description, state
+put/get/checkpoint, workflow compile/run/resume/cancel, and observability
+snapshot. Service-mode smoke starts the full \rdsn app graph and runs the same
+self-test through RPC.
+
+\section{\codepilot: A Coding CLI on \rasn}
+
+\subsection{User Model}
+
+\codepilot is a command-line application inspired by existing coding agents.
+It supports one-shot prompts, an interactive REPL, explicit tool commands,
+workflow commands, registry inspection, agent control, observability commands,
+skills, provider configuration, trace/replay, and a self-test. The CLI is not
+the runtime; it is an application adapter over \rasn.
+
+Table~\ref{tab:codepilot-commands} groups the current command surface. The
+important design point is that most commands exercise a generic \rasn service
+surface rather than a CodePilot-only implementation path.
+
+\begin{table}[t]
+\caption{\codepilot command groups.}
+\label{tab:codepilot-commands}
+\centering
+\begin{tabular}{ll}
+\toprule
+Group & Purpose \\
+\midrule
+\texttt{ask}/\texttt{stream}/prompt & Model completion and streamed chunks through coordinator \\
+\texttt{tool} & Explicit local tool execution \\
+\texttt{workflow} & Validate, compile, start, resume, query, cancel, nodes \\
+\texttt{state} & Put, get, query, checkpoint/recover smoke \\
+\texttt{registry} & Inspect descriptors and capability routing \\
+\texttt{agentctl} & Describe, heartbeat, query, cancel agent requests \\
+\texttt{observe} & Events, failures, timelines, snapshots, replay \\
+\texttt{schema} & Text, JSON, IDL, C++ contracts/clients, TypeScript, and Python export \\
+\texttt{eval} & Built-in and external-CLI benchmark harness \\
+\texttt{selftest} & End-to-end direct/service regression workload \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Command Routing}
+
+For model requests, \codepilot builds an \texttt{agent\_completion\_request},
+which is converted into a generic \texttt{agent\_request} with capability
+\texttt{model.complete}. For tools, it builds an \texttt{agent\_tool\_request}
+or a generic \texttt{agent\_request} with capability \texttt{tool.run}. These
+requests are sent through \texttt{rasn\_service\_graph}, which calls the
+coordinator inline or through RPC depending on mode.
+
+\codepilot has three execution shapes. In direct mode, a command owns a
+command-scoped service-graph reference and calls the in-process graph. In
+service mode, \codepilot is an rDSN app in a larger app graph and talks to
+service endpoints through clientlets. In self-test mode, it executes a fixed
+end-to-end workload that covers provider health, model invocation, tool
+description, state put/get/checkpoint, workflow compile/run/resume/cancel,
+observability snapshot, and service readiness. This makes \codepilot both a
+usable example application and a regression driver for the generic runtime.
+
+Prompt construction is deliberately conservative. Context files are read as
+explicit context entries, not silently concatenated into hidden global state.
+Timeouts and retry budgets are carried in the runtime request. Skill prompts are
+application-level templates that produce ordinary model requests. This keeps the
+runtime independent of CodePilot's prompt style and makes it possible for other
+agent applications to reuse the same services with different prompts.
+
+\subsection{Readiness and Error Reporting}
+
+Before dispatching service-mode commands, \codepilot probes every critical
+surface: state, registry, coordinator, model-agent identity, model health,
+tool-agent identity, workflow validation, and observability. A readiness failure
+names the missing boundary rather than returning a generic CLI failure. Command
+errors preserve structured runtime errors where possible, including
+state-recovery failures, lease conflicts, model health failures, policy denials,
+and cooperative cancellation results.
+
+\subsection{Local Tools}
+
+\codepilot provides a tool provider with:
+
+\begin{itemize}
+  \item \texttt{list <path>},
+  \item \texttt{read <path> [max-bytes]},
+  \item \texttt{search <path> <text>},
+  \item \texttt{write <path> <content>},
+  \item \texttt{replace <path> <old> <new>},
+  \item \texttt{shell <command>}.
+\end{itemize}
+
+Read/search/list are read-only, normalize platform separators, and require
+existing targets. Write and shell tools are disabled by default and require
+explicit configuration. Enabled write/replace/shell calls can additionally
+require human approval: direct CLI users can pass \texttt{tool --yes}, while
+agent-requested tool calls trigger an interactive prompt before CodePilot adds a
+side-effect-specific approval label. Tool output is bounded; oversized output is
+written to an artifact directory and indexed in state. Side-effecting tool
+intents are also recorded as \texttt{external.effect} events, and approved shell
+commands can run either locally or through a configured container command
+template.
+
+The local tool provider is intentionally small because it is a policy boundary,
+not a full shell automation framework. \texttt{list} is for fast orientation,
+\texttt{read} is for bounded context import, \texttt{search} is for targeted
+evidence gathering, \texttt{write} and \texttt{replace} are controlled mutation
+primitives, and \texttt{shell} is a last-resort escape hatch. In a production
+CodePilot, these would be complemented by diff preview, richer audit review, and
+hardened process or container orchestration for command execution.
+
+\subsection{Skills}
+
+Skills are \codepilot-specific reusable prompt templates, not generic \rasn
+runtime primitives. Current built-ins include rDSN plugin work, code review,
+build debugging, feature planning, and documentation. They demonstrate how an
+application can layer domain-specific prompt assets on top of the generic
+runtime without polluting core service abstractions.
+
+\subsection{Provider Modes}
+
+The simulator provider enables offline testing and deterministic replay
+experiments. HTTP providers connect to Copilot-compatible, OpenAI-compatible,
+Ollama, llama.cpp, and LM Studio endpoints. This design supports both cloud and
+local model serving, but the current provider layer is intentionally minimal
+and should be hardened before production use.
+
+\subsection{Configuration and Examples}
+
+\codepilot is configured through normal \rdsn configuration files plus
+provider-specific sections. Example files under \texttt{examples/} cover direct
+workflow execution, service-mode smoke, provider selection, state recovery, and
+tool-policy behavior. This is intentionally close to the way rDSN applications
+are normally deployed: the CLI can be used as a single local binary during
+development, but the same code can participate in an rDSN app graph when the
+runtime services need to be inspected independently.
+
+The examples also serve as executable documentation for the platform. A workflow
+example demonstrates the declarative graph; a service smoke configuration starts
+the full rDSN app graph; provider examples show local and HTTP-compatible model
+configuration; and self-test exercises the minimum viable product surface. This
+is important for research reproducibility because future experiments can pin a
+configuration file, provider mode, and workflow input rather than relying on an
+interactive transcript.
+
+\section{Experimental Design}
+\label{sec:experimental-design}
+
+\rasn is not yet finished enough for a definitive empirical evaluation.
+Nevertheless, the prototype now includes an executable evaluation harness so
+future experiments can reuse a stable procedure instead of a prose-only plan.
+\texttt{codepilot eval} runs built-in or file-backed task suites through
+\codepilot and reports success, latency, and output size. \texttt{codepilot eval
+external <template>} invokes an external CLI command template containing
+\texttt{\{prompt\}}, enabling side-by-side comparisons with OpenCode-, Codex-,
+or Copilot-style command-line agents under the same task prompts.
+
+\subsection{Research Questions}
+
+\begin{description}
+  \item[RQ1: Reliability.] Does \rasn reduce unrecoverable or ambiguous agent
+  failures compared with transcript-centric coding CLIs?
+  \item[RQ2: Diagnosability.] Do \rasn traces, state records, and observability
+  queries help developers localize failures faster?
+  \item[RQ3: Reproducibility.] Can captured nondeterminism and workflow state
+  support replay or partial replay of failed tasks?
+  \item[RQ4: Overhead.] What latency, CPU, memory, and storage overhead does
+  the service graph introduce in inline and \rdsn service modes?
+  \item[RQ5: Generality.] Can the same runtime support coding, review,
+  planning, and non-coding agent workflows without changing core services?
+\end{description}
+
+\subsection{Environment Setup}
+
+The primary development environment is Windows with Visual Studio 2022 and
+\rdsn's Windows build scripts. Cross-platform validation runs in WSL with a
+full TeX Live installation for this report and a Linux \rdsn build. The
+evaluation should include:
+
+\begin{itemize}
+  \item Windows 11, Visual Studio 2022, local \rdsn checkout, Boost 1.84.
+  \item Ubuntu WSL or native Ubuntu with the same \rdsn revision.
+  \item Local simulator provider for deterministic and offline tests.
+  \item Local model providers through Ollama, llama.cpp, or LM Studio.
+  \item Cloud provider adapters for OpenAI-compatible or Copilot-compatible
+  endpoints when credentials and policy permit.
+  \item Identical task repositories and benchmark scripts across all tools.
+\end{itemize}
+
+\subsection{Workloads}
+
+The workload suite should contain one prompt per non-empty, non-comment line
+when used with \texttt{codepilot eval <suite-file>}. It should cover:
+
+\begin{enumerate}
+  \item \textbf{Microbenchmarks}: model call, tool call, state put/get, workflow
+  compile, workflow start, registry query, observability query, cancellation,
+  and recovery.
+  \item \textbf{Coding tasks}: bug fixes, refactorings, test additions,
+  documentation updates, and build-failure diagnosis across small and medium
+  repositories.
+  \item \textbf{Failure-injection tasks}: state service unavailability, model
+  timeout, tool denial, duplicate workflow start, stale lease takeover,
+  cancellation storm, oversized tool output, and invalid workflow source.
+  \item \textbf{Replay tasks}: simulator traces and selected model traces where
+  nondeterministic choices can be captured and replayed.
+\end{enumerate}
+
+\subsection{Metrics}
+
+The evaluation should report:
+
+\begin{itemize}
+  \item task success rate and patch correctness,
+  \item number of failed or blocked workflow nodes,
+  \item mean and tail latency,
+  \item token/provider cost where available,
+  \item number of tool calls and denied side-effect attempts,
+  \item trace completeness and number of observable failure records,
+  \item recovery success after restart,
+  \item duplicate-execution prevention rate under lease contention,
+  \item cancellation acknowledgement and terminal-cancellation rate,
+  \item storage overhead of traces, state records, journals, and artifacts,
+  \item developer diagnosis time in controlled debugging studies.
+\end{itemize}
+
+\subsection{Comparison Targets}
+
+The comparison should include:
+
+\begin{itemize}
+  \item \textbf{\codepilot inline mode}: baseline \rasn without RPC boundaries.
+  \item \textbf{\codepilot service mode}: full \rdsn service graph.
+  \item \textbf{OpenCode-style CLI}: representative open-source coding CLI.
+  \item \textbf{Codex-style CLI}: a modern model-centric coding CLI.
+  \item \textbf{Claude Code or similar}: commercial coding-agent CLI when
+  accessible.
+  \item \textbf{GitHub Copilot CLI-style workflow}: comparison against a
+  developer-facing Copilot command-line experience where permitted.
+\end{itemize}
+
+Because commercial systems change rapidly and may not expose all internals,
+comparisons should focus on externally observable behavior: success, latency,
+failure reporting, reproducibility support, and operator controls.
+
+\subsection{Evaluation Procedure}
+
+Each task should be run multiple times with fixed repository snapshots,
+recorded prompts, provider settings, and random seeds where possible. For
+model-dependent tasks, the evaluation should separate provider quality from
+runtime behavior by using both the simulator and real models. Experiments can
+begin with:
+
+\begin{lstlisting}[language=bash]
+codepilot eval tasks.txt
+codepilot eval external "opencode run --prompt {prompt}" tasks.txt
+codepilot eval external "codex exec {prompt}" tasks.txt
+\end{lstlisting}
+
+The harness reports per-task success, latency, output bytes, and aggregate
+failure counts. External commands are templates rather than hard-coded
+integrations because CLI syntax and access policies change quickly.
+Failure-injection
+experiments should verify that errors are surfaced at the intended component
+boundary rather than converted into misleading success-shaped responses.
+
+\section{Discussion}
+
+\subsection{Threats to Validity}
+
+\textbf{Internal validity.} Runtime improvements may appear to improve task
+success when they only improve failure visibility. Evaluation must separate
+correctness, diagnosability, and overhead. Provider variability can dominate
+results, so experiments need fixed model versions where possible.
+
+\textbf{External validity.} The first application is a coding CLI. Results may
+not directly generalize to browser agents, data-analysis agents, or long-lived
+autonomous services. However, the core runtime concerns--state, RPC boundaries,
+observability, leases, cancellation, and nondeterminism--are common across many
+agent domains.
+
+\textbf{Construct validity.} Metrics such as "diagnosability" are hard to
+measure. The evaluation should combine quantitative trace completeness with
+controlled human studies or structured debugging tasks.
+
+\textbf{Implementation validity.} The current implementation is a prototype.
+Some components are intentionally lightweight, including the curl provider,
+single-node state service, and same-process service-mode smoke. These choices
+are useful for research iteration but not sufficient for production claims.
+
+\subsection{Practicality}
+
+\rasn's practical value is strongest where operators need robust execution
+rather than only fluent interaction. Coding agents in enterprise repositories
+need audit trails, policy gates, provider configurability, checkpointing, and
+recovery. \rasn provides early versions of these capabilities while preserving a
+simple local CLI path.
+
+The main practical cost is complexity. A service graph, state service,
+workflow engine, and observability layer are heavier than a direct script that
+calls an LLM. The design therefore supports inline mode for local prototyping
+and service mode for integration and robustness testing.
+
+\subsection{Generality}
+
+\rasn is not inherently tied to coding. The generic protocol uses capabilities,
+tasks, context entries, and tool providers. Future applications could implement
+research assistants, data-analysis agents, incident-response agents, or
+multi-agent review systems. The main requirement is that application-specific
+prompts and tools remain outside the core runtime.
+
+\subsection{Extensibility}
+
+The most important extension points are:
+
+\begin{itemize}
+  \item new LLM providers,
+  \item new tool providers,
+  \item external agent descriptors in the registry,
+  \item stronger state backends,
+  \item richer policy engines,
+  \item alternative workflow optimizers,
+  \item additional observability exporters,
+  \item production deployment topologies using \rdsn URI resolution.
+\end{itemize}
+
+\subsection{Remaining Product Gaps}
+
+Table~\ref{tab:remaining-gaps} summarizes the current product limitations after
+the latest hardening round. These are no longer prototype blockers, but they are
+the main differences between the current \rasn implementation and a
+production-complete platform.
+
+\begin{table*}[t]
+\caption{Remaining product limitations after the current hardening round.}
+\label{tab:remaining-gaps}
+\centering
+\begin{tabular}{p{0.16\textwidth}p{0.38\textwidth}p{0.36\textwidth}}
+\toprule
+Area & Current capability & Remaining limitation \\
+\midrule
+State availability & Checkpoints, append-only journals, conditional writes,
+workflow leases, optional local replica mirroring, and optional \rdsn NFS import
+& No quorum-replicated or externally managed HA state backend yet \\
+Tool isolation & Default-deny side effects, workspace scoping, approvals,
+command allowlists, timeout/job containment, and a configurable container
+command wrapper & No hardened container orchestrator with image, mount,
+network, and lifecycle policy \\
+Replay fidelity & Model-response replay, matching tool-result replay,
+workflow-schedule replay, filesystem snapshots, and an
+\texttt{external.effect} ledger for side-effect intents & No full virtualization
+of arbitrary external services, clocks, network state, or process environments \\
+Deployment validation & Inline mode, typed service-mode RPC, URI/host endpoint
+configuration, registry heartbeats, and active lease cleanup & Multi-process and
+cluster deployment tests remain limited \\
+Credential storage & \texttt{token\_ref} handles for environment variables,
+files, and commands plus deterministic redaction & No vault-backed or OS-backed
+credential provider integration \\
+SDK packaging & Generated C++/TypeScript/Python contracts and RPC-client source
+& Packaged SDKs and concrete TypeScript/Python transports are not shipped \\
+Evaluation evidence & Unit tests, self-tests, service smokes, schema smokes,
+report build, and a small eval harness & Large benchmarks and user studies for
+debugging effectiveness remain future work \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\section{Related Work}
+
+\textbf{Distributed systems and service runtimes.} \rdsn is the direct
+foundation for this work. More broadly, \rasn draws on distributed-systems
+ideas including explicit service identity, typed RPC, leases, checkpointing,
+failure detectors, and observable execution. Classical work on replicated state machines, Paxos, and distributed
+snapshots~\cite{lamport1998parttime,chandy1985distributed} motivates the
+emphasis on state, ownership, and traceability, although the current prototype
+is not a replicated system.
+
+\textbf{Workflow and orchestration systems.} Workflow engines and dataflow
+systems have long exposed task graphs, retries, checkpoints, and recovery.
+\rasn applies similar ideas to agent workflows, where nodes can be model calls
+or tool calls and nondeterminism is a first-class concern.
+
+\textbf{LLM agent frameworks.} Recent systems such as ReAct, Toolformer,
+Reflexion, AutoGen, LangChain, and related frameworks demonstrate how LLMs can
+reason, call tools, coordinate multiple agents, and reflect on
+failures~\cite{yao2023react,schick2023toolformer,shinn2023reflexion,wu2023autogen,langchain}.
+\rasn is complementary: it focuses less on prompting strategy and more on the
+runtime substrate for robustness, service boundaries, state, and observability.
+
+\textbf{Coding agents.} \codepilot is inspired by command-line coding agents
+such as OpenCode~\cite{opencode}, Codex-style CLIs, Claude Code, and GitHub
+Copilot CLI-style interfaces. The distinction is that \codepilot is designed
+as a sample application over a generic service nucleus rather than as a
+standalone model-tool loop.
+
+\textbf{Observability and replay.} Debugging nondeterministic systems has a
+long history in software engineering. \rasn's current replay support is modest,
+but its event model is intended to evolve toward stronger diagnosis and replay
+tools for agent behavior.
+
+\section{Conclusion}
+
+\rasn explores a systems-oriented path toward robust AI agent platforms. By
+building on \rdsn, the prototype treats agent components as distributed
+services with explicit lifecycle, typed RPC, state, leases, cancellation,
+readiness, and observability. \codepilot demonstrates how a coding CLI can be
+implemented as an application adapter over this nucleus while keeping generic
+runtime concerns reusable. The system remains a prototype, and a rigorous
+empirical evaluation is future work. Nevertheless, the current implementation
+shows that many agent robustness concerns can be expressed as concrete runtime
+abstractions and incrementally hardened through tests, service-mode smoke
+checks, and documented invariants.
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{main}
+
+\end{document}
