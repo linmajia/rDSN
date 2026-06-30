@@ -1771,7 +1771,7 @@ int codepilot_cli::run_observe(const std::vector<std::string> &args)
 
     if (args[0] == "resilience")
     {
-        std::cout << _services.model_breaker_report();
+        std::cout << _services.model_resilience_report();
         return 0;
     }
 
@@ -2185,7 +2185,7 @@ void codepilot_cli::print_help() const
               << "  observe failures         query classified failure records\n"
               << "  observe replay <file>    load replay choices through rasn.observability\n"
               << "  observe metrics [format] dump runtime metrics (text|prometheus|json)\n"
-              << "  observe resilience       dump model circuit-breaker state\n"
+              << "  observe resilience       dump model circuit-breaker + admission-control state\n"
               << "  observe snapshot         summarize observability state\n"
               << "  skills                   list built-in skills\n"
               << "  skill <name> [task]      show or apply a skill prompt\n"

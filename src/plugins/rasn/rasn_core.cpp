@@ -852,6 +852,38 @@ void nucleus_runtime::record_model_breaker_short_circuit(const agent_task &task,
     record_event(task, "model.breaker.short_circuit", provider, breaker_state, "", "", "", false, 0);
 }
 
+void nucleus_runtime::record_model_admission_rejected(const agent_task &task,
+                                                      const std::string &provider,
+                                                      uint32_t in_flight,
+                                                      uint32_t limit)
+{
+    record_event(task,
+                 "model.admission.rejected",
+                 provider,
+                 "in_flight=" + std::to_string(in_flight) + " limit=" + std::to_string(limit),
+                 "",
+                 "",
+                 "",
+                 false,
+                 0);
+}
+
+void nucleus_runtime::record_model_admission_delayed(const agent_task &task,
+                                                     const std::string &provider,
+                                                     uint32_t in_flight,
+                                                     uint32_t delay_ms)
+{
+    record_event(task,
+                 "model.admission.delayed",
+                 provider,
+                 "in_flight=" + std::to_string(in_flight) + " delay_ms=" + std::to_string(delay_ms),
+                 "",
+                 "",
+                 "",
+                 false,
+                 0);
+}
+
 std::string nucleus_runtime::resolve_nondeterminism(const agent_task &task,
                                                     const std::string &name,
                                                     const std::string &source,

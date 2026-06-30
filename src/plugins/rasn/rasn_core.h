@@ -136,6 +136,18 @@ public:
     void record_model_breaker_short_circuit(const agent_task &task,
                                             const std::string &provider,
                                             const std::string &breaker_state);
+    // Admission-control events for an outbound dependency.
+    // record_model_admission_rejected() is emitted when the concurrency bulkhead
+    // rejects a request; record_model_admission_delayed() when graceful
+    // backpressure delays one. Both trace and increment the matching metrics.
+    void record_model_admission_rejected(const agent_task &task,
+                                         const std::string &provider,
+                                         uint32_t in_flight,
+                                         uint32_t limit);
+    void record_model_admission_delayed(const agent_task &task,
+                                        const std::string &provider,
+                                        uint32_t in_flight,
+                                        uint32_t delay_ms);
     std::string resolve_nondeterminism(const agent_task &task,
                                        const std::string &name,
                                        const std::string &source,

@@ -220,6 +220,24 @@ std::string format_model_breaker_states(const std::vector<circuit_breaker_regist
     return oss.str();
 }
 
+std::string format_model_admission_states(const std::vector<admission_gate_registry::entry> &states)
+{
+    if (states.empty())
+    {
+        return "model admission control: none engaged";
+    }
+    std::ostringstream oss;
+    oss << "model admission control:";
+    for (size_t i = 0; i < states.size(); ++i)
+    {
+        const admission_gate_registry::entry &entry = states[i];
+        oss << "\n- provider=" << entry.key << " in_flight=" << entry.in_flight
+            << " max_concurrency=" << entry.max_concurrency
+            << " soft_concurrency=" << entry.soft_concurrency;
+    }
+    return oss.str();
+}
+
 std::string descriptor_line(const std::string &label, const agent_descriptor &descriptor)
 {
     std::ostringstream oss;
@@ -322,6 +340,32 @@ breaker_config read_model_breaker_config()
     return cfg;
 }
 
+admission_config read_model_admission_config()
+{
+    admission_config cfg;
+    cfg.enabled = ::dsn_config_get_value_bool(
+        "rasn.model",
+        "admission_enabled",
+        true,
+        "enable rASN model-gateway admission control (concurrency bulkhead + backpressure)");
+    cfg.max_concurrency = static_cast<uint32_t>(::dsn_config_get_value_uint64(
+        "rasn.model",
+        "max_concurrent_requests",
+        32,
+        "hard cap on concurrent in-flight model requests per provider (0 = unlimited)"));
+    cfg.soft_concurrency = static_cast<uint32_t>(::dsn_config_get_value_uint64(
+        "rasn.model",
+        "soft_concurrent_requests",
+        16,
+        "in-flight level at which graceful admission backpressure begins (0 = no backpressure)"));
+    cfg.max_backpressure_ms = static_cast<uint32_t>(::dsn_config_get_value_uint64(
+        "rasn.model",
+        "max_backpressure_ms",
+        200,
+        "upper bound in ms on the graceful admission backpressure delay"));
+    return cfg;
+}
+
 } // namespace
 
 rasn_llm_agent_service::rasn_llm_agent_service()
@@ -400,16 +444,22 @@ void rasn_llm_agent_service::ensure_model_breaker_config()
                    [this] { _model_breakers.set_config(read_model_breaker_config()); });
 }
 
-bool rasn_llm_agent_service::model_breaker_engaged() const
+void rasn_llm_agent_service::ensure_model_admission_config()
 {
-    // Circuit breaking only matters for providers that perform network I/O and
-    // can therefore fail or hang on a remote endpoint. Providers that run
-    // entirely in this process (the deterministic simulator, the workflow
-    // service-graph bridge, and test fakes) report in_process() == true and
-    // bypass the breaker, keeping existing behavior unchanged. Note this is
-    // distinct from describe().local: loopback HTTP providers such as Ollama,
-    // llama.cpp, and LM Studio are "local" but still issue curl/HTTP requests, so
-    // they are breaker-guarded.
+    std::call_once(_model_admission_config_once,
+                   [this] { _model_admission.set_config(read_model_admission_config()); });
+}
+
+bool rasn_llm_agent_service::provider_needs_guards() const
+{
+    // Overload and failure protection only matter for providers that perform
+    // network I/O and can therefore fail, hang, or be overwhelmed at a remote
+    // endpoint. Providers that run entirely in this process (the deterministic
+    // simulator, the workflow service-graph bridge, and test fakes) report
+    // in_process() == true and bypass the breaker and admission control, keeping
+    // existing behavior unchanged. Note this is distinct from describe().local:
+    // loopback HTTP providers such as Ollama, llama.cpp, and LM Studio are
+    // "local" but still issue curl/HTTP requests, so they are guarded.
     return _provider != nullptr && !_provider->in_process();
 }
 
@@ -461,6 +511,40 @@ std::vector<circuit_breaker_registry::entry> rasn_llm_agent_service::model_break
     return _model_breakers.snapshot();
 }
 
+admission_slot rasn_llm_agent_service::model_admission_admit(const std::string &provider,
+                                                             const agent_task &task,
+                                                             nucleus_runtime &runtime,
+                                                             llm_response *fast_fail)
+{
+    ensure_model_admission_config();
+    admission_gate &gate = _model_admission.get(provider);
+    admission_slot slot = gate.try_admit();
+    if (!slot.admitted())
+    {
+        dwarn("rASN model admission control rejected request for provider=%s; concurrency limit %u reached",
+              provider.c_str(),
+              static_cast<unsigned int>(slot.limit()));
+        runtime.record_model_admission_rejected(task, provider, slot.in_flight(), slot.limit());
+        if (fast_fail != nullptr)
+        {
+            *fast_fail = rpc_error_response("model admission control rejected request for provider " + provider +
+                                            "; concurrency limit " + std::to_string(slot.limit()) + " reached");
+        }
+        return slot;
+    }
+    if (slot.delay_ms() > 0)
+    {
+        runtime.record_model_admission_delayed(task, provider, slot.in_flight(), slot.delay_ms());
+        std::this_thread::sleep_for(std::chrono::milliseconds(slot.delay_ms()));
+    }
+    return slot;
+}
+
+std::vector<admission_gate_registry::entry> rasn_llm_agent_service::model_admission_states() const
+{
+    return _model_admission.snapshot();
+}
+
 llm_response rasn_llm_agent_service::complete(const agent_completion_request &request, nucleus_runtime &runtime)
 {
     const agent_request generic_request = make_model_agent_request(request, runtime.trace_id());
@@ -486,13 +570,23 @@ llm_response rasn_llm_agent_service::complete(const agent_completion_request &re
         return response;
     }
 
-    // Guard remote providers with a circuit breaker so a failing endpoint fails
-    // fast (before the provider's own retry loop) instead of piling up latency.
+    // Guard network providers with overload + failure protection: an admission
+    // bulkhead (with graceful backpressure) keeps a healthy endpoint from being
+    // overwhelmed, and a circuit breaker fast-fails a failing endpoint before its
+    // own retry loop. Admission runs first so a request the breaker would
+    // short-circuit never wastes a breaker probe; the admission slot releases when
+    // it leaves scope, covering the whole provider call.
     const std::string provider_name = _provider->name();
-    const bool guarded = model_breaker_engaged();
+    const bool guarded = provider_needs_guards();
+    admission_slot admission;
     if (guarded)
     {
         llm_response fast_fail;
+        admission = model_admission_admit(provider_name, request.task, runtime, &fast_fail);
+        if (!admission.admitted())
+        {
+            return fast_fail;
+        }
         if (!model_breaker_admit(provider_name, request.task, runtime, &fast_fail))
         {
             return fast_fail;
@@ -542,10 +636,16 @@ llm_response rasn_llm_agent_service::complete_streaming(const agent_completion_r
     }
 
     const std::string provider_name = _provider->name();
-    const bool guarded = model_breaker_engaged();
+    const bool guarded = provider_needs_guards();
+    admission_slot admission;
     if (guarded)
     {
         llm_response fast_fail;
+        admission = model_admission_admit(provider_name, request.task, runtime, &fast_fail);
+        if (!admission.admitted())
+        {
+            return fast_fail;
+        }
         if (!model_breaker_admit(provider_name, request.task, runtime, &fast_fail))
         {
             return fast_fail;
@@ -1133,12 +1233,13 @@ void rasn_service_graph::register_ops_commands_once()
 
         ::dsn::register_command(
             "rasn.resilience",
-            "rasn.resilience - dump rASN model circuit-breaker state",
+            "rasn.resilience - dump rASN model resilience state",
             "rasn.resilience - list each model provider's circuit-breaker state "
-            "(closed|open|half_open) and consecutive failure count",
+            "(closed|open|half_open) with consecutive failure count, and its "
+            "admission-control state (in-flight vs concurrency cap)",
             [](const ::dsn::safe_vector<::dsn::safe_string> &args) -> ::dsn::safe_string {
                 (void)args;
-                const std::string out = global_rasn_services().model_breaker_report();
+                const std::string out = global_rasn_services().model_resilience_report();
                 return ::dsn::safe_string(out.c_str());
             });
         dinfo("registered rASN ops command: rasn.resilience");
@@ -1354,6 +1455,11 @@ std::string rasn_service_graph::provider_summary() const
     {
         summary += "\n" + format_model_breaker_states(breakers);
     }
+    const std::vector<admission_gate_registry::entry> admission = model_admission_states();
+    if (!admission.empty())
+    {
+        summary += "\n" + format_model_admission_states(admission);
+    }
     return summary;
 }
 
@@ -1362,9 +1468,15 @@ std::vector<circuit_breaker_registry::entry> rasn_service_graph::model_breaker_s
     return _llm_agent.model_breaker_states();
 }
 
-std::string rasn_service_graph::model_breaker_report() const
+std::vector<admission_gate_registry::entry> rasn_service_graph::model_admission_states() const
 {
-    return format_model_breaker_states(model_breaker_states());
+    return _llm_agent.model_admission_states();
+}
+
+std::string rasn_service_graph::model_resilience_report() const
+{
+    return format_model_breaker_states(model_breaker_states()) + "\n" +
+           format_model_admission_states(model_admission_states());
 }
 
 std::string rasn_service_graph::topology() const

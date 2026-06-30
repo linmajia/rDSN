@@ -2774,6 +2774,72 @@ Validation:
   available on the authoring host).
 - [ ] `rasn.unit_tests` run on the remote dev machines.
 
+## Phase 70: model gateway admission control
+
+Status: `[~]`
+
+Goal: Protect a healthy-but-slow model endpoint from overload — the counterpart to
+Phase 69's circuit breaker. A per-provider admission gate caps simultaneous
+in-flight requests (a concurrency bulkhead) and applies graceful backpressure as
+load approaches the cap, so bursts are smoothed and excess load fast-fails instead
+of deepening queues and inflating tail latency. Together with the breaker this
+closes the "no global concurrency cap or admission queue" half of the
+"overload / dependency isolation" limitation (the remaining gap being a single
+process-wide budget rather than per-provider).
+
+rDSN modules reused:
+
+- `exp_delay` (`include/dsn/utility/exp_delay.h`) as the backpressure curve — the
+  same staged-delay admission-control primitive rDSN uses to throttle its task
+  queues — so the overload policy is consistent with the host runtime rather than
+  hand-rolled.
+- `perf_counter` (`include/dsn/c/api_utilities.h`) for the two admission counters,
+  reusing the existing `metrics_registry` choke point.
+- `dsn_config` (`include/dsn/c/api_layer1.h`) for null-safe `[rasn.model]`
+  admission tunables.
+- `command_manager` (`include/dsn/tool-api/command.h`) — the admission state is
+  surfaced through the existing `rasn.resilience` command alongside the breaker.
+
+Files:
+
+- `admission_gate.h` / `admission_gate.cpp` (new)
+- `metrics.cpp`, `rasn_core.h` / `rasn_core.cpp`
+- `agent_services.h` / `agent_services.cpp`
+- `codepilot/codepilot_app.cpp`, `config.ini`
+- `tests/rasn_unit_tests.cpp`
+- `docs/DESIGN.md`, `README.md`, `docs/report/main.tex`,
+  `docs/IMPLEMENTATION_PLAN.md`
+
+Work items:
+
+- [x] Add a dependency-light `admission_gate` / `admission_gate_registry` engine: a
+  per-provider concurrency bulkhead with an RAII `admission_slot` for capacity
+  release, and an `exp_delay`-seeded backpressure delay (zero below the soft
+  threshold, growing to a configured ceiling). The header stays rDSN-free; only the
+  `.cpp` pulls in `exp_delay.h`.
+- [x] Add `rasn_model_admission_rejected_total` and
+  `rasn_model_admission_delayed_total` `perf_counter` series routed through
+  `record_event`, plus runtime `record_model_admission_*` methods.
+- [x] Wire the gate into `rasn_llm_agent_service::complete` / `complete_streaming`
+  *before* the breaker and *after* the replay check, sharing the `in_process()`
+  exemption so in-process providers and replayed runs are unaffected; release the
+  slot via RAII on every exit path including a breaker short-circuit.
+- [x] Read `[rasn.model] admission_*` once via `dsn_config`; surface live
+  per-provider in-flight depth through the `rasn.resilience` command, CodePilot
+  `observe resilience`, and `provider_summary`.
+- [x] Add unit tests covering hard-cap rejection, RAII capacity release, disabled
+  passthrough, backpressure onset/monotonicity/clamp, and registry isolation and
+  ordered snapshots; extend the ops-command test to assert the admission section.
+
+Validation:
+
+- [x] Compile-and-run the admission engine standalone (all assertions pass) and
+  `-fsyntax-only` `metrics.cpp` against the real rDSN headers; counter
+  enum/array/map alignment verified.
+- [ ] Plugin build on a supported toolchain (thrift/boost externals are not
+  available on the authoring host).
+- [ ] `rasn.unit_tests` run on the remote dev machines.
+
 ## Dependency order
 
 ```text
@@ -2846,6 +2912,7 @@ Phase 1 task model
   -> Phase 67 runtime metrics and operational command surface
   -> Phase 68 deterministic environment-input boundary
   -> Phase 69 model gateway circuit breaker
+  -> Phase 70 model gateway admission control
 ```
 
 Some phases can overlap after Phase 3, but the public message model and generic

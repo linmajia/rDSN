@@ -18,7 +18,7 @@ The prototype is intentionally small and is organized around four building block
 | rDSN service graph | `agent_services.*`, `rasn.code.definition.h` | Defines rDSN-style micro-service roles for coordinator, model agent, tool agent, state service, workflow service, observability service, and CLI gateway; service mode exposes those roles as `serverlet` RPC services with `clientlet` callers and explicit `RPC_RASN_*` task codes. |
 | Runtime nucleus | `rasn_core.*`, `observability.*`, `schema_manifest.*` | Creates task IDs, trace IDs, structured JSONL runtime events, nondeterministic value capture, external-effect ledger entries, filesystem snapshots, replay lookup, failure records, schema/IDL/JSON manifests, generated C++/TypeScript/Python RPC clients, and observability query APIs. |
 | Runtime metrics | `metrics.*` | Exports cumulative event counters and task/model/tool latency percentiles through rDSN `perf_counter` counters (section `rasn`) and renders them as text, Prometheus, or JSON; exposed via `observe metrics` and the rDSN `command_manager` command `rasn.metrics`. |
-| Resilience | `circuit_breaker.*` | Guards each model provider with a consecutive-failure circuit breaker (closed/open/half-open) so a failing endpoint fails fast; clock comes from rDSN's env provider (`dsn_now_ms`), state is exported through `perf_counter` counters and the `rasn.resilience` command, and tuned via `[rasn.model] circuit_breaker_*`. |
+| Resilience | `circuit_breaker.*`, `admission_gate.*` | Guards each model provider with a consecutive-failure circuit breaker (closed/open/half-open) so a failing endpoint fails fast, and an admission gate (concurrency bulkhead plus `exp_delay`-based backpressure) that protects a healthy-but-slow endpoint from overload; clocks/curves come from rDSN (`dsn_now_ms`, `exp_delay`), state is exported through `perf_counter` counters and the `rasn.resilience` command, and tuned via `[rasn.model] circuit_breaker_*` / admission keys. |
 | LLM provider layer | `llm_provider.*` | Provides a common `llm_provider` interface and adapters for simulator, Copilot-compatible, Ollama, llama.cpp, LM Studio, and generic OpenAI-compatible HTTP APIs. |
 | Tool provider layer | `agent_tools.*` | Defines the generic rASN tool-provider contract and registration factory used by the tool-agent service. |
 | Workflow graph | `workflow.*` | Parses a declarative task graph, validates dependencies, topologically orders nodes, and executes them through the selected provider. |
@@ -225,6 +225,33 @@ the same `record_event` choke point as every other metric via two counters
 running deployment can dump live per-provider state through the rDSN command
 `rasn.resilience`. Tuning lives under `[rasn.model] circuit_breaker_*` and
 defaults to enabled.
+
+### Resilience: model admission control
+
+A circuit breaker stops calling a *broken* endpoint; admission control keeps the
+runtime from overwhelming a *healthy* one. A model endpoint that is up but slow has
+finite useful concurrency — beyond it, adding in-flight requests only deepens
+queues and inflates tail latency. The model gateway therefore fronts each provider
+with an admission gate that combines a concurrency *bulkhead* (a hard cap of
+`max_concurrent_requests` simultaneous in-flight calls per provider; excess load is
+rejected immediately with a failed `llm_response` instead of queueing unbounded)
+with graceful *backpressure* (once in-flight load passes `soft_concurrent_requests`
+the gate applies a short, growing pre-call delay, bounded by `max_backpressure_ms`,
+to smooth bursts).
+
+The backpressure curve is not hand-rolled: it reuses rDSN's own `exp_delay`
+admission-control primitive — the same staged-delay mechanism rDSN uses to throttle
+its task queues. The gate is evaluated *before* the breaker (so a rejected request
+never perturbs breaker state) and *after* the replay check (so replayed runs stay
+deterministic), and the same `in_process()` predicate that exempts the simulator
+and test fakes from the breaker exempts them here too. With the generous defaults,
+sequential CodePilot CLI use (in-flight ≈ 1) never delays or rejects; the gate only
+engages under the concurrent fan-out of service mode. Rejections and backpressure
+delays are exported as two counters
+(`rasn_model_admission_rejected_total`, `rasn_model_admission_delayed_total`), and
+live per-provider in-flight depth shows up in `rasn.resilience`. Tuning lives under
+`[rasn.model] admission_enabled`, `max_concurrent_requests`,
+`soft_concurrent_requests`, and `max_backpressure_ms`.
 
 ### Tool calling model
 
@@ -558,6 +585,10 @@ The most important sections are:
 | `[rasn.model] circuit_breaker_enabled` | Enables the per-provider model circuit breaker (default `true`). When `false`, every model request is admitted regardless of recent failures. |
 | `[rasn.model] circuit_breaker_failure_threshold` | Consecutive model-call failures that open the breaker (default `5`). |
 | `[rasn.model] circuit_breaker_open_ms` | Cooldown in milliseconds before an open breaker admits a single half-open probe (default `30000`). Inspect live state with the `rasn.resilience` command. |
+| `[rasn.model] admission_enabled` | Enables the per-provider model admission gate (default `true`). When `false`, requests are never rejected or delayed by concurrency limits. |
+| `[rasn.model] max_concurrent_requests` | Hard cap on concurrent in-flight model requests per provider (default `32`; `0` = unlimited). Excess requests fast-fail. |
+| `[rasn.model] soft_concurrent_requests` | In-flight level at which graceful backpressure begins (default `16`; `0` = no backpressure). |
+| `[rasn.model] max_backpressure_ms` | Upper bound in milliseconds on the graceful admission backpressure delay (default `200`). Inspect live in-flight depth with the `rasn.resilience` command. |
 | `[rasn.service] host`, `<name>_host`, `<name>_port`, `<name>_uri` | rDSN service graph endpoints. `<name>_uri` takes precedence and supports resolver-backed values such as `dsn://cluster/rasn.coordinator`; otherwise rASN uses host/port. |
 | `[rasn.coordinator] max_retry_budget` | Caps per-request `retry_budget` for retryable model-agent dispatch. Tool capabilities are never retried by the coordinator. |
 | `[rasn.workflow] execution_lease_ms` | Time-to-live for durable workflow execution owner leases. Active duplicate starts are rejected until the owner finishes or the lease becomes stale. |
@@ -747,7 +778,7 @@ observe diagnose [trace] summarize failures and replay issues
 observe failures         query classified failure records
 observe replay <file>    load replay choices through rasn.observability
 observe metrics [format] dump runtime metrics (text|prometheus|json)
-observe resilience       dump model circuit-breaker state
+observe resilience       dump model circuit-breaker and admission state
 observe snapshot         summarize observability state
 skills                   list CodePilot skills
 skill <name> [task]      show or apply a skill prompt
@@ -967,7 +998,7 @@ hardening gaps remain:
 | SDK packaging | Generated C++/TypeScript/Python contracts and RPC-client source. | Packaged SDKs and concrete TypeScript/Python transports are not shipped. |
 | Evaluation evidence | Unit tests, self-tests, service smokes, schema smokes, report build, and a small eval harness. | Large benchmarks and user studies for debugging effectiveness remain future work. |
 | Observability metrics | Cumulative event counters and task/model/tool latency percentiles via rDSN `perf_counter`, exported as text/Prometheus/JSON through `observe metrics` and the `rasn.metrics` rDSN command. | No bundled scrape gateway, retention store, or prebuilt dashboards; percentiles rely on rDSN's periodic counter timers. |
-| Overload / dependency isolation | Per-provider model circuit breaker (closed/open/half-open) that fast-fails calls to a failing endpoint, surfaced through `perf_counter` counters, `observe resilience`, and the `rasn.resilience` command. | Tool and remote-agent gateways are not breaker-guarded yet; no global concurrency cap; in RPC-client mode the breaker lives on the serving node. |
+| Overload / dependency isolation | Per-provider model circuit breaker (closed/open/half-open) that fast-fails calls to a failing endpoint, plus a per-provider admission gate (concurrency bulkhead and `exp_delay`-based backpressure) that protects a healthy-but-slow endpoint from overload — both surfaced through `perf_counter` counters, `observe resilience`, and the `rasn.resilience` command. | Tool and remote-agent gateways are not breaker- or admission-guarded yet; the cap is per-provider rather than a single process-wide budget; in RPC-client mode the state lives on the serving node. |
 
 ## Troubleshooting
 

@@ -3,6 +3,7 @@
 #include "../agent_registry.h"
 #include "../agent_runtime.h"
 #include "../agent_services.h"
+#include "../admission_gate.h"
 #include "../circuit_breaker.h"
 #include "../coordinator_service.h"
 #include "../codepilot/local_tools.h"
@@ -2002,6 +2003,7 @@ TEST(rasn_circuit_breaker, ops_command_reports_breaker_state)
     ::dsn::safe_string out;
     ASSERT_TRUE(::dsn::run_command("rasn.resilience", out));
     EXPECT_NE(std::string::npos, std::string(out.c_str()).find("model circuit breakers"));
+    EXPECT_NE(std::string::npos, std::string(out.c_str()).find("model admission control"));
 
     services.release();
 }
@@ -2024,6 +2026,112 @@ TEST(rasn_circuit_breaker, network_providers_are_breaker_guarded)
 
     // Remote providers are guarded too.
     EXPECT_FALSE(create_provider("copilot")->in_process());
+}
+
+TEST(rasn_admission_gate, bulkhead_rejects_over_concurrency_cap)
+{
+    admission_config cfg;
+    cfg.enabled = true;
+    cfg.max_concurrency = 3;
+    cfg.soft_concurrency = 0; // backpressure off; isolate the hard cap
+    admission_gate gate(cfg);
+
+    admission_slot s1 = gate.try_admit();
+    admission_slot s2 = gate.try_admit();
+    admission_slot s3 = gate.try_admit();
+    EXPECT_TRUE(s1.admitted());
+    EXPECT_TRUE(s2.admitted());
+    EXPECT_TRUE(s3.admitted());
+    EXPECT_EQ(3u, gate.in_flight());
+
+    admission_slot s4 = gate.try_admit();
+    EXPECT_FALSE(s4.admitted());
+    EXPECT_EQ(3u, s4.limit());
+    EXPECT_EQ(3u, gate.in_flight()); // rejection reserves nothing
+}
+
+TEST(rasn_admission_gate, releasing_a_slot_restores_capacity)
+{
+    admission_config cfg;
+    cfg.max_concurrency = 1;
+    cfg.soft_concurrency = 0;
+    admission_gate gate(cfg);
+
+    {
+        admission_slot held = gate.try_admit();
+        ASSERT_TRUE(held.admitted());
+        EXPECT_EQ(1u, gate.in_flight());
+        EXPECT_FALSE(gate.try_admit().admitted()); // at cap
+    }
+    // The RAII slot released on scope exit, so capacity is available again.
+    EXPECT_EQ(0u, gate.in_flight());
+    admission_slot again = gate.try_admit();
+    EXPECT_TRUE(again.admitted());
+}
+
+TEST(rasn_admission_gate, backpressure_is_zero_below_soft_then_grows_and_clamps)
+{
+    admission_config cfg;
+    cfg.enabled = true;
+    cfg.max_concurrency = 10;
+    cfg.soft_concurrency = 2;
+    cfg.max_backpressure_ms = 200;
+    admission_gate gate(cfg);
+
+    std::vector<admission_slot> held;
+    admission_slot first = gate.try_admit(); // in_flight 1 < soft
+    EXPECT_TRUE(first.admitted());
+    EXPECT_EQ(0u, first.delay_ms());
+    held.push_back(std::move(first));
+
+    admission_slot at_soft = gate.try_admit(); // in_flight 2 == soft
+    const uint32_t delay_at_soft = at_soft.delay_ms();
+    held.push_back(std::move(at_soft));
+
+    admission_slot above_soft = gate.try_admit(); // in_flight 3 > soft
+    const uint32_t delay_above_soft = above_soft.delay_ms();
+    held.push_back(std::move(above_soft));
+
+    EXPECT_GE(delay_above_soft, delay_at_soft); // delay grows with load
+    EXPECT_LE(delay_above_soft, 200u);          // clamped to max_backpressure_ms
+}
+
+TEST(rasn_admission_gate, disabled_gate_is_passthrough)
+{
+    admission_config cfg;
+    cfg.enabled = false;
+    cfg.max_concurrency = 1;
+    admission_gate gate(cfg);
+
+    admission_slot s1 = gate.try_admit();
+    admission_slot s2 = gate.try_admit();
+    EXPECT_TRUE(s1.admitted());
+    EXPECT_TRUE(s2.admitted());   // cap not enforced when disabled
+    EXPECT_EQ(0u, gate.in_flight()); // passthrough reserves no capacity
+}
+
+TEST(rasn_admission_gate, registry_isolates_gates_per_key)
+{
+    admission_config cfg;
+    cfg.max_concurrency = 5;
+    cfg.soft_concurrency = 3;
+    admission_gate_registry registry(cfg);
+
+    admission_slot a = registry.get("ollama").try_admit();
+    admission_slot b = registry.get("copilot").try_admit();
+    ASSERT_TRUE(a.admitted());
+    ASSERT_TRUE(b.admitted());
+
+    std::vector<admission_gate_registry::entry> snapshot = registry.snapshot();
+    ASSERT_EQ(2u, snapshot.size());
+    EXPECT_EQ("copilot", snapshot[0].key); // ordered by key
+    EXPECT_EQ("ollama", snapshot[1].key);
+    for (const admission_gate_registry::entry &entry : snapshot)
+    {
+        EXPECT_EQ(1u, entry.in_flight);
+        EXPECT_EQ(5u, entry.max_concurrency);
+        EXPECT_EQ(3u, entry.soft_concurrency);
+    }
 }
 
 } // namespace

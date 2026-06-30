@@ -3,6 +3,7 @@
 #include "agent_messages.h"
 #include "agent_runtime.h"
 #include "agent_tools.h"
+#include "admission_gate.h"
 #include "circuit_breaker.h"
 #include "llm_provider.h"
 #include "metrics.h"
@@ -45,10 +46,17 @@ public:
     // commands and the model gateway summary).
     std::vector<circuit_breaker_registry::entry> model_breaker_states() const;
 
+    // Point-in-time view of every model-provider admission gate (for ops
+    // commands and the model gateway summary).
+    std::vector<admission_gate_registry::entry> model_admission_states() const;
+
 private:
     // Lazily load [rasn.model] circuit-breaker tunables (config reads are
     // null-safe and return defaults before rDSN config is loaded).
     void ensure_model_breaker_config();
+    // Lazily load [rasn.model] admission-control tunables (null-safe; defaults
+    // before rDSN config is loaded).
+    void ensure_model_admission_config();
     // Returns false and fills *fast_fail when the breaker for the active provider
     // is open and the request must be short-circuited without calling out.
     bool model_breaker_admit(const std::string &provider,
@@ -60,12 +68,24 @@ private:
                               const agent_task &task,
                               nucleus_runtime &runtime,
                               bool ok);
-    // True when the active provider should be guarded by a breaker (remote only).
-    bool model_breaker_engaged() const;
+    // Acquire an admission slot for the active provider. The returned slot
+    // reserves capacity until destroyed; on rejection slot.admitted() is false
+    // and *fast_fail is filled. Records rejection/backpressure metrics and
+    // applies the backpressure delay before returning an admitted slot.
+    admission_slot model_admission_admit(const std::string &provider,
+                                         const agent_task &task,
+                                         nucleus_runtime &runtime,
+                                         llm_response *fast_fail);
+    // True when the active provider should be guarded by overload/failure
+    // protection (network-backed providers only; in-process providers are
+    // exempt). Shared by the circuit breaker and admission control.
+    bool provider_needs_guards() const;
 
     std::unique_ptr<llm_provider> _provider;
     circuit_breaker_registry _model_breakers;
     std::once_flag _model_breaker_config_once;
+    admission_gate_registry _model_admission;
+    std::once_flag _model_admission_config_once;
 };
 
 class rasn_tool_agent_service : public agent_runtime
@@ -133,9 +153,12 @@ public:
     std::string provider_summary() const;
     // Per-provider model circuit-breaker states (for ops commands / summaries).
     std::vector<circuit_breaker_registry::entry> model_breaker_states() const;
-    // Human-readable per-provider circuit-breaker report (shared by the
-    // `rasn.resilience` command and CodePilot's `observe resilience`).
-    std::string model_breaker_report() const;
+    // Per-provider model admission-control states (for ops commands / summaries).
+    std::vector<admission_gate_registry::entry> model_admission_states() const;
+    // Human-readable per-provider resilience report covering circuit breakers and
+    // admission control (shared by the `rasn.resilience` command and CodePilot's
+    // `observe resilience`).
+    std::string model_resilience_report() const;
     std::string topology() const;
     std::string tools_summary() const;
     void set_tool_provider(std::unique_ptr<agent_tool_provider> tools);

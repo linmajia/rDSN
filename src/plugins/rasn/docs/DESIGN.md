@@ -685,6 +685,58 @@ rDSN design:
   dumps each provider's live breaker state next to the existing `rasn.metrics`
   command.
 
+### 12.3 Model admission control
+
+The circuit breaker stops calling a *broken* dependency; admission control keeps
+the runtime from overwhelming a *healthy* one. A model endpoint that is up but
+slow has a finite amount of useful concurrency: past that point, piling on more
+in-flight requests only deepens queues, inflates tail latency, and can tip a
+healthy provider into failure (at which point the breaker takes over). rASN
+therefore fronts each model provider with an admission gate — a concurrency
+bulkhead plus graceful backpressure — that sits beside the breaker on the same
+gateway.
+
+Responsibilities:
+
+- Cap the number of simultaneous in-flight requests per provider (a *bulkhead*).
+  Requests beyond the hard cap are rejected immediately with a normal
+  `llm_response{ok=false}`, so excess load fails fast instead of queueing without
+  bound.
+- As in-flight load climbs past a soft threshold (but below the hard cap), apply a
+  short, growing *backpressure* delay before the call, smoothing bursts so the
+  provider sees a steadier arrival rate rather than a thundering herd.
+- Account every admitted request with an RAII *slot* so capacity is released on
+  every exit path — success, provider failure, exception, or an early breaker
+  short-circuit.
+
+rDSN design:
+
+- The admission engine (`admission_gate` / `admission_gate_registry`) is
+  dependency-light like the breaker and `metrics.h`. The backpressure curve is not
+  hand-rolled: it reuses rDSN's own `exp_delay` admission-control primitive
+  (`include/dsn/utility/exp_delay.h`) — the same staged-delay mechanism rDSN uses
+  to throttle its task queues — seeded so the delay ramps from zero at the soft
+  threshold up to a configured ceiling. This keeps the overload policy consistent
+  with the host runtime instead of inventing a parallel one.
+- It is wired into `rasn_llm_agent_service` alongside the breaker, and the gate is
+  evaluated *before* the breaker. Ordering matters: admitting first means a
+  rejected request never perturbs breaker state, and a request the breaker later
+  short-circuits still releases its admission slot through the RAII guard. Both
+  gates sit *after* the replay check, so replayed runs bypass admission entirely
+  and stay deterministic.
+- The same `in_process()` predicate that exempts the simulator and other
+  no-network providers from the breaker also exempts them from admission control,
+  so single-agent CLI runs and deterministic tests are unaffected. With the default
+  generous cap, sequential CodePilot usage (in-flight ≈ 1) never delays or rejects;
+  the gate only engages under the concurrent fan-out of service mode.
+- Two `perf_counter` series — `rasn_model_admission_rejected_total` and
+  `rasn_model_admission_delayed_total` — flow through the same `record_event`
+  choke point as every other metric. Live per-provider in-flight depth and limits
+  are surfaced in the `rasn.resilience` command and the model provider summary.
+- `[rasn.model] admission_enabled`, `max_concurrent_requests`,
+  `soft_concurrent_requests`, and `max_backpressure_ms` are read once through
+  `dsn_config` with null-safe defaults.
+
 ### 13. Service-mode integration self-test
 
 The service-mode integration layer turns rASN correctness assumptions into a
@@ -962,8 +1014,11 @@ remaining limitations are:
   store, or prebuilt dashboards, and latency percentiles depend on rDSN's
   periodic counter timers.
 - **Overload and dependency isolation:** the model gateway has a per-provider
-  circuit breaker that fast-fails calls to a failing endpoint, surfaced through
-  `perf_counter` metrics and the `rasn.resilience` command. Tool and
-  remote-agent gateways are not yet breaker-guarded, there is no global
-  concurrency cap or admission queue, and in RPC-client mode the breaker state
-  lives on the serving node rather than the client.
+  circuit breaker that fast-fails calls to a failing endpoint and a per-provider
+  admission gate (concurrency bulkhead plus `exp_delay`-based backpressure) that
+  protects a healthy-but-slow endpoint from overload, both surfaced through
+  `perf_counter` metrics and the `rasn.resilience` command. Remaining gaps: the
+  tool and remote-agent gateways are not yet breaker- or admission-guarded; the
+  cap is per-provider rather than a single process-wide concurrency budget; and in
+  RPC-client mode the breaker and admission state live on the serving node rather
+  than the client.
