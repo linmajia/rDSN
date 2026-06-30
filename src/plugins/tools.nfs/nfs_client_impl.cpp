@@ -93,6 +93,22 @@ namespace dsn {
                 return;
             }
 
+            // size_list and file_list are parallel arrays in the (remote, untrusted)
+            // response, but the loop below iterates size_list while indexing file_list.
+            // A malformed or corrupted response with mismatched lengths would otherwise
+            // read file_list out of bounds. Validate the lengths match and fail the
+            // request through the existing nfs_task error channel.
+            if (resp.size_list.size() != resp.file_list.size())
+            {
+                derror("invalid get file size response: size_list (%d) and file_list (%d) "
+                       "have mismatched lengths",
+                       (int)resp.size_list.size(),
+                       (int)resp.file_list.size());
+                ureq->nfs_task->enqueue(ERR_INVALID_DATA, 0);
+                delete ureq;
+                return;
+            }
+
             for (size_t i = 0; i < resp.size_list.size(); i++) // file list
             {
                 file_context *filec;
@@ -234,7 +250,28 @@ namespace dsn {
                 handle_completion(reqc->file_ctx->user_req, err);
                 return;
             }
-            
+
+            // response.size and response.file_content are independent fields filled in by the
+            // (untrusted) remote server. The local write issues
+            // file::write(response.file_content.data(), response.size, ...), so a response whose
+            // declared size is negative or larger than the actual file_content buffer would make
+            // that write read past the end of the buffer -- corrupting the destination file with
+            // adjacent heap memory (and disclosing it into the replicated data) or crashing. This
+            // is the client-side counterpart of the size validation on_copy already performs on
+            // the request. A zero size is legal (empty-file segment) and is handled specially in
+            // continue_write. On the honest path file_content is the full block buffer and size is
+            // the valid prefix, so size <= file_content.length() always holds.
+            if (resp.size < 0 || static_cast<uint64_t>(resp.size) > resp.file_content.length())
+            {
+                derror("nfs: invalid copy response for file %s: declared size %d exceeds "
+                       "content buffer length %u",
+                       reqc->file_ctx->file_name.c_str(),
+                       resp.size,
+                       (uint32_t)resp.file_content.length());
+                handle_completion(reqc->file_ctx->user_req, ERR_INVALID_DATA);
+                return;
+            }
+
             reqc->response = resp;
             reqc->response.error.end_tracking(); // always ERR_OK
             reqc->is_ready_for_write = true;
@@ -279,82 +316,121 @@ namespace dsn {
                 return;
             }
 
-            // get write
-            dsn::ref_ptr<copy_request_ex> reqc;
+            // Loop rather than recurse on per-file failures: a persistent error
+            // (e.g. a full disk that fails every transfer) would otherwise make
+            // continue_write() invoke itself once per failed request and could
+            // grow the call stack without bound.
             while (true)
             {
+                // get write
+                dsn::ref_ptr<copy_request_ex> reqc;
+                while (true)
                 {
-                    zauto_lock l(_local_writes_lock);
-                    if (!_local_writes.empty())
                     {
-                        reqc = _local_writes.front();
-                        _local_writes.pop();
+                        zauto_lock l(_local_writes_lock);
+                        if (!_local_writes.empty())
+                        {
+                            reqc = _local_writes.front();
+                            _local_writes.pop();
+                        }
+                        else
+                        {
+                            reqc = nullptr;
+                            break;
+                        }
                     }
-                    else
+
                     {
-                        reqc = nullptr;
-                        break;
-                    }   
+                        zauto_lock l(reqc->lock);
+                        if (reqc->is_valid)
+                            break;
+                    }
+                }
+
+                if (nullptr == reqc)
+                {
+                    --_concurrent_local_write_count;
+                    return;
+                }
+
+                // real write
+                std::string file_path = dsn::utils::filesystem::path_combine(reqc->copy_req.dst_dir, reqc->file_ctx->file_name);
+                std::string path = dsn::utils::filesystem::remove_file_name(file_path.c_str());
+                if (!dsn::utils::filesystem::create_directory(path))
+                {
+                    derror("create directory %s failed", path.c_str());
+                    error_code err = ERR_FILE_OPERATION_FAILED;
+                    handle_completion(reqc->file_ctx->user_req, err);
+                    continue;
+                }
+
+                dsn_handle_t hfile = reqc->file_ctx->file.load();
+                if (!hfile)
+                {
+                    zauto_lock l(reqc->file_ctx->user_req->user_req_lock);
+                    hfile = reqc->file_ctx->file.load();
+                    if (!hfile)
+                    {
+                        hfile = dsn_file_open(file_path.c_str(), O_RDWR | O_CREAT | O_BINARY, 0666);
+                        reqc->file_ctx->file = hfile;
+                    }
+                }
+
+                if (!hfile)
+                {
+                    derror("file open %s failed", file_path.c_str());
+                    error_code err = ERR_FILE_OPERATION_FAILED;
+                    handle_completion(reqc->file_ctx->user_req, err);
+                    continue;
+                }
+
+                // An empty source file yields a copy request with response.size == 0. The
+                // destination file has just been created (or already exists) via the
+                // O_RDWR | O_CREAT open above, so there is nothing to write: a zero-length
+                // file::write would complete with ERR_HANDLE_EOF and be reported as a
+                // failure. Finalize this segment as a success inline -- mirroring the
+                // success bookkeeping in local_write_callback -- and continue the loop
+                // (no recursion) instead of issuing the zero-length write.
+                if (reqc->response.size == 0)
+                {
+                    reqc->response.file_content = blob();
+
+                    bool completed = false;
+                    {
+                        zauto_lock l(reqc->file_ctx->user_req->user_req_lock);
+                        if (++reqc->file_ctx->finished_segments == (int)reqc->file_ctx->copy_requests.size())
+                        {
+                            if (++reqc->file_ctx->user_req->finished_files == (int)reqc->file_ctx->user_req->file_context_map.size())
+                            {
+                                completed = true;
+                            }
+                        }
+                    }
+
+                    if (completed)
+                    {
+                        handle_completion(reqc->file_ctx->user_req, ERR_OK);
+                    }
+                    continue;
                 }
 
                 {
                     zauto_lock l(reqc->lock);
-                    if (reqc->is_valid)
-                        break;
+                    auto& reqc_save = *reqc.get();
+                    reqc_save.local_write_task = file::write(
+                        hfile,
+                        reqc_save.response.file_content.data(),
+                        reqc_save.response.size,
+                        reqc_save.response.offset,
+                        LPC_NFS_WRITE,
+                        this,
+                        [this, reqc_cap = std::move(reqc)] (error_code err, int sz)
+                        {
+                            local_write_callback(err, sz, std::move(reqc_cap));
+                        }
+                    );
                 }
-            }
-
-            if (nullptr == reqc)
-            {
-                --_concurrent_local_write_count;
                 return;
-            }   
-
-            // real write
-            std::string file_path = dsn::utils::filesystem::path_combine(reqc->copy_req.dst_dir, reqc->file_ctx->file_name);
-            std::string path = dsn::utils::filesystem::remove_file_name(file_path.c_str());
-            if (!dsn::utils::filesystem::create_directory(path))
-            {
-                dassert(false, "Fail to create directory %s.", path.c_str());
-            }
-
-            dsn_handle_t hfile = reqc->file_ctx->file.load();
-            if (!hfile)
-            {
-                zauto_lock l(reqc->file_ctx->user_req->user_req_lock);
-                hfile = reqc->file_ctx->file.load();
-                if (!hfile)
-                {
-                    hfile = dsn_file_open(file_path.c_str(), O_RDWR | O_CREAT | O_BINARY, 0666);
-                    reqc->file_ctx->file = hfile;
-                }
-            }
-
-            if (!hfile)
-            {
-                derror("file open %s failed", file_path.c_str());
-                error_code err = ERR_FILE_OPERATION_FAILED;
-                handle_completion(reqc->file_ctx->user_req, err);
-                --_concurrent_local_write_count;
-                continue_write();
-                return;
-            }
-
-            {
-                zauto_lock l(reqc->lock);
-                auto& reqc_save = *reqc.get();
-                reqc_save.local_write_task = file::write(
-                    hfile,
-                    reqc_save.response.file_content.data(),
-                    reqc_save.response.size,
-                    reqc_save.response.offset,
-                    LPC_NFS_WRITE,
-                    this,
-                    [this, reqc_cap = std::move(reqc)] (error_code err, int sz)
-                    {
-                        local_write_callback(err, sz, std::move(reqc_cap));
-                    }
-                );
             }
         }
 
@@ -443,7 +519,10 @@ namespace dsn {
                 if (f.second->file)
                 {
                     auto err2 = dsn_file_close(f.second->file);
-                    dassert(err2 == ERR_OK, "dsn_file_close failed, err = %s", dsn_error_to_string(err2)); 
+                    if (err2 != ERR_OK)
+                    {
+                        dwarn("dsn_file_close failed, err = %s", dsn_error_to_string(err2));
+                    }
 
                     f.second->file = nullptr;
 

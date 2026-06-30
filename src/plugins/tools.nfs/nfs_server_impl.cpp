@@ -44,14 +44,33 @@ namespace dsn {
             //dinfo(">>> on call RPC_COPY end, exec RPC_NFS_COPY");
 
             // request.size is supplied by the (untrusted) client but the read below targets a
-            // buffer of exactly nfs_copy_block_bytes. Reject out-of-range sizes to avoid a heap
-            // buffer overflow when reading the file content into the fixed-size block buffer.
-            if (request.size <= 0 || static_cast<uint32_t>(request.size) > _opts.nfs_copy_block_bytes)
+            // buffer of exactly nfs_copy_block_bytes. Reject negative or oversized lengths to
+            // avoid a heap buffer overflow when reading the file content into the fixed-size
+            // block buffer. A zero length is legal and must be preserved: an empty source file
+            // produces a single zero-byte copy request, which has to succeed so the destination
+            // empty file still gets created (otherwise one empty file fails the whole transfer).
+            if (request.size < 0 || static_cast<uint32_t>(request.size) > _opts.nfs_copy_block_bytes)
             {
-                derror("nfs: invalid copy request size %d (allowed range is (0, %u]) for file %s",
+                derror("nfs: invalid copy request size %d (allowed range is [0, %u]) for file %s",
                     request.size, _opts.nfs_copy_block_bytes, request.file_name.c_str());
                 ::dsn::service::copy_response resp;
                 resp.error = ERR_INVALID_PARAMETERS;
+                reply(resp);
+                return;
+            }
+
+            // An empty source file produces exactly one zero-byte copy request. A
+            // zero-length file::read completes with ERR_HANDLE_EOF (not ERR_OK), which the
+            // client treats as a copy failure, so the destination empty file would never
+            // be created and one empty file would fail the whole transfer. There is no
+            // content to ship, so reply success directly without opening or reading the
+            // file; the client creates the empty destination on its own O_CREAT open.
+            if (request.size == 0)
+            {
+                ::dsn::service::copy_response resp;
+                resp.error = ERR_OK;
+                resp.offset = request.offset;
+                resp.size = 0;
                 reply(resp);
                 return;
             }
@@ -134,6 +153,21 @@ namespace dsn {
                 }
             }
 
+            // A short read (ERR_OK but fewer bytes than requested) means the source file
+            // no longer holds the full requested range -- it was truncated, raced with a
+            // writer, or is corrupt. cp.bb is allocated with make_shared_array<char>, i.e.
+            // uninitialized heap, and is sent in full with resp.size = cp.size (the
+            // requested size). Reporting success here would make the client write cp.size
+            // bytes whose tail [sz, cp.size) was never filled by the read, corrupting the
+            // destination file and disclosing uninitialized heap memory into the replicated
+            // data. Fail this copy block through the existing response error channel instead.
+            if (err == ERR_OK && sz != cp.size)
+            {
+                derror("nfs: short read on file %s at offset %" PRId64 ": read %u of %u bytes",
+                    cp.file_path.c_str(), cp.offset, (uint32_t)sz, (uint32_t)cp.size);
+                err = ERR_FILE_OPERATION_FAILED;
+            }
+
             ::dsn::service::copy_response resp;
             resp.error = err;
             resp.file_content = cp.bb;
@@ -173,7 +207,23 @@ namespace dsn {
                             int64_t sz;
                             if (!dsn::utils::filesystem::file_size(fpath, sz))
                             {
-                                dassert(false, "Fail to get file size of %s.", fpath.c_str());
+                                derror("get file size of %s failed", fpath.c_str());
+                                err = ERR_FILE_OPERATION_FAILED;
+                                break;
+                            }
+
+                            // fpath is built from the normalized source folder, while the
+                            // strip length below uses the raw (untrusted) request.source_dir.
+                            // A non-normalized source_dir (e.g. redundant or trailing '/')
+                            // from the peer can be longer than the normalized fpath, which
+                            // would make substr() throw std::out_of_range and abort the
+                            // server. Reject such a request instead of crashing.
+                            if (request.source_dir.length() > fpath.length())
+                            {
+                                derror("invalid source_dir(%s) does not prefix file(%s)",
+                                       request.source_dir.c_str(), fpath.c_str());
+                                err = ERR_INVALID_PARAMETERS;
+                                break;
                             }
 
                             resp.size_list.push_back((uint64_t)sz);
@@ -201,6 +251,18 @@ namespace dsn {
                     // Done
                     uint64_t size = st.st_size;
 
+                    // path_combine normalizes file_path, which may be shorter than the
+                    // raw (untrusted) request.source_dir; using source_dir.length() as the
+                    // substr position would throw std::out_of_range and abort the server on
+                    // a non-normalized source_dir from the peer. Reject it instead.
+                    if (request.source_dir.length() > file_path.length())
+                    {
+                        derror("invalid source_dir(%s) does not prefix file(%s)",
+                               request.source_dir.c_str(), file_path.c_str());
+                        err = ERR_INVALID_PARAMETERS;
+                        break;
+                    }
+
                     resp.size_list.push_back(size);
                     resp.file_list.push_back(file_path.substr(request.source_dir.length()));
                 }
@@ -222,11 +284,18 @@ namespace dsn {
                 if (fptr->file_access_count == 0 
                     && dsn_now_ms() - fptr->last_access_time > (uint64_t)_opts.file_close_expire_time_ms)
                 {
-                    dinfo("nfs: close file handle %s", it->first.c_str());
+                    std::string file_name = it->first;
+                    dinfo("nfs: close file handle %s", file_name.c_str());
                     it = _handles_map.erase(it);
 
                     ::dsn::error_code err = dsn_file_close(fptr->file_handle);
-                    dassert(err == ERR_OK, "dsn_file_close failed, err = %s", err.to_string());
+                    if (err != ERR_OK)
+                    {
+                        dwarn("nfs: close file handle %s failed, err = %s",
+                              file_name.c_str(),
+                              err.to_string());
+                    }
+
                     delete fptr;
                 }
                 else
