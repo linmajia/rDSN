@@ -216,12 +216,15 @@ success or reopening on failure. Short-circuited calls return a normal failed
 
 The breaker engine takes its clock from `::dsn_now_ms()` (routed through rDSN's
 pluggable environment provider), so it is deterministic under replay; replayed
-runs and local/simulator providers bypass it entirely, leaving existing behavior
-unchanged. Breaker activity flows through the same `record_event` choke point as
-every other metric via two counters (`rasn_model_breaker_open_total`,
-`rasn_model_breaker_short_circuit_total`), and a running deployment can dump live
-per-provider state through the rDSN command `rasn.resilience`. Tuning lives under
-`[rasn.model] circuit_breaker_*` and defaults to enabled.
+runs and in-process providers (the simulator, the workflow service-graph bridge,
+and test fakes) bypass it entirely, leaving existing behavior unchanged. Network
+providers are guarded even when their endpoint is loopback (Ollama, llama.cpp, LM
+Studio), since they still issue HTTP that can hang. Breaker activity flows through
+the same `record_event` choke point as every other metric via two counters
+(`rasn_model_breaker_open_total`, `rasn_model_breaker_short_circuit_total`), and a
+running deployment can dump live per-provider state through the rDSN command
+`rasn.resilience`. Tuning lives under `[rasn.model] circuit_breaker_*` and
+defaults to enabled.
 
 ### Tool calling model
 

@@ -402,11 +402,15 @@ void rasn_llm_agent_service::ensure_model_breaker_config()
 
 bool rasn_llm_agent_service::model_breaker_engaged() const
 {
-    // Circuit breaking only matters for remote providers whose endpoints can
-    // fail or hang. Local/in-process providers (such as the deterministic
-    // simulator) never trip a breaker, so they bypass it entirely and keep
-    // existing behavior unchanged.
-    return _provider != nullptr && !_provider->describe().local;
+    // Circuit breaking only matters for providers that perform network I/O and
+    // can therefore fail or hang on a remote endpoint. Providers that run
+    // entirely in this process (the deterministic simulator, the workflow
+    // service-graph bridge, and test fakes) report in_process() == true and
+    // bypass the breaker, keeping existing behavior unchanged. Note this is
+    // distinct from describe().local: loopback HTTP providers such as Ollama,
+    // llama.cpp, and LM Studio are "local" but still issue curl/HTTP requests, so
+    // they are breaker-guarded.
+    return _provider != nullptr && !_provider->in_process();
 }
 
 bool rasn_llm_agent_service::model_breaker_admit(const std::string &provider,
@@ -1592,16 +1596,23 @@ tool_result rasn_service_graph::run_tool(const std::string &name,
         std::tie(err, response) = client.invoke_sync(generic_request, request_rpc_timeout(generic_request));
         if (err != ::dsn::ERR_OK)
         {
-            // The RPC failed in transport/routing before reaching the tool agent,
-            // so rasn_tool_agent_service::run_tool() never recorded a latency
-            // sample for it. Record the failed-call latency here so the metric
-            // also covers RPC failures that never reach the agent. The success
-            // path is intentionally not recorded here -- it reaches the tool
-            // agent, which records it, and double-counting would skew the
-            // percentiles.
-            const uint64_t rpc_now_ms = ::dsn_now_ms();
-            metrics_registry::instance().observe_tool_latency_ms(rpc_now_ms >= rpc_start_ms ? rpc_now_ms - rpc_start_ms
-                                                                                            : 0);
+            // A failed RPC that never reached the tool agent produced no
+            // rasn_tool_latency_ms sample (the server-side
+            // rasn_tool_agent_service::run_tool() records that), so record the
+            // failed-call latency here to cover pre-dispatch failures such as a
+            // missing/unroutable coordinator. We deliberately skip ambiguous
+            // dispatch errors (timeout / network failure): there the server may
+            // have executed the tool and already recorded its own latency sample,
+            // so recording again would double-count and skew the percentiles. The
+            // success path is likewise not recorded here -- it reaches the tool
+            // agent, which records it.
+            const bool ambiguous_dispatch = (err == ::dsn::ERR_TIMEOUT || err == ::dsn::ERR_NETWORK_FAILURE);
+            if (!ambiguous_dispatch)
+            {
+                const uint64_t rpc_now_ms = ::dsn_now_ms();
+                metrics_registry::instance().observe_tool_latency_ms(
+                    rpc_now_ms >= rpc_start_ms ? rpc_now_ms - rpc_start_ms : 0);
+            }
             result = rpc_error_tool_result(std::string("RPC_RASN_AGENT_INVOKE coordinator failed: ") + err.to_string());
         }
         else
@@ -1615,9 +1626,10 @@ tool_result rasn_service_graph::run_tool(const std::string &name,
     }
     // On the success and in-process paths, tool latency is recorded in
     // rasn_tool_agent_service::run_tool(), the point where this facade, the
-    // CodePilot CLI path, and the RPC server path all converge. The only case
-    // that does not reach that method is an RPC-client transport/routing failure,
-    // which is recorded explicitly above.
+    // CodePilot CLI path, and the RPC server path all converge. Only an
+    // unambiguous pre-dispatch RPC failure is recorded at this facade (above);
+    // ambiguous timeouts/network failures are left to the server-side recorder to
+    // avoid double-counting.
     return result;
 }
 

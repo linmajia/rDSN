@@ -2006,6 +2006,26 @@ TEST(rasn_circuit_breaker, ops_command_reports_breaker_state)
     services.release();
 }
 
+TEST(rasn_circuit_breaker, network_providers_are_breaker_guarded)
+{
+    // In-process providers (simulator) must be exempt from the breaker.
+    EXPECT_TRUE(create_provider("simulator")->in_process());
+
+    // Loopback HTTP providers are marked local in their descriptor but still
+    // issue curl/HTTP requests, so they must NOT be exempt -- this is the exact
+    // regression: "local" must not imply breaker-exempt.
+    const char *loopback_http_providers[] = {"ollama", "llamacpp", "lmstudio"};
+    for (const char *provider : loopback_http_providers)
+    {
+        std::unique_ptr<llm_provider> instance = create_provider(provider);
+        EXPECT_TRUE(instance->describe().local) << "provider " << provider << " expected to be local";
+        EXPECT_FALSE(instance->in_process()) << "provider " << provider << " should be breaker-guarded";
+    }
+
+    // Remote providers are guarded too.
+    EXPECT_FALSE(create_provider("copilot")->in_process());
+}
+
 } // namespace
 } // namespace rasn
 } // namespace dsn

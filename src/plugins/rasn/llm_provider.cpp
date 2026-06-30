@@ -669,6 +669,7 @@ public:
 
     std::string name() const override { return _provider_name; }
     std::string model() const override { return _model; }
+    bool in_process() const override { return false; }
     model_provider_descriptor describe() const override
     {
         model_provider_descriptor descriptor;

@@ -669,9 +669,12 @@ rDSN design:
   `complete_streaming()` converge on the provider call. The gate sits *after* the
   replay check and *before* the provider, so replayed runs bypass it entirely and
   the provider's own retry loop is skipped when the breaker is open.
-- Local/in-process providers (the deterministic simulator) report
-  `describe().local == true` and bypass the breaker, so simulator-backed runs and
-  tests keep their existing behavior.
+- In-process providers that perform no network I/O (the deterministic simulator,
+  the workflow service-graph bridge, and test fakes) report `in_process() == true`
+  and bypass the breaker, so those runs and tests keep their existing behavior.
+  This is deliberately distinct from `describe().local`: loopback HTTP providers
+  such as Ollama, llama.cpp, and LM Studio are "local" but still issue curl/HTTP
+  requests to an endpoint that can hang or fail, so they are breaker-guarded.
 - Two `perf_counter` series — `rasn_model_breaker_open_total` and
   `rasn_model_breaker_short_circuit_total` — flow through the same
   `record_event` choke point as every other metric, so breaker activity shows up

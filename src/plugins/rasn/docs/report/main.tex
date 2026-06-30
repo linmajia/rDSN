@@ -1117,7 +1117,10 @@ reopens it. The breaker fast-fails a call to a dead or hanging endpoint
 \emph{before} the provider's own retry loop, so latency and budget are not wasted
 on it. It draws its clock from \texttt{dsn\_now\_ms} (the same pluggable
 \texttt{env\_provider} used elsewhere), so breaker timing is deterministic under
-replay and replayed runs and local/simulator providers bypass it entirely.
+replay and replayed runs and in-process providers (the simulator and other
+providers that perform no network I/O) bypass it entirely, while network-backed
+providers are guarded even when their endpoint is loopback (Ollama, llama.cpp, LM
+Studio).
 Breaker activity flows through the same \texttt{record\_event} choke point as
 every other metric, and live per-provider state is reachable through \codepilot's
 \texttt{observe resilience} and a \texttt{rasn.resilience} \texttt{command\_manager}
@@ -1848,9 +1851,13 @@ The engine mirrors the metrics layer's two design choices. First, it includes no
 \rdsn headers and the caller injects the clock as a \texttt{uint64\_t now\_ms}
 (\texttt{dsn\_now\_ms}); because that clock is routed through the pluggable
 \texttt{env\_provider}, breaker timing is deterministic under replay and the
-engine is unit-tested without a live node. Replayed runs and local/in-process
-providers (the deterministic simulator) bypass the breaker, so existing behavior
-and tests are unchanged. Second, breaker activity is reported through the same
+engine is unit-tested without a live node. Replayed runs and in-process
+providers (the deterministic simulator, the workflow service-graph bridge, and
+test fakes, identified by \texttt{llm\_provider::in\_process()}) bypass the
+breaker, so existing behavior and tests are unchanged; loopback HTTP providers
+(Ollama, llama.cpp, LM Studio) are \emph{not} exempt despite a local descriptor,
+since they still issue HTTP that can hang. Second, breaker activity is reported
+through the same
 \texttt{record\_event} choke point as every other metric, adding two counters
 (\texttt{rasn\_model\_breaker\_open\_total},
 \texttt{rasn\_model\_breaker\_short\_circuit\_total}); live per-provider state is

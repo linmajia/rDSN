@@ -2756,7 +2756,9 @@ Work items:
   `record_event`, plus runtime `record_model_breaker_*` methods.
 - [x] Wire the breaker into `rasn_llm_agent_service::complete` /
   `complete_streaming` after the replay check and before the provider call;
-  bypass local/simulator providers so existing behavior is unchanged.
+  exempt only in-process providers (`in_process()`), so loopback HTTP providers
+  (Ollama/llama.cpp/LM Studio) are guarded while the simulator and other
+  in-process providers keep existing behavior.
 - [x] Read `[rasn.model] circuit_breaker_*` once via `dsn_config`; expose state
   through the `rasn.resilience` command and CodePilot `observe resilience`, and
   append breaker state to `provider_summary`.
