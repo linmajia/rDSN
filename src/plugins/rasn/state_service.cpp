@@ -517,7 +517,7 @@ bool import_state_recovery_files_from_nfs(const std::string &checkpoint_path,
           config.remote_host.c_str(),
           static_cast<unsigned int>(config.remote_port),
           config.remote_checkpoint_dir.c_str(),
-          static_cast<unsigned int>(copy_result.size));
+          static_cast<unsigned int>(copy_result->size));
     return true;
 }
 
