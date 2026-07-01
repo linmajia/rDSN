@@ -19,7 +19,6 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -193,10 +192,50 @@ public:
                          const agent_task &task);
     agent_response invoke(const agent_request &request, nucleus_runtime &runtime);
     std::string describe_topology() const;
+    std::string remote_agent_resilience_report() const;
 
 private:
+    void ensure_remote_agent_breaker_config();
+    void ensure_remote_agent_admission_config();
+    void ensure_remote_agent_rate_config();
+    bool remote_agent_breaker_is_open(const agent_descriptor &agent,
+                                      const agent_request &request,
+                                      nucleus_runtime &runtime,
+                                      agent_response *fast_fail);
+    bool remote_agent_breaker_admit(const agent_descriptor &agent,
+                                    const agent_request &request,
+                                    nucleus_runtime &runtime,
+                                    agent_response *fast_fail);
+    void remote_agent_breaker_report(const agent_descriptor &agent,
+                                     const agent_task &task,
+                                     nucleus_runtime &runtime,
+                                     bool ok);
+    admission_slot remote_agent_admission_admit(const agent_descriptor &agent,
+                                                const agent_request &request,
+                                                nucleus_runtime &runtime,
+                                                agent_response *fast_fail);
+    rate_decision remote_agent_rate_acquire(const agent_descriptor &agent,
+                                            const agent_request &request,
+                                            nucleus_runtime &runtime,
+                                            agent_response *fast_fail);
+    void remote_agent_rate_refund(const agent_descriptor &agent);
+    void apply_remote_agent_backpressure(const agent_descriptor &agent,
+                                         const agent_task &task,
+                                         nucleus_runtime &runtime,
+                                         const admission_slot &slot,
+                                         const rate_decision &rate);
+    agent_response invoke_remote_agent(const agent_request &request,
+                                       nucleus_runtime &runtime,
+                                       const agent_descriptor &agent);
+
     rasn_llm_agent_service &_llm_agent;
     rasn_tool_agent_service &_tool_agent;
+    circuit_breaker_registry _remote_agent_breakers;
+    std::once_flag _remote_agent_breaker_config_once;
+    admission_gate_registry _remote_agent_admission;
+    std::once_flag _remote_agent_admission_config_once;
+    rate_limiter_registry _remote_agent_rate;
+    std::once_flag _remote_agent_rate_config_once;
 };
 
 class rasn_service_graph
@@ -231,6 +270,9 @@ public:
     // Human-readable per-tool resilience report covering tool admission/rate
     // controls.
     std::string tool_resilience_report() const;
+    // Human-readable remote-agent dispatch resilience report covering
+    // coordinator-to-agent RPC circuit breakers, admission, and rate controls.
+    std::string remote_agent_resilience_report() const;
     std::string topology() const;
     std::string tools_summary() const;
     void set_tool_provider(std::unique_ptr<agent_tool_provider> tools);

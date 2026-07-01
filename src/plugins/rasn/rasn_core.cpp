@@ -976,6 +976,90 @@ void nucleus_runtime::record_tool_rate_delayed(const agent_task &task,
                  0);
 }
 
+void nucleus_runtime::record_remote_agent_breaker_open(const agent_task &task,
+                                                       const std::string &agent,
+                                                       uint32_t consecutive_failures)
+{
+    record_event(task,
+                 "remote_agent.breaker.open",
+                 agent,
+                 "consecutive_failures=" + std::to_string(consecutive_failures),
+                 "",
+                 "",
+                 "",
+                 false,
+                 0);
+}
+
+void nucleus_runtime::record_remote_agent_breaker_short_circuit(const agent_task &task,
+                                                                const std::string &agent,
+                                                                const std::string &breaker_state)
+{
+    record_event(task, "remote_agent.breaker.short_circuit", agent, breaker_state, "", "", "", false, 0);
+}
+
+void nucleus_runtime::record_remote_agent_admission_rejected(const agent_task &task,
+                                                             const std::string &agent,
+                                                             uint32_t in_flight,
+                                                             uint32_t limit)
+{
+    record_event(task,
+                 "remote_agent.admission.rejected",
+                 agent,
+                 "in_flight=" + std::to_string(in_flight) + " limit=" + std::to_string(limit),
+                 "",
+                 "",
+                 "",
+                 false,
+                 0);
+}
+
+void nucleus_runtime::record_remote_agent_admission_delayed(const agent_task &task,
+                                                            const std::string &agent,
+                                                            uint32_t in_flight,
+                                                            uint32_t delay_ms)
+{
+    record_event(task,
+                 "remote_agent.admission.delayed",
+                 agent,
+                 "in_flight=" + std::to_string(in_flight) + " delay_ms=" + std::to_string(delay_ms),
+                 "",
+                 "",
+                 "",
+                 false,
+                 0);
+}
+
+void nucleus_runtime::record_remote_agent_rate_limited(const agent_task &task,
+                                                       const std::string &agent,
+                                                       uint32_t limit_per_min)
+{
+    record_event(task,
+                 "remote_agent.rate.limited",
+                 agent,
+                 "requests_per_min=" + std::to_string(limit_per_min),
+                 "",
+                 "",
+                 "",
+                 false,
+                 0);
+}
+
+void nucleus_runtime::record_remote_agent_rate_delayed(const agent_task &task,
+                                                       const std::string &agent,
+                                                       uint32_t delay_ms)
+{
+    record_event(task,
+                 "remote_agent.rate.delayed",
+                 agent,
+                 "delay_ms=" + std::to_string(delay_ms),
+                 "",
+                 "",
+                 "",
+                 false,
+                 0);
+}
+
 std::string nucleus_runtime::resolve_nondeterminism(const agent_task &task,
                                                     const std::string &name,
                                                     const std::string &source,

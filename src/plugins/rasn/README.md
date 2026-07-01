@@ -18,7 +18,7 @@ The prototype is intentionally small and is organized around four building block
 | rDSN service graph | `agent_services.*`, `rasn.code.definition.h` | Defines rDSN-style micro-service roles for coordinator, model agent, tool agent, state service, workflow service, observability service, and CLI gateway; service mode exposes those roles as `serverlet` RPC services with `clientlet` callers and explicit `RPC_RASN_*` task codes. |
 | Runtime nucleus | `rasn_core.*`, `observability.*`, `schema_manifest.*` | Creates task IDs, trace IDs, structured JSONL runtime events, nondeterministic value capture, external-effect ledger entries, filesystem snapshots, replay lookup, failure records, schema/IDL/JSON manifests, generated C++/TypeScript/Python RPC clients, and observability query APIs. |
 | Runtime metrics | `metrics.*` | Exports cumulative event counters and task/model/tool latency percentiles through rDSN `perf_counter` counters (section `rasn`) and renders them as text, Prometheus, or JSON; exposed via `observe metrics` and the rDSN `command_manager` command `rasn.metrics`. |
-| Resilience | `circuit_breaker.*`, `admission_gate.*`, `rate_limiter.*` | Guards model providers across the three classic dependency-protection dimensions: a consecutive-failure circuit breaker (closed/open/half-open), an admission gate (concurrency bulkhead plus `exp_delay`-based backpressure), and a token-bucket rate limiter. The same admission/rate engines also guard tool execution per tool name, so shell/filesystem/future remote tools cannot fan out unbounded. Clocks/curves come from rDSN (`dsn_now_ms`, `exp_delay`), state is exported through `perf_counter` counters and the `rasn.resilience` command, and tuning lives under `[rasn.model]` and `[rasn.tool]`. |
+| Resilience | `circuit_breaker.*`, `admission_gate.*`, `rate_limiter.*` | Guards model providers across the three classic dependency-protection dimensions: a consecutive-failure circuit breaker (closed/open/half-open), an admission gate (concurrency bulkhead plus `exp_delay`-based backpressure), and a token-bucket rate limiter. The same engines guard coordinator-to-agent RPC dispatch per remote agent, while admission/rate engines also guard tool execution per tool name, so shell/filesystem/future remote tools cannot fan out unbounded. Clocks/curves come from rDSN (`dsn_now_ms`, `exp_delay`), state is exported through `perf_counter` counters and the `rasn.resilience` command, and tuning lives under `[rasn.model]`, `[rasn.tool]`, and `[rasn.remote_agent]`. |
 | LLM provider layer | `llm_provider.*` | Provides a common `llm_provider` interface and adapters for simulator, Copilot-compatible, Ollama, llama.cpp, LM Studio, and generic OpenAI-compatible HTTP APIs. |
 | Tool provider layer | `agent_tools.*` | Defines the generic rASN tool-provider contract and registration factory used by the tool-agent service. |
 | Workflow graph | `workflow.*` | Parses a declarative task graph, validates dependencies, topologically orders nodes, and executes them through the selected provider. |
@@ -306,6 +306,26 @@ for normal sequential CLI use. Rejections and delays are exported as
 `rasn_tool_admission_rejected_total`, `rasn_tool_admission_delayed_total`,
 `rasn_tool_rate_limited_total`, and `rasn_tool_rate_delayed_total`; live state is
 shown by `rasn.resilience` and `observe resilience`.
+
+### Resilience: remote-agent dispatch guards
+
+In service mode, the coordinator is itself an outbound dependency client: after a
+registry lookup it sends `RPC_RASN_AGENT_INVOKE` to a selected remote model, tool,
+or custom agent. A slow or unhealthy remote agent can otherwise consume retry
+budget, worker threads, and queue capacity even though the model and tool gateways
+are individually guarded. The coordinator now applies the same three resilience
+engines to each remote agent id before invoking it: a circuit breaker for
+retryable dependency failures, an admission gate for concurrent fan-out, and a
+token-bucket rate limiter for request quotas.
+
+The remote-agent breaker is intentionally scoped to retryable dependency failures
+only. Transport errors and retryable remote responses count against it; deterministic
+application outcomes such as policy denials, validation failures, and tool errors
+do not poison the remote service. Admission and rate rejections happen before the
+breaker probe, and any admission/rate pacing is coalesced into a single delay just
+like the model gateway. The defaults are generous (`64/32/200ms`, rate unlimited),
+so normal CLI and smoke-test behavior is unchanged while service deployments get
+visible guard state in `rasn.resilience` and `observe resilience`.
 
 ### Tool calling model
 
@@ -655,6 +675,17 @@ The most important sections are:
 | `[rasn.tool] rate_limit_requests_per_min` | Sustained invocation rate per tool name in requests/minute (default `0` = unlimited / disabled). |
 | `[rasn.tool] rate_limit_burst` | Per-tool rate-limiter burst capacity in tokens (default `0` = about one second of the sustained rate, minimum 1). |
 | `[rasn.tool] rate_limit_max_wait_ms` | Max milliseconds an invocation may be paced waiting for a token before it is rejected (default `1000`; `0` = reject immediately when the bucket is empty). |
+| `[rasn.remote_agent] circuit_breaker_enabled` | Enables the per-agent coordinator RPC circuit breaker (default `true`). Only retryable dependency failures count against it. |
+| `[rasn.remote_agent] circuit_breaker_failure_threshold` | Consecutive retryable remote-agent failures that open the breaker (default `5`). |
+| `[rasn.remote_agent] circuit_breaker_open_ms` | Cooldown in milliseconds before an open remote-agent breaker admits a single half-open probe (default `30000`). |
+| `[rasn.remote_agent] admission_enabled` | Enables the per-agent coordinator RPC admission gate (default `true`). |
+| `[rasn.remote_agent] max_concurrent_requests` | Hard cap on concurrent in-flight coordinator RPC dispatches per remote agent (default `64`; `0` = unlimited). |
+| `[rasn.remote_agent] soft_concurrent_requests` | Per-agent in-flight level at which graceful backpressure begins (default `32`; `0` = no backpressure). |
+| `[rasn.remote_agent] max_backpressure_ms` | Upper bound in milliseconds on graceful remote-agent dispatch backpressure (default `200`). |
+| `[rasn.remote_agent] rate_limit_enabled` | Enables the per-agent coordinator RPC rate limiter (default `true`). Has no effect unless `rate_limit_requests_per_min` is non-zero. |
+| `[rasn.remote_agent] rate_limit_requests_per_min` | Sustained coordinator RPC dispatch rate per remote agent in requests/minute (default `0` = unlimited / disabled). |
+| `[rasn.remote_agent] rate_limit_burst` | Per-agent rate-limiter burst capacity in tokens (default `0` = about one second of the sustained rate, minimum 1). |
+| `[rasn.remote_agent] rate_limit_max_wait_ms` | Max milliseconds a dispatch may be paced waiting for a token before it is rejected (default `1000`; `0` = reject immediately when the bucket is empty). |
 | `[rasn.service] host`, `<name>_host`, `<name>_port`, `<name>_uri` | rDSN service graph endpoints. `<name>_uri` takes precedence and supports resolver-backed values such as `dsn://cluster/rasn.coordinator`; otherwise rASN uses host/port. |
 | `[rasn.coordinator] max_retry_budget` | Caps per-request `retry_budget` for retryable model-agent dispatch. Tool capabilities are never retried by the coordinator. |
 | `[rasn.workflow] execution_lease_ms` | Time-to-live for durable workflow execution owner leases. Active duplicate starts are rejected until the owner finishes or the lease becomes stale. |
@@ -844,7 +875,7 @@ observe diagnose [trace] summarize failures and replay issues
 observe failures         query classified failure records
 observe replay <file>    load replay choices through rasn.observability
 observe metrics [format] dump runtime metrics (text|prometheus|json)
-observe resilience       dump model/tool gateway resilience state
+observe resilience       dump model/tool/remote-agent resilience state
 observe snapshot         summarize observability state
 skills                   list CodePilot skills
 skill <name> [task]      show or apply a skill prompt
@@ -1064,7 +1095,7 @@ hardening gaps remain:
 | SDK packaging | Generated C++/TypeScript/Python contracts and RPC-client source. | Packaged SDKs and concrete TypeScript/Python transports are not shipped. |
 | Evaluation evidence | Unit tests, self-tests, service smokes, schema smokes, report build, and a small eval harness. | Large benchmarks and user studies for debugging effectiveness remain future work. |
 | Observability metrics | Cumulative event counters and task/model/tool latency percentiles via rDSN `perf_counter`, exported as text/Prometheus/JSON through `observe metrics` and the `rasn.metrics` rDSN command. | No bundled scrape gateway, retention store, or prebuilt dashboards; percentiles rely on rDSN's periodic counter timers. |
-| Overload / dependency isolation | Model providers have the full failure/concurrency/throughput trio: per-provider circuit breaker, admission gate, and token-bucket rate limiter. Tool execution now has per-tool admission and rate controls using the same engines, with replay/policy bypasses and live state in `observe resilience` / `rasn.resilience`. | Remote-agent gateways are not breaker-, admission-, or rate-guarded yet; model/tool limits are per-dependency rather than a single process-wide budget; rate limiting governs request count but not token/cost budgets; in RPC-client mode the state lives on the serving node. |
+| Overload / dependency isolation | Model providers and remote-agent RPC dispatch now have the full failure/concurrency/throughput trio: per-dependency circuit breaker, admission gate, and token-bucket rate limiter. Tool execution has per-tool admission and rate controls using the same engines, with replay/policy bypasses and live state in `observe resilience` / `rasn.resilience`. | Limits are per-dependency rather than a single process-wide budget; rate limiting governs request count but not token/cost budgets; in RPC-client mode model/tool guard state lives on the serving node while remote-agent guard state lives on the coordinator. |
 
 ## Troubleshooting
 

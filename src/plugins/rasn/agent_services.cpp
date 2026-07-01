@@ -294,6 +294,100 @@ std::string format_tool_rate_states(const std::vector<rate_limiter_registry::ent
     return oss.str();
 }
 
+std::string remote_agent_key(const agent_descriptor &agent)
+{
+    if (!agent.agent_id.empty())
+    {
+        return agent.agent_id;
+    }
+    if (!agent.endpoint_uri.empty())
+    {
+        return agent.endpoint_uri;
+    }
+    if (!agent.host.empty() || agent.port != 0)
+    {
+        return agent.host + ":" + std::to_string(agent.port);
+    }
+    return "<unknown-agent>";
+}
+
+agent_response remote_agent_gate_response(const agent_request &request,
+                                          const std::string &failure_class,
+                                          const std::string &code,
+                                          const std::string &message,
+                                          bool retryable,
+                                          const std::string &source)
+{
+    agent_response response;
+    response.request_id = request.request_id;
+    response.trace_id = request.trace_id;
+    response.ok = false;
+    response.error = make_agent_error(failure_class, code, message, retryable, source);
+    return response;
+}
+
+bool remote_agent_response_is_dependency_success(const agent_response &response)
+{
+    // Only retryable failures count against the remote-agent circuit breaker.
+    // Non-retryable application outcomes (policy denial, validation failure,
+    // deterministic tool errors) are a valid response from the remote service and
+    // should not poison the transport/dependency breaker.
+    return response.ok || !response.error.retryable;
+}
+
+std::string format_remote_agent_breaker_states(const std::vector<circuit_breaker_registry::entry> &states)
+{
+    if (states.empty())
+    {
+        return "remote agent circuit breakers: none engaged";
+    }
+    std::ostringstream oss;
+    oss << "remote agent circuit breakers:";
+    for (size_t i = 0; i < states.size(); ++i)
+    {
+        const circuit_breaker_registry::entry &entry = states[i];
+        oss << "\n- agent=" << entry.key << " state=" << to_string(entry.state)
+            << " consecutive_failures=" << entry.consecutive_failures;
+    }
+    return oss.str();
+}
+
+std::string format_remote_agent_admission_states(const std::vector<admission_gate_registry::entry> &states)
+{
+    if (states.empty())
+    {
+        return "remote agent admission control: none engaged";
+    }
+    std::ostringstream oss;
+    oss << "remote agent admission control:";
+    for (size_t i = 0; i < states.size(); ++i)
+    {
+        const admission_gate_registry::entry &entry = states[i];
+        oss << "\n- agent=" << entry.key << " in_flight=" << entry.in_flight
+            << " max_concurrency=" << entry.max_concurrency
+            << " soft_concurrency=" << entry.soft_concurrency;
+    }
+    return oss.str();
+}
+
+std::string format_remote_agent_rate_states(const std::vector<rate_limiter_registry::entry> &states)
+{
+    if (states.empty())
+    {
+        return "remote agent rate limiters: none engaged";
+    }
+    std::ostringstream oss;
+    oss << "remote agent rate limiters:";
+    for (size_t i = 0; i < states.size(); ++i)
+    {
+        const rate_limiter_registry::entry &entry = states[i];
+        oss << "\n- agent=" << entry.key << " requests_per_min=" << entry.requests_per_min
+            << " burst=" << entry.burst << " tokens=" << std::fixed << std::setprecision(2)
+            << entry.tokens;
+    }
+    return oss.str();
+}
+
 std::string descriptor_line(const std::string &label, const agent_descriptor &descriptor)
 {
     std::ostringstream oss;
@@ -511,6 +605,79 @@ rate_limit_config read_tool_rate_config()
         "rate_limit_max_wait_ms",
         1000,
         "max ms a tool invocation may be paced waiting for a token before it is rejected");
+    return cfg;
+}
+
+breaker_config read_remote_agent_breaker_config()
+{
+    breaker_config cfg;
+    cfg.enabled = ::dsn_config_get_value_bool(
+        "rasn.remote_agent",
+        "circuit_breaker_enabled",
+        true,
+        "enable the rASN coordinator remote-agent circuit breaker");
+    cfg.failure_threshold = read_config_u32(
+        "rasn.remote_agent",
+        "circuit_breaker_failure_threshold",
+        5,
+        "consecutive retryable remote-agent dispatch failures before the circuit breaker opens");
+    cfg.open_ms = ::dsn_config_get_value_uint64(
+        "rasn.remote_agent",
+        "circuit_breaker_open_ms",
+        30000,
+        "cooldown in ms before an open remote-agent circuit breaker admits a half-open probe");
+    return cfg;
+}
+
+admission_config read_remote_agent_admission_config()
+{
+    admission_config cfg;
+    cfg.enabled = ::dsn_config_get_value_bool(
+        "rasn.remote_agent",
+        "admission_enabled",
+        true,
+        "enable rASN coordinator remote-agent admission control (concurrency bulkhead + backpressure)");
+    cfg.max_concurrency = read_config_u32(
+        "rasn.remote_agent",
+        "max_concurrent_requests",
+        64,
+        "hard cap on concurrent in-flight coordinator RPC dispatches per remote agent (0 = unlimited)");
+    cfg.soft_concurrency = read_config_u32(
+        "rasn.remote_agent",
+        "soft_concurrent_requests",
+        32,
+        "in-flight level at which graceful remote-agent admission backpressure begins (0 = no backpressure)");
+    cfg.max_backpressure_ms = read_config_u32(
+        "rasn.remote_agent",
+        "max_backpressure_ms",
+        200,
+        "upper bound in ms on graceful remote-agent admission backpressure delay");
+    return cfg;
+}
+
+rate_limit_config read_remote_agent_rate_config()
+{
+    rate_limit_config cfg;
+    cfg.enabled = ::dsn_config_get_value_bool(
+        "rasn.remote_agent",
+        "rate_limit_enabled",
+        true,
+        "enable rASN coordinator remote-agent client-side rate limiter (token bucket)");
+    cfg.requests_per_min = read_config_u32(
+        "rasn.remote_agent",
+        "rate_limit_requests_per_min",
+        0,
+        "sustained coordinator RPC dispatch rate per remote agent in requests/minute (0 = unlimited)");
+    cfg.burst = read_config_u32(
+        "rasn.remote_agent",
+        "rate_limit_burst",
+        0,
+        "remote-agent rate-limiter burst capacity in tokens (0 = ~1s of the sustained rate)");
+    cfg.max_wait_ms = read_config_u32(
+        "rasn.remote_agent",
+        "rate_limit_max_wait_ms",
+        1000,
+        "max ms a remote-agent dispatch may be paced waiting for a token before it is rejected");
     return cfg;
 }
 
@@ -1291,6 +1458,237 @@ void rasn_coordinator_service::stop()
     agent_runtime::stop();
 }
 
+void rasn_coordinator_service::ensure_remote_agent_breaker_config()
+{
+    std::call_once(_remote_agent_breaker_config_once,
+                   [this] { _remote_agent_breakers.set_config(read_remote_agent_breaker_config()); });
+}
+
+void rasn_coordinator_service::ensure_remote_agent_admission_config()
+{
+    std::call_once(_remote_agent_admission_config_once,
+                   [this] { _remote_agent_admission.set_config(read_remote_agent_admission_config()); });
+}
+
+void rasn_coordinator_service::ensure_remote_agent_rate_config()
+{
+    std::call_once(_remote_agent_rate_config_once,
+                   [this] { _remote_agent_rate.set_config(read_remote_agent_rate_config()); });
+}
+
+bool rasn_coordinator_service::remote_agent_breaker_is_open(const agent_descriptor &agent,
+                                                           const agent_request &request,
+                                                           nucleus_runtime &runtime,
+                                                           agent_response *fast_fail)
+{
+    ensure_remote_agent_breaker_config();
+    const std::string key = remote_agent_key(agent);
+    circuit_breaker &breaker = _remote_agent_breakers.get(key);
+    if (!breaker.is_open(::dsn_now_ms()))
+    {
+        return false;
+    }
+    dwarn("rASN remote-agent circuit breaker open for agent=%s; short-circuiting dispatch before admission",
+          key.c_str());
+    runtime.record_remote_agent_breaker_short_circuit(request.task, key, to_string(breaker_state::open));
+    if (fast_fail != nullptr)
+    {
+        *fast_fail = remote_agent_gate_response(
+            request,
+            "remote_agent",
+            "remote_agent_breaker_open",
+            "remote-agent circuit breaker open for agent " + key + "; request short-circuited",
+            false,
+            descriptor().agent_id);
+    }
+    return true;
+}
+
+bool rasn_coordinator_service::remote_agent_breaker_admit(const agent_descriptor &agent,
+                                                         const agent_request &request,
+                                                         nucleus_runtime &runtime,
+                                                         agent_response *fast_fail)
+{
+    ensure_remote_agent_breaker_config();
+    const std::string key = remote_agent_key(agent);
+    circuit_breaker &breaker = _remote_agent_breakers.get(key);
+    const breaker_decision decision = breaker.allow(::dsn_now_ms());
+    if (decision.half_open_probe)
+    {
+        dinfo("rASN remote-agent circuit breaker half-open: admitting probe for agent=%s", key.c_str());
+    }
+    if (decision.allowed)
+    {
+        return true;
+    }
+    dwarn("rASN remote-agent circuit breaker %s for agent=%s; short-circuiting dispatch",
+          to_string(decision.state),
+          key.c_str());
+    runtime.record_remote_agent_breaker_short_circuit(request.task, key, to_string(decision.state));
+    if (fast_fail != nullptr)
+    {
+        *fast_fail = remote_agent_gate_response(
+            request,
+            "remote_agent",
+            "remote_agent_breaker_open",
+            "remote-agent circuit breaker " + std::string(to_string(decision.state)) +
+                " for agent " + key + "; request short-circuited",
+            false,
+            descriptor().agent_id);
+    }
+    return false;
+}
+
+void rasn_coordinator_service::remote_agent_breaker_report(const agent_descriptor &agent,
+                                                          const agent_task &task,
+                                                          nucleus_runtime &runtime,
+                                                          bool ok)
+{
+    const std::string key = remote_agent_key(agent);
+    circuit_breaker &breaker = _remote_agent_breakers.get(key);
+    if (breaker.report(ok, ::dsn_now_ms()))
+    {
+        dwarn("rASN remote-agent circuit breaker opened for agent=%s after %u consecutive retryable failures",
+              key.c_str(),
+              static_cast<unsigned int>(breaker.consecutive_failures()));
+        runtime.record_remote_agent_breaker_open(task, key, breaker.consecutive_failures());
+    }
+}
+
+admission_slot rasn_coordinator_service::remote_agent_admission_admit(const agent_descriptor &agent,
+                                                                      const agent_request &request,
+                                                                      nucleus_runtime &runtime,
+                                                                      agent_response *fast_fail)
+{
+    ensure_remote_agent_admission_config();
+    const std::string key = remote_agent_key(agent);
+    admission_gate &gate = _remote_agent_admission.get(key);
+    admission_slot slot = gate.try_admit();
+    if (!slot.admitted())
+    {
+        dwarn("rASN remote-agent admission control rejected dispatch for agent=%s; concurrency limit %u reached",
+              key.c_str(),
+              static_cast<unsigned int>(slot.limit()));
+        runtime.record_remote_agent_admission_rejected(request.task, key, slot.in_flight(), slot.limit());
+        if (fast_fail != nullptr)
+        {
+            *fast_fail = remote_agent_gate_response(
+                request,
+                "remote_agent",
+                "remote_agent_admission_rejected",
+                "remote-agent admission control rejected dispatch for agent " + key +
+                    "; concurrency limit " + std::to_string(slot.limit()) + " reached",
+                false,
+                descriptor().agent_id);
+        }
+    }
+    return slot;
+}
+
+rate_decision rasn_coordinator_service::remote_agent_rate_acquire(const agent_descriptor &agent,
+                                                                  const agent_request &request,
+                                                                  nucleus_runtime &runtime,
+                                                                  agent_response *fast_fail)
+{
+    ensure_remote_agent_rate_config();
+    const std::string key = remote_agent_key(agent);
+    rate_limiter &limiter = _remote_agent_rate.get(key);
+    const rate_decision decision = limiter.try_acquire(::dsn_now_ms());
+    if (!decision.allowed)
+    {
+        dwarn("rASN remote-agent rate limiter rejected dispatch for agent=%s; rate %u req/min exceeded",
+              key.c_str(),
+              static_cast<unsigned int>(decision.limit_per_min));
+        runtime.record_remote_agent_rate_limited(request.task, key, decision.limit_per_min);
+        if (fast_fail != nullptr)
+        {
+            *fast_fail = remote_agent_gate_response(
+                request,
+                "remote_agent",
+                "remote_agent_rate_limited",
+                "remote-agent rate limiter rejected dispatch for agent " + key +
+                    "; rate " + std::to_string(decision.limit_per_min) + " req/min exceeded",
+                false,
+                descriptor().agent_id);
+        }
+    }
+    return decision;
+}
+
+void rasn_coordinator_service::remote_agent_rate_refund(const agent_descriptor &agent)
+{
+    _remote_agent_rate.get(remote_agent_key(agent)).refund();
+}
+
+void rasn_coordinator_service::apply_remote_agent_backpressure(const agent_descriptor &agent,
+                                                              const agent_task &task,
+                                                              nucleus_runtime &runtime,
+                                                              const admission_slot &slot,
+                                                              const rate_decision &rate)
+{
+    const std::string key = remote_agent_key(agent);
+    const uint32_t admission_delay = slot.delay_ms();
+    const uint32_t rate_delay = rate.delay_ms;
+    if (admission_delay > 0)
+    {
+        runtime.record_remote_agent_admission_delayed(task, key, slot.in_flight(), admission_delay);
+    }
+    if (rate_delay > 0)
+    {
+        runtime.record_remote_agent_rate_delayed(task, key, rate_delay);
+    }
+    const uint32_t delay = (std::max)(admission_delay, rate_delay);
+    if (delay > 0)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+    }
+}
+
+agent_response rasn_coordinator_service::invoke_remote_agent(const agent_request &request,
+                                                            nucleus_runtime &runtime,
+                                                            const agent_descriptor &agent)
+{
+    std::string address_error;
+    if (!coordinator_router::validate_remote_endpoint(agent, &address_error))
+    {
+        return remote_agent_gate_response(
+            request, "routing", "invalid_agent_endpoint", address_error, false, descriptor().agent_id);
+    }
+
+    agent_response fast_fail;
+    if (remote_agent_breaker_is_open(agent, request, runtime, &fast_fail))
+    {
+        return fast_fail;
+    }
+    admission_slot admission = remote_agent_admission_admit(agent, request, runtime, &fast_fail);
+    if (!admission.admitted())
+    {
+        return fast_fail;
+    }
+    rate_decision rate = remote_agent_rate_acquire(agent, request, runtime, &fast_fail);
+    if (!rate.allowed)
+    {
+        return fast_fail;
+    }
+    if (!remote_agent_breaker_admit(agent, request, runtime, &fast_fail))
+    {
+        remote_agent_rate_refund(agent);
+        return fast_fail;
+    }
+    apply_remote_agent_backpressure(agent, request.task, runtime, admission, rate);
+
+    const agent_response response = coordinator_router::invoke_remote(request, agent, descriptor().agent_id);
+    remote_agent_breaker_report(agent, request.task, runtime, remote_agent_response_is_dependency_success(response));
+    return response;
+}
+
+std::string rasn_coordinator_service::remote_agent_resilience_report() const
+{
+    return format_remote_agent_breaker_states(_remote_agent_breakers.snapshot()) + "\n" +
+           format_remote_agent_admission_states(_remote_agent_admission.snapshot()) + "\n" +
+           format_remote_agent_rate_states(_remote_agent_rate.snapshot());
+}
+
 llm_response rasn_coordinator_service::complete(const agent_completion_request &request, nucleus_runtime &runtime)
 {
     const agent_request generic = make_model_agent_request(request, runtime.trace_id());
@@ -1362,12 +1760,12 @@ agent_response rasn_coordinator_service::invoke(const agent_request &request, nu
             runtime,
             route.agent,
             "coordinator.invoke",
-            [request, route, this](uint32_t) {
+            [request, route, this, &runtime](uint32_t) {
                 if (is_cancelled(request.request_id))
                 {
                     return cancelled_response(request);
                 }
-                return coordinator_router::invoke_remote(request, route.agent, descriptor().agent_id);
+                return invoke_remote_agent(request, runtime, route.agent);
             });
         if (is_cancelled(request.request_id))
         {
@@ -1633,11 +2031,12 @@ void rasn_service_graph::register_ops_commands_once()
             "(closed|open|half_open) with consecutive failure count, its "
             "admission-control state (in-flight vs concurrency cap), and its "
             "rate-limiter state (requests/min, burst, available tokens), plus "
-            "tool admission/rate limiter state",
+            "tool admission/rate limiter state and remote-agent dispatch guards",
             [](const ::dsn::safe_vector<::dsn::safe_string> &args) -> ::dsn::safe_string {
                 (void)args;
                 const std::string out = global_rasn_services().model_resilience_report() + "\n" +
-                                        global_rasn_services().tool_resilience_report();
+                                        global_rasn_services().tool_resilience_report() + "\n" +
+                                        global_rasn_services().remote_agent_resilience_report();
                 return ::dsn::safe_string(out.c_str());
             });
         dinfo("registered rASN ops command: rasn.resilience");
@@ -1891,6 +2290,11 @@ std::string rasn_service_graph::model_resilience_report() const
 std::string rasn_service_graph::tool_resilience_report() const
 {
     return _tool_agent.tool_resilience_report();
+}
+
+std::string rasn_service_graph::remote_agent_resilience_report() const
+{
+    return _coordinator.remote_agent_resilience_report();
 }
 
 std::string rasn_service_graph::topology() const

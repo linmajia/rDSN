@@ -1,7 +1,7 @@
 #pragma once
 
 // rASN client-side rate limiter for outbound dependencies (model providers,
-// tool adapters, and future remote-agent gateways).
+// tool adapters, and remote-agent gateways).
 //
 // This is the throughput-protection counterpart to circuit_breaker.h (failure
 // isolation) and admission_gate.h (concurrency bulkhead): together they form the

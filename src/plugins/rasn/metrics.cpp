@@ -118,6 +118,12 @@ enum core_counter
     CC_TOOL_ADMISSION_DELAYED,
     CC_TOOL_RATE_LIMITED,
     CC_TOOL_RATE_DELAYED,
+    CC_REMOTE_AGENT_BREAKER_OPEN,
+    CC_REMOTE_AGENT_BREAKER_SHORT_CIRCUIT,
+    CC_REMOTE_AGENT_ADMISSION_REJECTED,
+    CC_REMOTE_AGENT_ADMISSION_DELAYED,
+    CC_REMOTE_AGENT_RATE_LIMITED,
+    CC_REMOTE_AGENT_RATE_DELAYED,
     CC_COUNT
 };
 
@@ -167,6 +173,24 @@ const counter_def k_core_counters[CC_COUNT] = {
     {"rasn_tool_rate_delayed_total",
      "tool.rate.delayed",
      "tool invocations delayed (paced) by the client-side rate limiter"},
+    {"rasn_remote_agent_breaker_open_total",
+     "remote_agent.breaker.open",
+     "remote-agent circuit-breaker open transitions"},
+    {"rasn_remote_agent_breaker_short_circuit_total",
+     "remote_agent.breaker.short_circuit",
+     "remote-agent dispatches short-circuited by an open circuit breaker"},
+    {"rasn_remote_agent_admission_rejected_total",
+     "remote_agent.admission.rejected",
+     "remote-agent dispatches rejected by the admission-control concurrency cap"},
+    {"rasn_remote_agent_admission_delayed_total",
+     "remote_agent.admission.delayed",
+     "remote-agent dispatches delayed by admission-control backpressure"},
+    {"rasn_remote_agent_rate_limited_total",
+     "remote_agent.rate.limited",
+     "remote-agent dispatches rejected by the client-side rate limiter"},
+    {"rasn_remote_agent_rate_delayed_total",
+     "remote_agent.rate.delayed",
+     "remote-agent dispatches delayed (paced) by the client-side rate limiter"},
 };
 
 enum latency_counter
@@ -213,6 +237,12 @@ const std::unordered_map<std::string, int> &kind_to_core_counter()
         {"tool.admission.delayed", CC_TOOL_ADMISSION_DELAYED},
         {"tool.rate.limited", CC_TOOL_RATE_LIMITED},
         {"tool.rate.delayed", CC_TOOL_RATE_DELAYED},
+        {"remote_agent.breaker.open", CC_REMOTE_AGENT_BREAKER_OPEN},
+        {"remote_agent.breaker.short_circuit", CC_REMOTE_AGENT_BREAKER_SHORT_CIRCUIT},
+        {"remote_agent.admission.rejected", CC_REMOTE_AGENT_ADMISSION_REJECTED},
+        {"remote_agent.admission.delayed", CC_REMOTE_AGENT_ADMISSION_DELAYED},
+        {"remote_agent.rate.limited", CC_REMOTE_AGENT_RATE_LIMITED},
+        {"remote_agent.rate.delayed", CC_REMOTE_AGENT_RATE_DELAYED},
     };
     return m;
 }

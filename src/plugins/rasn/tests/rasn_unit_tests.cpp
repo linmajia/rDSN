@@ -866,6 +866,25 @@ TEST(rasn_coordinator, does_not_retry_tool_invocations)
     }
 }
 
+TEST(rasn_coordinator, validates_remote_endpoint_before_rpc_dispatch)
+{
+    agent_descriptor agent;
+    agent.agent_id = "unit.invalid";
+
+    std::string error = "stale";
+    EXPECT_FALSE(coordinator_router::validate_remote_endpoint(agent, &error));
+    EXPECT_NE(std::string::npos, error.find("no endpoint"));
+
+    agent.host = "0.0.0.0";
+    agent.port = 27102;
+    EXPECT_FALSE(coordinator_router::validate_remote_endpoint(agent, &error));
+    EXPECT_NE(std::string::npos, error.find("could not be resolved"));
+
+    agent.host = "127.0.0.1";
+    EXPECT_TRUE(coordinator_router::validate_remote_endpoint(agent, &error));
+    EXPECT_TRUE(error.empty());
+}
+
 TEST(rasn_policy, classifies_codepilot_tools_and_builds_requests)
 {
     EXPECT_EQ(tool_side_effect::read_only, classify_tool_side_effect("list"));
@@ -1930,6 +1949,9 @@ TEST(rasn_metrics_registry, snapshot_exposes_core_and_latency_series)
     EXPECT_NE(nullptr, snapshot.find("rasn_llm_requests_total"));
     EXPECT_NE(nullptr, snapshot.find("rasn_tool_ok_total"));
     EXPECT_NE(nullptr, snapshot.find("rasn_failures_total"));
+    EXPECT_NE(nullptr, snapshot.find("rasn_remote_agent_breaker_open_total"));
+    EXPECT_NE(nullptr, snapshot.find("rasn_remote_agent_admission_rejected_total"));
+    EXPECT_NE(nullptr, snapshot.find("rasn_remote_agent_rate_limited_total"));
 
     // Latency series are present and flagged as latency samples.
     const metric_sample *task_latency = snapshot.find("rasn_task_latency_ms");
@@ -1952,6 +1974,10 @@ TEST(rasn_metrics_registry, runtime_events_increment_cumulative_counters)
 
     const uint64_t begin_before = registry.snapshot().counter("rasn_tasks_begin_total");
     const uint64_t finish_before = registry.snapshot().counter("rasn_tasks_finish_total");
+    const uint64_t remote_breaker_before = registry.snapshot().counter("rasn_remote_agent_breaker_open_total");
+    const uint64_t remote_admission_before =
+        registry.snapshot().counter("rasn_remote_agent_admission_rejected_total");
+    const uint64_t remote_rate_before = registry.snapshot().counter("rasn_remote_agent_rate_limited_total");
 
     nucleus_runtime runtime;
     agent_task task;
@@ -1959,6 +1985,9 @@ TEST(rasn_metrics_registry, runtime_events_increment_cumulative_counters)
     task.name = "unit.metrics";
     task.input = "noop";
     runtime.begin_task(task);
+    runtime.record_remote_agent_breaker_open(task, "unit.remote", 2);
+    runtime.record_remote_agent_admission_rejected(task, "unit.remote", 3, 2);
+    runtime.record_remote_agent_rate_limited(task, "unit.remote", 60);
     runtime.finish_task(task, "ok");
 
     const uint64_t begin_after = registry.snapshot().counter("rasn_tasks_begin_total");
@@ -1966,6 +1995,10 @@ TEST(rasn_metrics_registry, runtime_events_increment_cumulative_counters)
 
     EXPECT_EQ(begin_before + 1, begin_after);
     EXPECT_EQ(finish_before + 1, finish_after);
+    EXPECT_EQ(remote_breaker_before + 1, registry.snapshot().counter("rasn_remote_agent_breaker_open_total"));
+    EXPECT_EQ(remote_admission_before + 1,
+              registry.snapshot().counter("rasn_remote_agent_admission_rejected_total"));
+    EXPECT_EQ(remote_rate_before + 1, registry.snapshot().counter("rasn_remote_agent_rate_limited_total"));
 
     // Observing a latency value must never crash, even though percentiles are
     // computed asynchronously by rDSN counter timers.
@@ -2189,6 +2222,9 @@ TEST(rasn_circuit_breaker, ops_command_reports_breaker_state)
     EXPECT_NE(std::string::npos, std::string(out.c_str()).find("model rate limiters"));
     EXPECT_NE(std::string::npos, std::string(out.c_str()).find("tool admission control"));
     EXPECT_NE(std::string::npos, std::string(out.c_str()).find("tool rate limiters"));
+    EXPECT_NE(std::string::npos, std::string(out.c_str()).find("remote agent circuit breakers"));
+    EXPECT_NE(std::string::npos, std::string(out.c_str()).find("remote agent admission control"));
+    EXPECT_NE(std::string::npos, std::string(out.c_str()).find("remote agent rate limiters"));
 
     services.release();
 }

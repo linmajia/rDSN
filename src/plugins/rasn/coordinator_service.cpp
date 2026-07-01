@@ -96,6 +96,25 @@ coordinator_route coordinator_router::resolve(const agent_request &request,
     return select_first(request, capability, candidates);
 }
 
+bool coordinator_router::validate_remote_endpoint(const agent_descriptor &agent, std::string *error)
+{
+    std::string address_error;
+    (void)address_from_descriptor(agent, &address_error);
+    if (!address_error.empty())
+    {
+        if (error != nullptr)
+        {
+            *error = address_error;
+        }
+        return false;
+    }
+    if (error != nullptr)
+    {
+        error->clear();
+    }
+    return true;
+}
+
 agent_response coordinator_router::invoke_remote(const agent_request &request,
                                                  const agent_descriptor &agent,
                                                  const std::string &source)
@@ -221,7 +240,16 @@ coordinator_route coordinator_router::route_error(const agent_request &request,
         return address;
     }
 
-    address.assign_ipv4(agent.host.c_str(), static_cast<uint16_t>(agent.port));
+    const uint32_t ip = ::dsn_ipv4_from_host(agent.host.c_str());
+    if (ip == 0)
+    {
+        if (error != nullptr)
+        {
+            *error = "agent descriptor host could not be resolved: " + agent.agent_id + " (" + agent.host + ")";
+        }
+        return address;
+    }
+    address.assign_ipv4(ip, static_cast<uint16_t>(agent.port));
     return address;
 }
 

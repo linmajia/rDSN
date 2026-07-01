@@ -870,6 +870,58 @@ rDSN design:
   the admission defaults are generous, so normal sequential CLI usage remains
   unchanged while service-mode fan-out becomes explicit and observable.
 
+### 12.6 Remote-agent dispatch resilience
+
+Service mode introduces another dependency boundary: the coordinator resolves a
+capability through the registry and then calls the selected agent over
+`RPC_RASN_AGENT_INVOKE`. That remote agent may be a built-in service role or a
+future custom agent registered dynamically. Without a gateway governor, a slow
+or unhealthy agent can consume coordinator threads, request budgets, and retry
+budget even though model providers and tools are individually guarded. rASN now
+guards the coordinator-to-agent RPC gateway per remote `agent_id`.
+
+Responsibilities:
+
+- Fast-fail repeated retryable remote-agent failures with a per-agent circuit
+  breaker, including the same open/half-open/closed state machine used for model
+  providers.
+- Cap concurrent coordinator dispatches to each remote agent with an admission
+  bulkhead and `exp_delay`-based backpressure.
+- Optionally pace requests to each remote agent with the shared token-bucket rate
+  limiter.
+- Treat only retryable dependency outcomes as breaker failures: RPC transport
+  errors and retryable remote responses count, while deterministic application
+  outcomes such as policy denials, validation errors, and tool failures do not
+  poison the remote service.
+
+rDSN design:
+
+- `rasn_coordinator_service` reuses `circuit_breaker_registry`,
+  `admission_gate_registry`, and `rate_limiter_registry`, keyed by the registry
+  descriptor's `agent_id` (falling back to endpoint text only for malformed
+  descriptors). The clock again comes from `::dsn_now_ms()`, preserving
+  replay-friendly behavior and unit-testability of the engines.
+- Guard ordering mirrors the model gateway: a non-mutating open-breaker precheck
+  wins first; admission and rate rejection happen before the authoritative
+  breaker probe; the rate token is refunded if that final breaker check
+  short-circuits; admission and rate delays are coalesced into one sleep.
+- The guards are applied only on the RPC-client dispatch path. Inline standalone
+  execution still calls the in-process model/tool services directly, so the
+  single-process CLI keeps its existing behavior.
+- Six `perf_counter` series flow through `record_event`:
+  `rasn_remote_agent_breaker_open_total`,
+  `rasn_remote_agent_breaker_short_circuit_total`,
+  `rasn_remote_agent_admission_rejected_total`,
+  `rasn_remote_agent_admission_delayed_total`,
+  `rasn_remote_agent_rate_limited_total`, and
+  `rasn_remote_agent_rate_delayed_total`. Live per-agent state is included in
+  `rasn.resilience` and CodePilot `observe resilience`.
+- `[rasn.remote_agent] circuit_breaker_*`, `admission_*`,
+  `max_concurrent_requests`, `soft_concurrent_requests`, `max_backpressure_ms`,
+  and `rate_limit_*` are read once through `dsn_config` with null-safe defaults.
+  The default admission cap is generous (`64` hard, `32` soft, `200ms`
+  backpressure) and the rate limiter is unlimited (`requests_per_min = 0`).
+
 ### 13. Service-mode integration self-test
 
 The service-mode integration layer turns rASN correctness assumptions into a
@@ -1146,13 +1198,13 @@ remaining limitations are:
   text/Prometheus/JSON, but rASN does not bundle a scrape gateway, a retention
   store, or prebuilt dashboards, and latency percentiles depend on rDSN's
   periodic counter timers.
-- **Overload and dependency isolation:** the model gateway has a per-provider
-  circuit breaker that fast-fails calls to a failing endpoint, a per-provider
-  admission gate (concurrency bulkhead plus `exp_delay`-based backpressure), and a
-  per-provider token-bucket rate limiter. The tool gateway now reuses the
+- **Overload and dependency isolation:** the model gateway and remote-agent RPC
+  gateway have the full per-dependency failure/concurrency/throughput trio:
+  circuit breaker, admission gate (concurrency bulkhead plus `exp_delay`-based
+  backpressure), and token-bucket rate limiter. The tool gateway reuses the
   admission and rate engines per tool name, after replay and policy checks, so
-  tool fan-out is bounded and observable. Remaining gaps: remote-agent gateways are
-  not yet breaker-, admission-, or rate-guarded; the limits are per-dependency
-  rather than a single process-wide budget; rate limiting governs request count
-  but not token/cost budgets; and in RPC-client mode the resilience state lives on
-  the serving node rather than the client.
+  tool fan-out is bounded and observable. Remaining gaps: the limits are
+  per-dependency rather than a single process-wide budget; rate limiting governs
+  request count but not token/cost budgets; and in RPC-client mode model/tool
+  resilience state lives on the serving node while remote-agent state lives on the
+  coordinator.

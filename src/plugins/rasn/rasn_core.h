@@ -174,9 +174,31 @@ public:
     void record_tool_rate_delayed(const agent_task &task,
                                   const std::string &tool,
                                   uint32_t delay_ms);
+    // Remote-agent dispatch events emitted by the coordinator when an outbound
+    // RPC dependency is breaker-, admission-, or rate-governed.
+    void record_remote_agent_breaker_open(const agent_task &task,
+                                          const std::string &agent,
+                                          uint32_t consecutive_failures);
+    void record_remote_agent_breaker_short_circuit(const agent_task &task,
+                                                   const std::string &agent,
+                                                   const std::string &breaker_state);
+    void record_remote_agent_admission_rejected(const agent_task &task,
+                                                const std::string &agent,
+                                                uint32_t in_flight,
+                                                uint32_t limit);
+    void record_remote_agent_admission_delayed(const agent_task &task,
+                                               const std::string &agent,
+                                               uint32_t in_flight,
+                                               uint32_t delay_ms);
+    void record_remote_agent_rate_limited(const agent_task &task,
+                                          const std::string &agent,
+                                          uint32_t limit_per_min);
+    void record_remote_agent_rate_delayed(const agent_task &task,
+                                          const std::string &agent,
+                                          uint32_t delay_ms);
     std::string resolve_nondeterminism(const agent_task &task,
-                                      const std::string &name,
-                                      const std::string &source,
+                                       const std::string &name,
+                                       const std::string &source,
                                        const std::function<std::string()> &generator);
     std::vector<runtime_event> events() const { return _log.snapshot(); }
 

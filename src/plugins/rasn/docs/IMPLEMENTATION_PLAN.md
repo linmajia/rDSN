@@ -2972,6 +2972,74 @@ Validation:
 - [x] `git diff --check`.
 - [x] Report brace/bracket balance check (LaTeX toolchain not installed locally).
 
+## Phase 73: remote-agent dispatch resilience
+
+Status: `[~]`
+
+Goal: Close the remaining remote-agent dependency-isolation gap by guarding
+coordinator-to-agent RPC dispatch with the same failure/concurrency/throughput
+engines already used by the model gateway. This makes service-mode custom agents
+usable under production-style fan-out without turning registry-selected remote
+agents into unbounded hidden dependencies.
+
+rDSN modules reused:
+
+- `circuit_breaker` / `circuit_breaker_registry`, keyed by remote `agent_id`, with
+  retryable remote/RPC failures counting against the breaker.
+- `admission_gate` / `admission_gate_registry`, including the `exp_delay`-backed
+  backpressure curve and RAII `admission_slot`, keyed by remote `agent_id`.
+- `rate_limiter` / `rate_limiter_registry`, with `dsn_now_ms` as the
+  token-bucket refill clock.
+- `perf_counter` through `record_event` / `metrics_registry` for six
+  remote-agent counters.
+- `dsn_config` for `[rasn.remote_agent]` circuit-breaker/admission/rate tunables.
+- `command_manager` for the expanded `rasn.resilience` command.
+
+Files:
+
+- `agent_services.h` / `agent_services.cpp`
+- `rasn_core.h` / `rasn_core.cpp`
+- `metrics.cpp`, `config.ini`
+- `codepilot/codepilot_app.cpp`
+- `tests/rasn_unit_tests.cpp`
+- `README.md`, `docs/DESIGN.md`, `docs/report/main.tex`,
+  `docs/IMPLEMENTATION_PLAN.md`
+
+Work items:
+
+- [x] Add per-remote-agent breaker/admission/rate helpers in
+  `rasn_coordinator_service` around the `RPC_RASN_AGENT_INVOKE` dispatch path.
+- [x] Preserve inline standalone semantics: guards only run when the coordinator
+  uses RPC clients.
+- [x] Make the remote-agent breaker count only retryable dependency failures, so
+  deterministic policy/validation/tool errors do not poison a remote agent.
+- [x] Keep model-gateway ordering invariants: open-breaker precheck first,
+  admission/rate before the authoritative breaker probe, rate-token refund on
+  breaker short-circuit, and one coalesced delay.
+- [x] Add remote-agent runtime events and `perf_counter` series:
+  `rasn_remote_agent_breaker_open_total`,
+  `rasn_remote_agent_breaker_short_circuit_total`,
+  `rasn_remote_agent_admission_rejected_total`,
+  `rasn_remote_agent_admission_delayed_total`,
+  `rasn_remote_agent_rate_limited_total`, and
+  `rasn_remote_agent_rate_delayed_total`.
+- [x] Expose live per-agent state through `rasn.resilience` and CodePilot
+  `observe resilience`.
+- [x] Add `[rasn.remote_agent]` defaults to the main and service-smoke configs.
+- [x] Update user docs, design notes, and the ACM-style technical report.
+
+Validation:
+
+- [x] Built `rasn.unit_tests` target with repo CMake 3.22.6 after implementation
+  wiring.
+- [x] Run full `rasn.unit_tests` (`81` tests passed).
+- [x] Build `codepilot`.
+- [x] Run direct `codepilot selftest`.
+- [x] Run `codepilot observe resilience` and confirm model/tool/remote-agent
+  sections.
+- [x] `git diff --check`.
+- [x] Report brace/bracket balance check (LaTeX toolchain not installed locally).
+
 ## Dependency order
 
 ```text
@@ -3047,6 +3115,7 @@ Phase 1 task model
   -> Phase 70 model gateway admission control
   -> Phase 71 model gateway rate limiter
   -> Phase 72 tool gateway admission and rate controls
+  -> Phase 73 remote-agent dispatch resilience
 ```
 
 Some phases can overlap after Phase 3, but the public message model and generic

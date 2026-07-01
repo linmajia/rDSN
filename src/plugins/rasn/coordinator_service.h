@@ -30,6 +30,7 @@ public:
                                      bool use_registry_rpc,
                                      const ::dsn::rpc_address &registry_address);
 
+    static bool validate_remote_endpoint(const agent_descriptor &agent, std::string *error);
     static agent_response invoke_remote(const agent_request &request,
                                         const agent_descriptor &agent,
                                         const std::string &source);
