@@ -965,10 +965,22 @@ rDSN design:
   flat sequential loop, and RPC handlers run on separate threads — so one
   admission slot per top-level operation counts each logical operation exactly once
   with no self-deadlock.
+- Both admission-plus-rate entry points share one helper (`enter_overload_gate`)
+  that returns an RAII hold. `invoke` uses it, and so does the inline streaming
+  fast path in `complete_streaming` — that path dispatches straight to the local
+  model agent for true token-by-token streaming instead of buffering through
+  `invoke`, so without the shared helper interactive streaming prompts would be the
+  one way to bypass the global budget. The admission slot is held for the whole
+  stream.
 - The admission slot is a local RAII handle held across retries and released on
-  every return path. No rate refund is needed here because the overload gate is
-  outermost: nothing short-circuits after the token is acquired within its scope
-  (unlike the per-dependency breaker/rate interplay, which refunds).
+  every return path. Because the gate is deliberately *outside* route resolution —
+  in RPC-client mode `resolve` issues a synchronous registry query, itself
+  dependency work the budget must bound — the one pre-dispatch short-circuit is a
+  route-resolution failure, and there the rate token is **refunded**
+  (`overload_rate_refund`, mirroring the model and remote-agent gateways) before
+  the error returns. Repeated registry/routing failures therefore cannot slowly
+  drain the global rate budget; the admission slot returns itself via its RAII
+  guard. The refund is a no-op when the ceiling is disabled or unlimited.
 - Admission and rate delays are coalesced into a single sleep (the larger of the
   two), matching the model, tool, and remote-agent gateways.
 - Four `perf_counter` series flow through `record_event`:

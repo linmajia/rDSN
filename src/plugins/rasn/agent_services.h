@@ -249,6 +249,26 @@ private:
                                      nucleus_runtime &runtime,
                                      const admission_slot &slot,
                                      const rate_decision &rate);
+    // Return a process-wide overload rate token taken by overload_rate_acquire()
+    // when the request is abandoned before dispatch (e.g. route resolution fails),
+    // so pre-dispatch failures cannot permanently drain the global rate budget.
+    // Mirrors model_rate_refund()/remote_agent_rate_refund(); a no-op when the rate
+    // ceiling is disabled or unlimited (no token was taken).
+    void overload_rate_refund();
+    // Result of entering the process-wide overload budget. Holds the RAII admission
+    // slot (reserved capacity is released when this object is destroyed), whether
+    // the gate passed, and a populated fast-fail response when it did not.
+    struct overload_gate_hold
+    {
+        admission_slot slot;
+        bool passed = false;
+        agent_response rejection;
+    };
+    // Combined entry into the process-wide overload budget: admission bulkhead, then
+    // rate ceiling, then coalesced graceful backpressure. Shared by invoke() and the
+    // inline streaming fast path so neither can bypass the global budget. On success
+    // the returned hold keeps the admission slot reserved for the caller's dispatch.
+    overload_gate_hold enter_overload_gate(const agent_request &request, nucleus_runtime &runtime);
 
     rasn_llm_agent_service &_llm_agent;
     rasn_tool_agent_service &_tool_agent;

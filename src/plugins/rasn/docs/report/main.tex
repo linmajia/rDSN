@@ -2154,10 +2154,19 @@ uniformly. Because \texttt{invoke} is never re-entered on the same thread (inlin
 handlers call external providers, workflow node dispatch is a flat sequential loop,
 and RPC handlers run on separate threads), one admission slot per top-level
 operation counts each logical operation exactly once with no self-deadlock. The
-slot is a local RAII handle held across retries and released on every return path;
-no rate refund is needed here because the budget is outermost --- nothing
-short-circuits after the token is acquired within its scope, unlike the
-per-dependency breaker/rate interplay. Admission and rate delays are coalesced into
+slot is a local RAII handle held across retries and released on every return path.
+Because the gate sits deliberately \emph{outside} route resolution --- in
+RPC-client mode \texttt{resolve} issues a synchronous registry query, itself
+dependency work the budget must bound --- the single pre-dispatch short-circuit is
+a route-resolution failure, and there the rate token is \emph{refunded} before the
+error returns, mirroring the model and remote-agent gateways so repeated routing
+failures cannot slowly drain the global bucket. A shared
+\texttt{enter\_overload\_gate} helper applies the identical
+admission-then-rate-then-backpressure sequence at both entry points: \texttt{invoke}
+and the inline streaming fast path in \texttt{complete\_streaming}, which dispatches
+straight to the local model agent for token-by-token streaming rather than buffering
+through \texttt{invoke} and would otherwise be the one way to bypass the budget.
+Admission and rate delays are coalesced into
 a single sleep, and rejections are structured, non-retryable \texttt{overload}
 responses so a caller with alternate nodes can route away instead of hammering a
 saturated process.

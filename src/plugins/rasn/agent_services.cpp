@@ -1848,6 +1848,33 @@ void rasn_coordinator_service::apply_overload_backpressure(const agent_task &tas
     }
 }
 
+void rasn_coordinator_service::overload_rate_refund()
+{
+    ensure_overload_config();
+    _overload_rate->refund();
+}
+
+rasn_coordinator_service::overload_gate_hold
+rasn_coordinator_service::enter_overload_gate(const agent_request &request, nucleus_runtime &runtime)
+{
+    overload_gate_hold hold;
+    hold.slot = overload_admit(request, runtime, &hold.rejection);
+    if (!hold.slot.admitted())
+    {
+        return hold;
+    }
+    const rate_decision rate = overload_rate_acquire(request, runtime, &hold.rejection);
+    if (!rate.allowed)
+    {
+        // The admission slot auto-releases when `hold` is destroyed on the caller's
+        // early return; a rejected rate decision reserved no token, so no refund.
+        return hold;
+    }
+    apply_overload_backpressure(request.task, runtime, hold.slot, rate);
+    hold.passed = true;
+    return hold;
+}
+
 std::string rasn_coordinator_service::overload_resilience_report() const
 {
     ensure_overload_config();
@@ -1889,6 +1916,19 @@ llm_response rasn_coordinator_service::complete_streaming(const agent_completion
 
     if (!services.rpc_clients_enabled() && route.agent.agent_id == "rasn.llm.agent")
     {
+        // The inline streaming fast path dispatches straight to the local model
+        // agent (true token-by-token streaming) instead of buffering through
+        // invoke(), so apply the same process-wide overload budget here; otherwise
+        // interactive streaming prompts would bypass the global concurrency
+        // bulkhead and rate ceiling. The admission slot is held for the whole
+        // stream (released when `overload` is destroyed on return). Route was
+        // already resolved above and this path is inline-only, so there is no
+        // pre-dispatch short-circuit after the gate and thus no token to refund.
+        overload_gate_hold overload = enter_overload_gate(generic, runtime);
+        if (!overload.passed)
+        {
+            return make_llm_response_from_agent(overload.rejection);
+        }
         return _llm_agent.complete_streaming(request, runtime, on_chunk);
     }
 
@@ -1926,33 +1966,35 @@ agent_response rasn_coordinator_service::invoke(const agent_request &request, nu
     // bulkhead + request-rate ceiling bounding total in-flight work across every
     // dependency (model, tool, remote-agent) in both inline and RPC modes.
     // Applied AFTER begin_request/scoped_agent_request so malformed or cancelled
-    // requests never consume budget, and BEFORE routing so the whole process
-    // sheds load uniformly at its outermost chokepoint. invoke() is never
-    // re-entered on the same thread (inline handlers call external providers;
-    // workflow node dispatch is a flat sequential loop; RPC handlers run on
-    // separate threads), so one slot per top-level operation counts each logical
-    // operation exactly once with no self-deadlock. The slot is a local RAII held
-    // across retries and released on every return path; no rate refund is needed
-    // because this gate is outermost -- nothing short-circuits after the token is
-    // acquired within its scope. Defaults are passthrough (opt-in caps).
-    agent_response overload_rejection;
-    admission_slot overload_slot = overload_admit(request, runtime, &overload_rejection);
-    if (!overload_slot.admitted())
+    // requests never consume budget, and BEFORE routing so the whole process sheds
+    // load uniformly at its outermost chokepoint -- including the registry query
+    // that route resolution performs in RPC mode, which is itself dependency work
+    // the budget must bound. invoke() is never re-entered on the same thread
+    // (inline handlers call external providers; workflow node dispatch is a flat
+    // sequential loop; RPC handlers run on separate threads), so one slot per
+    // top-level operation counts each logical operation exactly once with no
+    // self-deadlock. The admission slot is a local RAII held across retries and
+    // released on every return path; the rate token is refunded on the only
+    // pre-dispatch short-circuit (route resolution failure) so routing failures
+    // cannot drain the budget. The same gate guards the inline streaming fast path
+    // in complete_streaming(), so interactive prompts cannot bypass it. Defaults
+    // are passthrough (opt-in caps).
+    overload_gate_hold overload = enter_overload_gate(request, runtime);
+    if (!overload.passed)
     {
-        return overload_rejection;
+        return overload.rejection;
     }
-    const rate_decision overload_rate = overload_rate_acquire(request, runtime, &overload_rejection);
-    if (!overload_rate.allowed)
-    {
-        return overload_rejection;
-    }
-    apply_overload_backpressure(request.task, runtime, overload_slot, overload_rate);
 
     rasn_service_graph &services = global_rasn_services();
     const coordinator_route route =
         coordinator_router::resolve(request, services.rpc_clients_enabled(), services.registry_address());
     if (!route.ok)
     {
+        // Route resolution failed before any dependency was dispatched. Return the
+        // overload rate token so repeated registry/routing failures cannot slowly
+        // drain the global rate budget (the admission slot auto-releases when
+        // `overload` goes out of scope on this return).
+        overload_rate_refund();
         return route.error;
     }
     runtime.record_route_decision(request.task, route.capability, route.agent.agent_id);
