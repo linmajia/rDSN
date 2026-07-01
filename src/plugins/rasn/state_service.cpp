@@ -230,7 +230,7 @@ state_replica_config load_state_replica_config()
     state_replica_config config;
     config.enabled = config_bool("rasn.state.replica", "enabled", false, "Mirror state checkpoints and journal to a local replica");
     config.directory =
-        config_string("rasn.state.replica", "directory", "rasn-state-replica", "Local rASN state replica directory");
+        config_string("rasn.state.replica", "directory", "rasn/state/replica", "Local rASN state replica directory");
     config.recover =
         config_bool("rasn.state.replica", "recover", true, "Recover state from local replica when primary files are absent");
     return config;
@@ -672,6 +672,72 @@ bool state_key_matches_prefix(const std::string &key, const std::string &prefix)
 }
 
 } // namespace
+
+std::string configured_state_checkpoint_path()
+{
+    const std::string directory =
+        config_string("rasn.state", "checkpoint_dir", "rasn/state", "default rASN state checkpoint directory");
+    const std::string file =
+        config_string("rasn.state", "checkpoint_file", "rasn-state.chkpt", "default rASN state checkpoint file");
+    const std::string file_name = file.empty() ? "rasn-state.chkpt" : file;
+    return directory.empty() ? file_name : ::dsn::utils::filesystem::path_combine(directory, file_name);
+}
+
+std::string configured_state_journal_path(const std::string &checkpoint_path)
+{
+    const std::string journal =
+        config_string("rasn.state", "journal_file", "", "append-only rASN state journal file");
+    if (!journal.empty())
+    {
+        return journal;
+    }
+    const std::string default_checkpoint = configured_state_checkpoint_path();
+    return default_checkpoint.empty() ? checkpoint_path + ".journal" : default_checkpoint + ".journal";
+}
+
+state_checkpoint_request configured_state_recovery_request()
+{
+    state_checkpoint_request request;
+    const std::string recover_on_start =
+        config_string("rasn.state", "recover_on_start", "", "checkpoint file to recover at startup");
+    if (!recover_on_start.empty())
+    {
+        request.path = recover_on_start;
+    }
+    return request;
+}
+
+bool configured_state_recovery_available(const state_checkpoint_request &request)
+{
+    if (!request.path.empty())
+    {
+        return true;
+    }
+
+    const std::string checkpoint = configured_state_checkpoint_path();
+    const std::string journal = configured_state_journal_path(checkpoint);
+    if (::dsn::utils::filesystem::file_exists(checkpoint) || ::dsn::utils::filesystem::file_exists(journal))
+    {
+        return true;
+    }
+
+    const state_replica_config replica = load_state_replica_config();
+    if (replica.enabled && replica.recover)
+    {
+        if (replica.directory.empty())
+        {
+            return true;
+        }
+        if (::dsn::utils::filesystem::file_exists(replica_path_for(replica, checkpoint)) ||
+            ::dsn::utils::filesystem::file_exists(replica_path_for(replica, journal)))
+        {
+            return true;
+        }
+    }
+
+    const nfs_state_import_config nfs = load_nfs_state_import_config(checkpoint, journal);
+    return nfs.enabled;
+}
 
 state_response state_store::put(const state_record &record)
 {
@@ -1123,30 +1189,12 @@ state_response state_store::error_response(const std::string &error) const
 
 std::string state_store::default_checkpoint_path() const
 {
-    const char *directory_value = ::dsn_config_get_value_string(
-        "rasn.state", "checkpoint_dir", "", "default rASN state checkpoint directory");
-    const char *file_value = ::dsn_config_get_value_string(
-        "rasn.state", "checkpoint_file", "rasn-state.chkpt", "default rASN state checkpoint file");
-    const std::string directory = directory_value == nullptr ? "" : directory_value;
-    const std::string file = file_value == nullptr ? "" : file_value;
-    const std::string file_name = file.empty() ? "rasn-state.chkpt" : file;
-    if (directory.empty())
-    {
-        return file_name;
-    }
-    return ::dsn::utils::filesystem::path_combine(directory, file_name);
+    return configured_state_checkpoint_path();
 }
 
 std::string state_store::journal_path_for_checkpoint(const std::string &checkpoint_path) const
 {
-    const char *journal_value =
-        ::dsn_config_get_value_string("rasn.state", "journal_file", "", "append-only rASN state journal file");
-    const std::string configured = journal_value == nullptr ? "" : journal_value;
-    if (!configured.empty())
-    {
-        return configured;
-    }
-    return default_checkpoint_path() + ".journal";
+    return configured_state_journal_path(checkpoint_path);
 }
 
 bool state_store::append_journal_record(const state_record &record, std::string *error) const

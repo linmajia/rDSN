@@ -393,6 +393,9 @@ rDSN design:
 
 - `rasn.state` follows the SKV pattern: service app, serverlet, `zlock`,
   checkpoint directory, recovery on start.
+- Local CLI defaults group runtime outputs under one top-level `rasn` directory:
+  durable state under `rasn/state`, large artifacts under `rasn/artifacts`, and
+  configured JSONL traces under `rasn/traces`.
 - Mutations can be unconditional, create-only, or expected-sequence checked.
   The conditional path is exposed as `RPC_RASN_STATE_PUT_CONDITIONAL` and is used
   by workflow ownership leases.

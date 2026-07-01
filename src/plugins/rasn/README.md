@@ -623,14 +623,14 @@ To capture a trace by default, set this in the built `config.ini` next to the Co
 
 ```ini
 [rasn.runtime]
-trace_file = C:\Users\haoxlin\source\repos\rdsn\rb-rasn\rasn-trace.jsonl
+trace_file = C:\Users\haoxlin\source\repos\rdsn\rb-rasn\rasn\traces\rasn.trace.jsonl
 ```
 
 Replay the captured nondeterministic simulator choice and any matching recorded
 model/tool results:
 
 ```bat
-C:\Users\haoxlin\source\repos\rdsn\rb-rasn\bin\codepilot\Debug\codepilot.exe replay C:\Users\haoxlin\source\repos\rdsn\rb-rasn\rasn-trace.jsonl ask "Explain how to add a new rDSN plugin"
+C:\Users\haoxlin\source\repos\rdsn\rb-rasn\bin\codepilot\Debug\codepilot.exe replay C:\Users\haoxlin\source\repos\rdsn\rb-rasn\rasn\traces\rasn.trace.jsonl ask "Explain how to add a new rDSN plugin"
 ```
 
 ### 2. Start interactive mode
@@ -733,6 +733,16 @@ C:\Users\haoxlin\source\repos\rdsn\rb-rasn\bin\codepilot\config.ini
 
 The most important sections are:
 
+By default, local runtime files are grouped under a single top-level `rasn`
+directory in the process working directory:
+
+```text
+rasn/
+  state/       durable checkpoints, journals, workflow leases, incident records
+  artifacts/   spilled tool-output artifacts and payload references
+  traces/      JSONL runtime traces when trace output is enabled
+```
+
 | Section/key | Meaning |
 | --- | --- |
 | `[rasn.model] provider` | `simulator`, `copilot`, `ollama`, `llamacpp`, `lmstudio`, or any custom OpenAI-compatible provider name. `[rasn.llm]` remains a compatibility alias. |
@@ -791,10 +801,10 @@ The most important sections are:
 | `[rasn.workflow] execution_lease_ms` | Time-to-live for durable workflow execution owner leases. Active duplicate starts are rejected until the owner finishes or the lease becomes stale. |
 | `[rasn.workflow] execution_lease_renew_ms` | Lease renewal interval for active workflow runs. `0` derives a safe interval from the lease TTL. |
 | `[rasn.registry] dynamic_registration/heartbeat_ms/lease_ms/sweep_interval_ms/registration_timeout_ms` | Enables best-effort RPC registration of built-in agents plus rDSN timer-driven heartbeats and lease cleanup. `lease_ms = 0` disables TTL filtering; `sweep_interval_ms = 0` disables active cleanup. |
-| `[rasn.state] checkpoint_dir/checkpoint_file/journal_file/recover_on_start` | Durable state checkpoint and append-only journal paths. `recover_on_start` names an explicit recovery checkpoint; if set, recovery failures are surfaced instead of falling back to an empty store. State writes also support create-only and expected-sequence conditions for leases and compare-and-swap style ownership. |
+| `[rasn.state] checkpoint_dir/checkpoint_file/journal_file/recover_on_start` | Durable state checkpoint and append-only journal paths. Defaults place checkpoints and journals under `rasn/state`. `recover_on_start` names an explicit recovery checkpoint; if set, recovery failures are surfaced instead of falling back to an empty store. State writes also support create-only and expected-sequence conditions for leases and compare-and-swap style ownership. |
 | `[rasn.state.nfs] enabled/remote_host/remote_port/remote_checkpoint_dir/timeout_ms` | Optional rDSN NFS import source used before state recovery when no local checkpoint or journal exists. Enable `[core] start_nfs` on the importing process and run `dsn.tools.nfs` on the source process. `timeout_ms` defaults to `20000` (20 seconds); use about `5000` for local/LAN interactive CLI fail-fast behavior, and keep `20000` or higher when remote recovery success is more important than command latency. |
-| `[rasn.state.replica] enabled/directory/recover` | Optional local mirror for state checkpoints and journals. When enabled, writes fail explicitly if the mirror cannot be updated, and recovery can seed missing primary state from the replica directory. Keep `directory` non-empty; an empty directory is a configuration error and should block persistence rather than silently disabling recovery protection. |
-| `[rasn.runtime] trace_file` | JSONL file for runtime traces. |
+| `[rasn.state.replica] enabled/directory/recover` | Optional local mirror for state checkpoints and journals. When enabled, writes fail explicitly if the mirror cannot be updated, and recovery can seed missing primary state from the replica directory. The default mirror path is `rasn/state/replica`. Keep `directory` non-empty; an empty directory is a configuration error and should block persistence rather than silently disabling recovery protection. |
+| `[rasn.runtime] trace_file` | JSONL file for runtime traces. Defaults use `rasn/traces/<app>.trace.jsonl`; the trace writer creates parent directories. |
 | `[rasn.runtime] temp_dir` | Optional temporary directory for request bodies and curl config files. Empty or `.` uses the OS temp directory under `rasn-provider`. |
 | `[rasn.metrics] enabled` | Enables rDSN `perf_counter`-backed runtime metrics (event counters and task/model/tool latency percentiles in section `rasn`). Default `true`; `false` makes every counter update a no-op. Surface them with `observe metrics [text|prometheus|json]` or the `rasn.metrics` rDSN command. |
 | `[rasn.rpc] timeout_ms` | Default timeout for rASN RPC client calls. |
@@ -810,7 +820,7 @@ The most important sections are:
 | `[rasn.policy] shell_timeout_ms` | Maximum shell command runtime before the shell process is terminated. On Windows, the process is assigned to a job object so timeout termination also covers child processes. `0` disables the timeout for trusted local debugging. |
 | `[rasn.policy] workspace_root` | Optional absolute or relative root for local tool targets. When set, read/write/search/list/replace targets must stay inside this root after rDSN path normalization. Empty preserves unrestricted path compatibility. |
 | `[rasn.policy] max_tool_output_bytes` | Maximum tool output kept inline before spilling to an artifact file and `rasn.state` reference. |
-| `[rasn.policy] artifact_dir` | Directory used for spilled tool-output artifacts. |
+| `[rasn.policy] artifact_dir` | Directory used for spilled tool-output artifacts. Defaults to `rasn/artifacts`. |
 | `[rasn.policy] redaction_enabled` | Enables default secret redaction for runtime traces, model-provider prompts/context, model responses, tool previews, and spilled artifacts. |
 | `[rasn.policy] redact_env_names` | Comma-separated environment-variable names whose current values should be redacted as exact secrets. |
 | `[rasn.policy] redact_literal_values` | Optional comma-separated literal values to redact for local testing or deployment-specific secrets. |

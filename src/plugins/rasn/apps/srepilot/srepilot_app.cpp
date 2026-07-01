@@ -4,8 +4,6 @@
 #include "../../agent_registry.h"
 #include "../../observability.h"
 
-#include <dsn/cpp/utils.h>
-
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -290,94 +288,6 @@ std::string state_line(const state_record &record)
     return oss.str();
 }
 
-std::string config_value(const char *section, const char *key, const char *default_value, const char *description)
-{
-    const char *value = ::dsn_config_get_value_string(section, key, default_value, description);
-    return value == nullptr ? "" : value;
-}
-
-bool config_bool(const char *section, const char *key, bool default_value, const char *description)
-{
-    return ::dsn_config_get_value_bool(section, key, default_value, description);
-}
-
-std::string configured_checkpoint_path()
-{
-    const std::string directory = config_value("rasn.state", "checkpoint_dir", "", "default rASN state checkpoint directory");
-    const std::string file = config_value("rasn.state", "checkpoint_file", "rasn-state.chkpt", "default rASN state checkpoint file");
-    const std::string file_name = file.empty() ? "rasn-state.chkpt" : file;
-    return directory.empty() ? file_name : ::dsn::utils::filesystem::path_combine(directory, file_name);
-}
-
-std::string configured_journal_path(const std::string &checkpoint_path)
-{
-    const std::string journal =
-        config_value("rasn.state", "journal_file", "", "append-only rASN state journal file");
-    return journal.empty() ? checkpoint_path + ".journal" : journal;
-}
-
-bool local_recovery_state_available(const std::string &checkpoint_path)
-{
-    const std::string journal = configured_journal_path(checkpoint_path);
-    return ::dsn::utils::filesystem::file_exists(checkpoint_path) ||
-           ::dsn::utils::filesystem::file_exists(journal);
-}
-
-std::string replica_path_for(const std::string &directory, const std::string &source_path)
-{
-    const std::string file_name = ::dsn::utils::filesystem::get_file_name(source_path);
-    return ::dsn::utils::filesystem::path_combine(directory, file_name.empty() ? "rasn-state" : file_name);
-}
-
-bool replica_recovery_state_available(const std::string &checkpoint_path)
-{
-    if (!config_bool("rasn.state.replica", "enabled", false, "Mirror state checkpoints and journal to a local replica") ||
-        !config_bool("rasn.state.replica", "recover", true, "Recover state from local replica when primary files are absent"))
-    {
-        return false;
-    }
-
-    const std::string directory =
-        config_value("rasn.state.replica", "directory", "rasn-state-replica", "Local rASN state replica directory");
-    if (directory.empty())
-    {
-        return true;
-    }
-
-    const std::string journal = configured_journal_path(checkpoint_path);
-    return ::dsn::utils::filesystem::file_exists(replica_path_for(directory, checkpoint_path)) ||
-           ::dsn::utils::filesystem::file_exists(replica_path_for(directory, journal));
-}
-
-bool nfs_recovery_configured()
-{
-    return config_bool("rasn.state.nfs", "enabled", false, "Enable rDSN NFS import before state recovery");
-}
-
-state_checkpoint_request configured_recovery_request()
-{
-    state_checkpoint_request request;
-    const std::string recover_on_start =
-        config_value("rasn.state", "recover_on_start", "", "checkpoint file to recover at startup");
-    if (!recover_on_start.empty())
-    {
-        request.path = recover_on_start;
-    }
-    return request;
-}
-
-bool recovery_state_available(const state_checkpoint_request &request)
-{
-    if (!request.path.empty())
-    {
-        return true;
-    }
-
-    const std::string checkpoint = configured_checkpoint_path();
-    return local_recovery_state_available(checkpoint) || replica_recovery_state_available(checkpoint) ||
-           nfs_recovery_configured();
-}
-
 void print_check(bool ok, const std::string &name, const std::string &detail, bool *all_ok)
 {
     if (!ok)
@@ -586,8 +496,8 @@ int srepilot_cli::status()
 
     state_query_request query;
     query.key_prefix = "srepilot/";
-    const state_checkpoint_request recover = configured_recovery_request();
-    if (recovery_state_available(recover))
+    const state_checkpoint_request recover = configured_state_recovery_request();
+    if (configured_state_recovery_available(recover))
     {
         const state_response recovered = _services.recover_state(recover);
         if (!recovered.ok)
@@ -789,8 +699,8 @@ bool srepilot_cli::recover_state_for_persist(std::string *error)
         return true;
     }
 
-    const state_checkpoint_request recover = configured_recovery_request();
-    if (recovery_state_available(recover))
+    const state_checkpoint_request recover = configured_state_recovery_request();
+    if (configured_state_recovery_available(recover))
     {
         const state_response recovered = _services.recover_state(recover);
         if (!recovered.ok)

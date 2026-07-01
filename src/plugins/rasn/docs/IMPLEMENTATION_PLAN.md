@@ -3251,6 +3251,59 @@ Validation:
 - [x] Hand-verify guard-chain refund ordering and enum/array/map counter alignment.
 - [x] `git diff --check`.
 
+## Phase 78: unified local runtime output layout
+
+Status: `[x]`
+
+Goal: Replace the older split default directories (`rasn-state`,
+`rasn-artifacts`, and ad-hoc trace files) with one predictable local runtime
+root:
+
+```text
+rasn/
+  state/
+  artifacts/
+  traces/
+```
+
+This keeps the current working directory clean when running CodePilot, SREPilot,
+or service-mode examples while preserving the state/artifact/trace separation
+operators need for retention, cleanup, and backup policies.
+
+Files:
+
+- `config.ini`, `apps/srepilot/config.ini`,
+  `examples/service-rpc-smoke.ini` (default paths under `rasn/`)
+- `.gitignore` (ignore generated local runtime output directories)
+- `state_service.h`, `state_service.cpp`, `apps/srepilot/srepilot_app.cpp`
+  (shared state path/recovery helpers consumed by SREPilot direct CLI)
+- `policy_manager.cpp` (fallback artifact directory)
+- `rasn_core.cpp` (create trace-file parent directories before opening)
+- `README.md`, `apps/codepilot/README.md`, `apps/srepilot/README.md`,
+  `docs/DESIGN.md`, `docs/IMPLEMENTATION_PLAN.md`
+
+Work items:
+
+- [x] Move default durable checkpoints and journals to `rasn/state`.
+- [x] Move default spilled artifacts to `rasn/artifacts`.
+- [x] Move configured trace files to `rasn/traces` and create parent directories
+  at trace-open time.
+- [x] Keep the optional local state replica under the same top-level `rasn` root
+  while leaving it separate from primary state files.
+- [x] Refactor SREPilot direct-CLI recovery checks to call shared rASN
+  state-path helpers instead of duplicating checkpoint/journal/replica defaults.
+- [x] Document the unified layout for CodePilot, SREPilot, and design readers.
+
+Validation:
+
+- [x] Build `rasn.unit_tests`, `codepilot`, and `srepilot`.
+- [x] Run filtered `rasn_*.*:codepilot_*.*` unit tests.
+- [x] Smoke direct `codepilot selftest`, `srepilot selftest`, and SREPilot
+  diagnosis/status persistence under `rasn/state`.
+- [x] Smoke service-mode `examples/service-rpc-smoke.ini` with checkpoint and
+  trace files under `rasn/state` and `rasn/traces`.
+- [x] `git diff --check`.
+
 ## Dependency order
 
 ```text
@@ -3331,6 +3384,7 @@ Phase 1 task model
   -> Phase 75 application directory layout
   -> Phase 76 SREPilot incident-response application
   -> Phase 77 model gateway token/cost budget
+  -> Phase 78 unified local runtime output layout
 ```
 
 Some phases can overlap after Phase 3, but the public message model and generic

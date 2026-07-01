@@ -51,6 +51,15 @@ Inside interactive mode, prefix commands with `/`, for example:
 built CodePilot target. Provider settings, policy settings, tool sandboxing,
 trace output, and state checkpoint settings are read from that file.
 
+By default, local runtime files are grouped under a single `rasn` directory in
+the process working directory:
+
+```text
+rasn\state      durable state checkpoints and journals
+rasn\artifacts  spilled tool-output artifacts
+rasn\traces     runtime JSONL traces
+```
+
 CodePilot can run entirely offline with the simulator provider. It can also use
 Copilot-compatible, OpenAI-compatible, Ollama, llama.cpp, or LM Studio endpoints
 through the generic rASN provider layer.

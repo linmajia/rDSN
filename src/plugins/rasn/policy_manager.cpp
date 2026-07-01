@@ -504,7 +504,7 @@ std::string policy_manager::config_string(const std::string &key, const std::str
 
 std::string policy_manager::artifact_dir() const
 {
-    return config_string_compat("artifact_dir", "rasn-artifacts");
+    return config_string_compat("artifact_dir", "rasn/artifacts");
 }
 
 std::string policy_manager::effective_workspace_root() const

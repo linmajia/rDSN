@@ -3,6 +3,8 @@
 #include "metrics.h"
 #include "redaction.h"
 
+#include <dsn/cpp/utils.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -281,6 +283,11 @@ void event_log::set_output_file(const std::string &path)
     _output_stream.clear();
     if (!path.empty())
     {
+        const std::string parent = ::dsn::utils::filesystem::remove_file_name(path);
+        if (!parent.empty())
+        {
+            ::dsn::utils::filesystem::create_directory(parent);
+        }
         // Open once and keep the stream; the previous code re-opened (and flushed
         // and closed) the file on every single event under _lock, stalling all
         // recording and observability queries behind per-event filesystem calls.

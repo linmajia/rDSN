@@ -62,7 +62,8 @@ Recovery sources are treated as authoritative and fail-safe:
   set, SREPilot attempts that recovery path before writing new incident records;
   recovery errors fail the command instead of checkpointing a partial store.
 - The default local checkpoint/journal from `[rasn.state] checkpoint_dir`,
-  `checkpoint_file`, and `journal_file` is auto-recovered when present.
+  `checkpoint_file`, and `journal_file` is auto-recovered when present. The
+  app-local defaults store these files under `rasn/state`.
 - `[rasn.state.replica] enabled = true` with `recover = true` lets recovery seed
   missing primary checkpoint/journal files from a local replica directory before
   trying NFS. Keep `directory` non-empty when enabling this; an empty replica
@@ -87,6 +88,15 @@ remote, or avoiding false recovery failures matters more than CLI latency.
 SREPilot has an app-local `config.ini` in this folder. Its CMake target copies
 that config beside the built `srepilot` executable, keeping SREPilot service-app
 configuration separate from CodePilot's shared config.
+
+By default, local runtime files are grouped under a single `rasn` directory in
+the process working directory:
+
+```text
+rasn\state      durable state checkpoints, journals, and incident records
+rasn\artifacts  spilled tool-output artifacts
+rasn\traces     runtime JSONL traces
+```
 
 The default provider is the offline simulator. Hosted or local model providers
 use the same `[rasn.llm]`, `[rasn.model]`, `[rasn.state]`, `[rasn.runtime]`, and

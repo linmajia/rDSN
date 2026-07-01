@@ -209,6 +209,11 @@ private:
     uint64_t _write_epoch = 0;
 };
 
+std::string configured_state_checkpoint_path();
+std::string configured_state_journal_path(const std::string &checkpoint_path);
+state_checkpoint_request configured_state_recovery_request();
+bool configured_state_recovery_available(const state_checkpoint_request &request);
+
 state_store &global_state_store();
 
 class rasn_state_rpc_service : public ::dsn::serverlet<rasn_state_rpc_service>

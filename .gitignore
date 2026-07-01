@@ -22,6 +22,9 @@ install/
 data/
 test_reports/
 include/thrift/
+**/rasn/state/
+**/rasn/artifacts/
+**/rasn/traces/
 
 src/plugins/rasn/docs/report/*.aux
 src/plugins/rasn/docs/report/*.bbl
