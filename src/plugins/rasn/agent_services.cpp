@@ -326,6 +326,22 @@ agent_response remote_agent_gate_response(const agent_request &request,
     return response;
 }
 
+agent_response overload_gate_response(const agent_request &request,
+                                      const std::string &code,
+                                      const std::string &message,
+                                      const std::string &source)
+{
+    agent_response response;
+    response.request_id = request.request_id;
+    response.trace_id = request.trace_id;
+    response.ok = false;
+    // Process-wide overload rejections are non-retryable at this hop: the whole
+    // process is shedding load, so an immediate retry against the same node would
+    // just be rejected again. Callers with alternate nodes may still route away.
+    response.error = make_agent_error("overload", code, message, false, source);
+    return response;
+}
+
 bool remote_agent_response_is_dependency_success(const agent_response &response)
 {
     // Only retryable failures count against the remote-agent circuit breaker.
@@ -678,6 +694,63 @@ rate_limit_config read_remote_agent_rate_config()
         "rate_limit_max_wait_ms",
         1000,
         "max ms a remote-agent dispatch may be paced waiting for a token before it is rejected");
+    return cfg;
+}
+
+// Process-wide overload budget config. Unlike the per-dependency gateways these
+// govern the WHOLE process (a single global bulkhead + a single global rate
+// ceiling), so the concurrency defaults are 0 (disabled/passthrough): operators
+// opt in by setting a cap sized to their host, and the framework's zero-config
+// behavior is unchanged.
+admission_config read_overload_admission_config()
+{
+    admission_config cfg;
+    cfg.enabled = ::dsn_config_get_value_bool(
+        "rasn.overload",
+        "admission_enabled",
+        true,
+        "enable the rASN process-wide overload admission control (global concurrency bulkhead + backpressure)");
+    cfg.max_concurrency = read_config_u32(
+        "rasn.overload",
+        "max_concurrent_operations",
+        0,
+        "hard cap on concurrent in-flight coordinator operations across all dependencies (0 = unlimited)");
+    cfg.soft_concurrency = read_config_u32(
+        "rasn.overload",
+        "soft_concurrent_operations",
+        0,
+        "in-flight level at which graceful process-wide admission backpressure begins (0 = no backpressure)");
+    cfg.max_backpressure_ms = read_config_u32(
+        "rasn.overload",
+        "max_backpressure_ms",
+        200,
+        "upper bound in ms on graceful process-wide admission backpressure delay");
+    return cfg;
+}
+
+rate_limit_config read_overload_rate_config()
+{
+    rate_limit_config cfg;
+    cfg.enabled = ::dsn_config_get_value_bool(
+        "rasn.overload",
+        "rate_limit_enabled",
+        true,
+        "enable the rASN process-wide overload rate limiter (global token bucket)");
+    cfg.requests_per_min = read_config_u32(
+        "rasn.overload",
+        "rate_limit_requests_per_min",
+        0,
+        "sustained process-wide coordinator operation rate in requests/minute (0 = unlimited)");
+    cfg.burst = read_config_u32(
+        "rasn.overload",
+        "rate_limit_burst",
+        0,
+        "process-wide rate-limiter burst capacity in tokens (0 = ~1s of the sustained rate)");
+    cfg.max_wait_ms = read_config_u32(
+        "rasn.overload",
+        "rate_limit_max_wait_ms",
+        1000,
+        "max ms a coordinator operation may be paced waiting for a process-wide token before it is rejected");
     return cfg;
 }
 
@@ -1691,6 +1764,109 @@ std::string rasn_coordinator_service::remote_agent_resilience_report() const
            format_remote_agent_rate_states(_remote_agent_rate.snapshot());
 }
 
+void rasn_coordinator_service::ensure_overload_config() const
+{
+    // admission_gate and rate_limiter hold a mutex (non-copyable, non-movable) and
+    // expose no set_config, so the process-wide singletons are lazily constructed
+    // under a once_flag on first use. Members are mutable so the const report path
+    // (`rasn.resilience` / observe resilience) can trigger the same lazy init.
+    std::call_once(_overload_config_once, [this] {
+        _overload_admission.reset(new admission_gate(read_overload_admission_config()));
+        _overload_rate.reset(new rate_limiter(read_overload_rate_config()));
+    });
+}
+
+admission_slot rasn_coordinator_service::overload_admit(const agent_request &request,
+                                                        nucleus_runtime &runtime,
+                                                        agent_response *fast_fail)
+{
+    ensure_overload_config();
+    admission_slot slot = _overload_admission->try_admit();
+    if (!slot.admitted())
+    {
+        dwarn("rASN process-wide overload admission rejected operation; concurrency limit %u reached",
+              static_cast<unsigned int>(slot.limit()));
+        runtime.record_overload_admission_rejected(request.task, slot.in_flight(), slot.limit());
+        if (fast_fail != nullptr)
+        {
+            *fast_fail = overload_gate_response(
+                request,
+                "overload_admission_rejected",
+                "process-wide overload admission rejected operation; concurrency limit " +
+                    std::to_string(slot.limit()) + " reached",
+                descriptor().agent_id);
+        }
+    }
+    return slot;
+}
+
+rate_decision rasn_coordinator_service::overload_rate_acquire(const agent_request &request,
+                                                              nucleus_runtime &runtime,
+                                                              agent_response *fast_fail)
+{
+    ensure_overload_config();
+    const rate_decision decision = _overload_rate->try_acquire(::dsn_now_ms());
+    if (!decision.allowed)
+    {
+        dwarn("rASN process-wide overload rate limiter rejected operation; rate %u req/min exceeded",
+              static_cast<unsigned int>(decision.limit_per_min));
+        runtime.record_overload_rate_limited(request.task, decision.limit_per_min);
+        if (fast_fail != nullptr)
+        {
+            *fast_fail = overload_gate_response(
+                request,
+                "overload_rate_limited",
+                "process-wide overload rate limiter rejected operation; rate " +
+                    std::to_string(decision.limit_per_min) + " req/min exceeded",
+                descriptor().agent_id);
+        }
+    }
+    return decision;
+}
+
+void rasn_coordinator_service::apply_overload_backpressure(const agent_task &task,
+                                                           nucleus_runtime &runtime,
+                                                           const admission_slot &slot,
+                                                           const rate_decision &rate)
+{
+    const uint32_t admission_delay = slot.delay_ms();
+    const uint32_t rate_delay = rate.delay_ms;
+    if (admission_delay > 0)
+    {
+        runtime.record_overload_admission_delayed(task, slot.in_flight(), admission_delay);
+    }
+    if (rate_delay > 0)
+    {
+        runtime.record_overload_rate_delayed(task, rate_delay);
+    }
+    // Coalesce the two graceful delays: a single sleep of the larger value
+    // satisfies both governors (mirrors the per-dependency backpressure path).
+    const uint32_t delay = (std::max)(admission_delay, rate_delay);
+    if (delay > 0)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+    }
+}
+
+std::string rasn_coordinator_service::overload_resilience_report() const
+{
+    ensure_overload_config();
+    const admission_config &adm = _overload_admission->config();
+    const rate_limit_config &rate = _overload_rate->config();
+    std::ostringstream oss;
+    oss << "process-wide overload budget:";
+    oss << "\n- admission: enabled=" << (adm.enabled ? "true" : "false")
+        << " in_flight=" << _overload_admission->in_flight()
+        << " max_concurrent_operations=" << adm.max_concurrency
+        << " soft_concurrent_operations=" << adm.soft_concurrency
+        << " max_backpressure_ms=" << adm.max_backpressure_ms;
+    oss << "\n- rate: enabled=" << (rate.enabled ? "true" : "false")
+        << " requests_per_min=" << rate.requests_per_min
+        << " burst=" << rate.burst
+        << " tokens=" << std::fixed << std::setprecision(2) << _overload_rate->cached_tokens();
+    return oss.str();
+}
+
 llm_response rasn_coordinator_service::complete(const agent_completion_request &request, nucleus_runtime &runtime)
 {
     const agent_request generic = make_model_agent_request(request, runtime.trace_id());
@@ -1745,6 +1921,32 @@ agent_response rasn_coordinator_service::invoke(const agent_request &request, nu
         return rejection;
     }
     scoped_agent_request request_scope(*this, request);
+
+    // Process-wide overload budget (Round 11): a single global concurrency
+    // bulkhead + request-rate ceiling bounding total in-flight work across every
+    // dependency (model, tool, remote-agent) in both inline and RPC modes.
+    // Applied AFTER begin_request/scoped_agent_request so malformed or cancelled
+    // requests never consume budget, and BEFORE routing so the whole process
+    // sheds load uniformly at its outermost chokepoint. invoke() is never
+    // re-entered on the same thread (inline handlers call external providers;
+    // workflow node dispatch is a flat sequential loop; RPC handlers run on
+    // separate threads), so one slot per top-level operation counts each logical
+    // operation exactly once with no self-deadlock. The slot is a local RAII held
+    // across retries and released on every return path; no rate refund is needed
+    // because this gate is outermost -- nothing short-circuits after the token is
+    // acquired within its scope. Defaults are passthrough (opt-in caps).
+    agent_response overload_rejection;
+    admission_slot overload_slot = overload_admit(request, runtime, &overload_rejection);
+    if (!overload_slot.admitted())
+    {
+        return overload_rejection;
+    }
+    const rate_decision overload_rate = overload_rate_acquire(request, runtime, &overload_rejection);
+    if (!overload_rate.allowed)
+    {
+        return overload_rejection;
+    }
+    apply_overload_backpressure(request.task, runtime, overload_slot, overload_rate);
 
     rasn_service_graph &services = global_rasn_services();
     const coordinator_route route =
@@ -2297,9 +2499,18 @@ std::string rasn_service_graph::remote_agent_resilience_report() const
     return _coordinator.remote_agent_resilience_report();
 }
 
+std::string rasn_service_graph::overload_resilience_report() const
+{
+    return _coordinator.overload_resilience_report();
+}
+
 std::string rasn_service_graph::resilience_report() const
 {
-    return model_resilience_report() + "\n" + tool_resilience_report() + "\n" + remote_agent_resilience_report();
+    // Ordered outermost-first: the process-wide overload budget governs every
+    // dependency, so it heads the report, followed by the per-dependency model,
+    // tool, and remote-agent gateways.
+    return overload_resilience_report() + "\n" + model_resilience_report() + "\n" +
+           tool_resilience_report() + "\n" + remote_agent_resilience_report();
 }
 
 std::string rasn_service_graph::topology() const

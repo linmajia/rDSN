@@ -278,11 +278,11 @@ latency percentiles) exported as text/Prometheus/JSON via \texttt{observe
 metrics} and a \texttt{command\_manager} command & No bundled scrape gateway,
 retention store, or dashboards \\
 Resilience & Bounded coordinator retry, request deadlines, per-provider
-model circuit/admission/rate guards, per-tool admission/rate gates, and
-per-remote-agent RPC circuit/admission/rate guards, all surfaced through
-\texttt{perf\_counter} metrics and a \texttt{rasn.resilience} command & The
-limits are per-dependency rather than a single process-wide budget, and govern
-request count rather than token/cost budgets \\
+model circuit/admission/rate guards, per-tool admission/rate gates,
+per-remote-agent RPC circuit/admission/rate guards, and a process-wide overload
+budget (global concurrency bulkhead plus request-rate ceiling), all surfaced
+through \texttt{perf\_counter} metrics and a \texttt{rasn.resilience} command & The
+overload budget bounds request count rather than token/cost budgets \\
 \bottomrule
 \end{tabular}
 \end{table*}
@@ -1983,7 +1983,8 @@ Rejections and backpressure delays are exported as
 \texttt{rasn\_model\_admission\_delayed\_total} through the same
 \texttt{record\_event} choke point, and live per-provider in-flight depth is shown by
 the \texttt{rasn.resilience} command. The cap is per-provider; a single
-process-wide concurrency budget is noted as future work.
+process-wide concurrency budget layers above it (see the Process-Wide Overload
+Budget subsection).
 
 \subsection{Model Rate Limiter}
 
@@ -2042,8 +2043,10 @@ when pointing \rasn at a metered endpoint. Rejections and pacing delays are
 exported as \texttt{rasn\_model\_rate\_limited\_total} and
 \texttt{rasn\_model\_rate\_delayed\_total} through the same \texttt{record\_event}
 choke point, and live per-provider rate, burst, and available tokens are shown by
-the \texttt{rasn.resilience} command. Rate limiting governs request count;
-token/cost budgets and a process-wide budget are noted as future work.
+the \texttt{rasn.resilience} command. Rate limiting governs request count; a
+process-wide request-rate ceiling layers above the per-provider limiter (see the
+Process-Wide Overload Budget subsection), while token/cost budgets remain future
+work.
 
 \subsection{Tool Gateway Admission and Rate Controls}
 
@@ -2128,6 +2131,50 @@ events feed seven counters:
 \texttt{observe resilience} and the \texttt{rasn.resilience} command alongside the
 model and tool sections.
 
+\subsection{Process-Wide Overload Budget}
+
+The three preceding gateways each protect one outbound boundary, but a host has
+finite \emph{shared} capacity --- worker threads, memory, sockets, file
+descriptors. When many dependencies are individually healthy yet all busy at once,
+the sum of their deliberately generous per-dependency caps can still exhaust the
+process. \rasn therefore adds a single process-wide overload budget at the
+coordinator's \texttt{invoke} choke point: one global concurrency bulkhead plus one
+global request-rate ceiling that bound \emph{total} in-flight work and throughput
+across every dependency (model, tool, remote-agent), in both inline and RPC modes.
+
+The budget reuses the same \texttt{admission\_gate} and \texttt{rate\_limiter}
+engines as the per-dependency gateways, but as process-wide singletons rather than
+per-key registries, lazily constructed under a \texttt{std::once\_flag} from
+\texttt{[rasn.overload]}. It is applied at the outermost point of \texttt{invoke}:
+\emph{after} \texttt{begin\_request} and the \texttt{scoped\_agent\_request} guard
+--- so a malformed or cancelled request consumes no budget, the same
+preflight-before-slots principle used for remote-agent endpoint validation --- and
+\emph{before} capability resolution and routing, so the whole process sheds load
+uniformly. Because \texttt{invoke} is never re-entered on the same thread (inline
+handlers call external providers, workflow node dispatch is a flat sequential loop,
+and RPC handlers run on separate threads), one admission slot per top-level
+operation counts each logical operation exactly once with no self-deadlock. The
+slot is a local RAII handle held across retries and released on every return path;
+no rate refund is needed here because the budget is outermost --- nothing
+short-circuits after the token is acquired within its scope, unlike the
+per-dependency breaker/rate interplay. Admission and rate delays are coalesced into
+a single sleep, and rejections are structured, non-retryable \texttt{overload}
+responses so a caller with alternate nodes can route away instead of hammering a
+saturated process.
+
+Unlike the per-dependency caps, the concurrency defaults are \texttt{0}
+(disabled/passthrough), so zero-config behavior is unchanged and an operator opts in
+by sizing a global cap to the host. Four counters ---
+\texttt{rasn\_overload\_admission\_rejected\_total},
+\texttt{rasn\_overload\_admission\_delayed\_total},
+\texttt{rasn\_overload\_rate\_limited\_total}, and
+\texttt{rasn\_overload\_rate\_delayed\_total} --- flow through the same
+\texttt{record\_event} choke point, and live budget state (in-flight, configured
+caps, cached tokens) \emph{heads} the \texttt{rasn.resilience} and
+\texttt{observe resilience} report, since the process-wide budget governs every
+per-dependency gateway below it. The remaining overload gap is dimensional rather
+than structural: rate limiting still governs request count, not token/cost budgets.
+
 \subsection{Testing and Validation}
 
 The current unit suite covers message validation, endpoint metadata, registry
@@ -2138,7 +2185,8 @@ reporting, budget propagation, resume, state checkpoint/recovery, conditional
 writes, workflow execution leases, lease renewal, cancellation tombstones,
 state-recovery error propagation, metric label sanitization, metric snapshot
 rendering, cumulative counter deltas from runtime events, per-failure-class
-counters, remote-agent resilience counters, and the \texttt{rasn.metrics} and
+counters, remote-agent resilience counters, process-wide overload counters, and the
+\texttt{rasn.metrics} and
 \texttt{rasn.resilience} commands. The CodePilot tool tests cover
 provider-side default-deny write/shell policy and atomic file replacement. Direct
 \codepilot self-tests
@@ -2509,9 +2557,10 @@ bundled scrape gateway, retention store, or prebuilt dashboards; latency
 percentiles depend on \rdsn's periodic counter timers \\
 Overload/dependency isolation & Model providers and remote-agent RPC dispatch
 have circuit-breaker, admission, and rate controls; tools have per-tool admission
-and rate controls; all are surfaced through \texttt{observe resilience} and
-\texttt{rasn.resilience} & Limits are per-dependency rather than process-wide and
-request-count based rather than token/cost based \\
+and rate controls; a process-wide overload budget bounds total in-flight work and
+throughput across all dependencies; all are surfaced through
+\texttt{observe resilience} and \texttt{rasn.resilience} & The process-wide budget
+is request-count based rather than token/cost based \\
 \bottomrule
 \end{tabular}
 \end{table*}

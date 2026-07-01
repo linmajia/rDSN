@@ -201,6 +201,20 @@ public:
     void record_remote_agent_endpoint_invalid(const agent_task &task,
                                               const std::string &agent,
                                               const std::string &reason);
+    // Process-wide overload budget events emitted by the coordinator when the
+    // global concurrency bulkhead or request-rate ceiling governs an operation.
+    // These are process-scoped (not per-dependency), so no key is carried; the
+    // event name field is fixed to "process-wide".
+    void record_overload_admission_rejected(const agent_task &task,
+                                            uint32_t in_flight,
+                                            uint32_t limit);
+    void record_overload_admission_delayed(const agent_task &task,
+                                           uint32_t in_flight,
+                                           uint32_t delay_ms);
+    void record_overload_rate_limited(const agent_task &task,
+                                      uint32_t limit_per_min);
+    void record_overload_rate_delayed(const agent_task &task,
+                                      uint32_t delay_ms);
     std::string resolve_nondeterminism(const agent_task &task,
                                        const std::string &name,
                                        const std::string &source,

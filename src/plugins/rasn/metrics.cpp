@@ -125,6 +125,10 @@ enum core_counter
     CC_REMOTE_AGENT_RATE_LIMITED,
     CC_REMOTE_AGENT_RATE_DELAYED,
     CC_REMOTE_AGENT_ENDPOINT_INVALID,
+    CC_OVERLOAD_ADMISSION_REJECTED,
+    CC_OVERLOAD_ADMISSION_DELAYED,
+    CC_OVERLOAD_RATE_LIMITED,
+    CC_OVERLOAD_RATE_DELAYED,
     CC_COUNT
 };
 
@@ -195,6 +199,18 @@ const counter_def k_core_counters[CC_COUNT] = {
     {"rasn_remote_agent_endpoint_invalid_total",
      "remote_agent.endpoint.invalid",
      "remote-agent dispatches rejected by endpoint preflight (missing or unresolvable address)"},
+    {"rasn_overload_admission_rejected_total",
+     "overload.admission.rejected",
+     "operations rejected by the process-wide overload concurrency bulkhead"},
+    {"rasn_overload_admission_delayed_total",
+     "overload.admission.delayed",
+     "operations delayed by process-wide overload admission backpressure"},
+    {"rasn_overload_rate_limited_total",
+     "overload.rate.limited",
+     "operations rejected by the process-wide overload rate limiter"},
+    {"rasn_overload_rate_delayed_total",
+     "overload.rate.delayed",
+     "operations delayed (paced) by the process-wide overload rate limiter"},
 };
 
 enum latency_counter
@@ -248,6 +264,10 @@ const std::unordered_map<std::string, int> &kind_to_core_counter()
         {"remote_agent.rate.limited", CC_REMOTE_AGENT_RATE_LIMITED},
         {"remote_agent.rate.delayed", CC_REMOTE_AGENT_RATE_DELAYED},
         {"remote_agent.endpoint.invalid", CC_REMOTE_AGENT_ENDPOINT_INVALID},
+        {"overload.admission.rejected", CC_OVERLOAD_ADMISSION_REJECTED},
+        {"overload.admission.delayed", CC_OVERLOAD_ADMISSION_DELAYED},
+        {"overload.rate.limited", CC_OVERLOAD_RATE_LIMITED},
+        {"overload.rate.delayed", CC_OVERLOAD_RATE_DELAYED},
     };
     return m;
 }

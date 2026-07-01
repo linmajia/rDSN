@@ -3045,6 +3045,75 @@ Validation:
 - [x] `git diff --check`.
 - [x] Report brace/bracket balance check (LaTeX toolchain not installed locally).
 
+## Phase 74: process-wide overload budget
+
+Status: `[~]`
+
+Goal: Close the "limits are per-dependency rather than a single process-wide
+budget" gap called out in the design's product-limitations section. Add one
+global concurrency bulkhead and one global request-rate ceiling at the
+coordinator `invoke` chokepoint so the total in-flight work and aggregate
+throughput across every dependency (model, tool, remote-agent) are bounded,
+protecting the host's shared capacity (threads, memory, sockets) even when each
+individual dependency is healthy. The budget is opt-in (passthrough by default)
+so zero-config behavior is unchanged.
+
+rDSN modules reused:
+
+- `admission_gate` (the `exp_delay`-backed backpressure curve and RAII
+  `admission_slot`) as a single process-wide bulkhead — the same engine the
+  per-dependency gateways use, here as a singleton rather than a registry.
+- `rate_limiter` with `dsn_now_ms` as the token-bucket refill clock, as a single
+  process-wide rate ceiling.
+- `perf_counter` through `record_event` / `metrics_registry` for four overload
+  counters.
+- `dsn_config` for `[rasn.overload]` admission/rate tunables.
+- `command_manager` for the `rasn.resilience` command (report already shared with
+  CodePilot `observe resilience`).
+
+Files:
+
+- `agent_services.h` / `agent_services.cpp`
+- `rasn_core.h` / `rasn_core.cpp`
+- `metrics.cpp`, `config.ini`, `examples/service-rpc-smoke.ini`
+- `tests/rasn_unit_tests.cpp`
+- `README.md`, `docs/DESIGN.md`, `docs/report/main.tex`,
+  `docs/IMPLEMENTATION_PLAN.md`
+
+Work items:
+
+- [x] Add `[rasn.overload]` admission/rate config readers and lazily-constructed
+  process-wide `admission_gate` + `rate_limiter` singletons (under a
+  `std::once_flag`) on `rasn_coordinator_service`.
+- [x] Apply the budget at the outermost point of `invoke` — after
+  `begin_request`/`scoped_agent_request` (so malformed/cancelled requests consume
+  no budget) and before capability resolution/routing (so load sheds uniformly).
+- [x] Hold the admission slot as a local RAII across retries, releasing on every
+  return path; no rate refund needed (the gate is outermost, nothing
+  short-circuits after the token is taken within its scope).
+- [x] Coalesce admission and rate delays into a single sleep, matching the
+  per-dependency gateways.
+- [x] Fast-fail rejections with a structured, non-retryable `overload` response.
+- [x] Add overload runtime events and `perf_counter` series:
+  `rasn_overload_admission_rejected_total`,
+  `rasn_overload_admission_delayed_total`, `rasn_overload_rate_limited_total`, and
+  `rasn_overload_rate_delayed_total`.
+- [x] Head the shared `rasn.resilience` / `observe resilience` report with live
+  process-wide budget state (in-flight, caps, cached tokens).
+- [x] Add `[rasn.overload]` defaults (concurrency caps `0`/passthrough) to the
+  main and service-smoke configs.
+- [x] Extend the metrics tests to cover the four overload counters.
+- [x] Update user docs, design notes, and the ACM-style technical report.
+
+Validation:
+
+- [ ] Build/test deferred: this workstation has no C++ toolchain (per the
+  operator constraint), so `rasn.unit_tests`/`codepilot` were not rebuilt here.
+  The change mirrors the fully-tested Phase 73 remote-agent path and reuses the
+  Phase 70/71 engines (covered by the `rasn_admission_gate` and `rasn_rate_limiter`
+  suites); enum/array/map alignment, event-kind/counter-key agreement, and
+  signature/caller/test agreement were verified by structural review.
+
 ## Dependency order
 
 ```text
@@ -3121,6 +3190,7 @@ Phase 1 task model
   -> Phase 71 model gateway rate limiter
   -> Phase 72 tool gateway admission and rate controls
   -> Phase 73 remote-agent dispatch resilience
+  -> Phase 74 process-wide overload budget
 ```
 
 Some phases can overlap after Phase 3, but the public message model and generic
@@ -3144,3 +3214,8 @@ RPC layer should stabilize first.
 - Should shell container execution remain a configurable command template, or
   become a first-class orchestrated executor with image policy, mount policy, and
   lifecycle tracking?
+- Now that request-count overload is bounded per-dependency and process-wide,
+  should the admission/rate engines gain an optional token/cost dimension (e.g. a
+  tokens-per-minute bucket sized from provider usage) so metered model spend is
+  governed alongside request rate, or is that better handled by a separate budget
+  accountant above the coordinator?

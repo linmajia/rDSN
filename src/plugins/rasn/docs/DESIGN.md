@@ -928,6 +928,62 @@ rDSN design:
   The default admission cap is generous (`64` hard, `32` soft, `200ms`
   backpressure) and the rate limiter is unlimited (`requests_per_min = 0`).
 
+### 12.7 Process-wide overload budget
+
+The per-dependency gateways (model, tool, remote-agent) each protect one outbound
+boundary, but a host has finite *shared* capacity — threads, memory, sockets, file
+descriptors. When many dependencies are individually healthy yet all busy at once,
+the sum of their generous per-dependency caps can still exhaust the process. rASN
+adds a single process-wide overload budget at the coordinator's `invoke`
+chokepoint: one global concurrency bulkhead plus one global request-rate ceiling
+that bound *total* in-flight work and throughput across every dependency, in both
+inline and RPC-client modes.
+
+Responsibilities:
+
+- Bound the total number of concurrent in-flight coordinator operations with a
+  single global admission bulkhead, applying `exp_delay`-based backpressure as the
+  process approaches the cap.
+- Bound the aggregate operation rate the process will admit with a single global
+  token-bucket rate limiter.
+- Shed load uniformly and early: reject with a structured, non-retryable
+  `overload` response so a caller with alternate nodes can route away instead of
+  hammering a saturated process.
+
+rDSN design:
+
+- `rasn_coordinator_service` owns one `admission_gate` and one `rate_limiter`
+  (the same engines the per-dependency gateways use), lazily constructed under a
+  `std::once_flag` from `[rasn.overload]`. They are singletons rather than
+  registries because the budget is process-scoped, not per-key.
+- The gate is applied at the outermost point of `invoke`, *after*
+  `begin_request`/`scoped_agent_request` (so malformed or cancelled requests never
+  consume budget — the same preflight-before-slots principle used for remote-agent
+  endpoint validation) and *before* capability resolution and routing (so the
+  whole process sheds load uniformly). `invoke` is never re-entered on the same
+  thread — inline handlers call external providers, workflow node dispatch is a
+  flat sequential loop, and RPC handlers run on separate threads — so one
+  admission slot per top-level operation counts each logical operation exactly once
+  with no self-deadlock.
+- The admission slot is a local RAII handle held across retries and released on
+  every return path. No rate refund is needed here because the overload gate is
+  outermost: nothing short-circuits after the token is acquired within its scope
+  (unlike the per-dependency breaker/rate interplay, which refunds).
+- Admission and rate delays are coalesced into a single sleep (the larger of the
+  two), matching the model, tool, and remote-agent gateways.
+- Four `perf_counter` series flow through `record_event`:
+  `rasn_overload_admission_rejected_total`,
+  `rasn_overload_admission_delayed_total`, `rasn_overload_rate_limited_total`, and
+  `rasn_overload_rate_delayed_total`. Live budget state (in-flight, configured
+  caps, cached tokens) heads the `rasn.resilience` and CodePilot
+  `observe resilience` report, since the process-wide budget governs everything
+  below it.
+- `[rasn.overload] admission_*`, `max_concurrent_operations`,
+  `soft_concurrent_operations`, `max_backpressure_ms`, and `rate_limit_*` are read
+  once with null-safe defaults. Unlike the per-dependency caps, the concurrency
+  defaults are `0` (disabled/passthrough) so zero-config behavior is unchanged;
+  operators opt in by sizing a global cap to their host.
+
 ### 13. Service-mode integration self-test
 
 The service-mode integration layer turns rASN correctness assumptions into a
@@ -1209,8 +1265,10 @@ remaining limitations are:
   circuit breaker, admission gate (concurrency bulkhead plus `exp_delay`-based
   backpressure), and token-bucket rate limiter. The tool gateway reuses the
   admission and rate engines per tool name, after replay and policy checks, so
-  tool fan-out is bounded and observable. Remaining gaps: the limits are
-  per-dependency rather than a single process-wide budget; rate limiting governs
-  request count but not token/cost budgets; and in RPC-client mode model/tool
-  resilience state lives on the serving node while remote-agent state lives on the
-  coordinator.
+  tool fan-out is bounded and observable. A process-wide overload budget (§12.7)
+  now sits above them at the coordinator `invoke` chokepoint, bounding total
+  in-flight work and aggregate throughput across all dependencies with a single
+  global bulkhead and rate ceiling (opt-in; passthrough by default). Remaining
+  gaps: rate limiting governs request count but not token/cost budgets; and in
+  RPC-client mode model/tool resilience state lives on the serving node while
+  remote-agent and process-wide overload state live on the coordinator.

@@ -1067,6 +1067,62 @@ void nucleus_runtime::record_remote_agent_endpoint_invalid(const agent_task &tas
     record_event(task, "remote_agent.endpoint.invalid", agent, reason, "", "", "", false, 0);
 }
 
+void nucleus_runtime::record_overload_admission_rejected(const agent_task &task,
+                                                         uint32_t in_flight,
+                                                         uint32_t limit)
+{
+    record_event(task,
+                 "overload.admission.rejected",
+                 "process-wide",
+                 "in_flight=" + std::to_string(in_flight) + " limit=" + std::to_string(limit),
+                 "",
+                 "",
+                 "",
+                 false,
+                 0);
+}
+
+void nucleus_runtime::record_overload_admission_delayed(const agent_task &task,
+                                                        uint32_t in_flight,
+                                                        uint32_t delay_ms)
+{
+    record_event(task,
+                 "overload.admission.delayed",
+                 "process-wide",
+                 "in_flight=" + std::to_string(in_flight) + " delay_ms=" + std::to_string(delay_ms),
+                 "",
+                 "",
+                 "",
+                 false,
+                 0);
+}
+
+void nucleus_runtime::record_overload_rate_limited(const agent_task &task, uint32_t limit_per_min)
+{
+    record_event(task,
+                 "overload.rate.limited",
+                 "process-wide",
+                 "requests_per_min=" + std::to_string(limit_per_min),
+                 "",
+                 "",
+                 "",
+                 false,
+                 0);
+}
+
+void nucleus_runtime::record_overload_rate_delayed(const agent_task &task, uint32_t delay_ms)
+{
+    record_event(task,
+                 "overload.rate.delayed",
+                 "process-wide",
+                 "delay_ms=" + std::to_string(delay_ms),
+                 "",
+                 "",
+                 "",
+                 false,
+                 0);
+}
+
 std::string nucleus_runtime::resolve_nondeterminism(const agent_task &task,
                                                     const std::string &name,
                                                     const std::string &source,

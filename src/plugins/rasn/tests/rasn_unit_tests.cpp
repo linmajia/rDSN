@@ -1959,6 +1959,10 @@ TEST(rasn_metrics_registry, snapshot_exposes_core_and_latency_series)
     EXPECT_NE(nullptr, snapshot.find("rasn_remote_agent_admission_rejected_total"));
     EXPECT_NE(nullptr, snapshot.find("rasn_remote_agent_rate_limited_total"));
     EXPECT_NE(nullptr, snapshot.find("rasn_remote_agent_endpoint_invalid_total"));
+    EXPECT_NE(nullptr, snapshot.find("rasn_overload_admission_rejected_total"));
+    EXPECT_NE(nullptr, snapshot.find("rasn_overload_admission_delayed_total"));
+    EXPECT_NE(nullptr, snapshot.find("rasn_overload_rate_limited_total"));
+    EXPECT_NE(nullptr, snapshot.find("rasn_overload_rate_delayed_total"));
 
     // Latency series are present and flagged as latency samples.
     const metric_sample *task_latency = snapshot.find("rasn_task_latency_ms");
@@ -1987,6 +1991,13 @@ TEST(rasn_metrics_registry, runtime_events_increment_cumulative_counters)
     const uint64_t remote_rate_before = registry.snapshot().counter("rasn_remote_agent_rate_limited_total");
     const uint64_t remote_endpoint_before =
         registry.snapshot().counter("rasn_remote_agent_endpoint_invalid_total");
+    const uint64_t overload_admission_before =
+        registry.snapshot().counter("rasn_overload_admission_rejected_total");
+    const uint64_t overload_admission_delayed_before =
+        registry.snapshot().counter("rasn_overload_admission_delayed_total");
+    const uint64_t overload_rate_before = registry.snapshot().counter("rasn_overload_rate_limited_total");
+    const uint64_t overload_rate_delayed_before =
+        registry.snapshot().counter("rasn_overload_rate_delayed_total");
 
     nucleus_runtime runtime;
     agent_task task;
@@ -1998,6 +2009,10 @@ TEST(rasn_metrics_registry, runtime_events_increment_cumulative_counters)
     runtime.record_remote_agent_admission_rejected(task, "unit.remote", 3, 2);
     runtime.record_remote_agent_rate_limited(task, "unit.remote", 60);
     runtime.record_remote_agent_endpoint_invalid(task, "unit.remote", "agent descriptor has no endpoint");
+    runtime.record_overload_admission_rejected(task, 3, 2);
+    runtime.record_overload_admission_delayed(task, 2, 50);
+    runtime.record_overload_rate_limited(task, 60);
+    runtime.record_overload_rate_delayed(task, 40);
     runtime.finish_task(task, "ok");
 
     const uint64_t begin_after = registry.snapshot().counter("rasn_tasks_begin_total");
@@ -2011,6 +2026,13 @@ TEST(rasn_metrics_registry, runtime_events_increment_cumulative_counters)
     EXPECT_EQ(remote_rate_before + 1, registry.snapshot().counter("rasn_remote_agent_rate_limited_total"));
     EXPECT_EQ(remote_endpoint_before + 1,
               registry.snapshot().counter("rasn_remote_agent_endpoint_invalid_total"));
+    EXPECT_EQ(overload_admission_before + 1,
+              registry.snapshot().counter("rasn_overload_admission_rejected_total"));
+    EXPECT_EQ(overload_admission_delayed_before + 1,
+              registry.snapshot().counter("rasn_overload_admission_delayed_total"));
+    EXPECT_EQ(overload_rate_before + 1, registry.snapshot().counter("rasn_overload_rate_limited_total"));
+    EXPECT_EQ(overload_rate_delayed_before + 1,
+              registry.snapshot().counter("rasn_overload_rate_delayed_total"));
 
     // Observing a latency value must never crash, even though percentiles are
     // computed asynchronously by rDSN counter timers.

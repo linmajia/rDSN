@@ -193,6 +193,10 @@ public:
     agent_response invoke(const agent_request &request, nucleus_runtime &runtime);
     std::string describe_topology() const;
     std::string remote_agent_resilience_report() const;
+    // Human-readable process-wide overload budget report (global concurrency
+    // bulkhead + request-rate ceiling that bound total in-flight work across all
+    // dependencies). Shared by `rasn.resilience` and CodePilot observe resilience.
+    std::string overload_resilience_report() const;
 
 private:
     void ensure_remote_agent_breaker_config();
@@ -227,6 +231,24 @@ private:
     agent_response invoke_remote_agent(const agent_request &request,
                                        nucleus_runtime &runtime,
                                        const agent_descriptor &agent);
+    // Process-wide overload budget: a single global concurrency bulkhead and a
+    // single global request-rate ceiling applied at the coordinator invoke
+    // chokepoint, bounding total in-flight work and throughput across ALL
+    // dependencies (model, tool, remote-agent) in both inline and RPC modes.
+    // Reuses the same admission_gate (exp_delay backpressure) and rate_limiter
+    // (dsn_now_ms token bucket) engines as the per-dependency gateways. Lazily
+    // configured from [rasn.overload]; defaults are passthrough.
+    void ensure_overload_config() const;
+    admission_slot overload_admit(const agent_request &request,
+                                  nucleus_runtime &runtime,
+                                  agent_response *fast_fail);
+    rate_decision overload_rate_acquire(const agent_request &request,
+                                        nucleus_runtime &runtime,
+                                        agent_response *fast_fail);
+    void apply_overload_backpressure(const agent_task &task,
+                                     nucleus_runtime &runtime,
+                                     const admission_slot &slot,
+                                     const rate_decision &rate);
 
     rasn_llm_agent_service &_llm_agent;
     rasn_tool_agent_service &_tool_agent;
@@ -236,6 +258,9 @@ private:
     std::once_flag _remote_agent_admission_config_once;
     rate_limiter_registry _remote_agent_rate;
     std::once_flag _remote_agent_rate_config_once;
+    mutable std::unique_ptr<admission_gate> _overload_admission;
+    mutable std::unique_ptr<rate_limiter> _overload_rate;
+    mutable std::once_flag _overload_config_once;
 };
 
 class rasn_service_graph
@@ -273,6 +298,10 @@ public:
     // Human-readable remote-agent dispatch resilience report covering
     // coordinator-to-agent RPC circuit breakers, admission, and rate controls.
     std::string remote_agent_resilience_report() const;
+    // Human-readable process-wide overload budget report (global concurrency
+    // bulkhead + request-rate ceiling bounding total in-flight work across all
+    // dependencies).
+    std::string overload_resilience_report() const;
     // Combined resilience report (model + tool + remote-agent), the single
     // source of truth shared by the `rasn.resilience` command and CodePilot's
     // `observe resilience`.
