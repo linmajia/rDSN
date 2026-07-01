@@ -426,7 +426,8 @@ std::string file_content_fingerprint(const std::string &path)
     std::array<char, 65536> block;
     while (bytes < k_max_file_read_bytes && input)
     {
-        input.read(block.data(), static_cast<std::streamsize>(block.size()));
+        const size_t to_read = (std::min)(block.size(), k_max_file_read_bytes - static_cast<size_t>(bytes));
+        input.read(block.data(), static_cast<std::streamsize>(to_read));
         const std::streamsize got = input.gcount();
         if (got <= 0)
         {
@@ -440,8 +441,9 @@ std::string file_content_fingerprint(const std::string &path)
         }
     }
 
+    const bool has_more = bytes == k_max_file_read_bytes && input.peek() != EOF;
     std::ostringstream output;
-    output << "file bytes=" << bytes << " fnv1a=0x"
+    output << "file bytes=" << bytes << " has_more=" << (has_more ? "true" : "false") << " fnv1a=0x"
            << std::hex << std::setw(16) << std::setfill('0') << hash;
     return output.str();
 }

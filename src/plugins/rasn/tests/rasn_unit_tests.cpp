@@ -190,6 +190,11 @@ std::string temp_file_path(const std::string &name)
 #endif
 }
 
+std::string workspace_temp_file_path(const std::string &name)
+{
+    return normalize_platform_path(name);
+}
+
 void write_text_file(const std::string &path, const std::string &content)
 {
     std::ofstream output(path.c_str(), std::ios::binary | std::ios::trunc);
@@ -1646,7 +1651,7 @@ TEST(rasn_workflow_service, renews_active_execution_lease_during_long_node)
 
 TEST(codepilot_tools, read_and_search_files)
 {
-    const std::string path = temp_file_path("rasn-codepilot-tools-unit.txt");
+    const std::string path = workspace_temp_file_path("rasn-codepilot-tools-unit.txt");
     write_text_file(path, "alpha\nneedle beta\ngamma\n");
 
     codepilot_tool_provider provider;
@@ -1669,8 +1674,8 @@ TEST(codepilot_tools, read_and_search_files)
 
 TEST(codepilot_tools, records_and_replay_checks_filesystem_snapshots)
 {
-    const std::string path = temp_file_path("rasn-codepilot-fs-replay.txt");
-    const std::string trace_path = temp_file_path("rasn-codepilot-fs-replay.jsonl");
+    const std::string path = workspace_temp_file_path("rasn-codepilot-fs-replay.txt");
+    const std::string trace_path = workspace_temp_file_path("rasn-codepilot-fs-replay.jsonl");
     std::remove(trace_path.c_str());
     write_text_file(path, "first\n");
 
