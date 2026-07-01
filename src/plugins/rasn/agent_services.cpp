@@ -2660,7 +2660,8 @@ std::string rasn_service_graph::topology() const
     {
         oss << "- events=" << observed.events.size()
             << " failures=" << observed.failures.size()
-            << " last_sequence=" << observed.last_sequence << "\n";
+            << " last_sequence=" << observed.last_sequence
+            << (observed.truncated ? " [truncated]" : "") << "\n";
     }
 
     return oss.str();

@@ -65,6 +65,18 @@ private:
         {
             return fail(error, "internal parser error");
         }
+        // Cap recursion depth so a deeply nested payload (e.g. "[[[[...]]]]")
+        // arriving over RPC cannot overflow the stack and crash the service.
+        struct depth_guard
+        {
+            explicit depth_guard(size_t &depth) : _depth(depth) { ++_depth; }
+            ~depth_guard() { --_depth; }
+            size_t &_depth;
+        } guard(_depth);
+        if (_depth > _max_depth)
+        {
+            return fail(error, "JSON nesting exceeds maximum depth");
+        }
         skip_ws();
         if (_pos >= _text.size())
         {
@@ -299,6 +311,8 @@ private:
 
     const std::string &_text;
     size_t _pos = 0;
+    size_t _depth = 0;
+    static const size_t _max_depth = 256;
 };
 
 std::vector<std::string> split_csv(const std::string &value)
@@ -746,19 +760,41 @@ bool workflow_graph::load_from_stream(std::istream &input, const std::string &so
 
         std::ostringstream prompt;
         size_t i = 3;
+        // An explicit "--" token unambiguously separates the free-text prompt
+        // from options, so a prompt may contain words that collide with option
+        // keywords (policy, cost, state, ...). Without a delimiter we fall back
+        // to scanning for the first option keyword (backward compatible).
+        size_t delimiter = words.size();
+        for (size_t d = 3; d < words.size(); ++d)
+        {
+            if (words[d] == "--")
+            {
+                delimiter = d;
+                break;
+            }
+        }
+
+        bool prompt_started = false;
         for (; i < words.size(); ++i)
         {
-            if (is_workflow_option(words[i]))
+            const bool at_boundary =
+                delimiter != words.size() ? (i == delimiter) : is_workflow_option(words[i]);
+            if (at_boundary)
             {
                 break;
             }
-            if (i != 3)
+            if (prompt_started)
             {
                 prompt << " ";
             }
             prompt << words[i];
+            prompt_started = true;
         }
         node.prompt = prompt.str();
+        if (delimiter != words.size() && i == delimiter)
+        {
+            ++i; // consume the "--" delimiter before parsing options
+        }
 
         while (i < words.size())
         {
@@ -816,12 +852,13 @@ bool workflow_graph::load_from_stream(std::istream &input, const std::string &so
             else if (option == "cost_hint" || option == "cost")
             {
                 uint64_t parsed = 0;
-                if (!parse_uint64(value, &parsed))
+                if (!parse_uint64(value, &parsed) ||
+                    parsed > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()))
                 {
                     if (error != nullptr)
                     {
                         *error = "invalid workflow line " + std::to_string(line_number) + " in " + source_name +
-                                 ": cost_hint must be an unsigned integer";
+                                 ": cost_hint must be an unsigned 32-bit integer";
                     }
                     return false;
                 }
@@ -830,12 +867,13 @@ bool workflow_graph::load_from_stream(std::istream &input, const std::string &so
             else if (option == "latency_ms" || option == "latency")
             {
                 uint64_t parsed = 0;
-                if (!parse_uint64(value, &parsed))
+                if (!parse_uint64(value, &parsed) ||
+                    parsed > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()))
                 {
                     if (error != nullptr)
                     {
                         *error = "invalid workflow line " + std::to_string(line_number) + " in " + source_name +
-                                 ": latency_ms must be an unsigned integer";
+                                 ": latency_ms must be an unsigned 32-bit integer";
                     }
                     return false;
                 }

@@ -75,6 +75,7 @@ struct observability_response
     std::vector<runtime_event> events;
     std::vector<failure_record> failures;
     uint64_t last_sequence = 0;
+    bool truncated = false;
 };
 
 failure_record failure_from_event(const runtime_event &event);
@@ -251,6 +252,7 @@ inline void marshall(::dsn::binary_writer &writer, const observability_response 
     marshall_runtime_events(writer, value.events, fmt);
     marshall_failures(writer, value.failures, fmt);
     writer.write(value.last_sequence);
+    writer.write(value.truncated);
 }
 
 inline void unmarshall(::dsn::binary_reader &reader, observability_response &value, ::dsn_msg_serialize_format fmt)
@@ -261,6 +263,7 @@ inline void unmarshall(::dsn::binary_reader &reader, observability_response &val
     unmarshall_runtime_events(reader, value.events, fmt);
     unmarshall_failures(reader, value.failures, fmt);
     reader.read(value.last_sequence);
+    reader.read(value.truncated);
 }
 
 class rasn_observability_rpc_service : public ::dsn::serverlet<rasn_observability_rpc_service>

@@ -4,6 +4,8 @@
 
 #include <chrono>
 #include <cstddef>
+#include <deque>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <string>
@@ -24,6 +26,8 @@ struct agent_task
 class event_log
 {
 public:
+    ~event_log();
+
     void set_output_file(const std::string &path);
     bool load_replay_file(const std::string &path, std::string *error);
 
@@ -41,11 +45,15 @@ public:
     bool replay_workflow_node_start(const std::string &node_id, std::string *expected_node_id);
     bool replay_enabled() const;
     uint64_t last_sequence() const;
-    const std::string &output_file() const { return _output_file; }
+    // Returned by value under _lock: _output_file is mutated (set_output_file)
+    // concurrently with observability snapshot reads, so handing out a reference
+    // would be a data race / torn read.
+    std::string output_file() const;
 
 private:
     std::string _output_file;
-    std::vector<runtime_event> _events;
+    std::ofstream _output_stream;
+    std::deque<runtime_event> _events;
     std::map<std::string, std::string> _replay_values;
     std::map<std::string, runtime_event> _replay_tool_events;
     std::map<std::string, std::string> _replay_filesystem_snapshots;
@@ -65,7 +73,7 @@ public:
 
     const std::string &trace_id() const { return _trace_id; }
     void set_trace_file(const std::string &path) { _log.set_output_file(path); }
-    const std::string &trace_file() const { return _log.output_file(); }
+    std::string trace_file() const { return _log.output_file(); }
     bool enable_replay(const std::string &path, std::string *error);
 
     void begin_task(const agent_task &task);
@@ -239,8 +247,11 @@ private:
 
     std::string _trace_id;
     event_log _log;
-    std::map<std::string, uint64_t> _task_start_ms;
-    std::map<std::string, uint64_t> _llm_start_ms;
+    // FIFO of start timestamps per key: overlapping same-key requests must each
+    // record their own latency sample instead of the newer request clobbering the
+    // older start time (which dropped samples and skewed the histogram).
+    std::map<std::string, std::vector<uint64_t>> _task_start_ms;
+    std::map<std::string, std::vector<uint64_t>> _llm_start_ms;
     mutable ::dsn::service::zlock _timing_lock;
 };
 

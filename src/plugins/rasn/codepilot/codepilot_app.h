@@ -8,6 +8,7 @@
 #include <dsn/service_api_cpp.h>
 #include <dsn/cpp/task_helper.h>
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -22,6 +23,11 @@ public:
 
     int run(const std::vector<std::string> &args);
     int repl();
+
+    // Ask a running interactive repl() to exit at its next loop iteration. Safe to
+    // call from another thread (e.g. service_app::stop) so shutdown need not block
+    // on the non-preemptible, stdin-parked CLI task.
+    void request_shutdown() { _shutdown_requested.store(true); }
 
 private:
     int run_command(const std::vector<std::string> &args);
@@ -49,6 +55,7 @@ private:
 
     rasn_service_graph &_services;
     std::vector<std::string> _context;
+    std::atomic<bool> _shutdown_requested{false};
 };
 
 class codepilot_app : public ::dsn::service_app

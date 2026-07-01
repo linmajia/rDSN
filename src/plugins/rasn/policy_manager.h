@@ -73,6 +73,7 @@ private:
     size_t config_size(const std::string &key, size_t fallback) const;
     std::string config_string(const std::string &key, const std::string &fallback) const;
     std::string artifact_dir() const;
+    std::string effective_workspace_root() const;
 };
 
 policy_manager &global_policy_manager();

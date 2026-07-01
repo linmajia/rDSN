@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <mutex>
 #include <sstream>
 
 namespace dsn {
@@ -137,6 +138,44 @@ bool starts_with_case_insensitive(const std::string &value, size_t pos, const st
     return true;
 }
 
+// Length of a recognized HTTP auth-scheme keyword at `pos` when it is immediately
+// followed by whitespace, else 0. Used so the credential after the scheme is
+// redacted instead of just the scheme word -- without this,
+// "Authorization: Basic <base64>" would only scrub "Basic" and leak the secret.
+size_t auth_scheme_keyword_length(const std::string &text, size_t pos)
+{
+    static const std::string kSchemes[] = {
+        "bearer", "basic", "digest", "negotiate", "ntlm", "token", "apikey"};
+    for (const std::string &scheme : kSchemes)
+    {
+        if (starts_with_case_insensitive(text, pos, scheme))
+        {
+            const size_t after = pos + scheme.size();
+            if (after < text.size() && std::isspace(static_cast<unsigned char>(text[after])))
+            {
+                return scheme.size();
+            }
+        }
+    }
+    return 0;
+}
+
+// Process-wide registry of secret values resolved at runtime (e.g. bearer tokens
+// loaded from a file: or cmd: credential_ref) that never appear in an environment
+// variable. Populated by the provider at token-load time so redaction stays
+// consistent regardless of where a secret came from.
+std::mutex &runtime_secret_mutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::vector<std::string> &runtime_secret_registry()
+{
+    static std::vector<std::string> values;
+    return values;
+}
+
 void replace_all(std::string *text, const std::string &needle, const std::string &replacement)
 {
     if (needle.empty())
@@ -198,6 +237,17 @@ std::vector<std::string> configured_secret_values(size_t min_secret_length)
             if (value.size() >= min_secret_length)
             {
                 append_unique(&values, value);
+            }
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> guard(runtime_secret_mutex());
+        for (const std::string &secret : runtime_secret_registry())
+        {
+            if (secret.size() >= min_secret_length)
+            {
+                append_unique(&values, secret);
             }
         }
     }
@@ -289,23 +339,42 @@ void redact_key_value_secrets(std::string *text)
             ++value_begin;
         }
 
-        if (starts_with_case_insensitive(*text, value_begin, "bearer"))
+        bool auth_scheme_value = false;
+        const size_t scheme_len = auth_scheme_keyword_length(*text, value_begin);
+        if (scheme_len != 0)
         {
-            size_t bearer_end = value_begin + 6;
-            while (bearer_end < text->size() && std::isspace(static_cast<unsigned char>((*text)[bearer_end])))
+            size_t scheme_end = value_begin + scheme_len;
+            while (scheme_end < text->size() && std::isspace(static_cast<unsigned char>((*text)[scheme_end])))
             {
-                ++bearer_end;
+                ++scheme_end;
             }
-            if (bearer_end > value_begin + 6)
+            if (scheme_end > value_begin + scheme_len)
             {
-                value_begin = bearer_end;
+                value_begin = scheme_end;
+                auth_scheme_value = true;
             }
         }
 
         size_t value_end = value_begin;
         if (quote != 0)
         {
+            // Honor backslash escapes so a value like "ab\"cd" is redacted whole
+            // instead of stopping at the escaped quote and leaking the tail.
             while (value_end < text->size() && (*text)[value_end] != quote)
+            {
+                if ((*text)[value_end] == '\\' && value_end + 1 < text->size())
+                {
+                    ++value_end;
+                }
+                ++value_end;
+            }
+        }
+        else if (auth_scheme_value)
+        {
+            // Authorization-style scheme credentials (Basic/Digest/...) run to the
+            // end of the line and may contain spaces, commas, or '=' padding, so
+            // redact the whole credential rather than stopping at the first space.
+            while (value_end < text->size() && (*text)[value_end] != '\n' && (*text)[value_end] != '\r')
             {
                 ++value_end;
             }
@@ -363,6 +432,20 @@ std::string redact_sensitive_text(const std::string &text)
 std::string redact_sensitive_text(const std::string &text, const std::vector<std::string> &secret_values)
 {
     return redact_sensitive_text_internal(text, secret_values, 1);
+}
+
+void register_runtime_secret(const std::string &secret)
+{
+    if (secret.empty())
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> guard(runtime_secret_mutex());
+    std::vector<std::string> &registry = runtime_secret_registry();
+    if (std::find(registry.begin(), registry.end(), secret) == registry.end())
+    {
+        registry.push_back(secret);
+    }
 }
 
 } // namespace rasn

@@ -23,6 +23,9 @@ public:
     bool register_agent(const agent_descriptor &descriptor, std::string *error, bool lease_tracked);
     bool unregister_agent(const std::string &agent_id);
 
+    // Convenience overloads default to healthy_only=true so capability routing
+    // never selects unhealthy or lease-expired agents. Pass the explicit
+    // healthy_only=false overload for diagnostics that need the full roster.
     std::vector<agent_descriptor> list_agents() const;
     std::vector<agent_descriptor> list_agents(bool healthy_only) const;
     std::vector<agent_descriptor> query_by_capability(const std::string &capability) const;

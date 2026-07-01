@@ -8,12 +8,14 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 
 #if defined(_WIN32)
@@ -21,6 +23,11 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <poll.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 namespace dsn {
@@ -44,15 +51,32 @@ std::string join_tool_args(const std::vector<std::string> &args, size_t begin)
 
 bool parse_size(const std::string &value, size_t *parsed)
 {
+    // strtoul silently accepts a leading '-' (wrapping to ULONG_MAX) and does not
+    // by itself signal overflow, so a model-supplied "read <file> -1" or a huge
+    // number would otherwise drive an enormous allocation downstream. Require a
+    // pure non-negative decimal and honor ERANGE.
+    if (value.empty() || !std::isdigit(static_cast<unsigned char>(value.front())))
+    {
+        return false;
+    }
+    errno = 0;
     char *end = nullptr;
-    const unsigned long result = std::strtoul(value.c_str(), &end, 10);
-    if (end == value.c_str() || *end != '\0')
+    const unsigned long long result = std::strtoull(value.c_str(), &end, 10);
+    if (end == value.c_str() || *end != '\0' || errno == ERANGE)
+    {
+        return false;
+    }
+    if (result > static_cast<unsigned long long>((std::numeric_limits<size_t>::max)()))
     {
         return false;
     }
     *parsed = static_cast<size_t>(result);
     return true;
 }
+
+// Hard ceiling on how many bytes any single read/edit will buffer, independent of
+// the model-supplied max-bytes. Bounds worst-case memory for one tool call.
+const size_t k_max_file_read_bytes = 64u * 1024u * 1024u;
 
 std::string config_string_compat(const std::string &key, const std::string &fallback)
 {
@@ -119,8 +143,11 @@ std::string canonical_command_name(std::string command)
 
 bool command_contains_shell_metacharacter(const std::string &command)
 {
-    return command.find_first_of("&|;<>`") != std::string::npos || command.find('\n') != std::string::npos ||
-           command.find('\r') != std::string::npos;
+    // Include $ ( ) { } so an allow-listed word[0] cannot smuggle a command
+    // substitution / subshell (e.g. "echo $(rm -rf ~)" or "echo `id`") past the
+    // allow-list: on POSIX the string still runs through /bin/sh -c.
+    return command.find_first_of("&|;<>`$(){}") != std::string::npos ||
+           command.find('\n') != std::string::npos || command.find('\r') != std::string::npos;
 }
 
 std::string quote_shell_path(const std::string &path)
@@ -179,8 +206,17 @@ std::string absolute_or_normalized_path(const std::string &path)
     return normalize_platform_path(normalized);
 }
 
-bool read_text_prefix(const std::string &path, size_t max_bytes, std::string *content, std::string *error)
+bool read_text_prefix(const std::string &path,
+                      size_t max_bytes,
+                      std::string *content,
+                      std::string *error,
+                      bool *truncated = nullptr)
 {
+    if (truncated != nullptr)
+    {
+        *truncated = false;
+    }
+
     std::ifstream input(path.c_str(), std::ios::binary);
     if (!input)
     {
@@ -191,15 +227,79 @@ bool read_text_prefix(const std::string &path, size_t max_bytes, std::string *co
         return false;
     }
 
-    std::vector<char> buffer(max_bytes + 1);
-    input.read(buffer.data(), static_cast<std::streamsize>(max_bytes));
-    const std::streamsize count = input.gcount();
-    content->assign(buffer.data(), static_cast<size_t>(count));
-    if (input.peek() != EOF)
+    // Bound the allocation by the actual file size so a large model-supplied
+    // max_bytes cannot force a multi-GB allocation for a small (or empty) file.
+    // When the size is unknown (non-seekable input) fall back to max_bytes, which
+    // callers already clamp to k_max_file_read_bytes.
+    size_t to_read = max_bytes;
+    input.seekg(0, std::ios::end);
+    const std::streamoff end_pos = input.tellg();
+    if (end_pos >= 0)
     {
-        *content += "\n\n[truncated at " + std::to_string(max_bytes) + " bytes]";
+        to_read = (std::min)(max_bytes, static_cast<size_t>(end_pos));
+    }
+    input.clear();
+    input.seekg(0, std::ios::beg);
+
+    content->clear();
+    if (to_read > 0)
+    {
+        content->resize(to_read);
+        input.read(&(*content)[0], static_cast<std::streamsize>(to_read));
+        content->resize(static_cast<size_t>(input.gcount()));
+    }
+
+    // Report truncation to the caller WITHOUT mutating content. Editing tools must
+    // never write back a marker-polluted buffer, and read can surface the notice
+    // in its own output.
+    const bool more = input.good() && input.peek() != EOF;
+    if (more && truncated != nullptr)
+    {
+        *truncated = true;
     }
     return true;
+}
+
+// Read one line, retaining at most max_len bytes and discarding the rest of an
+// over-long line. A file with no newlines (minified JS, binary blob, giant log)
+// would otherwise load entirely into memory as a single std::getline "line".
+// Returns false only at end of input.
+bool read_bounded_line(std::istream &input, std::string *line, size_t max_len)
+{
+    line->clear();
+    int ch = input.get();
+    if (ch == EOF)
+    {
+        return false;
+    }
+    while (ch != EOF && ch != '\n')
+    {
+        if (line->size() < max_len)
+        {
+            line->push_back(static_cast<char>(ch));
+        }
+        ch = input.get();
+    }
+    return true;
+}
+
+// Detect obviously-binary files (a NUL byte in the first block) so search skips
+// them instead of streaming megabytes of non-text. Rewinds on a text result.
+bool stream_looks_binary(std::istream &input)
+{
+    std::array<char, 4096> probe;
+    input.read(probe.data(), static_cast<std::streamsize>(probe.size()));
+    const std::streamsize got = input.gcount();
+    for (std::streamsize i = 0; i < got; ++i)
+    {
+        if (probe[static_cast<size_t>(i)] == '\0')
+        {
+            return true;
+        }
+    }
+    input.clear();
+    input.seekg(0, std::ios::beg);
+    return false;
 }
 
 bool should_skip_path(const std::string &path)
@@ -294,14 +394,25 @@ std::string file_content_fingerprint(const std::string &path)
         return "missing";
     }
 
+    // Hash in blocks (not byte-by-byte) and stop at the same ceiling read/replace
+    // enforce, so fingerprinting a huge file cannot become an unbounded CPU sink.
     uint64_t hash = 1469598103934665603ull;
     uint64_t bytes = 0;
-    char c = 0;
-    while (input.get(c))
+    std::array<char, 65536> block;
+    while (bytes < k_max_file_read_bytes && input)
     {
-        hash ^= static_cast<unsigned char>(c);
-        hash *= 1099511628211ull;
-        ++bytes;
+        input.read(block.data(), static_cast<std::streamsize>(block.size()));
+        const std::streamsize got = input.gcount();
+        if (got <= 0)
+        {
+            break;
+        }
+        for (std::streamsize i = 0; i < got; ++i)
+        {
+            hash ^= static_cast<unsigned char>(block[static_cast<size_t>(i)]);
+            hash *= 1099511628211ull;
+            ++bytes;
+        }
     }
 
     std::ostringstream output;
@@ -547,10 +658,12 @@ std::string run_command_capture_stdout_and_stderr(const std::string &command,
     }
     CloseHandle(read_pipe);
 #else
-    std::array<char, 4096> buffer;
-    const std::string redirected = command + " 2>&1";
-    FILE *pipe = popen(redirected.c_str(), "r");
-    if (pipe == nullptr)
+    // popen/pclose give us no way to enforce a timeout or kill a hung child, so
+    // the previous POSIX path ignored timeout_ms entirely (a blocking command hung
+    // the agent forever). Run the command under our own fork/exec with a new
+    // session so a timeout can SIGKILL the whole process group.
+    int pipe_fds[2];
+    if (pipe(pipe_fds) != 0)
     {
         if (exit_code != nullptr)
         {
@@ -559,15 +672,110 @@ std::string run_command_capture_stdout_and_stderr(const std::string &command,
         return output;
     }
 
-    while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr)
+    const pid_t child = fork();
+    if (child < 0)
     {
-        output += buffer.data();
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        if (exit_code != nullptr)
+        {
+            *exit_code = -1;
+        }
+        return output;
     }
 
-    const int rc = pclose(pipe);
+    if (child == 0)
+    {
+        // Child: become a session/group leader, redirect stdout+stderr to the
+        // pipe, then exec the command through the shell.
+        setsid();
+        dup2(pipe_fds[1], STDOUT_FILENO);
+        dup2(pipe_fds[1], STDERR_FILENO);
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        execl("/bin/sh", "sh", "-c", command.c_str(), static_cast<char *>(nullptr));
+        _exit(127);
+    }
+
+    // Parent: read until EOF or timeout, killing the child's process group if it
+    // overruns the deadline.
+    close(pipe_fds[1]);
+    const int read_fd = pipe_fds[0];
+    const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    bool killed = false;
+    std::array<char, 4096> buffer;
+    for (;;)
+    {
+        struct pollfd pfd;
+        pfd.fd = read_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        const int poll_rc = poll(&pfd, 1, 200);
+        if (poll_rc > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR)) != 0)
+        {
+            const ssize_t n = read(read_fd, buffer.data(), buffer.size());
+            if (n > 0)
+            {
+                output.append(buffer.data(), static_cast<size_t>(n));
+                continue;
+            }
+            if (n == 0)
+            {
+                break; // child closed the pipe (exited)
+            }
+            if (errno != EINTR && errno != EAGAIN)
+            {
+                break;
+            }
+        }
+        else if (poll_rc < 0 && errno != EINTR)
+        {
+            break;
+        }
+
+        if (timeout_ms != 0)
+        {
+            const uint64_t elapsed_ms = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
+            if (elapsed_ms >= timeout_ms)
+            {
+                kill(-child, SIGKILL);
+                if (timed_out != nullptr)
+                {
+                    *timed_out = true;
+                }
+                killed = true;
+                break;
+            }
+        }
+    }
+    close(read_fd);
+
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR)
+    {
+    }
+
     if (exit_code != nullptr)
     {
-        *exit_code = rc;
+        if (killed)
+        {
+            *exit_code = -1;
+        }
+        else if (WIFEXITED(status))
+        {
+            // Decode the real exit code; a raw wait-status would report exit 1 as
+            // 256 and hide signal termination.
+            *exit_code = WEXITSTATUS(status);
+        }
+        else if (WIFSIGNALED(status))
+        {
+            *exit_code = 128 + WTERMSIG(status);
+        }
+        else
+        {
+            *exit_code = -1;
+        }
     }
 #endif
     return output;
@@ -821,13 +1029,13 @@ std::vector<tool_descriptor> codepilot_tool_provider::describe_tool_schemas() co
                                 "write",
                                 "Atomically write a file when policy allows write side effects.",
                                 std::vector<tool_argument_descriptor>{tool_argument("path", true, "File to write."),
-                                                                       tool_argument("content", true, "Content to write.")}));
+                                                                       tool_argument("content", true, "Content to write; pass as a single quoted argument so tabs, repeated spaces, and newlines are preserved (unquoted content is joined with single spaces).")}));
     tools.push_back(tool_schema("replace",
                                 "write",
                                 "Atomically replace the first text occurrence when policy allows write side effects.",
                                 std::vector<tool_argument_descriptor>{tool_argument("path", true, "File to edit."),
-                                                                       tool_argument("old", true, "Text to replace."),
-                                                                       tool_argument("new", true, "Replacement text.")}));
+                                                                       tool_argument("old", true, "Text to replace; pass as a single quoted argument to match interior whitespace exactly."),
+                                                                       tool_argument("new", true, "Replacement text; pass as a single quoted argument so tabs, repeated spaces, and newlines are preserved (unquoted text is joined with single spaces).")}));
     tools.push_back(tool_schema("shell",
                                 "shell",
                                 "Run a local command only when policy, approval, and shell sandbox controls allow it.",
@@ -864,8 +1072,12 @@ tool_result codepilot_tool_provider::run_checked(const std::string &name,
     }
 
     const std::string arguments = join_tool_args(args, 0);
+    // Only fingerprint the filesystem when a deterministic trace is actually being
+    // recorded or replayed. Otherwise computing the snapshot (hashing whole files
+    // / walking whole trees on every read/list/search) is pure overhead and a
+    // model-reachable CPU/time sink even with no trace configured.
     const std::string snapshot_key = filesystem_snapshot_key_for_tool(name, args);
-    if (!snapshot_key.empty())
+    if (!snapshot_key.empty() && (runtime.replay_enabled() || !runtime.trace_file().empty()))
     {
         const std::string snapshot = filesystem_snapshot_for_tool(name, args);
         std::string snapshot_error;
@@ -963,13 +1175,19 @@ tool_result codepilot_tool_provider::run_read(const std::vector<std::string> &ar
     {
         return make_tool_result(false, "", "invalid max-bytes: " + args[1]);
     }
+    max_bytes = (std::min)(max_bytes, k_max_file_read_bytes);
 
     std::string content;
     std::string error;
+    bool truncated = false;
     const std::string path = normalize_platform_path(args[0]);
-    if (!read_text_prefix(path, max_bytes, &content, &error))
+    if (!read_text_prefix(path, max_bytes, &content, &error, &truncated))
     {
         return make_tool_result(false, "", error);
+    }
+    if (truncated)
+    {
+        content += "\n\n[truncated at " + std::to_string(max_bytes) + " bytes]";
     }
 
     return make_tool_result(true, "file: " + path + "\n" + content, "");
@@ -1000,10 +1218,14 @@ tool_result codepilot_tool_provider::run_search(const std::vector<std::string> &
         {
             continue;
         }
+        if (stream_looks_binary(input))
+        {
+            continue;
+        }
 
         std::string line;
         size_t line_no = 0;
-        while (matches < _max_search_matches && std::getline(input, line))
+        while (matches < _max_search_matches && read_bounded_line(input, &line, 64u * 1024u))
         {
             ++line_no;
             if (line.find(args[1]) != std::string::npos)
@@ -1053,10 +1275,21 @@ tool_result codepilot_tool_provider::run_replace(const std::vector<std::string> 
 
     std::string content;
     std::string error;
+    bool truncated = false;
     const std::string path = normalize_platform_path(args[0]);
-    if (!read_text_prefix(path, 1024 * 1024, &content, &error))
+    // Read the entire file (up to the safety ceiling). Never edit a truncated
+    // buffer: previously replace read only the first 1 MiB and wrote that back,
+    // silently discarding everything past the cap and corrupting the source file.
+    if (!read_text_prefix(path, k_max_file_read_bytes, &content, &error, &truncated))
     {
         return make_tool_result(false, "", error);
+    }
+    if (truncated)
+    {
+        return make_tool_result(
+            false,
+            "",
+            "file too large to edit safely (exceeds " + std::to_string(k_max_file_read_bytes) + " bytes): " + path);
     }
 
     const std::string::size_type pos = content.find(args[1]);

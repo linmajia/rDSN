@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
+#include <limits>
+#include <memory>
 #include <sstream>
 
 namespace dsn {
@@ -442,7 +444,7 @@ bool import_state_recovery_files_from_nfs(const std::string &checkpoint_path,
     ::dsn::rpc_address remote;
     remote.assign_ipv4(config.remote_host.c_str(), config.remote_port);
 
-    nfs_copy_result copy_result;
+    auto copy_result = std::make_shared<nfs_copy_result>();
     ::dsn::task_ptr task = ::dsn::file::copy_remote_files(
         remote,
         config.remote_checkpoint_dir,
@@ -451,9 +453,9 @@ bool import_state_recovery_files_from_nfs(const std::string &checkpoint_path,
         config.overwrite,
         LPC_RASN_STATE_NFS_COPY,
         nullptr,
-        [&copy_result](::dsn::error_code err, size_t size) {
-            copy_result.error = err;
-            copy_result.size = size;
+        [copy_result](::dsn::error_code err, size_t size) {
+            copy_result->error = err;
+            copy_result->size = size;
         });
     if (task == nullptr)
     {
@@ -465,6 +467,8 @@ bool import_state_recovery_files_from_nfs(const std::string &checkpoint_path,
     }
     if (!task->wait(config.timeout_ms))
     {
+        // Best-effort cancel; the completion callback holds a shared_ptr to the
+        // result, so it stays alive even if the copy finishes after we return.
         bool finished = false;
         task->cancel(false, &finished);
         if (error != nullptr)
@@ -481,11 +485,11 @@ bool import_state_recovery_files_from_nfs(const std::string &checkpoint_path,
         }
         return false;
     }
-    if (copy_result.error != ::dsn::ERR_OK)
+    if (copy_result->error != ::dsn::ERR_OK)
     {
         if (error != nullptr)
         {
-            *error = std::string("rDSN NFS state import callback failed: ") + copy_result.error.to_string();
+            *error = std::string("rDSN NFS state import callback failed: ") + copy_result->error.to_string();
         }
         return false;
     }
@@ -631,6 +635,27 @@ bool valid_state_key(const std::string &key)
     return separator != std::string::npos && separator > 0 && separator + 1 < key.size();
 }
 
+// Namespace-aware prefix match. Keys are namespaced as <scope>/<id>, so a raw
+// substring prefix ("team1") must not match a sibling namespace ("team10/..").
+// A key matches when the prefix is empty, an exact key, already ends with the
+// separator, or the match stops on a path separator boundary.
+bool state_key_matches_prefix(const std::string &key, const std::string &prefix)
+{
+    if (prefix.empty())
+    {
+        return true;
+    }
+    if (key.size() < prefix.size() || key.compare(0, prefix.size(), prefix) != 0)
+    {
+        return false;
+    }
+    if (key.size() == prefix.size() || prefix.back() == '/')
+    {
+        return true;
+    }
+    return key[prefix.size()] == '/';
+}
+
 } // namespace
 
 state_response state_store::put(const state_record &record)
@@ -695,7 +720,22 @@ state_response state_store::put(const state_put_request &request)
 
         if (stored.sequence == 0)
         {
+            if (_last_sequence == (std::numeric_limits<uint64_t>::max)())
+            {
+                return error_response("state sequence space exhausted for key " + stored.key);
+            }
             stored.sequence = _last_sequence + 1;
+        }
+        else if (request.check_sequence && existing != _records.end() &&
+                 stored.sequence <= existing->second.sequence)
+        {
+            // A caller that manages its own versions (e.g. workflow runs) must
+            // advance the version on every conditional write. Refuse a stored
+            // sequence that does not move strictly forward so a stale or replayed
+            // record cannot silently overwrite a newer committed one.
+            return error_response("state conditional put must advance sequence for key " + stored.key +
+                                  ": existing " + std::to_string(existing->second.sequence) + " proposed " +
+                                  std::to_string(stored.sequence));
         }
 
         std::string journal_error;
@@ -706,6 +746,7 @@ state_response state_store::put(const state_put_request &request)
 
         _last_sequence = (std::max)(_last_sequence, stored.sequence);
         _records[stored.key] = stored;
+        ++_write_epoch;
         last_sequence = _last_sequence;
     }
 
@@ -759,7 +800,7 @@ state_response state_store::query(const state_query_request &request) const
     state_response response;
     for (const std::map<std::string, state_record>::value_type &entry : _records)
     {
-        if (request.key_prefix.empty() || entry.first.find(request.key_prefix) == 0)
+        if (state_key_matches_prefix(entry.first, request.key_prefix))
         {
             response.records.push_back(entry.second);
         }
@@ -784,9 +825,13 @@ state_response state_store::checkpoint(const state_checkpoint_request &request) 
 
     std::map<std::string, state_record> snapshot;
     uint64_t last_sequence = 0;
-    ::dsn::service::zauto_lock guard(_lock);
-    snapshot = _records;
-    last_sequence = _last_sequence;
+    uint64_t snapshot_epoch = 0;
+    {
+        ::dsn::service::zauto_lock guard(_lock);
+        snapshot = _records;
+        last_sequence = _last_sequence;
+        snapshot_epoch = _write_epoch;
+    }
 
     const std::string temp_path = path + ".tmp";
     std::ofstream output(temp_path.c_str(), std::ios::binary | std::ios::trunc);
@@ -840,10 +885,26 @@ state_response state_store::checkpoint(const state_checkpoint_request &request) 
     }
 
     const std::string journal_path = journal_path_for_checkpoint(path);
-    if (::dsn::utils::filesystem::file_exists(journal_path) &&
-        !::dsn::utils::filesystem::remove_path(journal_path))
+    // Only compact (delete) the journal if no write landed since we snapshotted
+    // _records. A put that appended to the journal after the snapshot is not in
+    // this checkpoint file, so removing the whole journal would lose it from
+    // durable storage. In that case leave the journal for the next checkpoint to
+    // fold in (recovery replays checkpoint + journal, so keeping it is safe).
+    //
+    // The epoch re-check and the removal must happen under a single lock
+    // acquisition. A concurrent put() serializes on _lock to append its durable
+    // journal record and bump _write_epoch atomically (see put()); checking the
+    // epoch under the lock but unlinking after releasing it would let such a put
+    // slip in between and have its just-acknowledged record deleted along with
+    // the journal. remove_path is a fast unlink, so holding _lock across it
+    // matches the pre-refactor design where the whole checkpoint ran locked.
     {
-        return error_response("failed to compact state journal: " + journal_path);
+        ::dsn::service::zauto_lock guard(_lock);
+        if (_write_epoch == snapshot_epoch && ::dsn::utils::filesystem::file_exists(journal_path) &&
+            !::dsn::utils::filesystem::remove_path(journal_path))
+        {
+            return error_response("failed to compact state journal: " + journal_path);
+        }
     }
     std::string replica_error;
     if (!mirror_checkpoint_to_replica(path, journal_path, &replica_error))
@@ -980,8 +1041,21 @@ state_response state_store::recover(const state_checkpoint_request &request)
 
     {
         ::dsn::service::zauto_lock guard(_lock);
-        _records.swap(recovered);
-        _last_sequence = last_sequence;
+        // Merge by max sequence instead of swapping wholesale. A put that
+        // committed (and was acked) after we read the checkpoint/journal files
+        // but before acquiring this lock has a higher per-key sequence than the
+        // recovered copy, so it must be preserved. Recovered records only win
+        // when they are strictly newer than the in-memory record (or the key is
+        // absent, e.g. startup recovery into an empty store).
+        for (std::map<std::string, state_record>::value_type &entry : recovered)
+        {
+            const std::map<std::string, state_record>::iterator current = _records.find(entry.first);
+            if (current == _records.end() || entry.second.sequence > current->second.sequence)
+            {
+                _records[entry.first] = entry.second;
+            }
+        }
+        _last_sequence = (std::max)(_last_sequence, last_sequence);
     }
 
     state_response response;

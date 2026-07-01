@@ -11,6 +11,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
+#include <exception>
 #include <memory>
 #include <sstream>
 #include <thread>
@@ -59,6 +60,16 @@ uint64_t workflow_execution_lease_renew_ms()
 bool has_workflow_timer_context()
 {
     return ::dsn::task::get_current_node2() != nullptr;
+}
+
+uint64_t workflow_cancel_probe_ms()
+{
+    // How often a running executor re-reads the shared run record to observe a
+    // cancellation that was routed to a different instance than the lease
+    // holder. 0 disables the cross-instance probe (single-instance deployments
+    // do not need it and avoid the extra state read).
+    return ::dsn_config_get_value_uint64(
+        "rasn.workflow", "cancel_probe_ms", 2000, "cross-instance workflow cancellation probe interval in milliseconds");
 }
 
 struct workflow_execution_lease
@@ -205,12 +216,76 @@ void copy_lease_fields(const workflow_run_record &source, workflow_run_record *t
     target->lease_expires_ms = source.lease_expires_ms;
 }
 
+// Header fields are serialized one per line as key=value, so any newline in a
+// value (LLM/tool/compiler errors routinely carry stack traces and stderr)
+// would otherwise split into lines the line-by-line decoder rejects, corrupting
+// the record and aborting recovery. Escape newlines (and the escape character)
+// on write and reverse it on read so multi-line values survive a round trip on
+// a single physical line.
+std::string escape_state_field(const std::string &value)
+{
+    std::string out;
+    out.reserve(value.size());
+    for (char c : value)
+    {
+        switch (c)
+        {
+        case '\\':
+            out += "\\\\";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        default:
+            out += c;
+            break;
+        }
+    }
+    return out;
+}
+
+std::string unescape_state_field(const std::string &value)
+{
+    std::string out;
+    out.reserve(value.size());
+    for (size_t i = 0; i < value.size(); ++i)
+    {
+        if (value[i] == '\\' && i + 1 < value.size())
+        {
+            const char next = value[i + 1];
+            if (next == '\\')
+            {
+                out += '\\';
+                ++i;
+                continue;
+            }
+            if (next == 'n')
+            {
+                out += '\n';
+                ++i;
+                continue;
+            }
+            if (next == 'r')
+            {
+                out += '\r';
+                ++i;
+                continue;
+            }
+        }
+        out += value[i];
+    }
+    return out;
+}
+
 std::string record_value(const workflow_run_record &record)
 {
     std::ostringstream oss;
     oss << "run_id=" << record.run_id << "\n"
-        << "workflow_id=" << record.workflow_id << "\n"
-        << "source_name=" << record.source_name << "\n"
+        << "workflow_id=" << escape_state_field(record.workflow_id) << "\n"
+        << "source_name=" << escape_state_field(record.source_name) << "\n"
         << "status=" << record.status << "\n"
         << "sequence=" << record.sequence << "\n";
     if (!record.execution_owner.empty())
@@ -231,7 +306,7 @@ std::string record_value(const workflow_run_record &record)
     }
     if (!record.error.empty())
     {
-        oss << "error=" << record.error << "\n";
+        oss << "error=" << escape_state_field(record.error) << "\n";
     }
     if (!record.plan.empty())
     {
@@ -266,13 +341,13 @@ std::string node_status_value(const std::string &run_id,
 {
     std::ostringstream oss;
     oss << "run_id=" << run_id << "\n"
-        << "workflow_id=" << workflow_id << "\n"
+        << "workflow_id=" << escape_state_field(workflow_id) << "\n"
         << "node_id=" << status.node_id << "\n"
         << "action=" << status.action << "\n"
         << "status=" << status.status << "\n";
     if (!status.error.empty())
     {
-        oss << "error=" << status.error << "\n";
+        oss << "error=" << escape_state_field(status.error) << "\n";
     }
     if (!status.output.empty())
     {
@@ -544,6 +619,15 @@ public:
         return _state->record;
     }
 
+    // True once a lease renewal attempt has failed: the executor has (or is
+    // about to) lose ownership, so execution must abort rather than continue as
+    // a split-brain writer against a lease another owner may have taken over.
+    bool failed() const
+    {
+        ::dsn::service::zauto_lock guard(_state->lock);
+        return _state->failed;
+    }
+
 private:
     std::shared_ptr<workflow_lease_renewal_state> _state;
     ::dsn::task_ptr _timer;
@@ -658,11 +742,11 @@ bool decode_workflow_run_record(const state_record &state, workflow_run_record *
         }
         else if (consume_prefix(line, "workflow_id=", &value))
         {
-            decoded.workflow_id = value;
+            decoded.workflow_id = unescape_state_field(value);
         }
         else if (consume_prefix(line, "source_name=", &value))
         {
-            decoded.source_name = value;
+            decoded.source_name = unescape_state_field(value);
         }
         else if (consume_prefix(line, "status=", &value))
         {
@@ -712,7 +796,7 @@ bool decode_workflow_run_record(const state_record &state, workflow_run_record *
         }
         else if (consume_prefix(line, "error=", &value))
         {
-            decoded.error = value;
+            decoded.error = unescape_state_field(value);
         }
         else if (!line.empty())
         {
@@ -812,7 +896,7 @@ bool decode_workflow_node_status(const state_record &state,
         }
         else if (consume_prefix(line, "workflow_id=", &value))
         {
-            decoded_workflow_id = value;
+            decoded_workflow_id = unescape_state_field(value);
         }
         else if (consume_prefix(line, "node_id=", &value))
         {
@@ -828,7 +912,7 @@ bool decode_workflow_node_status(const state_record &state,
         }
         else if (consume_prefix(line, "error=", &value))
         {
-            decoded.error = value;
+            decoded.error = unescape_state_field(value);
         }
         else if (!line.empty())
         {
@@ -1061,22 +1145,100 @@ workflow_response workflow_store::start(const workflow_start_request &request)
 
     workflow_lease_renewal_guard lease_renewer(running);
     service_graph_provider provider;
-    workflow_result result = graph.execute(provider,
-                                           global_rasn_services().runtime(),
-                                           [](const std::string &name,
-                                              const std::vector<std::string> &args,
-                                              nucleus_runtime &runtime,
-                                              const agent_task &task,
-                                              uint32_t timeout_ms) {
-                                             return global_rasn_services().run_tool(name, args, task, timeout_ms);
-                                           },
-                                           [this, run_id, workflow_id](const workflow_node_status &status) {
-                                              persist_node_status(run_id, workflow_id, status);
-                                           },
-                                           [this, run_id]() {
-                                              return is_cancelled(run_id, nullptr);
-                                           },
-                                           resume_state);
+
+    // Best-effort terminal-failed finalization used when execution throws. It
+    // stops lease renewal, records a "failed" terminal state under the lease we
+    // still hold, and releases the lease. If ownership was already lost (CAS
+    // conflict / renewal failure) the persist and release simply no-op, leaving
+    // the authoritative owner to finalize, and we surface the failure locally.
+    auto finalize_failed = [this, &lease_renewer, running](const std::string &message) -> workflow_response {
+        lease_renewer.stop();
+        workflow_run_record failed = running;
+        copy_lease_fields(lease_renewer.snapshot(), &failed);
+        failed.status = "failed";
+        failed.error = message;
+        const workflow_response persisted = store_record_if_current(failed, running.sequence);
+        if (!persisted.run.run_id.empty())
+        {
+            release_execution_lease(persisted.run, "failed");
+            return persisted;
+        }
+        release_execution_lease(failed, "failed");
+        return error_response(message);
+    };
+
+    // Cross-instance cancellation probe throttle. A cancel routed to a different
+    // instance than the lease holder only lands in shared state, so the running
+    // executor periodically re-reads its run record to observe it.
+    struct cancel_probe_state
+    {
+        ::dsn::service::zlock lock;
+        uint64_t last_ms = 0;
+    };
+    auto probe = std::make_shared<cancel_probe_state>();
+    const uint64_t probe_interval_ms = workflow_cancel_probe_ms();
+
+    auto should_cancel = [this, run_id, &lease_renewer, probe, probe_interval_ms]() -> bool {
+        // Same-instance cancellation (cheap, in-memory).
+        if (is_cancelled(run_id, nullptr))
+        {
+            return true;
+        }
+        // Lost the execution lease (renewal failed): abort rather than run on as
+        // a split-brain writer against a lease another owner may have taken.
+        if (lease_renewer.failed())
+        {
+            return true;
+        }
+        // Cross-instance cancellation: re-read the shared run record, throttled.
+        if (probe_interval_ms == 0)
+        {
+            return false;
+        }
+        const uint64_t now = ::dsn_now_ms();
+        {
+            ::dsn::service::zauto_lock guard(probe->lock);
+            if (probe->last_ms != 0 && now - probe->last_ms < probe_interval_ms)
+            {
+                return false;
+            }
+            probe->last_ms = now;
+        }
+        workflow_run_record remote;
+        std::string probe_error;
+        if (recover_run_from_state(run_id, &remote, &probe_error) && remote.status == "cancelled")
+        {
+            return true;
+        }
+        return false;
+    };
+
+    workflow_result result;
+    try
+    {
+        result = graph.execute(provider,
+                               global_rasn_services().runtime(),
+                               [](const std::string &name,
+                                  const std::vector<std::string> &args,
+                                  nucleus_runtime &runtime,
+                                  const agent_task &task,
+                                  uint32_t timeout_ms) {
+                                 return global_rasn_services().run_tool(name, args, task, timeout_ms);
+                               },
+                               [this, run_id, workflow_id](const workflow_node_status &status) {
+                                  persist_node_status(run_id, workflow_id, status);
+                               },
+                               should_cancel,
+                               resume_state);
+    }
+    catch (const std::exception &ex)
+    {
+        return finalize_failed(std::string("workflow execution error: ") + ex.what());
+    }
+    catch (...)
+    {
+        return finalize_failed("workflow execution error: unknown exception");
+    }
 
     lease_renewer.stop();
     const workflow_run_record lease_snapshot = lease_renewer.snapshot();
@@ -1112,6 +1274,15 @@ workflow_response workflow_store::start(const workflow_start_request &request)
     if (!completed_response.run.run_id.empty())
     {
         release_execution_lease(completed_response.run, completed.status);
+    }
+    else
+    {
+        // The completion CAS failed (e.g. a cancel on another instance wrote a
+        // terminal record first) or we lost ownership. We may still hold the
+        // lease, so release it with the fields captured above; the release
+        // no-ops if ownership was already lost. This keeps the lease from
+        // leaking and blocking resume/restart until it expires.
+        release_execution_lease(completed, completed.status);
     }
     return completed_response;
 }
@@ -1372,6 +1543,7 @@ workflow_response workflow_store::recover_from_state()
 
     std::vector<workflow_run_record> recovered;
     recovered.reserve(state.records.size());
+    size_t skipped = 0;
     for (const state_record &record : state.records)
     {
         if (record.kind != "workflow")
@@ -1382,7 +1554,12 @@ workflow_response workflow_store::recover_from_state()
         std::string error;
         if (!decode_workflow_run_record(record, &run, &error))
         {
-            return error_response(error);
+            // Skip and log a single unreadable record instead of aborting the
+            // entire recovery batch: one corrupt run must not block startup
+            // recovery of every other run.
+            ++skipped;
+            dwarn("skipping unrecoverable rASN workflow record %s: %s", record.key.c_str(), error.c_str());
+            continue;
         }
         recovered.push_back(run);
     }
@@ -1396,10 +1573,12 @@ workflow_response workflow_store::recover_from_state()
         }
     }
 
-    dinfo("recovered rASN workflow runs=%u", static_cast<unsigned int>(recovered.size()));
+    dinfo("recovered rASN workflow runs=%u skipped=%u",
+          static_cast<unsigned int>(recovered.size()),
+          static_cast<unsigned int>(skipped));
     workflow_response response;
     response.run.status = "recovered";
-    response.run.result_text = "runs=" + std::to_string(recovered.size());
+    response.run.result_text = "runs=" + std::to_string(recovered.size()) + " skipped=" + std::to_string(skipped);
     return response;
 }
 

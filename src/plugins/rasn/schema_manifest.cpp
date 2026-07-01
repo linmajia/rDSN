@@ -548,7 +548,8 @@ std::vector<schema_type_descriptor> rasn_schema_manifest()
             field("error", "string", false),
             field("events", "runtime_event[]", false),
             field("failures", "failure_record[]", false),
-            field("last_sequence", "uint64", false)}));
+            field("last_sequence", "uint64", false),
+            field("truncated", "bool", false)}));
     manifest.push_back(schema(
         "redaction_policy",
         RASN_AGENT_SCHEMA_VERSION,

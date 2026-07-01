@@ -17,6 +17,19 @@ namespace rasn {
 
 namespace {
 
+// Upper bound on runtime events retained in memory for observability queries.
+// 0 disables the cap (unbounded, legacy behavior). Read once; config is fixed at
+// startup for the lifetime of the process.
+size_t event_log_memory_capacity()
+{
+    static const size_t capacity = static_cast<size_t>(::dsn_config_get_value_uint64(
+        "rasn.observability",
+        "max_in_memory_events",
+        100000,
+        "maximum runtime events retained in memory for observability queries (0 = unbounded)"));
+    return capacity;
+}
+
 std::string extract_json_string_field(const std::string &json, const std::string &field)
 {
     const std::string needle = "\"" + field + "\"";
@@ -259,7 +272,36 @@ std::vector<std::string> split_words(const std::string &line)
 void event_log::set_output_file(const std::string &path)
 {
     ::dsn::service::zauto_lock guard(_lock);
+    if (_output_stream.is_open())
+    {
+        _output_stream.flush();
+        _output_stream.close();
+    }
     _output_file = path;
+    _output_stream.clear();
+    if (!path.empty())
+    {
+        // Open once and keep the stream; the previous code re-opened (and flushed
+        // and closed) the file on every single event under _lock, stalling all
+        // recording and observability queries behind per-event filesystem calls.
+        _output_stream.open(path.c_str(), std::ios::app);
+    }
+}
+
+std::string event_log::output_file() const
+{
+    ::dsn::service::zauto_lock guard(_lock);
+    return _output_file;
+}
+
+event_log::~event_log()
+{
+    ::dsn::service::zauto_lock guard(_lock);
+    if (_output_stream.is_open())
+    {
+        _output_stream.flush();
+        _output_stream.close();
+    }
 }
 
 bool event_log::load_replay_file(const std::string &path, std::string *error)
@@ -346,19 +388,36 @@ void event_log::append(runtime_event event)
     event.value = redact_sensitive_text(event.value);
     _events.push_back(event);
 
-    if (_output_file.empty())
+    // Bound in-memory retention so a long-running process cannot grow _events (and
+    // therefore every observability snapshot copy) without limit. Events already
+    // persist to the trace file; the in-memory buffer is a recent-events window.
+    const size_t capacity = event_log_memory_capacity();
+    if (capacity != 0)
     {
-        return;
+        while (_events.size() > capacity)
+        {
+            _events.pop_front();
+        }
     }
 
-    std::ofstream output(_output_file.c_str(), std::ios::app);
-    output << event_to_json(event) << std::endl;
+    if (_output_stream.is_open())
+    {
+        _output_stream << event_to_json(event) << '\n';
+        _output_stream.flush();
+        if (!_output_stream)
+        {
+            // Surface the failure by clearing error flags so subsequent writes are
+            // attempted, rather than silently dropping every later trace event once
+            // the stream latches a failbit.
+            _output_stream.clear();
+        }
+    }
 }
 
 std::vector<runtime_event> event_log::snapshot() const
 {
     ::dsn::service::zauto_lock guard(_lock);
-    return _events;
+    return std::vector<runtime_event>(_events.begin(), _events.end());
 }
 
 bool event_log::replay_value(const std::string &name, std::string *value) const
@@ -522,7 +581,7 @@ void nucleus_runtime::begin_task(const agent_task &task)
 {
     {
         ::dsn::service::zauto_lock guard(_timing_lock);
-        _task_start_ms[task.id] = ::dsn_now_ms();
+        _task_start_ms[task.id].push_back(::dsn_now_ms());
     }
     record(task, "task.begin", task.name, task.input);
 }
@@ -534,12 +593,16 @@ void nucleus_runtime::finish_task(const agent_task &task, const std::string &sta
     bool found = false;
     {
         ::dsn::service::zauto_lock guard(_timing_lock);
-        std::map<std::string, uint64_t>::iterator it = _task_start_ms.find(task.id);
-        if (it != _task_start_ms.end())
+        std::map<std::string, std::vector<uint64_t>>::iterator it = _task_start_ms.find(task.id);
+        if (it != _task_start_ms.end() && !it->second.empty())
         {
-            start_ms = it->second;
+            start_ms = it->second.front();
             found = true;
-            _task_start_ms.erase(it);
+            it->second.erase(it->second.begin());
+            if (it->second.empty())
+            {
+                _task_start_ms.erase(it);
+            }
         }
     }
     if (found)
@@ -553,7 +616,7 @@ void nucleus_runtime::record_llm_request(const agent_task &task, const std::stri
 {
     {
         ::dsn::service::zauto_lock guard(_timing_lock);
-        _llm_start_ms[task.id + "\x1f" + provider] = ::dsn_now_ms();
+        _llm_start_ms[task.id + "\x1f" + provider].push_back(::dsn_now_ms());
     }
     record(task, "llm.request", provider, model);
 }
@@ -577,12 +640,16 @@ void nucleus_runtime::finalize_llm_timing(const agent_task &task, const std::str
     bool found = false;
     {
         ::dsn::service::zauto_lock guard(_timing_lock);
-        std::map<std::string, uint64_t>::iterator it = _llm_start_ms.find(task.id + "\x1f" + provider);
-        if (it != _llm_start_ms.end())
+        std::map<std::string, std::vector<uint64_t>>::iterator it = _llm_start_ms.find(task.id + "\x1f" + provider);
+        if (it != _llm_start_ms.end() && !it->second.empty())
         {
-            start_ms = it->second;
+            start_ms = it->second.front();
             found = true;
-            _llm_start_ms.erase(it);
+            it->second.erase(it->second.begin());
+            if (it->second.empty())
+            {
+                _llm_start_ms.erase(it);
+            }
         }
     }
     if (found)

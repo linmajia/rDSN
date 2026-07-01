@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -19,8 +20,15 @@
 
 #if defined(_WIN32)
 #include <process.h>
+#include <io.h>
+#include <fcntl.h>
+#include <share.h>
+#include <sys/stat.h>
 #else
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #endif
 
 namespace dsn {
@@ -242,13 +250,36 @@ std::string run_command_capture_stdout(const std::string &command, int *exit_cod
 
 #if defined(_WIN32)
     const int rc = _pclose(pipe);
-#else
-    const int rc = pclose(pipe);
-#endif
     if (exit_code != nullptr)
     {
         *exit_code = rc;
     }
+#else
+    const int status = pclose(pipe);
+    if (exit_code != nullptr)
+    {
+        // Decode the POSIX wait-status into the child's real exit code. Without
+        // this, WEXITSTATUS-style values are left shifted (e.g. curl's exit 28
+        // for a timeout arrives as 28 << 8), so downstream timeout/error
+        // detection that compares against small integers never matches.
+        if (status == -1)
+        {
+            *exit_code = -1;
+        }
+        else if (WIFEXITED(status))
+        {
+            *exit_code = WEXITSTATUS(status);
+        }
+        else if (WIFSIGNALED(status))
+        {
+            *exit_code = 128 + WTERMSIG(status);
+        }
+        else
+        {
+            *exit_code = status;
+        }
+    }
+#endif
     return output;
 }
 
@@ -266,6 +297,59 @@ std::string curl_config_escape(const std::string &value)
     return escaped;
 }
 
+bool contains_newline(const std::string &value)
+{
+    return value.find('\n') != std::string::npos || value.find('\r') != std::string::npos;
+}
+
+// Write file content with owner-only (0600) permissions and O_EXCL so a hostile
+// local user cannot (a) read a bearer token from a world-readable temp file, nor
+// (b) pre-plant a symlink at the predictable path to capture or redirect the
+// write. Fails if the path already exists.
+bool write_private_file(const std::string &path, const std::string &content, std::string *error)
+{
+#if defined(_WIN32)
+    int fd = -1;
+    const errno_t open_err = _sopen_s(&fd,
+                                      path.c_str(),
+                                      _O_WRONLY | _O_CREAT | _O_EXCL | _O_TRUNC | _O_BINARY,
+                                      _SH_DENYRW,
+                                      _S_IREAD | _S_IWRITE);
+    if (open_err != 0 || fd < 0)
+    {
+        if (error != nullptr)
+        {
+            *error = "cannot create private temp file: " + path;
+        }
+        return false;
+    }
+    const int written = _write(fd, content.data(), static_cast<unsigned int>(content.size()));
+    _close(fd);
+#else
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
+    if (fd < 0)
+    {
+        if (error != nullptr)
+        {
+            *error = "cannot create private temp file: " + path;
+        }
+        return false;
+    }
+    const ssize_t written = ::write(fd, content.data(), content.size());
+    ::close(fd);
+#endif
+    if (written < 0 || static_cast<size_t>(written) != content.size())
+    {
+        ::dsn::utils::filesystem::remove_path(path);
+        if (error != nullptr)
+        {
+            *error = "failed to write private temp file: " + path;
+        }
+        return false;
+    }
+    return true;
+}
+
 bool write_curl_config(const std::string &path,
                        const std::string &endpoint,
                        const std::string &payload_path,
@@ -274,16 +358,31 @@ bool write_curl_config(const std::string &path,
                        const std::string &request_timeout_sec,
                        std::string *error)
 {
-    std::ofstream config(path.c_str(), std::ios::binary);
-    if (!config)
+    // The curl config is line-oriented and curl_config_escape only neutralizes
+    // \ and ". A raw CR/LF in the endpoint, token, or a custom header would end
+    // the current directive and let an attacker inject arbitrary curl options
+    // (e.g. url=, -o <file>). Reject such values outright.
+    if (contains_newline(endpoint) || contains_newline(token))
     {
         if (error != nullptr)
         {
-            *error = "cannot write temporary curl config";
+            *error = "provider endpoint or credential contains an illegal newline";
         }
         return false;
     }
+    for (const std::string &header : headers)
+    {
+        if (contains_newline(header))
+        {
+            if (error != nullptr)
+            {
+                *error = "provider header contains an illegal newline";
+            }
+            return false;
+        }
+    }
 
+    std::ostringstream config;
     config << "silent\n";
     config << "show-error\n";
     config << "fail-with-body\n";
@@ -306,7 +405,9 @@ bool write_curl_config(const std::string &path,
         }
     }
     config << "data-binary = \"@" << curl_config_escape(payload_path) << "\"\n";
-    return true;
+
+    // The config embeds the bearer token, so write it with private permissions.
+    return write_private_file(path, config.str(), error);
 }
 
 std::vector<std::string> split_env_names(const std::string &value)
@@ -512,6 +613,64 @@ std::string make_ollama_chat_payload(const std::string &model, const llm_request
     return oss.str();
 }
 
+bool parse_hex4(const std::string &text, std::string::size_type pos, unsigned int *out)
+{
+    if (pos + 4 > text.size())
+    {
+        return false;
+    }
+    unsigned int value = 0;
+    for (int i = 0; i < 4; ++i)
+    {
+        const char c = text[pos + static_cast<std::string::size_type>(i)];
+        value <<= 4;
+        if (c >= '0' && c <= '9')
+        {
+            value |= static_cast<unsigned int>(c - '0');
+        }
+        else if (c >= 'a' && c <= 'f')
+        {
+            value |= static_cast<unsigned int>(c - 'a' + 10);
+        }
+        else if (c >= 'A' && c <= 'F')
+        {
+            value |= static_cast<unsigned int>(c - 'A' + 10);
+        }
+        else
+        {
+            return false;
+        }
+    }
+    *out = value;
+    return true;
+}
+
+void append_utf8(std::string *out, unsigned int code)
+{
+    if (code <= 0x7F)
+    {
+        out->push_back(static_cast<char>(code));
+    }
+    else if (code <= 0x7FF)
+    {
+        out->push_back(static_cast<char>(0xC0 | (code >> 6)));
+        out->push_back(static_cast<char>(0x80 | (code & 0x3F)));
+    }
+    else if (code <= 0xFFFF)
+    {
+        out->push_back(static_cast<char>(0xE0 | (code >> 12)));
+        out->push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
+        out->push_back(static_cast<char>(0x80 | (code & 0x3F)));
+    }
+    else
+    {
+        out->push_back(static_cast<char>(0xF0 | (code >> 18)));
+        out->push_back(static_cast<char>(0x80 | ((code >> 12) & 0x3F)));
+        out->push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
+        out->push_back(static_cast<char>(0x80 | (code & 0x3F)));
+    }
+}
+
 std::string extract_json_string(const std::string &json, const std::string &field)
 {
     const std::string needle = "\"" + field + "\"";
@@ -527,15 +686,22 @@ std::string extract_json_string(const std::string &json, const std::string &fiel
         return "";
     }
 
-    std::string::size_type quote = json.find('"', colon + 1);
-    if (quote == std::string::npos)
+    std::string::size_type value_pos = colon + 1;
+    while (value_pos < json.size() && std::isspace(static_cast<unsigned char>(json[value_pos])))
+    {
+        ++value_pos;
+    }
+    // Only extract when the value is genuinely a JSON string. A non-string value
+    // (e.g. "content":null or a number) must not fall through to json.find('"')
+    // and accidentally capture the NEXT field's quoted string.
+    if (value_pos >= json.size() || json[value_pos] != '"')
     {
         return "";
     }
 
     std::string result;
     bool escaping = false;
-    for (++quote; quote < json.size(); ++quote)
+    for (std::string::size_type quote = value_pos + 1; quote < json.size(); ++quote)
     {
         const char c = json[quote];
         if (escaping)
@@ -551,6 +717,37 @@ std::string extract_json_string(const std::string &json, const std::string &fiel
             case 't':
                 result.push_back('\t');
                 break;
+            case 'b':
+                result.push_back('\b');
+                break;
+            case 'f':
+                result.push_back('\f');
+                break;
+            case 'u':
+            {
+                unsigned int code = 0;
+                if (parse_hex4(json, quote + 1, &code))
+                {
+                    quote += 4;
+                    // Combine a UTF-16 surrogate pair into a single code point.
+                    if (code >= 0xD800 && code <= 0xDBFF && quote + 2 < json.size() &&
+                        json[quote + 1] == '\\' && json[quote + 2] == 'u')
+                    {
+                        unsigned int low = 0;
+                        if (parse_hex4(json, quote + 3, &low) && low >= 0xDC00 && low <= 0xDFFF)
+                        {
+                            code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+                            quote += 6;
+                        }
+                    }
+                    append_utf8(&result, code);
+                }
+                else
+                {
+                    result.push_back('u');
+                }
+                break;
+            }
             default:
                 result.push_back(c);
                 break;
@@ -743,15 +940,17 @@ public:
         const std::string path = temp_request_path();
 
         {
-            std::ofstream file(path.c_str(), std::ios::binary);
-            if (!file)
+            // Write privately (0600 + O_EXCL) so the predictable temp path cannot be
+            // pre-planted with a symlink to clobber an arbitrary file the daemon can
+            // reach. The payload itself carries the user's prompt content.
+            std::string payload_error;
+            if (!write_private_file(path, payload, &payload_error))
             {
                 llm_response response;
                 response.ok = false;
                 response.error = "cannot write temporary request payload: " + path;
                 return response;
             }
-            file << payload;
         }
 
         const std::string config_path = temp_curl_config_path();
@@ -766,6 +965,10 @@ public:
             runtime.record_failure(task, "provider", "llm_provider_credential_error", response.error, false, _provider_name);
             return response;
         }
+        // Register the resolved token so it is scrubbed from traces/logs even when
+        // it came from a file:/cmd: credential_ref (which never sets an env var that
+        // configured_secret_values() would otherwise pick up).
+        register_runtime_secret(token);
         std::string config_error;
         if (!write_curl_config(
                 config_path, _endpoint, path, token, _headers, request_timeout_sec, &config_error))
@@ -869,10 +1072,20 @@ void emit_llm_stream_chunks(const agent_task &task,
         return;
     }
 
-    size_t chunk_index = 0;
-    for (size_t offset = 0; offset < text.size(); offset += effective_chunk_bytes)
+    // Redact the FULL text once, then chunk the redacted result. Redacting each
+    // fixed-size slice independently (the previous behavior) let a secret that
+    // straddles a chunk boundary escape, because neither half matched a secret
+    // pattern on its own.
+    const std::string redacted = redact_sensitive_text(text);
+    if (redacted.empty())
     {
-        const std::string redacted_chunk = redact_sensitive_text(text.substr(offset, effective_chunk_bytes));
+        return;
+    }
+
+    size_t chunk_index = 0;
+    for (size_t offset = 0; offset < redacted.size(); offset += effective_chunk_bytes)
+    {
+        const std::string redacted_chunk = redacted.substr(offset, effective_chunk_bytes);
         runtime.record_llm_response_chunk(task, provider, chunk_index, redacted_chunk);
         if (on_chunk)
         {

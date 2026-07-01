@@ -9,7 +9,11 @@ const size_t kMaxCancelledRequestTombstones = 1024;
 
 std::string cancel_target_id(const agent_request &request)
 {
-    return request.request_id.empty() ? request.task.id : request.request_id;
+    // In-flight requests and cancellation tombstones are keyed strictly by
+    // request_id (validate_agent_request forces it non-empty before a request
+    // can begin), so cancellation must use the same key. A task.id fallback
+    // could never match an in-flight entry and would silently drop the cancel.
+    return request.request_id;
 }
 
 } // namespace

@@ -442,6 +442,14 @@ Each line has this form:
 task <id> <ask|plan> <prompt> [after dependency1,dependency2]
 ```
 
+The prompt is free text. Words are scanned until the first recognized option
+keyword (`after`, `capability`, `policy`, `cost`, `state`, ...), so a prompt that
+contains one of those words is either quoted as a single argument
+(`task a ask "review the cost report"`) or separated from options with an explicit
+`--` delimiter (`task a ask review the cost report -- policy read_only cost 3`).
+Everything before `--` is taken verbatim as the prompt; everything after it is
+options.
+
 Nodes can also declare generic runtime metadata:
 
 ```text

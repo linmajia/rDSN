@@ -142,11 +142,12 @@ observability_response query_observability_events(const std::vector<runtime_even
         {
             continue;
         }
-        response.events.push_back(event);
         if (response.events.size() >= limit)
         {
+            response.truncated = true;
             break;
         }
+        response.events.push_back(event);
     }
     return response;
 }
@@ -171,11 +172,12 @@ observability_response query_observability_failures(const std::vector<runtime_ev
         if (event.failure_class.empty() && event.kind.find(".error") == std::string::npos &&
             event.kind != "failure" && event.kind != "replay.miss")
             continue;
-        response.failures.push_back(failure_from_event(event));
         if (response.failures.size() >= limit)
         {
+            response.truncated = true;
             break;
         }
+        response.failures.push_back(failure_from_event(event));
     }
     return response;
 }
@@ -349,6 +351,7 @@ state_response index_observability_snapshot(const observability_response &snapsh
           << "events=" << snapshot.events.size() << "\n"
           << "failures=" << snapshot.failures.size() << "\n"
           << "last_sequence=" << snapshot.last_sequence << "\n"
+          << "truncated=" << (snapshot.truncated ? "true" : "false") << "\n"
           << "timestamp=" << now_utc_string() << "\n";
     record.value = value.str();
     return write_observability_state_record(record);

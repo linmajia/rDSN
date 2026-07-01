@@ -16,6 +16,7 @@
 #if defined(_WIN32)
 #include <process.h>
 #else
+#include <climits>
 #include <unistd.h>
 #endif
 
@@ -101,6 +102,39 @@ std::string policy_path_for_compare(std::string path)
         path = normalized;
     }
     path = normalize_platform_path(path);
+
+#if !defined(_WIN32)
+    // Resolve symbolic links against the real filesystem so an in-workspace
+    // symlink that points outside the workspace root cannot slip past the
+    // lexical prefix check below. realpath() also collapses ".." segments.
+    if (!path.empty())
+    {
+        char resolved[PATH_MAX];
+        if (::realpath(path.c_str(), resolved) != nullptr)
+        {
+            path = resolved;
+        }
+        else
+        {
+            // The leaf may not exist yet (e.g. a write target). Canonicalize
+            // the nearest existing parent and re-append the trailing name so a
+            // symlinked parent directory is still forced back to its real
+            // location.
+            const std::string parent = ::dsn::utils::filesystem::remove_file_name(path);
+            const std::string leaf = ::dsn::utils::filesystem::get_file_name(path);
+            if (!parent.empty() && parent != path && ::realpath(parent.c_str(), resolved) != nullptr)
+            {
+                path = resolved;
+                if (!leaf.empty())
+                {
+                    path += "/";
+                    path += leaf;
+                }
+            }
+        }
+        path = normalize_platform_path(path);
+    }
+#endif
 
 #if defined(_WIN32)
     std::transform(path.begin(), path.end(), path.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -307,20 +341,27 @@ void reset_policy_state_writer()
 policy_decision policy_manager::evaluate(const policy_request &request) const
 {
     policy_decision decision;
-    decision.side_effect = request.side_effect;
     decision.policy_name = "config";
 
     if (request.schema_version != RASN_AGENT_SCHEMA_VERSION)
     {
+        decision.side_effect = request.side_effect;
         decision.reason = "policy request has unsupported schema version";
         return decision;
     }
 
-    if (request.side_effect == "read_only" || request.side_effect == "write")
+    // Re-derive the side-effect class from the tool name rather than trusting a
+    // caller-supplied request.side_effect. Otherwise a request that arrives over
+    // RPC could claim tool_name="shell" while labeling side_effect="read_only"
+    // and take the read path, bypassing the shell opt-in.
+    const std::string side_effect = to_string(classify_tool_side_effect(request.tool_name));
+    decision.side_effect = side_effect;
+
+    if (side_effect == "read_only" || side_effect == "write")
     {
         std::string normalized_target;
         std::string normalized_root;
-        if (!policy_target_within_workspace(request.target, config_string("workspace_root", ""), &normalized_target, &normalized_root))
+        if (!policy_target_within_workspace(request.target, effective_workspace_root(), &normalized_target, &normalized_root))
         {
             decision.reason = "tool target is outside workspace root: target=" + normalized_target +
                               " root=" + normalized_root;
@@ -328,14 +369,14 @@ policy_decision policy_manager::evaluate(const policy_request &request) const
         }
     }
 
-    if (request.side_effect == "read_only")
+    if (side_effect == "read_only")
     {
         decision.allowed = existing_read_target(request.tool_name, request.target);
         decision.reason = decision.allowed ? "read-only tool allowed" : "read-only tool target is invalid";
         return decision;
     }
 
-    if (request.side_effect == "write")
+    if (side_effect == "write")
     {
         if (!config_bool("allow_write", false))
         {
@@ -354,7 +395,7 @@ policy_decision policy_manager::evaluate(const policy_request &request) const
         return decision;
     }
 
-    if (request.side_effect == "shell")
+    if (side_effect == "shell")
     {
         if (!config_bool("allow_shell", false))
         {
@@ -373,7 +414,7 @@ policy_decision policy_manager::evaluate(const policy_request &request) const
         return decision;
     }
 
-    if (request.side_effect == "network")
+    if (side_effect == "network")
     {
         decision.allowed = config_bool("allow_network", false);
         decision.reason = decision.allowed ? "network tool explicitly enabled" : "network tool denied by default policy";
@@ -464,6 +505,31 @@ std::string policy_manager::config_string(const std::string &key, const std::str
 std::string policy_manager::artifact_dir() const
 {
     return config_string_compat("artifact_dir", "rasn-artifacts");
+}
+
+std::string policy_manager::effective_workspace_root() const
+{
+    const std::string configured = config_string("workspace_root", "");
+    if (!configured.empty())
+    {
+        return configured;
+    }
+
+    // An explicit, opt-in escape hatch preserves the unconfined dev-CLI
+    // behavior for operators who knowingly want it.
+    if (config_bool("allow_unconfined_paths", false))
+    {
+        return "";
+    }
+
+    // Default to the process working directory so read/list/search tools are
+    // confined out of the box instead of accepting arbitrary absolute paths.
+    std::string cwd;
+    if (::dsn::utils::filesystem::get_current_directory(cwd) && !cwd.empty())
+    {
+        return cwd;
+    }
+    return configured;
 }
 
 policy_manager &global_policy_manager()

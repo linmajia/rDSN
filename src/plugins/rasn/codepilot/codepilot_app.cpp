@@ -651,6 +651,11 @@ int codepilot_cli::repl()
     std::string line;
     while (true)
     {
+        if (_shutdown_requested.load())
+        {
+            return 0;
+        }
+
         std::cout << "codepilot> ";
         if (!std::getline(std::cin, line))
         {
@@ -1803,7 +1808,8 @@ int codepilot_cli::run_observe(const std::vector<std::string> &args)
         if (response.ok)
         {
             std::cout << "events=" << response.events.size()
-                      << " last_sequence=" << response.last_sequence << "\n";
+                      << " last_sequence=" << response.last_sequence
+                      << (response.truncated ? " [truncated]" : "") << "\n";
             for (const runtime_event &event : response.events)
             {
                 std::cout << format_observability_event(event) << "\n";
@@ -1818,7 +1824,8 @@ int codepilot_cli::run_observe(const std::vector<std::string> &args)
         if (response.ok)
         {
             std::cout << "failures=" << response.failures.size()
-                      << " last_sequence=" << response.last_sequence << "\n";
+                      << " last_sequence=" << response.last_sequence
+                      << (response.truncated ? " [truncated]" : "") << "\n";
             for (const failure_record &failure : response.failures)
             {
                 std::cout << format_failure_record(failure) << "\n";
@@ -1832,7 +1839,8 @@ int codepilot_cli::run_observe(const std::vector<std::string> &args)
         {
             std::cout << "events=" << response.events.size()
                       << " failures=" << response.failures.size()
-                      << " last_sequence=" << response.last_sequence << "\n";
+                      << " last_sequence=" << response.last_sequence
+                      << (response.truncated ? " [truncated]" : "") << "\n";
         }
     }
     else
@@ -2231,7 +2239,12 @@ std::string codepilot_cli::provider_summary() const
 {
     if (_cli_task != nullptr)
     {
-        _cli_task->cancel(true);
+        // Ask the interactive loop to stop, then cancel WITHOUT waiting. The CLI
+        // task may be parked in repl() on a blocking std::getline(std::cin), and
+        // rDSN tasks are not preemptible, so cancel(true) would hang shutdown until
+        // the user happened to press enter/EOF.
+        _cli.request_shutdown();
+        _cli_task->cancel(false);
         _cli_task = nullptr;
     }
     global_rasn_services().release();

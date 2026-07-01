@@ -204,6 +204,9 @@ private:
     mutable ::dsn::service::zlock _lock;
     std::map<std::string, state_record> _records;
     uint64_t _last_sequence = 0;
+    // Incremented on every successful put; lets checkpoint detect whether any
+    // write landed since it snapshotted so it can safely compact the journal.
+    uint64_t _write_epoch = 0;
 };
 
 state_store &global_state_store();

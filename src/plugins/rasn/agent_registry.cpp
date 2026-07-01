@@ -161,7 +161,7 @@ bool agent_registry::unregister_agent(const std::string &agent_id)
 
 std::vector<agent_descriptor> agent_registry::list_agents() const
 {
-    return list_agents(false);
+    return list_agents(true);
 }
 
 std::vector<agent_descriptor> agent_registry::list_agents(bool healthy_only) const
@@ -184,7 +184,7 @@ std::vector<agent_descriptor> agent_registry::list_agents(bool healthy_only) con
 
 std::vector<agent_descriptor> agent_registry::query_by_capability(const std::string &capability) const
 {
-    return query_by_capability(capability, false);
+    return query_by_capability(capability, true);
 }
 
 std::vector<agent_descriptor> agent_registry::query_by_capability(const std::string &capability, bool healthy_only) const
@@ -289,7 +289,7 @@ size_t agent_registry::expire_leases(uint64_t now_ms, uint64_t lease_ms)
 
 std::string agent_registry::describe() const
 {
-    const std::vector<agent_descriptor> agents = list_agents();
+    const std::vector<agent_descriptor> agents = list_agents(false);
     std::ostringstream oss;
     oss << "registered agents:\n";
     if (agents.empty())
@@ -432,6 +432,16 @@ void rasn_registry_rpc_service::close_service()
 void rasn_registry_rpc_service::on_register(const agent_descriptor &request,
                                             ::dsn::rpc_replier<agent_response> &reply)
 {
+    if (request.schema_version == 0)
+    {
+        reply(registry_response(request.agent_id, false, "missing registry register schema version"));
+        return;
+    }
+    if (request.agent_id.empty())
+    {
+        reply(registry_response(request.agent_id, false, "missing registry register agent id"));
+        return;
+    }
     std::string error;
     const bool ok = global_agent_registry().register_agent(request, &error, true);
     reply(registry_response(request.agent_id, ok, error));
@@ -440,6 +450,11 @@ void rasn_registry_rpc_service::on_register(const agent_descriptor &request,
 void rasn_registry_rpc_service::on_unregister(const std::string &agent_id,
                                               ::dsn::rpc_replier<agent_response> &reply)
 {
+    if (agent_id.empty())
+    {
+        reply(registry_response(agent_id, false, "missing registry unregister agent id"));
+        return;
+    }
     const bool ok = global_agent_registry().unregister_agent(agent_id);
     reply(registry_response(agent_id, ok, ok ? "" : "unknown agent: " + agent_id));
 }
@@ -474,6 +489,11 @@ void rasn_registry_rpc_service::on_list(const std::string &request,
 void rasn_registry_rpc_service::on_heartbeat(const agent_descriptor &request,
                                              ::dsn::rpc_replier<agent_response> &reply)
 {
+    if (request.schema_version == 0)
+    {
+        reply(registry_response(request.agent_id, false, "missing registry heartbeat schema version"));
+        return;
+    }
     std::string error;
     const bool ok = global_agent_registry().heartbeat(request, &error);
     reply(registry_response(request.agent_id, ok, error));
