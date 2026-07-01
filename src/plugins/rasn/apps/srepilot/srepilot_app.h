@@ -31,6 +31,7 @@ private:
     int observe(const std::vector<std::string> &args);
     int selftest();
     int set_provider(const std::vector<std::string> &args);
+    bool recover_state_for_persist(std::string *error);
     bool persist_response(const std::string &kind,
                           const agent_task &task,
                           const std::string &input,
@@ -40,6 +41,7 @@ private:
 
     rasn_service_graph &_services;
     std::atomic<bool> _shutdown_requested{false};
+    bool _state_recovered_for_persist = false;
 };
 
 class srepilot_app : public ::dsn::service_app

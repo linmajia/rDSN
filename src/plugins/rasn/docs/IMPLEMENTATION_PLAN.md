@@ -3171,7 +3171,8 @@ Work items:
 - [x] Implement `diagnose`, `runbook`, `status`, `observe`, `provider`,
   `selftest`, and `interactive` commands over `rasn_service_graph`.
 - [x] Persist generated diagnosis/runbook artifacts under the `srepilot/` state
-  namespace.
+  namespace, honoring configured direct-CLI recovery sources before
+  checkpointing a new incident artifact.
 - [x] Reuse the model gateway, state service, observability queries, metrics, and
   shared resilience report instead of adding SREPilot-specific runtime paths.
 - [x] Wire the app into CMake and rDSN config.
@@ -3181,7 +3182,8 @@ Validation:
 
 - [x] Build `srepilot`.
 - [x] Run direct `srepilot selftest`.
-- [x] Run direct `srepilot status` and `srepilot diagnose`.
+- [x] Run direct `srepilot status`, a two-incident `srepilot diagnose`
+  persistence regression, and a replica-only recovery regression.
 - [x] Re-run `rasn.unit_tests`.
 - [x] Re-run direct `codepilot selftest` after introducing per-app configs.
 - [x] `git diff --check`.

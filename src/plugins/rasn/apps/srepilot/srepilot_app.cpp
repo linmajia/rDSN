@@ -1,5 +1,7 @@
 #include "srepilot_app.h"
 
+#include "../../agent_clients.h"
+#include "../../agent_registry.h"
 #include "../../observability.h"
 
 #include <dsn/cpp/utils.h>
@@ -9,6 +11,8 @@
 #include <cstdlib>
 #include <iostream>
 #include <sstream>
+#include <thread>
+#include <tuple>
 
 namespace dsn {
 namespace rasn {
@@ -26,6 +30,202 @@ public:
 private:
     rasn_service_graph &_services;
 };
+
+void append_readiness_error(std::vector<std::string> *errors,
+                            const std::string &component,
+                            const std::string &detail)
+{
+    if (errors != nullptr)
+    {
+        errors->push_back(component + "=" + detail);
+    }
+}
+
+std::string readiness_errors_summary(const std::vector<std::string> &errors)
+{
+    std::ostringstream oss;
+    for (size_t i = 0; i < errors.size(); ++i)
+    {
+        if (i != 0)
+        {
+            oss << "; ";
+        }
+        oss << errors[i];
+    }
+    return oss.str();
+}
+
+bool probe_state_service(const rasn_service_graph &services, std::vector<std::string> *errors)
+{
+    rasn_state_client state(services.state_address());
+    state_query_request request;
+    request.key_prefix = "__srepilot_readiness_probe__";
+    ::dsn::error_code err;
+    state_response response;
+    std::tie(err, response) = state.query_sync(request, std::chrono::milliseconds(500));
+    if (err != ::dsn::ERR_OK)
+    {
+        append_readiness_error(errors, "state", err.to_string());
+        return false;
+    }
+    if (!response.ok)
+    {
+        append_readiness_error(errors, "state", response.error);
+        return false;
+    }
+    return true;
+}
+
+bool probe_registry_service(const rasn_service_graph &services, std::vector<std::string> *errors)
+{
+    rasn_registry_client registry(services.registry_address());
+    ::dsn::error_code err;
+    registry_query_response response;
+    std::tie(err, response) = registry.list_sync("", std::chrono::milliseconds(500));
+    if (err != ::dsn::ERR_OK)
+    {
+        append_readiness_error(errors, "registry", err.to_string());
+        return false;
+    }
+    if (!response.ok)
+    {
+        append_readiness_error(errors, "registry", response.error);
+        return false;
+    }
+    return true;
+}
+
+bool probe_agent_service(const std::string &label,
+                         const ::dsn::rpc_address &address,
+                         const std::string &expected_agent_id,
+                         std::vector<std::string> *errors)
+{
+    rasn_agent_client client(address);
+    ::dsn::error_code err;
+    agent_descriptor descriptor;
+    std::tie(err, descriptor) = client.describe_sync("readiness", std::chrono::milliseconds(500));
+    if (err != ::dsn::ERR_OK)
+    {
+        append_readiness_error(errors, label, err.to_string());
+        return false;
+    }
+    if (descriptor.agent_id != expected_agent_id)
+    {
+        append_readiness_error(errors, label, "unexpected agent id: " + descriptor.agent_id);
+        return false;
+    }
+    return true;
+}
+
+bool probe_model_health(const rasn_service_graph &services, std::vector<std::string> *errors)
+{
+    rasn_llm_agent_client model(services.llm_agent_address());
+    ::dsn::error_code err;
+    model_gateway_response response;
+    std::tie(err, response) = model.health_sync("readiness", std::chrono::milliseconds(500));
+    if (err != ::dsn::ERR_OK)
+    {
+        append_readiness_error(errors, "model.health", err.to_string());
+        return false;
+    }
+    if (!response.ok)
+    {
+        append_readiness_error(errors, "model.health", response.error);
+        return false;
+    }
+    return true;
+}
+
+bool probe_workflow_service(const rasn_service_graph &services, std::vector<std::string> *errors)
+{
+    rasn_workflow_client workflow(services.workflow_address());
+    workflow_source source;
+    source.workflow_id = "srepilot-readiness";
+    source.source_name = "<srepilot-readiness>";
+    source.source_text = "task readiness ask \"ping\"\n";
+    ::dsn::error_code err;
+    workflow_response response;
+    std::tie(err, response) = workflow.validate_sync(source, std::chrono::milliseconds(500));
+    if (err != ::dsn::ERR_OK)
+    {
+        append_readiness_error(errors, "workflow", err.to_string());
+        return false;
+    }
+    if (!response.ok)
+    {
+        append_readiness_error(errors, "workflow", response.error);
+        return false;
+    }
+    return true;
+}
+
+bool probe_observability_service(const rasn_service_graph &services, std::vector<std::string> *errors)
+{
+    rasn_observability_client observability(services.observability_address());
+    observability_query_request request;
+    request.limit = 1;
+    ::dsn::error_code err;
+    observability_response response;
+    std::tie(err, response) = observability.query_sync(request, std::chrono::milliseconds(500));
+    if (err != ::dsn::ERR_OK)
+    {
+        append_readiness_error(errors, "observability", err.to_string());
+        return false;
+    }
+    if (!response.ok)
+    {
+        append_readiness_error(errors, "observability", response.error);
+        return false;
+    }
+    return true;
+}
+
+bool probe_service_dependencies_once(const rasn_service_graph &services, std::vector<std::string> *errors)
+{
+    bool ready = true;
+    ready = probe_state_service(services, errors) && ready;
+    ready = probe_registry_service(services, errors) && ready;
+    ready = probe_agent_service("coordinator", services.coordinator_address(), "rasn.coordinator", errors) && ready;
+    ready = probe_agent_service("model.agent", services.llm_agent_address(), "rasn.llm.agent", errors) && ready;
+    ready = probe_model_health(services, errors) && ready;
+    ready = probe_agent_service("tool.agent", services.tool_agent_address(), "rasn.tool.agent", errors) && ready;
+    ready = probe_workflow_service(services, errors) && ready;
+    ready = probe_observability_service(services, errors) && ready;
+    return ready;
+}
+
+bool wait_for_service_dependencies(const rasn_service_graph &services, std::string *error)
+{
+    if (!services.rpc_clients_enabled())
+    {
+        return true;
+    }
+
+    const std::chrono::steady_clock::time_point deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    std::vector<std::string> last_errors;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        std::vector<std::string> errors;
+        if (probe_service_dependencies_once(services, &errors))
+        {
+            return true;
+        }
+        last_errors.swap(errors);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    if (error != nullptr)
+    {
+        *error = "SREPilot service dependencies not ready";
+        if (!last_errors.empty())
+        {
+            *error += ": " + readiness_errors_summary(last_errors);
+        }
+    }
+    return false;
+}
 
 std::string join_args(const std::vector<std::string> &args, size_t begin)
 {
@@ -96,6 +296,11 @@ std::string config_value(const char *section, const char *key, const char *defau
     return value == nullptr ? "" : value;
 }
 
+bool config_bool(const char *section, const char *key, bool default_value, const char *description)
+{
+    return ::dsn_config_get_value_bool(section, key, default_value, description);
+}
+
 std::string configured_checkpoint_path()
 {
     const std::string directory = config_value("rasn.state", "checkpoint_dir", "", "default rASN state checkpoint directory");
@@ -111,12 +316,66 @@ std::string configured_journal_path(const std::string &checkpoint_path)
     return journal.empty() ? checkpoint_path + ".journal" : journal;
 }
 
-bool recovery_state_available()
+bool local_recovery_state_available(const std::string &checkpoint_path)
 {
-    const std::string checkpoint = configured_checkpoint_path();
-    const std::string journal = configured_journal_path(checkpoint);
-    return ::dsn::utils::filesystem::file_exists(checkpoint) ||
+    const std::string journal = configured_journal_path(checkpoint_path);
+    return ::dsn::utils::filesystem::file_exists(checkpoint_path) ||
            ::dsn::utils::filesystem::file_exists(journal);
+}
+
+std::string replica_path_for(const std::string &directory, const std::string &source_path)
+{
+    const std::string file_name = ::dsn::utils::filesystem::get_file_name(source_path);
+    return ::dsn::utils::filesystem::path_combine(directory, file_name.empty() ? "rasn-state" : file_name);
+}
+
+bool replica_recovery_state_available(const std::string &checkpoint_path)
+{
+    if (!config_bool("rasn.state.replica", "enabled", false, "Mirror state checkpoints and journal to a local replica") ||
+        !config_bool("rasn.state.replica", "recover", true, "Recover state from local replica when primary files are absent"))
+    {
+        return false;
+    }
+
+    const std::string directory =
+        config_value("rasn.state.replica", "directory", "rasn-state-replica", "Local rASN state replica directory");
+    if (directory.empty())
+    {
+        return true;
+    }
+
+    const std::string journal = configured_journal_path(checkpoint_path);
+    return ::dsn::utils::filesystem::file_exists(replica_path_for(directory, checkpoint_path)) ||
+           ::dsn::utils::filesystem::file_exists(replica_path_for(directory, journal));
+}
+
+bool nfs_recovery_configured()
+{
+    return config_bool("rasn.state.nfs", "enabled", false, "Enable rDSN NFS import before state recovery");
+}
+
+state_checkpoint_request configured_recovery_request()
+{
+    state_checkpoint_request request;
+    const std::string recover_on_start =
+        config_value("rasn.state", "recover_on_start", "", "checkpoint file to recover at startup");
+    if (!recover_on_start.empty())
+    {
+        request.path = recover_on_start;
+    }
+    return request;
+}
+
+bool recovery_state_available(const state_checkpoint_request &request)
+{
+    if (!request.path.empty())
+    {
+        return true;
+    }
+
+    const std::string checkpoint = configured_checkpoint_path();
+    return local_recovery_state_available(checkpoint) || replica_recovery_state_available(checkpoint) ||
+           nfs_recovery_configured();
 }
 
 void print_check(bool ok, const std::string &name, const std::string &detail, bool *all_ok)
@@ -327,9 +586,9 @@ int srepilot_cli::status()
 
     state_query_request query;
     query.key_prefix = "srepilot/";
-    if (recovery_state_available())
+    const state_checkpoint_request recover = configured_recovery_request();
+    if (recovery_state_available(recover))
     {
-        state_checkpoint_request recover;
         const state_response recovered = _services.recover_state(recover);
         if (!recovered.ok)
         {
@@ -523,12 +782,44 @@ int srepilot_cli::set_provider(const std::vector<std::string> &args)
     return 0;
 }
 
+bool srepilot_cli::recover_state_for_persist(std::string *error)
+{
+    if (_state_recovered_for_persist)
+    {
+        return true;
+    }
+
+    const state_checkpoint_request recover = configured_recovery_request();
+    if (recovery_state_available(recover))
+    {
+        const state_response recovered = _services.recover_state(recover);
+        if (!recovered.ok)
+        {
+            if (error != nullptr)
+            {
+                *error = recovered.error;
+            }
+            return false;
+        }
+    }
+
+    _state_recovered_for_persist = true;
+    return true;
+}
+
 bool srepilot_cli::persist_response(const std::string &kind,
                                     const agent_task &task,
                                     const std::string &input,
                                     const std::string &output,
                                     std::string *stored_key)
 {
+    std::string recovery_error;
+    if (!recover_state_for_persist(&recovery_error))
+    {
+        std::cout << "state recovery failed: " << recovery_error << "\n";
+        return false;
+    }
+
     state_record record;
     record.key = "srepilot/" + kind + "/" + task.id;
     record.kind = "srepilot." + kind;
@@ -612,7 +903,12 @@ void srepilot_cli::print_help() const
 
 void srepilot_app::run_cli_task()
 {
-    const int rc = _cli.run(_args);
+    std::string readiness_error;
+    const int rc = wait_for_service_dependencies(global_rasn_services(), &readiness_error) ? _cli.run(_args) : 1;
+    if (!readiness_error.empty())
+    {
+        std::cerr << readiness_error << "\n";
+    }
     std::cout.flush();
     std::cerr.flush();
     if (rc != 0)
