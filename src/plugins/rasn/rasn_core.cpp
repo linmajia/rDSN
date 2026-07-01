@@ -4,6 +4,7 @@
 #include "redaction.h"
 
 #include <dsn/cpp/utils.h>
+#include <dsn/service_api_cpp.h>
 
 #include <algorithm>
 #include <cctype>
@@ -286,7 +287,10 @@ void event_log::set_output_file(const std::string &path)
         const std::string parent = ::dsn::utils::filesystem::remove_file_name(path);
         if (!parent.empty())
         {
-            ::dsn::utils::filesystem::create_directory(parent);
+            if (!::dsn::utils::filesystem::create_directory(parent))
+            {
+                dwarn("failed to create rASN trace directory: %s", parent.c_str());
+            }
         }
         // Open once and keep the stream; the previous code re-opened (and flushed
         // and closed) the file on every single event under _lock, stalling all

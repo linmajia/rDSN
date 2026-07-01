@@ -683,7 +683,7 @@ std::string configured_state_checkpoint_path()
     return directory.empty() ? file_name : ::dsn::utils::filesystem::path_combine(directory, file_name);
 }
 
-std::string configured_state_journal_path(const std::string &checkpoint_path)
+std::string configured_state_journal_path()
 {
     const std::string journal =
         config_string("rasn.state", "journal_file", "", "append-only rASN state journal file");
@@ -691,8 +691,7 @@ std::string configured_state_journal_path(const std::string &checkpoint_path)
     {
         return journal;
     }
-    const std::string default_checkpoint = configured_state_checkpoint_path();
-    return default_checkpoint.empty() ? checkpoint_path + ".journal" : default_checkpoint + ".journal";
+    return configured_state_checkpoint_path() + ".journal";
 }
 
 state_checkpoint_request configured_state_recovery_request()
@@ -715,7 +714,7 @@ bool configured_state_recovery_available(const state_checkpoint_request &request
     }
 
     const std::string checkpoint = configured_state_checkpoint_path();
-    const std::string journal = configured_state_journal_path(checkpoint);
+    const std::string journal = configured_state_journal_path();
     if (::dsn::utils::filesystem::file_exists(checkpoint) || ::dsn::utils::filesystem::file_exists(journal))
     {
         return true;
@@ -965,7 +964,7 @@ state_response state_store::checkpoint(const state_checkpoint_request &request) 
         ::dsn::utils::filesystem::remove_path(backup_path);
     }
 
-    const std::string journal_path = journal_path_for_checkpoint(path);
+    const std::string journal_path = default_journal_path();
 
     // Mirror the checkpoint file to the replica first. This is the slow I/O and
     // must stay outside _lock; copying a checkpoint that is current-or-superseded
@@ -1030,7 +1029,7 @@ state_response state_store::recover(const state_checkpoint_request &request)
     }
 
     const std::string path = request.path.empty() ? default_checkpoint_path() : request.path;
-    const std::string journal_path = journal_path_for_checkpoint(path);
+    const std::string journal_path = default_journal_path();
     std::map<std::string, state_record> recovered;
     uint64_t last_sequence = 0;
 
@@ -1175,7 +1174,7 @@ bool state_store::has_recovery_state(const state_checkpoint_request &request) co
     }
 
     const std::string path = request.path.empty() ? default_checkpoint_path() : request.path;
-    const std::string journal_path = journal_path_for_checkpoint(path);
+    const std::string journal_path = default_journal_path();
     return ::dsn::utils::filesystem::file_exists(path) || ::dsn::utils::filesystem::file_exists(journal_path);
 }
 
@@ -1192,15 +1191,15 @@ std::string state_store::default_checkpoint_path() const
     return configured_state_checkpoint_path();
 }
 
-std::string state_store::journal_path_for_checkpoint(const std::string &checkpoint_path) const
+std::string state_store::default_journal_path() const
 {
-    return configured_state_journal_path(checkpoint_path);
+    return configured_state_journal_path();
 }
 
 bool state_store::append_journal_record(const state_record &record, std::string *error) const
 {
     const std::string checkpoint_path = default_checkpoint_path();
-    const std::string journal_path = journal_path_for_checkpoint(checkpoint_path);
+    const std::string journal_path = default_journal_path();
     if (!ensure_parent_directory(journal_path, error))
     {
         return false;

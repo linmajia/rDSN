@@ -55,9 +55,9 @@ By default, local runtime files are grouped under a single `rasn` directory in
 the process working directory:
 
 ```text
-rasn\state      durable state checkpoints and journals
-rasn\artifacts  spilled tool-output artifacts
-rasn\traces     runtime JSONL traces
+rasn/state      durable state checkpoints and journals
+rasn/artifacts  spilled tool-output artifacts
+rasn/traces     runtime JSONL traces
 ```
 
 CodePilot can run entirely offline with the simulator provider. It can also use

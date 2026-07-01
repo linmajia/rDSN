@@ -93,9 +93,9 @@ By default, local runtime files are grouped under a single `rasn` directory in
 the process working directory:
 
 ```text
-rasn\state      durable state checkpoints, journals, and incident records
-rasn\artifacts  spilled tool-output artifacts
-rasn\traces     runtime JSONL traces
+rasn/state      durable state checkpoints, journals, and incident records
+rasn/artifacts  spilled tool-output artifacts
+rasn/traces     runtime JSONL traces
 ```
 
 The default provider is the offline simulator. Hosted or local model providers

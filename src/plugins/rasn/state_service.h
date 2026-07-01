@@ -198,7 +198,7 @@ public:
 private:
     state_response error_response(const std::string &error) const;
     std::string default_checkpoint_path() const;
-    std::string journal_path_for_checkpoint(const std::string &checkpoint_path) const;
+    std::string default_journal_path() const;
     bool append_journal_record(const state_record &record, std::string *error) const;
 
     mutable ::dsn::service::zlock _lock;
@@ -210,7 +210,7 @@ private:
 };
 
 std::string configured_state_checkpoint_path();
-std::string configured_state_journal_path(const std::string &checkpoint_path);
+std::string configured_state_journal_path();
 state_checkpoint_request configured_state_recovery_request();
 bool configured_state_recovery_available(const state_checkpoint_request &request);
 
