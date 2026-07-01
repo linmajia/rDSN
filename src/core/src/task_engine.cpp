@@ -112,20 +112,23 @@ void task_worker_pool::create()
 
 void task_worker_pool::start()
 {
+    // Convenience path for starting a single pool standalone. task_engine::start() does NOT call this;
+    // it instead drives the two phases across all pools -- enable_enqueue() on every pool, then
+    // start_workers() on every pool -- so a worker on_start hook can safely enqueue to any pool during
+    // startup (see task_engine::start()).
+    enable_enqueue();
+    start_workers();
+}
+
+void task_worker_pool::enable_enqueue()
+{
     if (_is_running.load(std::memory_order_acquire))
+    {
         return;
+    }
 
-    for (auto& wk : _workers)
-        wk->start();
-
-    ddebug("[%s] thread pool [%s] started, pool_code = %s, worker_count = %d, worker_share_core = %s, partitioned = %s, ...",
-        _node->name(), _spec.name.c_str(),
-        dsn_threadpool_code_to_string(_spec.pool_code),
-        _spec.worker_count,
-        _spec.worker_share_core ? "true" : "false",
-        _spec.partitioned ? "true" : "false");
-
-    // setup cached ptrs for fast timer service access
+    // Populate the timer-service caches BEFORE any worker starts: a worker's on_start hook may enqueue
+    // a delayed task, which calls add_timer() directly and requires these caches to already be set.
     if (service_engine::fast_instance().spec().timer_io_mode == IOE_PER_QUEUE)
     {
         for (size_t i = 0; i < _queues.size(); i++)
@@ -134,13 +137,42 @@ void task_worker_pool::start()
             dassert(svc, "per queue timer service must be present");
             _per_queue_timer_svcs.push_back(svc);
         }
+
+        // add_timer() indexes _per_queue_timer_svcs with a per-queue hash, so enforce the invariant
+        // it relies on once here at startup: exactly one (non-null) timer service per queue. The
+        // per-call asserts in add_timer() remain as a cheap runtime backstop.
+        dassert(_per_queue_timer_svcs.size() == _queues.size(),
+            "per-queue timer service count (%d) must equal queue count (%d)",
+            static_cast<int>(_per_queue_timer_svcs.size()), static_cast<int>(_queues.size()));
     }
     else
     {
         _per_node_timer_svc = node()->tsvc(nullptr);
     }
 
+    // Publish the running state so this pool accepts enqueues before any worker runs its on_start
+    // hook. Such a hook can enqueue an immediate task (to this pool or another), or a short-delay
+    // timer can fire before startup finishes; both reach task_worker_pool::enqueue(), which fatally
+    // asserts the target pool is already running. The queues already exist (from create()), so such
+    // tasks safely wait in-queue until the workers enter loop() and drain them. This release store
+    // also publishes the timer-service caches populated above to any thread that later observes
+    // _is_running via enqueue() or add_timer().
     _is_running.store(true, std::memory_order_release);
+}
+
+void task_worker_pool::start_workers()
+{
+    for (auto& wk : _workers)
+    {
+        wk->start();
+    }
+
+    ddebug("[%s] thread pool [%s] started, pool_code = %s, worker_count = %d, worker_share_core = %s, partitioned = %s, ...",
+        _node->name(), _spec.name.c_str(),
+        dsn_threadpool_code_to_string(_spec.pool_code),
+        _spec.worker_count,
+        _spec.worker_share_core ? "true" : "false",
+        _spec.partitioned ? "true" : "false");
 }
 
 void task_worker_pool::add_timer(task* t)
@@ -152,8 +184,21 @@ void task_worker_pool::add_timer(task* t)
         _per_node_timer_svc->add_timer(t);
     else
     {
-        unsigned int idx = (_spec.partitioned ? static_cast<unsigned int>(t->hash()) % static_cast<unsigned int>(_queues.size()) : 0);
-        _per_queue_timer_svcs[idx]->add_timer(t);
+        // A pool that receives delayed tasks must have its per-queue timer services populated during
+        // start(). Reaching here with an empty/null vector is a configuration/startup error. We must
+        // NOT just return: task::enqueue() has already add_ref()'d this task, so returning would leak
+        // it and hang any caller waiting on it. Fail loudly instead.
+        dassert(!_per_queue_timer_svcs.empty(),
+            "pool %s has no per-queue timer service configured for delayed tasks",
+            _spec.name.c_str());
+        unsigned int idx = (_spec.partitioned
+            ? static_cast<unsigned int>(t->hash()) % static_cast<unsigned int>(_per_queue_timer_svcs.size())
+            : 0);
+        timer_service* svc = _per_queue_timer_svcs[idx];
+        dassert(svc != nullptr,
+            "pool %s has a null per-queue timer service at index %u",
+            _spec.name.c_str(), idx);
+        svc->add_timer(t);
     }
 }
 
@@ -268,12 +313,30 @@ void task_engine::create(const safe_list<dsn_threadpool_code_t>& pools)
 void task_engine::start()
 {
     if (_is_running.load(std::memory_order_acquire))
+    {
         return;
+    }
+
+    // Two-phase startup across all pools. First enable_enqueue() on every pool (init timer caches and
+    // publish _is_running), THEN start_workers() on every pool. A worker on_start hook in one pool may
+    // enqueue a task targeting a DIFFERENT pool; enabling enqueue everywhere first guarantees the
+    // target pool already accepts tasks (buffering them in its queues) instead of tripping
+    // task_worker_pool::enqueue()'s "must be started" assert. Starting pools one-by-one (enable+start
+    // per pool) left earlier-started pools able to enqueue into not-yet-started pools.
+    for (auto& pl : _pools)
+    {
+        if (pl)
+        {
+            pl->enable_enqueue();
+        }
+    }
 
     for (auto& pl : _pools)
     {
         if (pl)
-            pl->start();
+        {
+            pl->start_workers();
+        }
     }
 
     _is_running.store(true, std::memory_order_release);
@@ -284,8 +347,36 @@ volatile int* task_engine::get_task_queue_virtual_length_ptr(
     int hash
     )
 {
-    auto pl = get_pool(task_spec::get(code)->pool_code);
-    auto idx = (pl->spec().partitioned ? hash % pl->spec().worker_count : 0);
+    task_spec* spec = task_spec::get(code);
+    if (spec == nullptr)
+    {
+        derror("get_task_queue_virtual_length_ptr got invalid task code %d", code);
+        return nullptr;
+    }
+
+    auto pl = get_pool(spec->pool_code);
+    if (pl == nullptr)
+    {
+        derror("get_task_queue_virtual_length_ptr: no thread pool for task code %s",
+            spec->name.c_str());
+        return nullptr;
+    }
+
+    int worker_count = pl->spec().worker_count;
+    unsigned int idx = 0;
+    if (pl->spec().partitioned && worker_count > 0)
+    {
+        // treat hash as unsigned so a negative hash cannot produce a negative index
+        idx = static_cast<unsigned int>(hash) % static_cast<unsigned int>(worker_count);
+    }
+
+    if (idx >= pl->queues().size())
+    {
+        derror("get_task_queue_virtual_length_ptr: queue index %u out of range (%u queues) for task code %s",
+            idx, static_cast<unsigned int>(pl->queues().size()), spec->name.c_str());
+        return nullptr;
+    }
+
     return pl->queues()[idx]->get_virtual_length_ptr();
 }
 
