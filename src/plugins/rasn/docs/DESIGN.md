@@ -1183,8 +1183,8 @@ rDSN design:
 - Packaging remains source-tree local: `config.ini` is copied beside the built
   executable by CMake, and examples are stored under `examples/`.
 - rASN builds as a reusable `rasn` static library containing the engine, while
-  CodePilot (`apps/codepilot/`, including `apps/codepilot/main.cpp`) and the
-  `rasn.unit_tests` binary are thin executables that link it. This keeps the
+  CodePilot (`apps/codepilot/`), SREPilot (`apps/srepilot/`), and the
+  `rasn.unit_tests` binary are thin consumers that link it. This keeps the
   platform reusable by other applications and avoids recompiling the engine per
   consumer.
 - The CLI is an adapter over generic rASN APIs and should not introduce hidden
@@ -1202,7 +1202,7 @@ Correctness and robustness requirements:
 
 ## Application adapter rule
 
-Application adapters such as CodePilot may provide:
+Application adapters such as CodePilot and SREPilot may provide:
 
 - User interface and CLI commands.
 - Application-specific skills and prompts.
@@ -1231,6 +1231,7 @@ Application adapters must not own:
 | `llm_provider.*` | Remain provider adapters behind generic model gateway. |
 | `agent_tools.h` | Become generic tool provider interface; CodePilot tools stay in `apps/codepilot/`. |
 | `apps/codepilot/*` | Application adapter using generic rASN APIs. |
+| `apps/srepilot/*` | Incident-response application adapter using generic rASN APIs. |
 
 ## Current product limitations
 

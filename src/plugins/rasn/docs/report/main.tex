@@ -1218,6 +1218,7 @@ src/plugins/rasn/
   agent_tools.{h,cpp}
   apps/
     codepilot/
+    srepilot/
   tests/
   examples/
   docs/report/
@@ -1225,17 +1226,17 @@ src/plugins/rasn/
 
 The build is organized so that rASN is a reusable platform rather than a
 single application binary. The engine sources in \texttt{src/plugins/rasn/}
-compile into a \texttt{rasn} static library, and both the \codepilot
-executable (\texttt{apps/codepilot/}, including \texttt{apps/codepilot/main.cpp}) and the
+compile into a \texttt{rasn} static library, and \codepilot, SREPilot, and the
 \texttt{rasn.unit\_tests} executable link that library instead of recompiling
-the engine. \texttt{CMakeLists.txt} integrates the library, the application,
-and the unit tests into the \rdsn build. The implementation is intentionally
-header-heavy for message serialization helpers and uses \cpp service classes
-for runtime behavior.
+the engine. \texttt{CMakeLists.txt} integrates the library, application
+subdirectories, and the unit tests into the \rdsn build. The implementation is
+intentionally header-heavy for message serialization helpers and uses \cpp
+service classes for runtime behavior.
 
 Table~\ref{tab:file-responsibilities} maps the main implementation files to
 their responsibilities. This table is also useful for future maintainers because
-it distinguishes reusable nucleus code from the CodePilot application layer.
+it distinguishes reusable nucleus code from application layers such as CodePilot
+and SREPilot.
 
 \begin{table*}[t]
 \caption{Main source files and responsibilities.}
@@ -1262,6 +1263,7 @@ Files & Layer & Responsibility \\
 \texttt{llm\_provider/model\_agent} & Provider & Simulator and HTTP-compatible model adapters \\
 \texttt{agent\_tools} & Provider API & Generic tool provider interface \\
 \texttt{apps/codepilot/*} & Application & CLI commands, local tools, skills, provider configuration \\
+\texttt{apps/srepilot/*} & Application & Incident diagnosis, runbook, status, observability commands \\
 \bottomrule
 \end{tabular}
 \end{table*}

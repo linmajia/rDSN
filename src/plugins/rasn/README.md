@@ -2,7 +2,7 @@
 
 rASN is a prototype framework for building robust AI agent systems on top of rDSN. It treats agent execution as a task-centric distributed runtime problem: every agent step is represented as an explicit task, runtime nondeterminism is captured as data, and workflow execution is exposed as an instrumented graph that can be traced, diagnosed, and replayed.
 
-The first sample application is **rASN CodePilot** (short name: **CodePilot**), a coding CLI inspired by OpenCode, Codex CLI, and GitHub Copilot CLI. It can run entirely offline with a random simulator, or connect to OpenAI-compatible APIs such as GitHub Copilot-style endpoints, Ollama, llama.cpp, and LM Studio.
+The first sample application is **rASN CodePilot** (short name: **CodePilot**), a coding CLI inspired by OpenCode, Codex CLI, and GitHub Copilot CLI. It can run entirely offline with a random simulator, or connect to OpenAI-compatible APIs such as GitHub Copilot-style endpoints, Ollama, llama.cpp, and LM Studio. The second sample application is **SREPilot**, an SRE / incident-response CLI that reuses the same model gateway, state service, observability surface, and resilience controls for production-operations workflows.
 
 ## Design
 
@@ -25,6 +25,7 @@ The prototype is intentionally small and is organized around four building block
 | CodePilot tools | `apps/codepilot/local_tools.*` | Implements and registers the CodePilot application tool provider: project inspection tools, read/search, and opt-in shell/write execution. |
 | CodePilot skills | `apps/codepilot/skills.*` | Provides reusable coding-agent skill prompts for rDSN plugin work, code review, build debugging, feature planning, and documentation. |
 | CodePilot app | `apps/codepilot/codepilot_app.*`, `apps/codepilot/main.cpp` | Exposes one-shot and interactive coding-agent commands as an adapter that builds generic `agent_request` messages and routes them through the rASN coordinator. |
+| SREPilot app | `apps/srepilot/srepilot_app.*`, `apps/srepilot/main.cpp` | Exposes incident diagnosis, runbook generation, status, observability, and self-test commands as a second application adapter over the same rASN nucleus. |
 
 ### rDSN micro-service model
 
@@ -39,6 +40,7 @@ rasn.state          stores namespaced state and checkpoints
 rasn.workflow       validates, compiles, and executes declarative agent graphs
 rasn.observability  queries events, failures, snapshots, and replay loading
 rasn.codepilot      exposes rASN CodePilot as a gateway service
+rasn.srepilot       exposes rASN SREPilot as a gateway service
 ```
 
 The CLI does not directly call an LLM provider or local tool. It sends requests through a `rasn_service_graph`, where the coordinator dispatches work to the LLM or tool agent. In rDSN service mode, the graph follows the same pattern as `apps.echo` and `apps.skv`: each agent role registers `serverlet` handlers, clients use `clientlet` wrappers, and requests flow through explicit RPC task codes:
@@ -558,6 +560,12 @@ After building, the CodePilot executable is:
 C:\Users\haoxlin\source\repos\rdsn\rb-rasn\bin\codepilot\Debug\codepilot.exe
 ```
 
+The SREPilot executable is:
+
+```bat
+C:\Users\haoxlin\source\repos\rdsn\rb-rasn\bin\srepilot\Debug\srepilot.exe
+```
+
 Before running it directly, put the rDSN runtime DLL directory on `PATH`:
 
 ```bat
@@ -608,6 +616,18 @@ Inside the REPL:
 ```
 
 Plain text without a slash is treated as an `ask` prompt.
+
+## Run SREPilot
+
+SREPilot is a second application adapter that exercises rASN outside coding tasks. It uses the same simulator/provider configuration by default, persists incident artifacts under the `srepilot/` state namespace, and exposes rASN observability/resilience views for operations workflows.
+
+```bat
+set PATH=C:\Users\haoxlin\source\repos\rdsn\rb-rasn\bin\Debug;%PATH%
+C:\Users\haoxlin\source\repos\rdsn\rb-rasn\bin\srepilot\Debug\srepilot.exe diagnose "checkout latency p95 doubled after the last deployment"
+C:\Users\haoxlin\source\repos\rdsn\rb-rasn\bin\srepilot\Debug\srepilot.exe runbook "database connection pool exhaustion"
+C:\Users\haoxlin\source\repos\rdsn\rb-rasn\bin\srepilot\Debug\srepilot.exe observe resilience
+C:\Users\haoxlin\source\repos\rdsn\rb-rasn\bin\srepilot\Debug\srepilot.exe selftest
+```
 
 ### 3. Run a workflow
 

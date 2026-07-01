@@ -32,4 +32,5 @@ set(MY_BINPLACES "")
 dsn_add_static_library()
 
 add_subdirectory(apps/codepilot)
+add_subdirectory(apps/srepilot)
 add_subdirectory(tests)

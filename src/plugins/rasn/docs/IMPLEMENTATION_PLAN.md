@@ -3150,6 +3150,42 @@ Validation:
 - [x] Direct `codepilot selftest` passes after the move.
 - [x] `git diff --check`.
 
+## Phase 76: SREPilot incident-response application
+
+Status: `[x]`
+
+Goal: Add SREPilot as a second application adapter to prove that rASN is a
+reusable platform rather than a CodePilot-specific implementation.
+
+Files:
+
+- `apps/srepilot/*`
+- `rasn.code.definition.h`
+- `CMakeLists.txt`, `config.ini`, `examples/service-rpc-smoke.ini`
+- `README.md`, `docs/DESIGN.md`, `docs/report/main.tex`,
+  `docs/IMPLEMENTATION_PLAN.md`
+
+Work items:
+
+- [x] Add a `srepilot` executable and `rasn.srepilot` service app.
+- [x] Implement `diagnose`, `runbook`, `status`, `observe`, `provider`,
+  `selftest`, and `interactive` commands over `rasn_service_graph`.
+- [x] Persist generated diagnosis/runbook artifacts under the `srepilot/` state
+  namespace.
+- [x] Reuse the model gateway, state service, observability queries, metrics, and
+  shared resilience report instead of adding SREPilot-specific runtime paths.
+- [x] Wire the app into CMake and rDSN config.
+- [x] Update user docs, design notes, and the ACM-style technical report.
+
+Validation:
+
+- [x] Build `srepilot`.
+- [x] Run direct `srepilot selftest`.
+- [x] Run direct `srepilot status` and `srepilot diagnose`.
+- [x] Re-run `rasn.unit_tests`.
+- [x] Re-run direct `codepilot selftest` after introducing per-app configs.
+- [x] `git diff --check`.
+
 ## Dependency order
 
 ```text
@@ -3228,6 +3264,7 @@ Phase 1 task model
   -> Phase 73 remote-agent dispatch resilience
   -> Phase 74 process-wide overload budget
   -> Phase 75 application directory layout
+  -> Phase 76 SREPilot incident-response application
 ```
 
 Some phases can overlap after Phase 3, but the public message model and generic
