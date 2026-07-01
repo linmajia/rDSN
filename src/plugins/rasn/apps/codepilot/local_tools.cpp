@@ -130,14 +130,12 @@ std::string canonical_command_name(std::string command)
 {
     command = normalize_platform_path(command);
     command = ::dsn::utils::filesystem::get_file_name(command);
-#if defined(_WIN32)
     command = lower_ascii(command);
     if (has_suffix(command, ".exe") || has_suffix(command, ".cmd") || has_suffix(command, ".bat") ||
         has_suffix(command, ".ps1"))
     {
         command = command.substr(0, command.find_last_of('.'));
     }
-#endif
     return command;
 }
 
