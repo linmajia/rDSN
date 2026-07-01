@@ -1216,7 +1216,8 @@ src/plugins/rasn/
   rate_limiter.{h,cpp}
   llm_provider.{h,cpp}
   agent_tools.{h,cpp}
-  codepilot/
+  apps/
+    codepilot/
   tests/
   examples/
   docs/report/
@@ -1225,7 +1226,7 @@ src/plugins/rasn/
 The build is organized so that rASN is a reusable platform rather than a
 single application binary. The engine sources in \texttt{src/plugins/rasn/}
 compile into a \texttt{rasn} static library, and both the \codepilot
-executable (\texttt{codepilot/}, including \texttt{codepilot/main.cpp}) and the
+executable (\texttt{apps/codepilot/}, including \texttt{apps/codepilot/main.cpp}) and the
 \texttt{rasn.unit\_tests} executable link that library instead of recompiling
 the engine. \texttt{CMakeLists.txt} integrates the library, the application,
 and the unit tests into the \rdsn build. The implementation is intentionally
@@ -1260,7 +1261,7 @@ Files & Layer & Responsibility \\
 \texttt{rate\_limiter} & Resilience & Per-provider/per-tool token-bucket rate limiter (requests/minute pacing) \\
 \texttt{llm\_provider/model\_agent} & Provider & Simulator and HTTP-compatible model adapters \\
 \texttt{agent\_tools} & Provider API & Generic tool provider interface \\
-\texttt{codepilot/*} & Application & CLI commands, local tools, skills, provider configuration \\
+\texttt{apps/codepilot/*} & Application & CLI commands, local tools, skills, provider configuration \\
 \bottomrule
 \end{tabular}
 \end{table*}
@@ -1571,7 +1572,7 @@ instead of a mysterious model-call failure later in a workflow.
 
 \subsection{Tool Agent and Policy Manager}
 
-\texttt{agent\_tools.*} and \texttt{codepilot/local\_tools.*} implement local
+\texttt{agent\_tools.*} and \texttt{apps/codepilot/local\_tools.*} implement local
 tool execution behind the generic \texttt{tool.run} capability. The current tool
 provider supports listing, reading, searching, writing, replacing, and shell
 execution. The \texttt{policy\_manager} classifies each operation by capability

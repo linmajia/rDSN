@@ -6,7 +6,7 @@
 #include "../admission_gate.h"
 #include "../circuit_breaker.h"
 #include "../coordinator_service.h"
-#include "../codepilot/local_tools.h"
+#include "../apps/codepilot/local_tools.h"
 #include "../metrics.h"
 #include "../policy_manager.h"
 #include "../rate_limiter.h"

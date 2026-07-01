@@ -1183,7 +1183,7 @@ rDSN design:
 - Packaging remains source-tree local: `config.ini` is copied beside the built
   executable by CMake, and examples are stored under `examples/`.
 - rASN builds as a reusable `rasn` static library containing the engine, while
-  CodePilot (`codepilot/`, including `codepilot/main.cpp`) and the
+  CodePilot (`apps/codepilot/`, including `apps/codepilot/main.cpp`) and the
   `rasn.unit_tests` binary are thin executables that link it. This keeps the
   platform reusable by other applications and avoids recompiling the engine per
   consumer.
@@ -1229,8 +1229,8 @@ Application adapters must not own:
 | `metrics.*` | Aggregate runtime metrics over rDSN `perf_counter`; surfaced via `observe metrics` and the `rasn.metrics` command. |
 | `workflow.*` | Promote to workflow graph plus compiler/executor service. |
 | `llm_provider.*` | Remain provider adapters behind generic model gateway. |
-| `agent_tools.h` | Become generic tool provider interface; CodePilot tools stay in `codepilot/`. |
-| `codepilot/*` | Application adapter using generic rASN APIs. |
+| `agent_tools.h` | Become generic tool provider interface; CodePilot tools stay in `apps/codepilot/`. |
+| `apps/codepilot/*` | Application adapter using generic rASN APIs. |
 
 ## Current product limitations
 

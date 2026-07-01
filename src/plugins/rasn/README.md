@@ -22,9 +22,9 @@ The prototype is intentionally small and is organized around four building block
 | LLM provider layer | `llm_provider.*` | Provides a common `llm_provider` interface and adapters for simulator, Copilot-compatible, Ollama, llama.cpp, LM Studio, and generic OpenAI-compatible HTTP APIs. |
 | Tool provider layer | `agent_tools.*` | Defines the generic rASN tool-provider contract and registration factory used by the tool-agent service. |
 | Workflow graph | `workflow.*` | Parses a declarative task graph, validates dependencies, topologically orders nodes, and executes them through the selected provider. |
-| CodePilot tools | `codepilot/local_tools.*` | Implements and registers the CodePilot application tool provider: project inspection tools, read/search, and opt-in shell/write execution. |
-| CodePilot skills | `codepilot/skills.*` | Provides reusable coding-agent skill prompts for rDSN plugin work, code review, build debugging, feature planning, and documentation. |
-| CodePilot app | `codepilot/codepilot_app.*`, `codepilot/main.cpp` | Exposes one-shot and interactive coding-agent commands as an adapter that builds generic `agent_request` messages and routes them through the rASN coordinator. |
+| CodePilot tools | `apps/codepilot/local_tools.*` | Implements and registers the CodePilot application tool provider: project inspection tools, read/search, and opt-in shell/write execution. |
+| CodePilot skills | `apps/codepilot/skills.*` | Provides reusable coding-agent skill prompts for rDSN plugin work, code review, build debugging, feature planning, and documentation. |
+| CodePilot app | `apps/codepilot/codepilot_app.*`, `apps/codepilot/main.cpp` | Exposes one-shot and interactive coding-agent commands as an adapter that builds generic `agent_request` messages and routes them through the rASN coordinator. |
 
 ### rDSN micro-service model
 
@@ -601,7 +601,7 @@ Inside the REPL:
 /help
 /provider simulator
 /trace C:\temp\rasn.jsonl
-/context src\plugins\rasn\codepilot\codepilot_app.cpp
+/context src\plugins\rasn\apps\codepilot\codepilot_app.cpp
 /plan Add a new command to CodePilot
 /ask Summarize the current rASN design
 /exit

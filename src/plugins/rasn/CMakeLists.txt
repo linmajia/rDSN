@@ -12,7 +12,7 @@ endif()
 # agent-system engine (runtime, services, workflow, observability, metrics,
 # schema, ...). Both the CodePilot executable and the unit-test executable link
 # this library instead of recompiling every engine source. Application entry
-# points live with their executables (codepilot/main.cpp), so this directory
+# points live with their executables (apps/*/main.cpp), so this directory
 # intentionally contains no main().
 set(MY_PROJ_NAME rasn)
 
@@ -31,5 +31,5 @@ set(MY_BINPLACES "")
 
 dsn_add_static_library()
 
-add_subdirectory(codepilot)
+add_subdirectory(apps/codepilot)
 add_subdirectory(tests)

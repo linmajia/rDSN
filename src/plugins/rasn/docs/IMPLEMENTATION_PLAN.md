@@ -15,7 +15,7 @@ simple so they can be updated in source control:
   `src/plugins_ext`.
 - Prefer `service_app`, `serverlet`, `clientlet`, typed task codes, rDSN config,
   rDSN logging, rDSN locks, and rDSN filesystem utilities.
-- Keep CodePilot-specific logic under `codepilot/`.
+- Keep CodePilot-specific logic under `apps/codepilot/`.
 - Every component must define correctness invariants and validation checks before
   it is considered complete.
 - Every behavior-changing phase must pass build and direct/service-mode smoke
@@ -46,7 +46,8 @@ src/plugins/rasn/
   tool_agent.h/.cpp
   llm_provider.h/.cpp
   agent_tools.h/.cpp
-  codepilot/
+  apps/
+    codepilot/
 ```
 
 The exact file split can be adjusted during implementation, but each generic
@@ -415,7 +416,7 @@ Files:
 - `policy_manager.h`
 - `policy_manager.cpp`
 - `agent_tools.h/.cpp`
-- `codepilot/local_tools.*`
+- `apps/codepilot/local_tools.*`
 
 Work items:
 
@@ -483,9 +484,9 @@ Goal: Make CodePilot an application adapter over generic rASN.
 
 Files:
 
-- `codepilot/codepilot_app.*`
-- `codepilot/local_tools.*`
-- `codepilot/skills.*`
+- `apps/codepilot/codepilot_app.*`
+- `apps/codepilot/local_tools.*`
+- `apps/codepilot/skills.*`
 
 Work items:
 
@@ -582,7 +583,7 @@ Goal: Make service-mode rDSN RPC flows repeatably testable.
 
 Files:
 
-- `codepilot/codepilot_app.*`
+- `apps/codepilot/codepilot_app.*`
 - `examples/service-rpc-smoke.ini`
 - `README.md`
 - `examples/README.md`
@@ -689,7 +690,7 @@ Goal: Add richer trace inspection and failure diagnosis.
 Files:
 
 - `observability.*`
-- `codepilot/codepilot_app.*`
+- `apps/codepilot/codepilot_app.*`
 - `README.md`
 
 Work items:
@@ -780,7 +781,7 @@ Files:
 - `agent_registry.*`
 - `workflow.*`
 - `workflow_service.*`
-- `codepilot/codepilot_app.cpp`
+- `apps/codepilot/codepilot_app.cpp`
 - `docs/DESIGN.md`
 - `README.md`
 
@@ -814,7 +815,7 @@ Linux.
 
 Files:
 
-- `codepilot/codepilot_app.*`
+- `apps/codepilot/codepilot_app.*`
 - `README.md`
 - `docs/DESIGN.md`
 - `docs/IMPLEMENTATION_PLAN.md`
@@ -849,7 +850,7 @@ Files:
 
 - `agent_registry.*`
 - `agent_services.cpp`
-- `codepilot/codepilot_app.cpp`
+- `apps/codepilot/codepilot_app.cpp`
 - `README.md`
 - `docs/DESIGN.md`
 - `docs/IMPLEMENTATION_PLAN.md`
@@ -881,7 +882,7 @@ Files:
 
 - `workflow.*`
 - `workflow_service.*`
-- `codepilot/codepilot_app.cpp`
+- `apps/codepilot/codepilot_app.cpp`
 - `README.md`
 - `docs/DESIGN.md`
 - `docs/IMPLEMENTATION_PLAN.md`
@@ -916,7 +917,7 @@ checkpoint/journal instead of relying only on in-memory workflow-service state.
 Files:
 
 - `workflow_service.*`
-- `codepilot/codepilot_app.cpp`
+- `apps/codepilot/codepilot_app.cpp`
 - `README.md`
 - `docs/DESIGN.md`
 - `docs/IMPLEMENTATION_PLAN.md`
@@ -1107,7 +1108,7 @@ Files:
 - `agent_registry.cpp`
 - `agent_services.cpp`
 - `coordinator_service.cpp`
-- `codepilot/codepilot_app.cpp`
+- `apps/codepilot/codepilot_app.cpp`
 - `tests/*`
 - `config.ini`
 - `examples/service-rpc-smoke.ini`
@@ -1234,7 +1235,7 @@ Files:
 
 - `workflow.*`
 - `workflow_service.*`
-- `codepilot/codepilot_app.*`
+- `apps/codepilot/codepilot_app.*`
 - `tests/rasn_unit_tests.cpp`
 - `README.md`
 - `docs/DESIGN.md`
@@ -1523,7 +1524,7 @@ Files:
 
 - `observability.*`
 - `agent_services.cpp`
-- `codepilot/codepilot_app.cpp`
+- `apps/codepilot/codepilot_app.cpp`
 - `tests/rasn_unit_tests.cpp`
 - `README.md`
 - `docs/DESIGN.md`
@@ -1564,7 +1565,7 @@ Files:
 - `agent_services.*`
 - `workflow_service.cpp`
 - `observability.cpp`
-- `codepilot/codepilot_app.cpp`
+- `apps/codepilot/codepilot_app.cpp`
 - `tests/rasn_unit_tests.cpp`
 - `README.md`
 - `docs/DESIGN.md`
@@ -1604,7 +1605,7 @@ Files:
 
 - `agent_services.*`
 - `rasn.code.definition.h`
-- `codepilot/codepilot_app.cpp`
+- `apps/codepilot/codepilot_app.cpp`
 - `workflow_service.*`
 - `tests/rasn_unit_tests.cpp`
 - `README.md`
@@ -1647,7 +1648,7 @@ diagnosably when any required rASN service surface is not yet accepting RPCs.
 
 Files:
 
-- `codepilot/codepilot_app.cpp`
+- `apps/codepilot/codepilot_app.cpp`
 - `README.md`
 - `docs/DESIGN.md`
 - `docs/IMPLEMENTATION_PLAN.md`
@@ -1685,7 +1686,7 @@ Files:
 
 - `agent_runtime.*`
 - `agent_services.cpp`
-- `codepilot/codepilot_app.cpp`
+- `apps/codepilot/codepilot_app.cpp`
 - `tests/rasn_unit_tests.cpp`
 - `README.md`
 - `docs/DESIGN.md`
@@ -1834,7 +1835,7 @@ truncate writes with rDSN filesystem-backed atomic replacement.
 
 Files:
 
-- `codepilot/local_tools.*`
+- `apps/codepilot/local_tools.*`
 - `tests/rasn_unit_tests.cpp`
 - `README.md`
 - `docs/DESIGN.md`
@@ -1913,8 +1914,8 @@ Files:
 - `agent_tools.h`
 - `agent_services.*`
 - `policy_manager.*`
-- `codepilot/codepilot_app.*`
-- `codepilot/local_tools.*`
+- `apps/codepilot/codepilot_app.*`
+- `apps/codepilot/local_tools.*`
 - `tests/rasn_unit_tests.cpp`
 - `config.ini`
 - `examples/service-rpc-smoke.ini`
@@ -1994,7 +1995,7 @@ configurable command allowlists and workspace-rooted command execution.
 
 Files:
 
-- `codepilot/local_tools.*`
+- `apps/codepilot/local_tools.*`
 - `tests/rasn_unit_tests.cpp`
 - `config.ini`
 - `examples/service-rpc-smoke.ini`
@@ -2034,7 +2035,7 @@ message contracts explicit, inspectable, and regression-tested.
 Files:
 
 - `schema_manifest.*`
-- `codepilot/codepilot_app.cpp`
+- `apps/codepilot/codepilot_app.cpp`
 - `CMakeLists.txt`
 - `tests/CMakeLists.txt`
 - `tests/rasn_unit_tests.cpp`
@@ -2108,7 +2109,7 @@ descriptors instead of relying only on prose descriptions.
 Files:
 
 - `agent_tools.h`
-- `codepilot/local_tools.*`
+- `apps/codepilot/local_tools.*`
 - `schema_manifest.cpp`
 - `tests/rasn_unit_tests.cpp`
 - `README.md`
@@ -2231,7 +2232,7 @@ command runtime and terminating timed-out shell processes.
 
 Files:
 
-- `codepilot/local_tools.*`
+- `apps/codepilot/local_tools.*`
 - `config.ini`
 - `examples/service-rpc-smoke.ini`
 - `tests/rasn_unit_tests.cpp`
@@ -2271,8 +2272,8 @@ Files:
 
 - `schema_manifest.*`
 - `rasn_core.*`
-- `codepilot/codepilot_app.*`
-- `codepilot/local_tools.*`
+- `apps/codepilot/codepilot_app.*`
+- `apps/codepilot/local_tools.*`
 - `tests/rasn_unit_tests.cpp`
 - `README.md`
 - `docs/DESIGN.md`
@@ -2316,7 +2317,7 @@ contract stubs from the same manifest used for text, JSON, and IDL export.
 Files:
 
 - `schema_manifest.*`
-- `codepilot/codepilot_app.cpp`
+- `apps/codepilot/codepilot_app.cpp`
 - `tests/rasn_unit_tests.cpp`
 - `README.md`
 - `docs/DESIGN.md`
@@ -2360,7 +2361,7 @@ Files:
 
 - `schema_manifest.*`
 - `main.cpp`
-- `codepilot/codepilot_app.cpp`
+- `apps/codepilot/codepilot_app.cpp`
 - `tests/rasn_unit_tests.cpp`
 - `README.md`
 - `docs/DESIGN.md`
@@ -2442,7 +2443,7 @@ Files:
 - `llm_provider.*`
 - `rasn_core.*`
 - `agent_services.*`
-- `codepilot/codepilot_app.*`
+- `apps/codepilot/codepilot_app.*`
 - `tests/rasn_unit_tests.cpp`
 - `README.md`
 - `docs/DESIGN.md`
@@ -2479,7 +2480,7 @@ data-contract export into executable C++ rDSN RPC-client generation.
 Files:
 
 - `schema_manifest.*`
-- `codepilot/codepilot_app.cpp`
+- `apps/codepilot/codepilot_app.cpp`
 - `tests/rasn_unit_tests.cpp`
 - `README.md`
 - `docs/DESIGN.md`
@@ -2560,11 +2561,11 @@ Files:
 
 - `schema_manifest.*`
 - `main.cpp`
-- `codepilot/codepilot_app.cpp`
+- `apps/codepilot/codepilot_app.cpp`
 - `rasn_core.*`
 - `agent_services.cpp`
 - `state_service.*`
-- `codepilot/local_tools.*`
+- `apps/codepilot/local_tools.*`
 - `config.ini`
 - `examples/service-rpc-smoke.ini`
 - `tests/rasn_unit_tests.cpp`
@@ -2624,7 +2625,7 @@ Files:
 - `metrics.cpp`
 - `rasn_core.*`
 - `agent_services.*`
-- `codepilot/codepilot_app.cpp`
+- `apps/codepilot/codepilot_app.cpp`
 - `config.ini`
 - `tests/CMakeLists.txt`
 - `tests/rasn_unit_tests.cpp`
@@ -2741,7 +2742,7 @@ Files:
 - `circuit_breaker.h` / `circuit_breaker.cpp` (new)
 - `metrics.cpp`, `rasn_core.h` / `rasn_core.cpp`
 - `agent_services.h` / `agent_services.cpp`
-- `codepilot/codepilot_app.cpp`, `config.ini`
+- `apps/codepilot/codepilot_app.cpp`, `config.ini`
 - `tests/rasn_unit_tests.cpp`
 - `docs/DESIGN.md`, `README.md`, `docs/report/main.tex`,
   `docs/IMPLEMENTATION_PLAN.md`
@@ -2805,7 +2806,7 @@ Files:
 - `admission_gate.h` / `admission_gate.cpp` (new)
 - `metrics.cpp`, `rasn_core.h` / `rasn_core.cpp`
 - `agent_services.h` / `agent_services.cpp`
-- `codepilot/codepilot_app.cpp`, `config.ini`
+- `apps/codepilot/codepilot_app.cpp`, `config.ini`
 - `tests/rasn_unit_tests.cpp`
 - `docs/DESIGN.md`, `README.md`, `docs/report/main.tex`,
   `docs/IMPLEMENTATION_PLAN.md`
@@ -2873,7 +2874,7 @@ Files:
 - `rate_limiter.h` / `rate_limiter.cpp` (new)
 - `metrics.cpp`, `rasn_core.h` / `rasn_core.cpp`
 - `agent_services.h` / `agent_services.cpp`
-- `codepilot/codepilot_app.cpp`, `config.ini`
+- `apps/codepilot/codepilot_app.cpp`, `config.ini`
 - `tests/rasn_unit_tests.cpp`
 - `docs/DESIGN.md`, `README.md`, `docs/report/main.tex`,
   `docs/IMPLEMENTATION_PLAN.md`
@@ -2937,7 +2938,7 @@ Files:
 - `agent_services.h` / `agent_services.cpp`
 - `rasn_core.h` / `rasn_core.cpp`
 - `metrics.cpp`, `rate_limiter.h`, `config.ini`
-- `codepilot/codepilot_app.cpp`
+- `apps/codepilot/codepilot_app.cpp`
 - `tests/rasn_unit_tests.cpp`
 - `README.md`, `docs/DESIGN.md`, `docs/report/main.tex`,
   `docs/IMPLEMENTATION_PLAN.md`
@@ -3000,7 +3001,7 @@ Files:
 - `agent_services.h` / `agent_services.cpp`
 - `rasn_core.h` / `rasn_core.cpp`
 - `metrics.cpp`, `config.ini`
-- `codepilot/codepilot_app.cpp`
+- `apps/codepilot/codepilot_app.cpp`
 - `tests/rasn_unit_tests.cpp`
 - `README.md`, `docs/DESIGN.md`, `docs/report/main.tex`,
   `docs/IMPLEMENTATION_PLAN.md`
@@ -3114,6 +3115,41 @@ Validation:
   suites); enum/array/map alignment, event-kind/counter-key agreement, and
   signature/caller/test agreement were verified by structural review.
 
+## Phase 75: application directory layout
+
+Status: `[x]`
+
+Goal: Move CodePilot under an `apps/` namespace so rASN can host multiple
+application adapters without mixing reusable nucleus code and product-specific
+front ends.
+
+Files:
+
+- `apps/codepilot/*`
+- `CMakeLists.txt`
+- `tests/CMakeLists.txt`
+- `tests/rasn_unit_tests.cpp`
+- `README.md`, `docs/DESIGN.md`, `docs/report/main.tex`,
+  `docs/IMPLEMENTATION_PLAN.md`
+
+Work items:
+
+- [x] Move the CodePilot executable sources from `codepilot/` to
+  `apps/codepilot/`.
+- [x] Keep the reusable rASN engine as the top-level `rasn` static library and
+  build CodePilot as a thin executable with `add_subdirectory(apps/codepilot)`.
+- [x] Update CodePilot include roots, config binplace paths, and unit-test helper
+  source references for the deeper application directory.
+- [x] Update user docs, design notes, and the technical report to describe
+  `apps/codepilot/` as the first application adapter location.
+
+Validation:
+
+- [x] `rasn.unit_tests` target builds after the move.
+- [x] `codepilot` target builds after the move.
+- [x] Direct `codepilot selftest` passes after the move.
+- [x] `git diff --check`.
+
 ## Dependency order
 
 ```text
@@ -3191,6 +3227,7 @@ Phase 1 task model
   -> Phase 72 tool gateway admission and rate controls
   -> Phase 73 remote-agent dispatch resilience
   -> Phase 74 process-wide overload budget
+  -> Phase 75 application directory layout
 ```
 
 Some phases can overlap after Phase 3, but the public message model and generic

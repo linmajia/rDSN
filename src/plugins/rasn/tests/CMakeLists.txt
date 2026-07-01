@@ -10,10 +10,10 @@ endif()
 
 # The rASN engine is linked from the rasn static library, so the unit-test
 # executable only compiles the test sources plus the CodePilot local-tools
-# component it exercises directly (codepilot/local_tools.cpp, which is part of
-# the CodePilot executable rather than the engine library).
+# component it exercises directly (apps/codepilot/local_tools.cpp, which is part
+# of the CodePilot executable rather than the engine library).
 set(RASN_UNIT_TEST_SUPPORT_SRC
-    "${CMAKE_CURRENT_SOURCE_DIR}/../codepilot/local_tools.cpp")
+    "${CMAKE_CURRENT_SOURCE_DIR}/../apps/codepilot/local_tools.cpp")
 
 set(MY_PROJ_NAME rasn.unit_tests)
 

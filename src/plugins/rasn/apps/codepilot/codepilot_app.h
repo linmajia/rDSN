@@ -1,8 +1,8 @@
 #pragma once
 
-#include "../agent_services.h"
-#include "../rasn.code.definition.h"
-#include "../workflow.h"
+#include "../../agent_services.h"
+#include "../../rasn.code.definition.h"
+#include "../../workflow.h"
 #include "skills.h"
 
 #include <dsn/service_api_cpp.h>

@@ -1,9 +1,9 @@
 #include "codepilot_app.h"
-#include "../agent_registry.h"
-#include "../observability.h"
-#include "../schema_manifest.h"
-#include "../state_service.h"
-#include "../workflow_service.h"
+#include "../../agent_registry.h"
+#include "../../observability.h"
+#include "../../schema_manifest.h"
+#include "../../state_service.h"
+#include "../../workflow_service.h"
 
 #include <dsn/cpp/utils.h>
 

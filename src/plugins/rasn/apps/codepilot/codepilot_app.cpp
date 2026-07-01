@@ -1,11 +1,11 @@
 #include "codepilot_app.h"
 
-#include "../agent_clients.h"
-#include "../agent_registry.h"
-#include "../metrics.h"
-#include "../observability.h"
-#include "../policy_manager.h"
-#include "../schema_manifest.h"
+#include "../../agent_clients.h"
+#include "../../agent_registry.h"
+#include "../../metrics.h"
+#include "../../observability.h"
+#include "../../policy_manager.h"
+#include "../../schema_manifest.h"
 #include "local_tools.h"
 
 #include <dsn/c/app_model.h>

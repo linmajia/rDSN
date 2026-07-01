@@ -1,6 +1,6 @@
 #include "local_tools.h"
 
-#include "../policy_manager.h"
+#include "../../policy_manager.h"
 
 #include <dsn/cpp/utils.h>
 #include <dsn/service_api_cpp.h>
