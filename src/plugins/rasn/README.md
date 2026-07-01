@@ -18,7 +18,7 @@ The prototype is intentionally small and is organized around four building block
 | rDSN service graph | `agent_services.*`, `rasn.code.definition.h` | Defines rDSN-style micro-service roles for coordinator, model agent, tool agent, state service, workflow service, observability service, and CLI gateway; service mode exposes those roles as `serverlet` RPC services with `clientlet` callers and explicit `RPC_RASN_*` task codes. |
 | Runtime nucleus | `rasn_core.*`, `observability.*`, `schema_manifest.*` | Creates task IDs, trace IDs, structured JSONL runtime events, nondeterministic value capture, external-effect ledger entries, filesystem snapshots, replay lookup, failure records, schema/IDL/JSON manifests, generated C++/TypeScript/Python RPC clients, and observability query APIs. |
 | Runtime metrics | `metrics.*` | Exports cumulative event counters and task/model/tool latency percentiles through rDSN `perf_counter` counters (section `rasn`) and renders them as text, Prometheus, or JSON; exposed via `observe metrics` and the rDSN `command_manager` command `rasn.metrics`. |
-| Resilience | `circuit_breaker.*`, `admission_gate.*`, `rate_limiter.*` | Guards model providers across the three classic dependency-protection dimensions: a consecutive-failure circuit breaker (closed/open/half-open), an admission gate (concurrency bulkhead plus `exp_delay`-based backpressure), and a token-bucket rate limiter. The same engines guard coordinator-to-agent RPC dispatch per remote agent, while admission/rate engines also guard tool execution per tool name, so shell/filesystem/future remote tools cannot fan out unbounded. A process-wide overload budget reuses the admission/rate engines as singletons at the coordinator `invoke` chokepoint to bound total in-flight work and throughput across all dependencies (opt-in; passthrough by default). Clocks/curves come from rDSN (`dsn_now_ms`, `exp_delay`), state is exported through `perf_counter` counters and the `rasn.resilience` command, and tuning lives under `[rasn.model]`, `[rasn.tool]`, `[rasn.remote_agent]`, and `[rasn.overload]`. |
+| Resilience | `circuit_breaker.*`, `admission_gate.*`, `rate_limiter.*`, `model_cost.*` | Guards model providers across the three classic dependency-protection dimensions: a consecutive-failure circuit breaker (closed/open/half-open), an admission gate (concurrency bulkhead plus `exp_delay`-based backpressure), and a token-bucket rate limiter. The model gateway adds a fourth governor — a token/cost budget that reuses the token bucket to weigh each request by its estimated token cost, bounding tokens-per-minute and metered spend rather than just request count. The same engines guard coordinator-to-agent RPC dispatch per remote agent, while admission/rate engines also guard tool execution per tool name, so shell/filesystem/future remote tools cannot fan out unbounded. A process-wide overload budget reuses the admission/rate engines as singletons at the coordinator `invoke` chokepoint to bound total in-flight work and throughput across all dependencies (opt-in; passthrough by default). Clocks/curves come from rDSN (`dsn_now_ms`, `exp_delay`), state is exported through `perf_counter` counters and the `rasn.resilience` command, and tuning lives under `[rasn.model]`, `[rasn.tool]`, `[rasn.remote_agent]`, and `[rasn.overload]`. |
 | LLM provider layer | `llm_provider.*` | Provides a common `llm_provider` interface and adapters for simulator, Copilot-compatible, Ollama, llama.cpp, LM Studio, and generic OpenAI-compatible HTTP APIs. |
 | Tool provider layer | `agent_tools.*` | Defines the generic rASN tool-provider contract and registration factory used by the tool-agent service. |
 | Workflow graph | `workflow.*` | Parses a declarative task graph, validates dependencies, topologically orders nodes, and executes them through the selected provider. |
@@ -285,6 +285,42 @@ two counters (`rasn_model_rate_limited_total`, `rasn_model_rate_delayed_total`),
 and live per-provider rate/burst/available-tokens show up in `rasn.resilience`.
 Tuning lives under `[rasn.model] rate_limit_enabled`,
 `rate_limit_requests_per_min`, `rate_limit_burst`, and `rate_limit_max_wait_ms`.
+
+### Resilience: model cost/token budget
+
+The rate limiter above governs request *count*, but a hosted model API also meters
+*tokens*-per-minute — and on metered endpoints the token dimension is what drives
+spend. A request counter cannot bound token throughput or cost, because one
+large-context prompt can cost many times a small one (ten small requests can be
+cheaper than a single 100K-token completion). rASN therefore adds a fourth
+model-gateway governor: a **token/cost budget** that weighs each request by its
+estimated token cost.
+
+It does not introduce a second engine — it *reuses the token bucket*, which meters
+whatever weight it is handed. Instead of the constant `1` a request counter spends,
+the cost budget spends an estimated **token** charge:
+`max(1, ceil(prompt_chars / chars_per_token) * completion_percent / 100)` over the
+system prompt, user prompt, and context. The estimate depends on prompt size
+**only**, never the provider response, so charging a request stays deterministic and
+replay-safe. `cost_tokens_per_min` becomes the bucket's refill rate and
+`cost_burst_tokens` its capacity, so a request the budget cannot fund within
+`cost_max_wait_ms` is paced or fast-failed exactly like the rate limiter — size
+`cost_burst_tokens` at least as large as the biggest single-request estimate you
+intend to admit.
+
+The budget slots into the gateway chain right after the request-count rate limiter
+and before the breaker, so a cost-rejected request never strands a half-open probe;
+its pacing delay joins the single coalesced wait. Refunds compose: a cost rejection
+refunds the rate token already taken, and a breaker short-circuit after both were
+taken refunds both, so a downstream rejection never drains the request quota *or*
+the token budget. The same `in_process()` exemption applies (the simulator has no
+token cost), and it is **disabled by default** (`cost_tokens_per_min = 0` =
+unlimited) so CLI and test behavior is unchanged. Rejections and pacing delays are
+exported as `rasn_model_cost_limited_total` and `rasn_model_cost_delayed_total`, and
+live per-provider tokens/minute, burst tokens, and available budget show up in
+`rasn.resilience`. Tuning lives under `[rasn.model] cost_budget_enabled`,
+`cost_tokens_per_min`, `cost_burst_tokens`, `cost_max_wait_ms`,
+`cost_chars_per_token`, and `cost_completion_percent`.
 
 ### Resilience: tool admission and rate controls
 
@@ -717,6 +753,12 @@ The most important sections are:
 | `[rasn.model] rate_limit_requests_per_min` | Sustained model request rate per provider in requests/minute (default `0` = unlimited / disabled). The token-bucket refill rate. |
 | `[rasn.model] rate_limit_burst` | Rate-limiter burst capacity in tokens (default `0` = about one second of the sustained rate, minimum 1). |
 | `[rasn.model] rate_limit_max_wait_ms` | Max milliseconds a request may be paced waiting for a token before it is rejected instead (default `1000`; `0` = reject immediately when the bucket is empty). Inspect live rate/burst/tokens with the `rasn.resilience` command. |
+| `[rasn.model] cost_budget_enabled` | Enables the per-provider model token/cost budget (default `true`). Has no effect unless `cost_tokens_per_min` is non-zero. Weighs each request by its estimated token cost so it bounds tokens-per-minute and metered spend, not just request count. |
+| `[rasn.model] cost_tokens_per_min` | Sustained token budget per provider in estimated tokens/minute (default `0` = unlimited / disabled). The token bucket's refill rate, denominated in tokens. |
+| `[rasn.model] cost_burst_tokens` | Cost-budget burst capacity in estimated tokens (default `0` = about one second of the sustained budget, minimum 1). Size this at least as large as the biggest single-request estimate you intend to admit. |
+| `[rasn.model] cost_max_wait_ms` | Max milliseconds a request may be paced waiting for token budget before it is rejected instead (default `1000`; `0` = reject immediately when the budget is exhausted). Inspect live tokens/min, burst, and available budget with `rasn.resilience`. |
+| `[rasn.model] cost_chars_per_token` | Prompt characters per estimated token (default `0` = 4, the common ~4-chars/token heuristic for byte-pair tokenizers). |
+| `[rasn.model] cost_completion_percent` | Completion allowance as a percent of estimated input tokens added to the charge (default `0` = 150 = +50% for the completion; `100` = charge input tokens only). |
 | `[rasn.tool] admission_enabled` | Enables the per-tool admission gate (default `true`). Replayed tool results and policy-denied calls bypass the gate. |
 | `[rasn.tool] max_concurrent_requests` | Hard cap on concurrent in-flight tool invocations per tool name (default `16`; `0` = unlimited). Excess invocations fast-fail. |
 | `[rasn.tool] soft_concurrent_requests` | Per-tool in-flight level at which graceful backpressure begins (default `8`; `0` = no backpressure). |
@@ -1153,7 +1195,7 @@ hardening gaps remain:
 | SDK packaging | Generated C++/TypeScript/Python contracts and RPC-client source. | Packaged SDKs and concrete TypeScript/Python transports are not shipped. |
 | Evaluation evidence | Unit tests, self-tests, service smokes, schema smokes, report build, and a small eval harness. | Large benchmarks and user studies for debugging effectiveness remain future work. |
 | Observability metrics | Cumulative event counters and task/model/tool latency percentiles via rDSN `perf_counter`, exported as text/Prometheus/JSON through `observe metrics` and the `rasn.metrics` rDSN command. | No bundled scrape gateway, retention store, or prebuilt dashboards; percentiles rely on rDSN's periodic counter timers. |
-| Overload / dependency isolation | Model providers and remote-agent RPC dispatch now have the full failure/concurrency/throughput trio: per-dependency circuit breaker, admission gate, and token-bucket rate limiter. Tool execution has per-tool admission and rate controls using the same engines, with replay/policy bypasses and live state in `observe resilience` / `rasn.resilience`. A process-wide overload budget (`[rasn.overload]`) reuses the admission/rate engines as singletons at the coordinator `invoke` chokepoint to bound total in-flight work and aggregate throughput across all dependencies (opt-in; passthrough by default). | Rate limiting governs request count but not token/cost budgets; in RPC-client mode model/tool guard state lives on the serving node while remote-agent and process-wide overload guard state live on the coordinator. |
+| Overload / dependency isolation | Model providers and remote-agent RPC dispatch now have the full failure/concurrency/throughput trio: per-dependency circuit breaker, admission gate, and token-bucket rate limiter. The model gateway adds a token/cost budget that weighs each request by its estimated token cost, bounding tokens-per-minute and metered spend rather than just request count. Tool execution has per-tool admission and rate controls using the same engines, with replay/policy bypasses and live state in `observe resilience` / `rasn.resilience`. A process-wide overload budget (`[rasn.overload]`) reuses the admission/rate engines as singletons at the coordinator `invoke` chokepoint to bound total in-flight work and aggregate throughput across all dependencies (opt-in; passthrough by default). | In RPC-client mode model/tool guard state lives on the serving node while remote-agent and process-wide overload guard state live on the coordinator. |
 
 ## Troubleshooting
 

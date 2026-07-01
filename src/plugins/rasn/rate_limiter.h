@@ -13,6 +13,13 @@
 // when the caller is slightly ahead of the rate, and fast-fails when the
 // projected wait would exceed a bound.
 //
+// Each acquire consumes a caller-supplied cost (default 1). With cost 1 the
+// bucket meters request COUNT -- a requests-per-minute limiter. With a larger
+// per-request cost it meters weighted THROUGHPUT: e.g. a model gateway can charge
+// each completion its estimated token cost so the same engine enforces a
+// tokens-per-minute budget (see model_cost.h), which a request counter cannot
+// because one large prompt may cost many times a small one.
+//
 // Like its siblings this header is intentionally dependency-light: it pulls in no
 // rDSN headers and no thrift/serialization types. Wall-clock time is supplied by
 // the caller as a monotonic millisecond value (e.g. ::dsn_now_ms(), which rDSN
@@ -62,25 +69,28 @@ struct rate_decision
 //
 // The bucket starts full (capacity tokens), so an idle dependency can absorb an
 // initial burst. Tokens accrue at requests_per_min/60000 per millisecond up to
-// capacity. try_acquire() consumes one token; when none is available it reserves
-// a token from future refill (driving the count negative) and returns the wait
-// until that token would have accrued, unless the wait exceeds max_wait_ms in
-// which case it rejects without reserving.
+// capacity. try_acquire() consumes `cost` tokens (default 1); when fewer than
+// `cost` are available it reserves the shortfall from future refill (driving the
+// count negative) and returns the wait until they would have accrued, unless the
+// wait exceeds max_wait_ms in which case it rejects without reserving.
 class rate_limiter
 {
 public:
     explicit rate_limiter(const rate_limit_config &config);
 
-    // Attempt to acquire one token at now_ms. When rate limiting is disabled this
-    // is an unconditional passthrough (allowed, no delay).
-    rate_decision try_acquire(uint64_t now_ms);
+    // Attempt to acquire `cost` tokens at now_ms. When rate limiting is disabled
+    // this is an unconditional passthrough (allowed, no delay). A non-positive
+    // cost is treated as a free passthrough that consumes nothing. The default
+    // cost of 1 makes the bucket a plain requests-per-minute limiter.
+    rate_decision try_acquire(uint64_t now_ms, double cost = 1.0);
 
-    // Return a token previously taken by an allowed try_acquire() whose request was
-    // abandoned before it reached the dependency (e.g. a later gate short-circuited
-    // it). Adds one token back, clamped to capacity, so a fast-failed request does
-    // not permanently drain the quota or delay the eventual recovery probe. A no-op
-    // when rate limiting is disabled or unlimited (try_acquire took no token then).
-    void refund();
+    // Return `cost` tokens previously taken by an allowed try_acquire() whose
+    // request was abandoned before it reached the dependency (e.g. a later gate
+    // short-circuited it). Adds the tokens back, clamped to capacity, so a
+    // fast-failed request does not permanently drain the quota or delay the
+    // eventual recovery probe. A no-op when rate limiting is disabled or unlimited
+    // (try_acquire took no token then). Pass the same cost that was acquired.
+    void refund(double cost = 1.0);
 
     // Refill to now_ms and return the current token count without consuming one
     // (diagnostic / test helper).

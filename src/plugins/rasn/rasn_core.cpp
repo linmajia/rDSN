@@ -981,6 +981,38 @@ void nucleus_runtime::record_model_rate_delayed(const agent_task &task,
                  0);
 }
 
+void nucleus_runtime::record_model_cost_limited(const agent_task &task,
+                                                const std::string &provider,
+                                                uint32_t tokens_per_min,
+                                                uint32_t estimated_tokens)
+{
+    record_event(task,
+                 "model.cost.limited",
+                 provider,
+                 "tokens_per_min=" + std::to_string(tokens_per_min) +
+                     " estimated_tokens=" + std::to_string(estimated_tokens),
+                 "",
+                 "",
+                 "",
+                 false,
+                 0);
+}
+
+void nucleus_runtime::record_model_cost_delayed(const agent_task &task,
+                                                const std::string &provider,
+                                                uint32_t delay_ms)
+{
+    record_event(task,
+                 "model.cost.delayed",
+                 provider,
+                 "delay_ms=" + std::to_string(delay_ms),
+                 "",
+                 "",
+                 "",
+                 false,
+                 0);
+}
+
 void nucleus_runtime::record_tool_admission_rejected(const agent_task &task,
                                                      const std::string &tool,
                                                      uint32_t in_flight,

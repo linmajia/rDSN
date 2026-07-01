@@ -8,6 +8,7 @@
 #include "../coordinator_service.h"
 #include "../apps/codepilot/local_tools.h"
 #include "../metrics.h"
+#include "../model_cost.h"
 #include "../policy_manager.h"
 #include "../rate_limiter.h"
 #include "../redaction.h"
@@ -2046,6 +2047,30 @@ TEST(rasn_metrics_registry, runtime_events_increment_cumulative_counters)
     registry.observe_tool_latency_ms(5);
 }
 
+TEST(rasn_metrics_registry, model_cost_events_increment_counters)
+{
+    (void)::dsn::task::get_current_node();
+
+    metrics_registry &registry = metrics_registry::instance();
+    registry.ensure_core_counters();
+
+    const uint64_t limited_before = registry.snapshot().counter("rasn_model_cost_limited_total");
+    const uint64_t delayed_before = registry.snapshot().counter("rasn_model_cost_delayed_total");
+
+    nucleus_runtime runtime;
+    agent_task task;
+    task.id = "model-cost-task";
+    task.name = "unit.model.cost";
+    task.input = "noop";
+    runtime.begin_task(task);
+    runtime.record_model_cost_limited(task, "unit.provider", 12000, 150);
+    runtime.record_model_cost_delayed(task, "unit.provider", 40);
+    runtime.finish_task(task, "ok");
+
+    EXPECT_EQ(limited_before + 1, registry.snapshot().counter("rasn_model_cost_limited_total"));
+    EXPECT_EQ(delayed_before + 1, registry.snapshot().counter("rasn_model_cost_delayed_total"));
+}
+
 TEST(rasn_metrics_registry, failure_events_create_per_class_counters)
 {
     (void)::dsn::task::get_current_node();
@@ -2625,6 +2650,110 @@ TEST(rasn_rate_limiter, backward_clock_holds_high_water_mark_no_premature_refill
     // Only once the clock advances a full period past the high-water mark
     // (100000 + 1000) does a fresh token become available.
     EXPECT_TRUE(limiter.try_acquire(101000).allowed);
+}
+
+TEST(rasn_rate_limiter, cost_weight_consumes_multiple_tokens)
+{
+    // A request with cost N draws N tokens, so the same bucket meters weighted
+    // throughput (e.g. estimated LLM tokens) instead of request count. A burst of
+    // 10 funds one cost-4 and one cost-6 request, then is empty.
+    rate_limit_config cfg;
+    cfg.requests_per_min = 60;
+    cfg.burst = 10;
+    cfg.max_wait_ms = 0; // never delay: empty bucket rejects immediately
+    rate_limiter limiter(cfg);
+
+    EXPECT_TRUE(limiter.try_acquire(0, 4.0).allowed);  // 10 -> 6
+    EXPECT_TRUE(limiter.try_acquire(0, 6.0).allowed);  // 6 -> 0
+    EXPECT_FALSE(limiter.try_acquire(0, 1.0).allowed); // empty
+}
+
+TEST(rasn_rate_limiter, refund_returns_the_full_cost_weight)
+{
+    rate_limit_config cfg;
+    cfg.requests_per_min = 60;
+    cfg.burst = 10;
+    cfg.max_wait_ms = 0;
+    rate_limiter limiter(cfg);
+
+    EXPECT_TRUE(limiter.try_acquire(0, 8.0).allowed);  // 10 -> 2
+    EXPECT_FALSE(limiter.try_acquire(0, 8.0).allowed); // only 2 left, cannot fund 8
+    limiter.refund(8.0);                               // 2 -> 10 (clamped to capacity)
+    EXPECT_TRUE(limiter.try_acquire(0, 8.0).allowed);  // funded again by the refund
+}
+
+TEST(rasn_rate_limiter, cost_exceeding_capacity_within_wait_is_rejected)
+{
+    // A single request whose cost exceeds what can accrue within max_wait_ms is
+    // rejected outright without draining the bucket: size the burst >= the largest
+    // single-request cost you intend to admit.
+    rate_limit_config cfg;
+    cfg.requests_per_min = 60; // 1 token / 1000ms
+    cfg.burst = 5;
+    cfg.max_wait_ms = 1000; // at most ~1 extra token can accrue within the wait
+    rate_limiter limiter(cfg);
+
+    // Cost 20 needs 15 tokens beyond the full burst of 5 => 15000ms wait, far
+    // beyond the 1000ms cap, so it is rejected without reserving anything.
+    const rate_decision rejected = limiter.try_acquire(0, 20.0);
+    EXPECT_FALSE(rejected.allowed);
+    EXPECT_EQ(0u, rejected.delay_ms);
+    // The bucket was not drained, so a normal cost-1 request still passes.
+    EXPECT_TRUE(limiter.try_acquire(0, 1.0).allowed);
+}
+
+TEST(rasn_rate_limiter, non_positive_cost_is_free_passthrough)
+{
+    rate_limit_config cfg;
+    cfg.requests_per_min = 60;
+    cfg.burst = 1;
+    cfg.max_wait_ms = 0;
+    rate_limiter limiter(cfg);
+
+    EXPECT_TRUE(limiter.try_acquire(0, 1.0).allowed);  // drain the only token
+    EXPECT_FALSE(limiter.try_acquire(0, 1.0).allowed); // empty
+    EXPECT_TRUE(limiter.try_acquire(0, 0.0).allowed);  // zero cost => free passthrough
+    EXPECT_TRUE(limiter.try_acquire(0, -5.0).allowed); // negative cost => free passthrough
+}
+
+TEST(rasn_model_cost, estimate_scales_with_prompt_and_floors_at_one_token)
+{
+    model_cost_config cfg; // defaults: chars_per_token = 4, completion_percent = 150
+
+    // An empty prompt still costs at least one token so every request draws budget.
+    EXPECT_DOUBLE_EQ(1.0, estimate_prompt_cost_tokens(0, cfg));
+    // 400 chars => ceil(400/4) = 100 input tokens; +50% completion => 150 tokens.
+    EXPECT_DOUBLE_EQ(150.0, estimate_prompt_cost_tokens(400, cfg));
+    // ceil rounds a partial input token up: 401 chars => ceil(401/4) = 101 => 151.5.
+    EXPECT_DOUBLE_EQ(151.5, estimate_prompt_cost_tokens(401, cfg));
+}
+
+TEST(rasn_model_cost, estimate_honors_chars_per_token_and_completion_percent)
+{
+    model_cost_config cfg;
+    cfg.chars_per_token = 2;      // finer granularity than the default 4
+    cfg.completion_percent = 100; // charge input tokens only (no completion add)
+
+    // 10 chars => ceil(10/2) = 5 input tokens; 100% => 5 total.
+    EXPECT_DOUBLE_EQ(5.0, estimate_prompt_cost_tokens(10, cfg));
+    // 200% doubles the estimate to model a longer completion.
+    cfg.completion_percent = 200;
+    EXPECT_DOUBLE_EQ(10.0, estimate_prompt_cost_tokens(10, cfg));
+}
+
+TEST(rasn_model_cost, to_rate_limit_config_maps_token_budget_onto_the_bucket)
+{
+    model_cost_config cfg;
+    cfg.enabled = true;
+    cfg.tokens_per_min = 12000;
+    cfg.burst_tokens = 3000;
+    cfg.max_wait_ms = 750;
+
+    const rate_limit_config bucket = to_rate_limit_config(cfg);
+    EXPECT_TRUE(bucket.enabled);
+    EXPECT_EQ(12000u, bucket.requests_per_min); // tokens/min carried as the refill rate
+    EXPECT_EQ(3000u, bucket.burst);             // burst tokens as the bucket capacity
+    EXPECT_EQ(750u, bucket.max_wait_ms);
 }
 
 } // namespace

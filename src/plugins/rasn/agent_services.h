@@ -7,6 +7,7 @@
 #include "circuit_breaker.h"
 #include "llm_provider.h"
 #include "rate_limiter.h"
+#include "model_cost.h"
 #include "metrics.h"
 #include "rasn.code.definition.h"
 #include "state_service.h"
@@ -55,6 +56,11 @@ public:
     // and the model gateway summary).
     std::vector<rate_limiter_registry::entry> model_rate_states() const;
 
+    // Point-in-time view of every model-provider cost/token budget (for ops
+    // commands and the model gateway summary). The entry's requests_per_min/burst
+    // fields carry tokens/minute and burst tokens rather than request counts.
+    std::vector<rate_limiter_registry::entry> model_cost_states() const;
+
 private:
     // Lazily load [rasn.model] circuit-breaker tunables (config reads are
     // null-safe and return defaults before rDSN config is loaded).
@@ -65,6 +71,10 @@ private:
     // Lazily load [rasn.model] rate-limit tunables (null-safe; defaults before
     // rDSN config is loaded).
     void ensure_model_rate_config();
+    // Lazily load [rasn.model] cost/token-budget tunables (null-safe; defaults
+    // before rDSN config is loaded). Caches the full model_cost_config for the
+    // estimator in addition to seeding the token bucket.
+    void ensure_model_cost_config();
     // Non-mutating breaker precheck: returns true and fills *fast_fail when the
     // provider's breaker is open and still cooling down, so an open breaker
     // fast-fails ahead of admission/rate rejection. Does not consume the half-open
@@ -109,15 +119,37 @@ private:
     // the token was acquired). Keeps a breaker fast-fail from draining the quota. A
     // no-op when the limiter is disabled/unlimited (no token was taken).
     void model_rate_refund(const std::string &provider);
-    // Apply (and record) the combined admission + rate-limiter backpressure delay,
-    // if any. Called after admission, the rate limiter, and the breaker have all
-    // admitted the request. Sleeps once for the larger of the two delays so the
-    // two governors never stack into additive over-delay.
+    // Acquire cost/token budget for the active provider, charging the request's
+    // estimated token cost derived from prompt_chars (system + user + context
+    // characters). On rejection the returned decision has allowed() false and
+    // *fast_fail is filled (recording the rejection metric); *charged is always
+    // set to the estimated cost so the caller can refund it if a later gate (the
+    // breaker) abandons the request. Ordered after the request-count rate limiter
+    // and before the breaker, like model_rate_acquire(), so a cost-rejected
+    // request never consumes a half-open breaker probe. The pacing delay carried
+    // by the decision is NOT applied here; apply_model_backpressure() applies it.
+    rate_decision model_cost_acquire(const std::string &provider,
+                                     size_t prompt_chars,
+                                     const agent_task &task,
+                                     nucleus_runtime &runtime,
+                                     double *charged,
+                                     llm_response *fast_fail);
+    // Return the token charge taken by model_cost_acquire() when the request is
+    // abandoned before reaching the provider (the breaker short-circuited it after
+    // the charge was taken). A no-op when the budget is disabled/unlimited (no
+    // charge was deducted).
+    void model_cost_refund(const std::string &provider, double charged);
+    // Apply (and record) the combined admission + rate-limiter + cost-budget
+    // backpressure delay, if any. Called after admission, the rate limiter, the
+    // cost budget, and the breaker have all admitted the request. Sleeps once for
+    // the largest of the delays so the governors never stack into additive
+    // over-delay.
     void apply_model_backpressure(const std::string &provider,
                                   const agent_task &task,
                                   nucleus_runtime &runtime,
                                   const admission_slot &slot,
-                                  const rate_decision &rate);
+                                  const rate_decision &rate,
+                                  const rate_decision &cost);
     // True when the active provider should be guarded by overload/failure
     // protection (network-backed providers only; in-process providers are
     // exempt). Shared by the circuit breaker, admission control, and rate limiter.
@@ -130,6 +162,9 @@ private:
     std::once_flag _model_admission_config_once;
     rate_limiter_registry _model_rate;
     std::once_flag _model_rate_config_once;
+    rate_limiter_registry _model_cost;
+    std::once_flag _model_cost_config_once;
+    model_cost_config _model_cost_config_cache;
 };
 
 class rasn_tool_agent_service : public agent_runtime
@@ -308,6 +343,8 @@ public:
     std::vector<admission_gate_registry::entry> model_admission_states() const;
     // Per-provider model rate-limiter states (for ops commands / summaries).
     std::vector<rate_limiter_registry::entry> model_rate_states() const;
+    // Per-provider model cost/token-budget states (for ops commands / summaries).
+    std::vector<rate_limiter_registry::entry> model_cost_states() const;
     // Human-readable per-provider resilience report covering circuit breakers,
     // admission control, and rate limiting (shared by the `rasn.resilience`
     // command and CodePilot's `observe resilience`).

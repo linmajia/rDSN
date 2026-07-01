@@ -834,7 +834,75 @@ rDSN design:
   `rate_limit_burst`, and `rate_limit_max_wait_ms` are read once through
   `dsn_config` with null-safe defaults.
 
-### 12.5 Tool gateway admission and rate controls
+### 12.5 Model cost/token budget
+
+The rate limiter of §12.4 governs request *count*, but a hosted model API meters
+two different quantities: requests-per-minute **and** tokens-per-minute, and it is
+the token dimension that dominates real spend. A request counter cannot bound
+either token throughput or metered cost, because one large-context prompt can cost
+many times a small one — ten requests can be cheaper than a single 100K-token
+completion. rASN therefore adds a fourth model-gateway governor: a **token/cost
+budget** that weighs each request by its estimated token cost so the same gateway
+can enforce a tokens-per-minute ceiling and a cost ceiling that the request-count
+limiter cannot.
+
+Rather than introduce a second engine, the cost budget *reuses the token bucket*.
+The bucket is unit-agnostic — it meters whatever weight `try_acquire()` is handed —
+so the cost budget simply feeds it an estimated **token** charge instead of the
+constant `1` a request counter uses. `requests_per_min` is reinterpreted as
+tokens/minute (the refill rate) and `burst` as burst tokens (the capacity); every
+resilience property of §12.4 (injected `dsn_now_ms` clock, deterministic refill,
+non-monotonic-clock hardening, `perf_counter` export) carries over unchanged.
+
+Responsibilities:
+
+- Estimate a request's token charge from its **prompt size only** —
+  `max(1, ceil(prompt_chars / chars_per_token) * completion_percent / 100)` over the
+  system prompt, user prompt, and joined context. The estimate is a pure function of
+  the request, never of the provider response, so charging a request is
+  deterministic and replay-safe and captures no nondeterminism. A floor of one token
+  ensures every request draws from the budget.
+- Charge the estimate to the per-provider bucket. A request whose charge the budget
+  cannot fund within `cost_max_wait_ms` is paced (when the wait is bounded) or
+  fast-failed with a normal `llm_response{ok=false}`, exactly like the rate limiter.
+- Because a single request can cost more than one token, an operator must size
+  `cost_burst_tokens` at least as large as the largest single-request estimate they
+  intend to admit; a prompt whose charge exceeds the burst can never fit.
+
+rDSN design:
+
+- The estimator and the cost-to-bucket mapping live in a dependency-light
+  `model_cost.h` / `model_cost.cpp` that pulls in only `rate_limiter.h`, mirroring
+  the breaker, admission gate, and rate limiter. The budget is a
+  `rate_limiter_registry` (`_model_cost`) sitting beside `_model_rate` on
+  `rasn_llm_agent_service`.
+- It slots into the gateway chain immediately **after** the request-count rate
+  limiter and **before** the authoritative breaker check, so a cost-rejected request
+  never strands a half-open breaker probe — the same invariant the rate limiter
+  observes. Its pacing delay joins admission and rate pacing in the single coalesced
+  wait (the largest of the three), so the governors never stack into additive
+  over-delay.
+- Refunds compose with the rate limiter's. When the budget rejects a request after
+  the rate token was already taken, that rate token is **refunded**; when the breaker
+  short-circuits a request after *both* the rate token and the token charge were
+  taken, both are refunded before the fast-fail returns. A downstream rejection
+  therefore never silently drains the request quota *or* the token budget, and each
+  refund is clamped to capacity so it can never inflate a bucket past its size.
+- The same `in_process()` predicate that exempts no-network providers from the other
+  governors exempts them here (the simulator has no token cost). The budget is
+  **disabled by default** (`cost_tokens_per_min = 0` = unlimited), so single-agent
+  CLI runs and deterministic tests are byte-for-byte unchanged; an operator opts in
+  by setting a budget when pointing rASN at a metered endpoint.
+- Two `perf_counter` series — `rasn_model_cost_limited_total` (rejected) and
+  `rasn_model_cost_delayed_total` (paced) — flow through the same `record_event`
+  choke point as every other metric. Per-provider tokens/minute, burst tokens, and
+  available token budget are surfaced in the `rasn.resilience` command and the model
+  provider summary.
+- `[rasn.model] cost_budget_enabled`, `cost_tokens_per_min`, `cost_burst_tokens`,
+  `cost_max_wait_ms`, `cost_chars_per_token`, and `cost_completion_percent` are read
+  once through `dsn_config` with null-safe defaults.
+
+### 12.6 Tool gateway admission and rate controls
 
 The same overload dimensions apply to tools. A single model response can request a
 burst of `read`/`search` calls, or an application adapter can expose shell/network
@@ -876,7 +944,7 @@ rDSN design:
   the admission defaults are generous, so normal sequential CLI usage remains
   unchanged while service-mode fan-out becomes explicit and observable.
 
-### 12.6 Remote-agent dispatch resilience
+### 12.7 Remote-agent dispatch resilience
 
 Service mode introduces another dependency boundary: the coordinator resolves a
 capability through the registry and then calls the selected agent over
@@ -934,7 +1002,7 @@ rDSN design:
   The default admission cap is generous (`64` hard, `32` soft, `200ms`
   backpressure) and the rate limiter is unlimited (`requests_per_min = 0`).
 
-### 12.7 Process-wide overload budget
+### 12.8 Process-wide overload budget
 
 The per-dependency gateways (model, tool, remote-agent) each protect one outbound
 boundary, but a host has finite *shared* capacity — threads, memory, sockets, file
@@ -1280,14 +1348,16 @@ remaining limitations are:
   store, or prebuilt dashboards, and latency percentiles depend on rDSN's
   periodic counter timers.
 - **Overload and dependency isolation:** the model gateway and remote-agent RPC
-  gateway have the full per-dependency failure/concurrency/throughput trio:
+  gateway have the full per-dependency failure/concurrency/throughput protection:
   circuit breaker, admission gate (concurrency bulkhead plus `exp_delay`-based
-  backpressure), and token-bucket rate limiter. The tool gateway reuses the
-  admission and rate engines per tool name, after replay and policy checks, so
-  tool fan-out is bounded and observable. A process-wide overload budget (§12.7)
-  now sits above them at the coordinator `invoke` chokepoint, bounding total
-  in-flight work and aggregate throughput across all dependencies with a single
-  global bulkhead and rate ceiling (opt-in; passthrough by default). Remaining
-  gaps: rate limiting governs request count but not token/cost budgets; and in
-  RPC-client mode model/tool resilience state lives on the serving node while
-  remote-agent and process-wide overload state live on the coordinator.
+  backpressure), and token-bucket rate limiter. The model gateway additionally
+  carries a **token/cost budget** that weighs each request by its estimated token
+  cost, so it bounds tokens-per-minute and metered spend rather than just request
+  count. The tool gateway reuses the admission and rate engines per tool name, after
+  replay and policy checks, so tool fan-out is bounded and observable. A
+  process-wide overload budget (§12.8) now sits above them at the coordinator
+  `invoke` chokepoint, bounding total in-flight work and aggregate throughput across
+  all dependencies with a single global bulkhead and rate ceiling (opt-in;
+  passthrough by default). Remaining gap: in RPC-client mode model/tool resilience
+  state lives on the serving node while remote-agent and process-wide overload state
+  live on the coordinator.

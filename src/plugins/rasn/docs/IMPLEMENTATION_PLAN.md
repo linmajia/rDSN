@@ -3188,6 +3188,69 @@ Validation:
 - [x] Re-run direct `codepilot selftest` after introducing per-app configs.
 - [x] `git diff --check`.
 
+## Phase 77: model gateway token/cost budget
+
+Status: `[x]`
+
+Goal: Close the named resilience gap "rate limiting governs request count but not
+token/cost budgets." Add a fourth model-gateway governor that weighs each request by
+its estimated LLM-token cost so the gateway bounds tokens-per-minute and metered
+spend, not just request count — the failure mode a request counter cannot prevent
+because one large-context prompt can cost many times a small one.
+
+Approach: Reuse the existing token bucket rather than add a second engine. The
+bucket already meters an arbitrary weight; the cost budget simply feeds it an
+estimated token charge instead of the constant 1 a request counter spends. This
+fulfills `rate_limiter.h`'s own stated intent (governing "tokens-per-minute"
+quotas) and inherits every rDSN-aligned property already proven for the rate
+limiter: injected `dsn_now_ms` clock, deterministic refill under replay,
+non-monotonic-clock hardening, and `perf_counter` export.
+
+Files:
+
+- `rate_limiter.h`, `rate_limiter.cpp` (generalize `try_acquire`/`refund` with a
+  per-request cost, default 1 — source-compatible with every existing caller)
+- `model_cost.h`, `model_cost.cpp` (new: deterministic prompt-size estimator and
+  cost-to-bucket mapping; dependency-light, includes only `rate_limiter.h`)
+- `agent_services.h`, `agent_services.cpp` (cost budget beside the rate limiter on
+  `rasn_llm_agent_service`; guard-chain integration in `complete()` and
+  `complete_streaming()`; resilience report/summary passthroughs)
+- `rasn_core.h`, `rasn_core.cpp` (`record_model_cost_limited` / `_delayed` events)
+- `metrics.cpp` (`rasn_model_cost_limited_total` / `_delayed_total` counters)
+- `config.ini`, `apps/srepilot/config.ini`
+- `tests/rasn_unit_tests.cpp`
+- `README.md`, `docs/DESIGN.md`, `docs/report/main.tex`,
+  `docs/IMPLEMENTATION_PLAN.md`
+
+Work items:
+
+- [x] Generalize the token bucket with a caller-supplied cost (default 1), keeping
+  request-count callers byte-for-byte unchanged.
+- [x] Add a deterministic prompt-size cost estimator
+  (`max(1, ceil(prompt_chars / chars_per_token) * completion_percent / 100)`) and a
+  mapping from cost tunables onto `rate_limit_config`.
+- [x] Charge the estimate in `complete()` / `complete_streaming()` after the
+  request-count rate limiter and before the authoritative breaker check, so a
+  cost-rejected request never strands a half-open probe. Fold cost pacing into the
+  single coalesced backpressure wait.
+- [x] Compose refunds: refund the rate token on a cost rejection, and refund both
+  the rate token and the token charge on a post-charge breaker short-circuit.
+- [x] Add events, `perf_counter` counters, and `rasn.resilience` / model summary
+  reporting for the budget.
+- [x] Add `[rasn.model] cost_*` config knobs (disabled by default:
+  `cost_tokens_per_min = 0`).
+- [x] Update user docs, design notes, and the ACM-style technical report; close the
+  limitation in the DESIGN, README, and report limitation tables.
+
+Validation:
+
+- [ ] Build `rasn.unit_tests` and `codepilot` (deferred to the Ubuntu build host;
+  no local toolchain).
+- [x] Add unit tests for cost-weighted acquire/refund, the estimator, the
+  cost-to-bucket mapping, and the new metrics counters.
+- [x] Hand-verify guard-chain refund ordering and enum/array/map counter alignment.
+- [x] `git diff --check`.
+
 ## Dependency order
 
 ```text
@@ -3267,6 +3330,7 @@ Phase 1 task model
   -> Phase 74 process-wide overload budget
   -> Phase 75 application directory layout
   -> Phase 76 SREPilot incident-response application
+  -> Phase 77 model gateway token/cost budget
 ```
 
 Some phases can overlap after Phase 3, but the public message model and generic

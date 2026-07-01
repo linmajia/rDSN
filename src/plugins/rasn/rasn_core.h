@@ -166,8 +166,20 @@ public:
     void record_model_rate_delayed(const agent_task &task,
                                    const std::string &provider,
                                    uint32_t delay_ms);
-    // Tool-gateway overload/quota events. These mirror the model-gateway
-    // admission/rate events but are keyed by tool name.
+    // Cost/token-budget events for an outbound model dependency. The cost budget
+    // meters each request by its estimated token charge rather than as one unit,
+    // so it can bound token throughput and metered spend that the request-count
+    // rate limiter cannot. record_model_cost_limited() is emitted when the budget
+    // rejects a request (the token bucket cannot fund the estimated charge within
+    // the wait ceiling); record_model_cost_delayed() when it paces one with a
+    // backpressure delay. Both trace and increment the matching metrics.
+    void record_model_cost_limited(const agent_task &task,
+                                   const std::string &provider,
+                                   uint32_t tokens_per_min,
+                                   uint32_t estimated_tokens);
+    void record_model_cost_delayed(const agent_task &task,
+                                   const std::string &provider,
+                                   uint32_t delay_ms);
     void record_tool_admission_rejected(const agent_task &task,
                                        const std::string &tool,
                                        uint32_t in_flight,

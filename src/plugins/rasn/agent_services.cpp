@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <iomanip>
 #include <memory>
 #include <mutex>
@@ -256,6 +257,46 @@ std::string format_model_rate_states(const std::vector<rate_limiter_registry::en
             << entry.tokens;
     }
     return oss.str();
+}
+
+std::string format_model_cost_states(const std::vector<rate_limiter_registry::entry> &states)
+{
+    if (states.empty())
+    {
+        return "model cost budgets: none engaged";
+    }
+    // The cost budget reuses the token-bucket registry, so the entry's generic
+    // requests_per_min/burst/tokens fields carry token-denominated values here.
+    std::ostringstream oss;
+    oss << "model cost budgets:";
+    for (size_t i = 0; i < states.size(); ++i)
+    {
+        const rate_limiter_registry::entry &entry = states[i];
+        oss << "\n- provider=" << entry.key << " tokens_per_min=" << entry.requests_per_min
+            << " burst_tokens=" << entry.burst << " tokens=" << std::fixed << std::setprecision(2)
+            << entry.tokens;
+    }
+    return oss.str();
+}
+
+// Total prompt characters charged to the cost budget: the system prompt, the user
+// prompt, and every context element including the per-element framing the provider
+// wraps around it. The estimate is a function of prompt size only (never the
+// provider response), so charging a request stays deterministic and replay-safe.
+size_t prompt_cost_chars(const llm_request &llm)
+{
+    // Fixed characters llm_provider.cpp join_context() wraps around each context
+    // element: "\n\n--- context " (14) + " ---\n" (5). The provider sends
+    // user_prompt + join_context(context) as one message, so the model tokenizes
+    // this framing too; charging only the raw element size would systematically
+    // undercount requests with many (or empty) context entries.
+    constexpr size_t k_context_frame_chars = 19;
+    size_t chars = llm.system_prompt.size() + llm.user_prompt.size();
+    for (size_t i = 0; i < llm.context.size(); ++i)
+    {
+        chars += llm.context[i].size() + k_context_frame_chars + std::to_string(i + 1).size();
+    }
+    return chars;
 }
 
 std::string format_tool_admission_states(const std::vector<admission_gate_registry::entry> &states)
@@ -572,6 +613,42 @@ rate_limit_config read_model_rate_config()
     return cfg;
 }
 
+model_cost_config read_model_cost_config()
+{
+    model_cost_config cfg;
+    cfg.enabled = ::dsn_config_get_value_bool(
+        "rasn.model",
+        "cost_budget_enabled",
+        true,
+        "enable the rASN model-gateway token/cost budget (weighs each request by estimated tokens)");
+    cfg.tokens_per_min = read_config_u32(
+        "rasn.model",
+        "cost_tokens_per_min",
+        0,
+        "sustained model token budget per provider in estimated tokens/minute (0 = unlimited)");
+    cfg.burst_tokens = read_config_u32(
+        "rasn.model",
+        "cost_burst_tokens",
+        0,
+        "cost-budget burst capacity in estimated tokens (0 = ~1s of the sustained budget)");
+    cfg.max_wait_ms = read_config_u32(
+        "rasn.model",
+        "cost_max_wait_ms",
+        1000,
+        "max ms a request may be paced waiting for token budget before it is rejected (0 = reject immediately)");
+    cfg.chars_per_token = read_config_u32(
+        "rasn.model",
+        "cost_chars_per_token",
+        0,
+        "prompt characters per estimated token (0 = default 4)");
+    cfg.completion_percent = read_config_u32(
+        "rasn.model",
+        "cost_completion_percent",
+        0,
+        "completion allowance as a percent of estimated input tokens (0 = default 150; 100 = input only)");
+    return cfg;
+}
+
 admission_config read_tool_admission_config()
 {
     admission_config cfg;
@@ -844,6 +921,14 @@ void rasn_llm_agent_service::ensure_model_rate_config()
                    [this] { _model_rate.set_config(read_model_rate_config()); });
 }
 
+void rasn_llm_agent_service::ensure_model_cost_config()
+{
+    std::call_once(_model_cost_config_once, [this] {
+        _model_cost_config_cache = read_model_cost_config();
+        _model_cost.set_config(to_rate_limit_config(_model_cost_config_cache));
+    });
+}
+
 bool rasn_llm_agent_service::provider_needs_guards() const
 {
     // Overload and failure protection only matter for providers that perform
@@ -993,14 +1078,62 @@ void rasn_llm_agent_service::model_rate_refund(const std::string &provider)
     _model_rate.get(provider).refund();
 }
 
+rate_decision rasn_llm_agent_service::model_cost_acquire(const std::string &provider,
+                                                         size_t prompt_chars,
+                                                         const agent_task &task,
+                                                         nucleus_runtime &runtime,
+                                                         double *charged,
+                                                         llm_response *fast_fail)
+{
+    ensure_model_cost_config();
+    // Estimate the request's token charge from prompt size and meter it against
+    // the provider's token bucket. The estimate is deterministic in prompt_chars,
+    // so charging is replay-safe and never depends on the provider response.
+    const double cost = estimate_prompt_cost_tokens(prompt_chars, _model_cost_config_cache);
+    if (charged != nullptr)
+    {
+        *charged = cost;
+    }
+    rate_limiter &limiter = _model_cost.get(provider);
+    const rate_decision decision = limiter.try_acquire(::dsn_now_ms(), cost);
+    if (!decision.allowed)
+    {
+        const uint32_t estimated_tokens = static_cast<uint32_t>(std::ceil(cost));
+        dwarn("rASN model cost budget rejected request for provider=%s; budget %u tokens/min exceeded "
+              "(estimated %u tokens)",
+              provider.c_str(),
+              static_cast<unsigned int>(decision.limit_per_min),
+              static_cast<unsigned int>(estimated_tokens));
+        runtime.record_model_cost_limited(task, provider, decision.limit_per_min, estimated_tokens);
+        if (fast_fail != nullptr)
+        {
+            *fast_fail = rpc_error_response("model cost budget rejected request for provider " + provider +
+                                            "; budget " + std::to_string(decision.limit_per_min) +
+                                            " tokens/min exceeded (estimated " +
+                                            std::to_string(estimated_tokens) + " tokens)");
+        }
+    }
+    // Like admission and the rate limiter, the pacing delay carried by the
+    // decision is NOT applied here; apply_model_backpressure() applies it after
+    // the breaker also admits.
+    return decision;
+}
+
+void rasn_llm_agent_service::model_cost_refund(const std::string &provider, double charged)
+{
+    _model_cost.get(provider).refund(charged);
+}
+
 void rasn_llm_agent_service::apply_model_backpressure(const std::string &provider,
                                                       const agent_task &task,
                                                       nucleus_runtime &runtime,
                                                       const admission_slot &slot,
-                                                      const rate_decision &rate)
+                                                      const rate_decision &rate,
+                                                      const rate_decision &cost)
 {
     const uint32_t admission_delay = slot.delay_ms();
     const uint32_t rate_delay = rate.delay_ms;
+    const uint32_t cost_delay = cost.delay_ms;
     if (admission_delay > 0)
     {
         runtime.record_model_admission_delayed(task, provider, slot.in_flight(), admission_delay);
@@ -1009,10 +1142,15 @@ void rasn_llm_agent_service::apply_model_backpressure(const std::string &provide
     {
         runtime.record_model_rate_delayed(task, provider, rate_delay);
     }
-    // Sleep once for the larger of the two delays: a single wait that is >= each
-    // governor's requested delay satisfies both (concurrency smoothing and rate
-    // pacing) without stacking them into additive over-delay.
-    const uint32_t delay = (std::max)(admission_delay, rate_delay);
+    if (cost_delay > 0)
+    {
+        runtime.record_model_cost_delayed(task, provider, cost_delay);
+    }
+    // Sleep once for the largest of the delays: a single wait that is >= each
+    // governor's requested delay satisfies all of them (concurrency smoothing,
+    // rate pacing, and cost/token pacing) without stacking them into additive
+    // over-delay.
+    const uint32_t delay = (std::max)((std::max)(admission_delay, rate_delay), cost_delay);
     if (delay > 0)
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(delay));
@@ -1027,6 +1165,11 @@ std::vector<admission_gate_registry::entry> rasn_llm_agent_service::model_admiss
 std::vector<rate_limiter_registry::entry> rasn_llm_agent_service::model_rate_states() const
 {
     return _model_rate.snapshot();
+}
+
+std::vector<rate_limiter_registry::entry> rasn_llm_agent_service::model_cost_states() const
+{
+    return _model_cost.snapshot();
 }
 
 llm_response rasn_llm_agent_service::complete(const agent_completion_request &request, nucleus_runtime &runtime)
@@ -1071,6 +1214,7 @@ llm_response rasn_llm_agent_service::complete(const agent_completion_request &re
     const bool guarded = provider_needs_guards();
     admission_slot admission;
     rate_decision rate;
+    rate_decision cost;
     if (guarded)
     {
         llm_response fast_fail;
@@ -1088,16 +1232,30 @@ llm_response rasn_llm_agent_service::complete(const agent_completion_request &re
         {
             return fast_fail;
         }
-        if (!model_breaker_admit(provider_name, request.task, runtime, &fast_fail))
+        double cost_charged = 0.0;
+        cost = model_cost_acquire(
+            provider_name, prompt_cost_chars(llm), request.task, runtime, &cost_charged, &fast_fail);
+        if (!cost.allowed)
         {
-            // The breaker short-circuited this request after the rate token was
-            // taken, so it will not reach the provider; refund the token so a
-            // breaker fast-fail does not drain the quota or delay the eventual
-            // recovery probe. The RAII admission slot releases itself on return.
+            // The token/cost budget rejected this request after the rate token was
+            // taken; refund the request-count token so a cost rejection does not
+            // also drain the request-rate quota. The RAII admission slot releases
+            // itself on return.
             model_rate_refund(provider_name);
             return fast_fail;
         }
-        apply_model_backpressure(provider_name, request.task, runtime, admission, rate);
+        if (!model_breaker_admit(provider_name, request.task, runtime, &fast_fail))
+        {
+            // The breaker short-circuited this request after the rate token and the
+            // cost charge were taken, so it will not reach the provider; refund both
+            // so a breaker fast-fail does not drain the quota or the token budget or
+            // delay the eventual recovery probe. The RAII admission slot releases
+            // itself on return.
+            model_rate_refund(provider_name);
+            model_cost_refund(provider_name, cost_charged);
+            return fast_fail;
+        }
+        apply_model_backpressure(provider_name, request.task, runtime, admission, rate, cost);
     }
 
     const llm_response response = redact_llm_response(_provider->complete(redact_llm_request(llm), runtime));
@@ -1146,6 +1304,7 @@ llm_response rasn_llm_agent_service::complete_streaming(const agent_completion_r
     const bool guarded = provider_needs_guards();
     admission_slot admission;
     rate_decision rate;
+    rate_decision cost;
     if (guarded)
     {
         llm_response fast_fail;
@@ -1164,14 +1323,26 @@ llm_response rasn_llm_agent_service::complete_streaming(const agent_completion_r
         {
             return fast_fail;
         }
-        if (!model_breaker_admit(provider_name, request.task, runtime, &fast_fail))
+        double cost_charged = 0.0;
+        cost = model_cost_acquire(
+            provider_name, prompt_cost_chars(llm), request.task, runtime, &cost_charged, &fast_fail);
+        if (!cost.allowed)
         {
-            // See complete(): refund the rate token taken above when the breaker
-            // short-circuits, so a fast-failed request does not drain the quota.
+            // See complete(): refund the rate token when the cost budget rejects so
+            // a cost rejection does not also drain the request-rate quota.
             model_rate_refund(provider_name);
             return fast_fail;
         }
-        apply_model_backpressure(provider_name, request.task, runtime, admission, rate);
+        if (!model_breaker_admit(provider_name, request.task, runtime, &fast_fail))
+        {
+            // See complete(): refund both the rate token and the cost charge taken
+            // above when the breaker short-circuits, so a fast-failed request does
+            // not drain the quota or the token budget.
+            model_rate_refund(provider_name);
+            model_cost_refund(provider_name, cost_charged);
+            return fast_fail;
+        }
+        apply_model_backpressure(provider_name, request.task, runtime, admission, rate, cost);
     }
 
     const llm_response response =
@@ -2506,6 +2677,11 @@ std::string rasn_service_graph::provider_summary() const
     {
         summary += "\n" + format_model_rate_states(rate);
     }
+    const std::vector<rate_limiter_registry::entry> cost = model_cost_states();
+    if (!cost.empty())
+    {
+        summary += "\n" + format_model_cost_states(cost);
+    }
     return summary;
 }
 
@@ -2524,11 +2700,17 @@ std::vector<rate_limiter_registry::entry> rasn_service_graph::model_rate_states(
     return _llm_agent.model_rate_states();
 }
 
+std::vector<rate_limiter_registry::entry> rasn_service_graph::model_cost_states() const
+{
+    return _llm_agent.model_cost_states();
+}
+
 std::string rasn_service_graph::model_resilience_report() const
 {
     return format_model_breaker_states(model_breaker_states()) + "\n" +
            format_model_admission_states(model_admission_states()) + "\n" +
-           format_model_rate_states(model_rate_states());
+           format_model_rate_states(model_rate_states()) + "\n" +
+           format_model_cost_states(model_cost_states());
 }
 
 std::string rasn_service_graph::tool_resilience_report() const

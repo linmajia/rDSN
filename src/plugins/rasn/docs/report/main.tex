@@ -282,7 +282,8 @@ model circuit/admission/rate guards, per-tool admission/rate gates,
 per-remote-agent RPC circuit/admission/rate guards, and a process-wide overload
 budget (global concurrency bulkhead plus request-rate ceiling), all surfaced
 through \texttt{perf\_counter} metrics and a \texttt{rasn.resilience} command & The
-overload budget bounds request count rather than token/cost budgets \\
+process-wide overload budget is request-count based; per-provider token/cost
+budgets are enforced separately at the model gateway \\
 \bottomrule
 \end{tabular}
 \end{table*}
@@ -1155,7 +1156,10 @@ beside the other two gates (acquiring before the breaker so a rate rejection nev
 strands a half-open probe), shares the \texttt{in\_process()} exemption, and is
 disabled by default so existing behavior is unchanged. Its two counters follow the
 same pattern, and live per-provider rate, burst, and tokens appear in the
-\texttt{rasn.resilience} command.
+\texttt{rasn.resilience} command. Because a hosted API also meters tokens, not just
+requests, a fourth governor reuses the same bucket as a per-provider token/cost
+budget: it charges a deterministic prompt-size estimate rather than a flat $1$ per
+call, so the gateway bounds tokens-per-minute and spend as well as request count.
 
 The tool gateway reuses the same admission and rate engines, keyed by tool name.
 After replay lookup and policy approval, \texttt{rasn.tool.agent} reserves an
@@ -1260,6 +1264,7 @@ Files & Layer & Responsibility \\
 \texttt{circuit\_breaker} & Resilience & Per-provider model circuit breaker (closed/open/half-open) \\
 \texttt{admission\_gate} & Resilience & Per-provider/per-tool concurrency bulkhead and \texttt{exp\_delay} backpressure \\
 \texttt{rate\_limiter} & Resilience & Per-provider/per-tool token-bucket rate limiter (requests/minute pacing) \\
+\texttt{model\_cost} & Resilience & Deterministic prompt-size token/cost estimator mapped onto the token bucket (tokens/minute budget) \\
 \texttt{llm\_provider/model\_agent} & Provider & Simulator and HTTP-compatible model adapters \\
 \texttt{agent\_tools} & Provider API & Generic tool provider interface \\
 \texttt{apps/codepilot/*} & Application & CLI commands, local tools, skills, provider configuration \\
@@ -2046,10 +2051,33 @@ when pointing \rasn at a metered endpoint. Rejections and pacing delays are
 exported as \texttt{rasn\_model\_rate\_limited\_total} and
 \texttt{rasn\_model\_rate\_delayed\_total} through the same \texttt{record\_event}
 choke point, and live per-provider rate, burst, and available tokens are shown by
-the \texttt{rasn.resilience} command. Rate limiting governs request count; a
-process-wide request-rate ceiling layers above the per-provider limiter (see the
-Process-Wide Overload Budget subsection), while token/cost budgets remain future
-work.
+the \texttt{rasn.resilience} command.
+
+The rate limiter governs request \emph{count}, but a hosted model API also meters
+\emph{tokens} per minute, and on metered endpoints that token dimension is what
+drives spend: a request counter cannot bound it because one large-context prompt
+can cost many times a small one. \rasn therefore adds a fourth model-gateway
+governor, a token/cost budget, that does not introduce a second engine but reuses
+the token bucket, which meters an arbitrary weight. Instead of the constant $1$ a
+request counter spends, the budget spends an estimated token charge
+$\max(1, \lceil c / k \rceil \cdot p / 100)$ over the prompt characters $c$, with a
+characters-per-token divisor $k$ and a completion-allowance percent $p$. The
+estimate is a pure function of prompt size, never of the provider response, so
+charging a request stays deterministic and replay-safe. \texttt{cost\_tokens\_per\_min}
+becomes the bucket refill rate and \texttt{cost\_burst\_tokens} its capacity, so the
+same pacing/fast-fail logic bounds tokens-per-minute and cost. The budget slots into
+the guard chain immediately after the request-count rate limiter and before the
+authoritative breaker check, so a cost rejection never strands a half-open probe;
+its pacing joins the single coalesced wait, and refunds compose (a cost rejection
+refunds the rate token, and a post-charge breaker short-circuit refunds both the
+rate token and the token charge). It is disabled by default
+(\texttt{cost\_tokens\_per\_min}~$=0$ means unlimited) and exempts no-network
+providers, so existing behavior is unchanged. Rejections and pacing are exported as
+\texttt{rasn\_model\_cost\_limited\_total} and
+\texttt{rasn\_model\_cost\_delayed\_total}, and per-provider tokens/minute, burst,
+and available budget are shown by \texttt{rasn.resilience}. A process-wide
+request-rate ceiling still layers above the per-provider limiter (see the
+Process-Wide Overload Budget subsection).
 
 \subsection{Tool Gateway Admission and Rate Controls}
 
@@ -2184,8 +2212,10 @@ by sizing a global cap to the host. Four counters ---
 \texttt{record\_event} choke point, and live budget state (in-flight, configured
 caps, cached tokens) \emph{heads} the \texttt{rasn.resilience} and
 \texttt{observe resilience} report, since the process-wide budget governs every
-per-dependency gateway below it. The remaining overload gap is dimensional rather
-than structural: rate limiting still governs request count, not token/cost budgets.
+per-dependency gateway below it. The per-provider model gateway now closes the
+token/cost dimension with its own budget (see the Model Gateway Rate Limiter
+subsection); the remaining process-wide gap is dimensional rather than structural:
+the global budget still governs request count, not aggregate token/cost.
 
 \subsection{Testing and Validation}
 
@@ -2568,9 +2598,10 @@ JSON via \texttt{observe metrics} and the \texttt{rasn.metrics} command & No
 bundled scrape gateway, retention store, or prebuilt dashboards; latency
 percentiles depend on \rdsn's periodic counter timers \\
 Overload/dependency isolation & Model providers and remote-agent RPC dispatch
-have circuit-breaker, admission, and rate controls; tools have per-tool admission
-and rate controls; a process-wide overload budget bounds total in-flight work and
-throughput across all dependencies; all are surfaced through
+have circuit-breaker, admission, and rate controls; the model gateway adds a
+per-provider token/cost budget; tools have per-tool admission and rate controls; a
+process-wide overload budget bounds total in-flight work and throughput across all
+dependencies; all are surfaced through
 \texttt{observe resilience} and \texttt{rasn.resilience} & The process-wide budget
 is request-count based rather than token/cost based \\
 \bottomrule

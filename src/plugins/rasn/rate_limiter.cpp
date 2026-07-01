@@ -1,10 +1,11 @@
 // rASN client-side rate limiter implementation.
 //
 // A standard token bucket: tokens accrue linearly at the configured sustained
-// rate up to a capacity (the burst), and each admitted request consumes one. The
-// engine is dependency-light -- it takes the current time as an injected
-// millisecond value rather than reading a clock -- so refill is deterministic
-// under replay and the limiter is unit-testable without a live rDSN node.
+// rate up to a capacity (the burst), and each admitted request consumes a
+// caller-supplied cost (default one). The engine is dependency-light -- it takes
+// the current time as an injected millisecond value rather than reading a clock
+// -- so refill is deterministic under replay and the limiter is unit-testable
+// without a live rDSN node.
 
 #include "rate_limiter.h"
 
@@ -64,12 +65,22 @@ void rate_limiter::refill(uint64_t now_ms)
     _last_refill_ms = now_ms;
 }
 
-rate_decision rate_limiter::try_acquire(uint64_t now_ms)
+rate_decision rate_limiter::try_acquire(uint64_t now_ms, double cost)
 {
     std::lock_guard<std::mutex> guard(_lock);
 
     rate_decision decision;
     decision.limit_per_min = _config.requests_per_min;
+
+    // A non-positive cost reserves nothing; admit it as a free passthrough so
+    // callers never have to special-case a zero-weight request.
+    if (cost <= 0.0)
+    {
+        decision.allowed = true;
+        decision.delay_ms = 0;
+        decision.tokens = _tokens;
+        return decision;
+    }
 
     if (!_config.enabled || _config.requests_per_min == 0)
     {
@@ -82,27 +93,30 @@ rate_decision rate_limiter::try_acquire(uint64_t now_ms)
 
     refill(now_ms);
 
-    if (_tokens >= 1.0)
+    if (_tokens >= cost)
     {
-        _tokens -= 1.0;
+        _tokens -= cost;
         decision.allowed = true;
         decision.delay_ms = 0;
         decision.tokens = _tokens;
         return decision;
     }
 
-    // Not enough tokens: compute the wait until one accrues. Reserve it (driving
-    // the count negative) when the wait is within bounds, so concurrent callers
-    // queue with progressively larger -- but bounded -- delays that pace them to
-    // the sustained rate. Reject when the wait would exceed max_wait_ms.
-    const double deficit = 1.0 - _tokens;      // in (0, 1]
+    // Not enough tokens: compute the wait until `cost` accrues. Reserve the
+    // shortfall (driving the count negative) when the wait is within bounds, so
+    // concurrent callers queue with progressively larger -- but bounded -- delays
+    // that pace them to the sustained rate. Reject when the wait would exceed
+    // max_wait_ms. A single request whose cost exceeds what can accrue within
+    // max_wait_ms (e.g. cost > burst and max_wait too small) is rejected; size
+    // the burst >= the largest single-request cost you intend to admit.
+    const double deficit = cost - _tokens;     // > 0 here
     const double tpm = tokens_per_ms();        // > 0 here (requests_per_min != 0)
     const double wait = std::ceil(deficit / tpm);
     const uint64_t wait_ms = wait <= 0.0 ? 0 : static_cast<uint64_t>(wait);
 
     if (wait_ms <= _config.max_wait_ms)
     {
-        _tokens -= 1.0;
+        _tokens -= cost;
         decision.allowed = true;
         decision.delay_ms = static_cast<uint32_t>(wait_ms);
         decision.tokens = _tokens;
@@ -115,19 +129,20 @@ rate_decision rate_limiter::try_acquire(uint64_t now_ms)
     return decision;
 }
 
-void rate_limiter::refund()
+void rate_limiter::refund(double cost)
 {
     std::lock_guard<std::mutex> guard(_lock);
-    if (!_config.enabled || _config.requests_per_min == 0)
+    if (!_config.enabled || _config.requests_per_min == 0 || cost <= 0.0)
     {
-        // Passthrough mode took no token, so there is nothing to give back.
+        // Passthrough mode (or a zero-weight request) took no token, so there is
+        // nothing to give back.
         return;
     }
-    // Restore the single token taken by the corresponding try_acquire(). This is
-    // the inverse of the "_tokens -= 1.0" there; no refill is needed because the
+    // Restore the `cost` tokens taken by the corresponding try_acquire(). This is
+    // the inverse of the "_tokens -= cost" there; no refill is needed because the
     // abandon happens in the same instant (the breaker short-circuits before any
     // wait). Clamp to capacity so the bucket never exceeds its burst.
-    _tokens = (std::min)(capacity(), _tokens + 1.0);
+    _tokens = (std::min)(capacity(), _tokens + cost);
 }
 
 double rate_limiter::tokens(uint64_t now_ms)
