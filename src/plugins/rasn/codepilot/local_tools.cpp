@@ -264,21 +264,46 @@ bool read_text_prefix(const std::string &path,
 // over-long line. A file with no newlines (minified JS, binary blob, giant log)
 // would otherwise load entirely into memory as a single std::getline "line".
 // Returns false only at end of input.
-bool read_bounded_line(std::istream &input, std::string *line, size_t max_len)
+bool read_bounded_line(std::istream &input, std::string *line, size_t max_len,
+                       bool *line_truncated = nullptr, size_t *bytes_consumed = nullptr)
 {
     line->clear();
+    if (line_truncated != nullptr)
+    {
+        *line_truncated = false;
+    }
+    if (bytes_consumed != nullptr)
+    {
+        *bytes_consumed = 0;
+    }
     int ch = input.get();
     if (ch == EOF)
     {
         return false;
     }
+    size_t consumed = 0;
     while (ch != EOF && ch != '\n')
     {
+        ++consumed;
         if (line->size() < max_len)
         {
             line->push_back(static_cast<char>(ch));
         }
+        else if (line_truncated != nullptr)
+        {
+            // The line is longer than max_len; the tail is consumed but dropped,
+            // so a caller scanning `line` must treat its result as partial.
+            *line_truncated = true;
+        }
         ch = input.get();
+    }
+    if (ch == '\n')
+    {
+        ++consumed; // count the delimiter so byte-bounded callers stay accurate
+    }
+    if (bytes_consumed != nullptr)
+    {
+        *bytes_consumed = consumed;
     }
     return true;
 }
@@ -745,6 +770,41 @@ std::string run_command_capture_stdout_and_stderr(const std::string &command,
                     *timed_out = true;
                 }
                 killed = true;
+                // Drain output the child already wrote before we killed it, so a
+                // timeout does not silently discard buffered stdout/stderr. The
+                // killed process group's write ends close, so read() reaches EOF
+                // (or poll reports POLLHUP) quickly. Cap the drain by a deadline
+                // so a process that escaped the group (e.g. via setsid) cannot
+                // hang the parent here.
+                const std::chrono::steady_clock::time_point drain_deadline =
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+                while (std::chrono::steady_clock::now() < drain_deadline)
+                {
+                    struct pollfd dpfd;
+                    dpfd.fd = read_fd;
+                    dpfd.events = POLLIN;
+                    dpfd.revents = 0;
+                    const int drain_rc = poll(&dpfd, 1, 50);
+                    if (drain_rc < 0)
+                    {
+                        if (errno == EINTR)
+                        {
+                            continue;
+                        }
+                        break;
+                    }
+                    if (drain_rc == 0)
+                    {
+                        continue; // no data yet; keep waiting until the deadline
+                    }
+                    const ssize_t drained = read(read_fd, buffer.data(), buffer.size());
+                    if (drained > 0)
+                    {
+                        output.append(buffer.data(), static_cast<size_t>(drained));
+                        continue;
+                    }
+                    break; // EOF (write ends closed) or unrecoverable read error
+                }
                 break;
             }
         }
@@ -1225,14 +1285,43 @@ tool_result codepilot_tool_provider::run_search(const std::vector<std::string> &
 
         std::string line;
         size_t line_no = 0;
-        while (matches < _max_search_matches && read_bounded_line(input, &line, 64u * 1024u))
+        uint64_t scanned_bytes = 0;
+        bool file_partial = false;
+        while (matches < _max_search_matches)
         {
+            // Stop scanning at the same ceiling the filesystem-replay fingerprint
+            // hashes (k_max_file_read_bytes). If search read past it, a change or
+            // match beyond the fingerprinted prefix could alter output without
+            // changing the replay snapshot, breaking deterministic replay.
+            if (scanned_bytes >= k_max_file_read_bytes)
+            {
+                file_partial = true;
+                break;
+            }
+            bool line_truncated = false;
+            size_t consumed = 0;
+            if (!read_bounded_line(input, &line, 64u * 1024u, &line_truncated, &consumed))
+            {
+                break;
+            }
+            scanned_bytes += consumed;
             ++line_no;
+            if (line_truncated)
+            {
+                // A match could exist past the 64 KiB per-line cap in this line.
+                file_partial = true;
+            }
             if (line.find(args[1]) != std::string::npos)
             {
                 output << path << ":" << line_no << ": " << line << "\n";
                 ++matches;
             }
+        }
+        if (file_partial)
+        {
+            output << path << ": [partial: scan limited to first " << k_max_file_read_bytes
+                   << " bytes/file and " << (64u * 1024u)
+                   << " bytes/line; some matches may be omitted]\n";
         }
     }
 

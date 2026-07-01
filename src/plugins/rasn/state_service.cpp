@@ -242,7 +242,7 @@ std::string replica_path_for(const state_replica_config &config, const std::stri
     return ::dsn::utils::filesystem::path_combine(config.directory, file_name.empty() ? "rasn-state" : file_name);
 }
 
-bool mirror_checkpoint_to_replica(const std::string &checkpoint_path, const std::string &journal_path, std::string *error)
+bool copy_checkpoint_to_replica(const std::string &checkpoint_path, std::string *error)
 {
     const state_replica_config config = load_state_replica_config();
     if (!config.enabled)
@@ -259,10 +259,25 @@ bool mirror_checkpoint_to_replica(const std::string &checkpoint_path, const std:
     }
 
     const std::string replica_checkpoint = replica_path_for(config, checkpoint_path);
-    if (!copy_local_file(checkpoint_path, replica_checkpoint, error))
+    return copy_local_file(checkpoint_path, replica_checkpoint, error);
+}
+
+bool remove_replica_journal(const std::string &journal_path, std::string *error)
+{
+    const state_replica_config config = load_state_replica_config();
+    if (!config.enabled)
     {
+        return true;
+    }
+    if (config.directory.empty())
+    {
+        if (error != nullptr)
+        {
+            *error = "rasn.state.replica is enabled but directory is empty";
+        }
         return false;
     }
+
     const std::string replica_journal = replica_path_for(config, journal_path);
     if (::dsn::utils::filesystem::file_exists(replica_journal) &&
         !::dsn::utils::filesystem::remove_path(replica_journal))
@@ -885,31 +900,47 @@ state_response state_store::checkpoint(const state_checkpoint_request &request) 
     }
 
     const std::string journal_path = journal_path_for_checkpoint(path);
-    // Only compact (delete) the journal if no write landed since we snapshotted
-    // _records. A put that appended to the journal after the snapshot is not in
-    // this checkpoint file, so removing the whole journal would lose it from
-    // durable storage. In that case leave the journal for the next checkpoint to
-    // fold in (recovery replays checkpoint + journal, so keeping it is safe).
-    //
-    // The epoch re-check and the removal must happen under a single lock
-    // acquisition. A concurrent put() serializes on _lock to append its durable
-    // journal record and bump _write_epoch atomically (see put()); checking the
-    // epoch under the lock but unlinking after releasing it would let such a put
-    // slip in between and have its just-acknowledged record deleted along with
-    // the journal. remove_path is a fast unlink, so holding _lock across it
-    // matches the pre-refactor design where the whole checkpoint ran locked.
-    {
-        ::dsn::service::zauto_lock guard(_lock);
-        if (_write_epoch == snapshot_epoch && ::dsn::utils::filesystem::file_exists(journal_path) &&
-            !::dsn::utils::filesystem::remove_path(journal_path))
-        {
-            return error_response("failed to compact state journal: " + journal_path);
-        }
-    }
+
+    // Mirror the checkpoint file to the replica first. This is the slow I/O and
+    // must stay outside _lock; copying a checkpoint that is current-or-superseded
+    // is always safe because the journal (kept or compacted below) determines
+    // which post-snapshot writes recovery must replay.
     std::string replica_error;
-    if (!mirror_checkpoint_to_replica(path, journal_path, &replica_error))
+    if (!copy_checkpoint_to_replica(path, &replica_error))
     {
         return error_response(replica_error);
+    }
+
+    // Only compact (delete) the journals if no write landed since we snapshotted
+    // _records. A put that appended to the journal after the snapshot is not in
+    // this checkpoint file, so removing the journal would lose it from durable
+    // storage. In that case leave both journals for the next checkpoint to fold
+    // in (recovery replays checkpoint + journal, so keeping them is safe).
+    //
+    // The epoch re-check and the removals must happen under a single lock
+    // acquisition. A concurrent put() serializes on _lock to append its durable
+    // journal record (to both the primary and, via append_journal_record, the
+    // mirrored replica journal) and bump _write_epoch atomically; checking the
+    // epoch under the lock but unlinking after releasing it would let such a put
+    // slip in between and have its just-acknowledged record deleted from either
+    // journal. The primary and replica journals are compacted together so the
+    // replica can never lose an acked write the primary keeps (and vice versa).
+    // remove_path is a fast unlink, so holding _lock across both matches the
+    // pre-refactor design where the whole checkpoint ran locked.
+    {
+        ::dsn::service::zauto_lock guard(_lock);
+        if (_write_epoch == snapshot_epoch)
+        {
+            if (::dsn::utils::filesystem::file_exists(journal_path) &&
+                !::dsn::utils::filesystem::remove_path(journal_path))
+            {
+                return error_response("failed to compact state journal: " + journal_path);
+            }
+            if (!remove_replica_journal(journal_path, &replica_error))
+            {
+                return error_response(replica_error);
+            }
+        }
     }
 
     state_response response;
@@ -1058,9 +1089,12 @@ state_response state_store::recover(const state_checkpoint_request &request)
         _last_sequence = (std::max)(_last_sequence, last_sequence);
     }
 
-    state_response response;
-    response.last_sequence = last_sequence;
-    response.records = query(state_query_request()).records;
+    // Report the merged store's records and last_sequence together. query()
+    // reads both under _lock, so a concurrent put() preserved by the merge above
+    // cannot leave response.records holding a per-key sequence higher than
+    // response.last_sequence (which would happen if we returned the pre-merge
+    // on-disk last_sequence while records came from the merged in-memory store).
+    state_response response = query(state_query_request());
     dinfo("recovered rASN state records=%u path=%s",
           static_cast<unsigned int>(response.records.size()),
           path.c_str());
