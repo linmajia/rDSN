@@ -273,6 +273,10 @@ public:
     // Human-readable remote-agent dispatch resilience report covering
     // coordinator-to-agent RPC circuit breakers, admission, and rate controls.
     std::string remote_agent_resilience_report() const;
+    // Combined resilience report (model + tool + remote-agent), the single
+    // source of truth shared by the `rasn.resilience` command and CodePilot's
+    // `observe resilience`.
+    std::string resilience_report() const;
     std::string topology() const;
     std::string tools_summary() const;
     void set_tool_provider(std::unique_ptr<agent_tool_provider> tools);

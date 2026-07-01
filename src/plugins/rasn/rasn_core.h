@@ -196,6 +196,11 @@ public:
     void record_remote_agent_rate_delayed(const agent_task &task,
                                           const std::string &agent,
                                           uint32_t delay_ms);
+    // Emitted when a remote-agent descriptor fails endpoint preflight (missing
+    // or unresolvable address) before any breaker/admission/rate slot is used.
+    void record_remote_agent_endpoint_invalid(const agent_task &task,
+                                              const std::string &agent,
+                                              const std::string &reason);
     std::string resolve_nondeterminism(const agent_task &task,
                                        const std::string &name,
                                        const std::string &source,

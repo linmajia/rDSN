@@ -1771,9 +1771,7 @@ int codepilot_cli::run_observe(const std::vector<std::string> &args)
 
     if (args[0] == "resilience")
     {
-        std::cout << _services.model_resilience_report() << "\n"
-                  << _services.tool_resilience_report() << "\n"
-                  << _services.remote_agent_resilience_report() << "\n";
+        std::cout << _services.resilience_report() << "\n";
         return 0;
     }
 

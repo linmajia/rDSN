@@ -30,9 +30,18 @@ public:
                                      bool use_registry_rpc,
                                      const ::dsn::rpc_address &registry_address);
 
-    static bool validate_remote_endpoint(const agent_descriptor &agent, std::string *error);
+    static bool validate_remote_endpoint(const agent_descriptor &agent,
+                                         ::dsn::rpc_address *address,
+                                         std::string *error);
     static agent_response invoke_remote(const agent_request &request,
                                         const agent_descriptor &agent,
+                                        const std::string &source);
+    // Overload that dispatches to an already-resolved endpoint, avoiding a
+    // second descriptor resolution when the caller has preflighted the address
+    // via validate_remote_endpoint().
+    static agent_response invoke_remote(const agent_request &request,
+                                        const agent_descriptor &agent,
+                                        const ::dsn::rpc_address &address,
                                         const std::string &source);
     static agent_response invoke_with_retries(const agent_request &request,
                                               nucleus_runtime &runtime,

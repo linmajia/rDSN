@@ -1648,9 +1648,11 @@ agent_response rasn_coordinator_service::invoke_remote_agent(const agent_request
                                                             nucleus_runtime &runtime,
                                                             const agent_descriptor &agent)
 {
+    ::dsn::rpc_address address;
     std::string address_error;
-    if (!coordinator_router::validate_remote_endpoint(agent, &address_error))
+    if (!coordinator_router::validate_remote_endpoint(agent, &address, &address_error))
     {
+        runtime.record_remote_agent_endpoint_invalid(request.task, remote_agent_key(agent), address_error);
         return remote_agent_gate_response(
             request, "routing", "invalid_agent_endpoint", address_error, false, descriptor().agent_id);
     }
@@ -1677,7 +1679,7 @@ agent_response rasn_coordinator_service::invoke_remote_agent(const agent_request
     }
     apply_remote_agent_backpressure(agent, request.task, runtime, admission, rate);
 
-    const agent_response response = coordinator_router::invoke_remote(request, agent, descriptor().agent_id);
+    const agent_response response = coordinator_router::invoke_remote(request, agent, address, descriptor().agent_id);
     remote_agent_breaker_report(agent, request.task, runtime, remote_agent_response_is_dependency_success(response));
     return response;
 }
@@ -2034,9 +2036,7 @@ void rasn_service_graph::register_ops_commands_once()
             "tool admission/rate limiter state and remote-agent dispatch guards",
             [](const ::dsn::safe_vector<::dsn::safe_string> &args) -> ::dsn::safe_string {
                 (void)args;
-                const std::string out = global_rasn_services().model_resilience_report() + "\n" +
-                                        global_rasn_services().tool_resilience_report() + "\n" +
-                                        global_rasn_services().remote_agent_resilience_report();
+                const std::string out = global_rasn_services().resilience_report();
                 return ::dsn::safe_string(out.c_str());
             });
         dinfo("registered rASN ops command: rasn.resilience");
@@ -2295,6 +2295,11 @@ std::string rasn_service_graph::tool_resilience_report() const
 std::string rasn_service_graph::remote_agent_resilience_report() const
 {
     return _coordinator.remote_agent_resilience_report();
+}
+
+std::string rasn_service_graph::resilience_report() const
+{
+    return model_resilience_report() + "\n" + tool_resilience_report() + "\n" + remote_agent_resilience_report();
 }
 
 std::string rasn_service_graph::topology() const

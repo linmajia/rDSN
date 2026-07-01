@@ -96,10 +96,12 @@ coordinator_route coordinator_router::resolve(const agent_request &request,
     return select_first(request, capability, candidates);
 }
 
-bool coordinator_router::validate_remote_endpoint(const agent_descriptor &agent, std::string *error)
+bool coordinator_router::validate_remote_endpoint(const agent_descriptor &agent,
+                                                  ::dsn::rpc_address *address,
+                                                  std::string *error)
 {
     std::string address_error;
-    (void)address_from_descriptor(agent, &address_error);
+    const ::dsn::rpc_address resolved = address_from_descriptor(agent, &address_error);
     if (!address_error.empty())
     {
         if (error != nullptr)
@@ -107,6 +109,10 @@ bool coordinator_router::validate_remote_endpoint(const agent_descriptor &agent,
             *error = address_error;
         }
         return false;
+    }
+    if (address != nullptr)
+    {
+        *address = resolved;
     }
     if (error != nullptr)
     {
@@ -131,6 +137,14 @@ agent_response coordinator_router::invoke_remote(const agent_request &request,
         return response;
     }
 
+    return invoke_remote(request, agent, address, source);
+}
+
+agent_response coordinator_router::invoke_remote(const agent_request &request,
+                                                 const agent_descriptor &agent,
+                                                 const ::dsn::rpc_address &address,
+                                                 const std::string &source)
+{
     rasn_agent_client client(address);
     ::dsn::error_code err;
     agent_response response;

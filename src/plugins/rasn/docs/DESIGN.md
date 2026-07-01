@@ -901,6 +901,11 @@ rDSN design:
   descriptor's `agent_id` (falling back to endpoint text only for malformed
   descriptors). The clock again comes from `::dsn_now_ms()`, preserving
   replay-friendly behavior and unit-testability of the engines.
+- Endpoint preflight (`coordinator_router::validate_remote_endpoint`) resolves the
+  descriptor address once and rejects malformed or unresolvable endpoints before
+  any breaker probe, admission slot, or rate token is consumed; the resolved
+  address is then reused for the actual dispatch to avoid a second resolution.
+  Preflight rejections emit `remote_agent.endpoint.invalid`.
 - Guard ordering mirrors the model gateway: a non-mutating open-breaker precheck
   wins first; admission and rate rejection happen before the authoritative
   breaker probe; the rate token is refunded if that final breaker check
@@ -908,13 +913,14 @@ rDSN design:
 - The guards are applied only on the RPC-client dispatch path. Inline standalone
   execution still calls the in-process model/tool services directly, so the
   single-process CLI keeps its existing behavior.
-- Six `perf_counter` series flow through `record_event`:
+- Seven `perf_counter` series flow through `record_event`:
   `rasn_remote_agent_breaker_open_total`,
   `rasn_remote_agent_breaker_short_circuit_total`,
   `rasn_remote_agent_admission_rejected_total`,
   `rasn_remote_agent_admission_delayed_total`,
-  `rasn_remote_agent_rate_limited_total`, and
-  `rasn_remote_agent_rate_delayed_total`. Live per-agent state is included in
+  `rasn_remote_agent_rate_limited_total`,
+  `rasn_remote_agent_rate_delayed_total`, and
+  `rasn_remote_agent_endpoint_invalid_total`. Live per-agent state is included in
   `rasn.resilience` and CodePilot `observe resilience`.
 - `[rasn.remote_agent] circuit_breaker_*`, `admission_*`,
   `max_concurrent_requests`, `soft_concurrent_requests`, `max_backpressure_ms`,

@@ -124,6 +124,7 @@ enum core_counter
     CC_REMOTE_AGENT_ADMISSION_DELAYED,
     CC_REMOTE_AGENT_RATE_LIMITED,
     CC_REMOTE_AGENT_RATE_DELAYED,
+    CC_REMOTE_AGENT_ENDPOINT_INVALID,
     CC_COUNT
 };
 
@@ -191,6 +192,9 @@ const counter_def k_core_counters[CC_COUNT] = {
     {"rasn_remote_agent_rate_delayed_total",
      "remote_agent.rate.delayed",
      "remote-agent dispatches delayed (paced) by the client-side rate limiter"},
+    {"rasn_remote_agent_endpoint_invalid_total",
+     "remote_agent.endpoint.invalid",
+     "remote-agent dispatches rejected by endpoint preflight (missing or unresolvable address)"},
 };
 
 enum latency_counter
@@ -243,6 +247,7 @@ const std::unordered_map<std::string, int> &kind_to_core_counter()
         {"remote_agent.admission.delayed", CC_REMOTE_AGENT_ADMISSION_DELAYED},
         {"remote_agent.rate.limited", CC_REMOTE_AGENT_RATE_LIMITED},
         {"remote_agent.rate.delayed", CC_REMOTE_AGENT_RATE_DELAYED},
+        {"remote_agent.endpoint.invalid", CC_REMOTE_AGENT_ENDPOINT_INVALID},
     };
     return m;
 }

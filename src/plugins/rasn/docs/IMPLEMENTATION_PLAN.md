@@ -3021,8 +3021,13 @@ Work items:
   `rasn_remote_agent_breaker_short_circuit_total`,
   `rasn_remote_agent_admission_rejected_total`,
   `rasn_remote_agent_admission_delayed_total`,
-  `rasn_remote_agent_rate_limited_total`, and
-  `rasn_remote_agent_rate_delayed_total`.
+  `rasn_remote_agent_rate_limited_total`,
+  `rasn_remote_agent_rate_delayed_total`, and
+  `rasn_remote_agent_endpoint_invalid_total`.
+- [x] Preflight remote-agent endpoints before consuming any guard resource:
+  resolve the descriptor address once, reject malformed/unresolvable endpoints
+  with a counted `remote_agent.endpoint.invalid` event, and reuse the resolved
+  address for dispatch.
 - [x] Expose live per-agent state through `rasn.resilience` and CodePilot
   `observe resilience`.
 - [x] Add `[rasn.remote_agent]` defaults to the main and service-smoke configs.

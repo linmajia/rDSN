@@ -871,18 +871,24 @@ TEST(rasn_coordinator, validates_remote_endpoint_before_rpc_dispatch)
     agent_descriptor agent;
     agent.agent_id = "unit.invalid";
 
+    ::dsn::rpc_address address;
     std::string error = "stale";
-    EXPECT_FALSE(coordinator_router::validate_remote_endpoint(agent, &error));
+    EXPECT_FALSE(coordinator_router::validate_remote_endpoint(agent, &address, &error));
     EXPECT_NE(std::string::npos, error.find("no endpoint"));
 
     agent.host = "0.0.0.0";
     agent.port = 27102;
-    EXPECT_FALSE(coordinator_router::validate_remote_endpoint(agent, &error));
+    EXPECT_FALSE(coordinator_router::validate_remote_endpoint(agent, &address, &error));
     EXPECT_NE(std::string::npos, error.find("could not be resolved"));
 
     agent.host = "127.0.0.1";
-    EXPECT_TRUE(coordinator_router::validate_remote_endpoint(agent, &error));
+    EXPECT_TRUE(coordinator_router::validate_remote_endpoint(agent, &address, &error));
     EXPECT_TRUE(error.empty());
+    EXPECT_EQ(static_cast<uint16_t>(27102), address.port());
+    EXPECT_FALSE(address.is_invalid());
+
+    // Address is optional: a null out-param must still validate.
+    EXPECT_TRUE(coordinator_router::validate_remote_endpoint(agent, nullptr, &error));
 }
 
 TEST(rasn_policy, classifies_codepilot_tools_and_builds_requests)
@@ -1952,6 +1958,7 @@ TEST(rasn_metrics_registry, snapshot_exposes_core_and_latency_series)
     EXPECT_NE(nullptr, snapshot.find("rasn_remote_agent_breaker_open_total"));
     EXPECT_NE(nullptr, snapshot.find("rasn_remote_agent_admission_rejected_total"));
     EXPECT_NE(nullptr, snapshot.find("rasn_remote_agent_rate_limited_total"));
+    EXPECT_NE(nullptr, snapshot.find("rasn_remote_agent_endpoint_invalid_total"));
 
     // Latency series are present and flagged as latency samples.
     const metric_sample *task_latency = snapshot.find("rasn_task_latency_ms");
@@ -1978,6 +1985,8 @@ TEST(rasn_metrics_registry, runtime_events_increment_cumulative_counters)
     const uint64_t remote_admission_before =
         registry.snapshot().counter("rasn_remote_agent_admission_rejected_total");
     const uint64_t remote_rate_before = registry.snapshot().counter("rasn_remote_agent_rate_limited_total");
+    const uint64_t remote_endpoint_before =
+        registry.snapshot().counter("rasn_remote_agent_endpoint_invalid_total");
 
     nucleus_runtime runtime;
     agent_task task;
@@ -1988,6 +1997,7 @@ TEST(rasn_metrics_registry, runtime_events_increment_cumulative_counters)
     runtime.record_remote_agent_breaker_open(task, "unit.remote", 2);
     runtime.record_remote_agent_admission_rejected(task, "unit.remote", 3, 2);
     runtime.record_remote_agent_rate_limited(task, "unit.remote", 60);
+    runtime.record_remote_agent_endpoint_invalid(task, "unit.remote", "agent descriptor has no endpoint");
     runtime.finish_task(task, "ok");
 
     const uint64_t begin_after = registry.snapshot().counter("rasn_tasks_begin_total");
@@ -1999,6 +2009,8 @@ TEST(rasn_metrics_registry, runtime_events_increment_cumulative_counters)
     EXPECT_EQ(remote_admission_before + 1,
               registry.snapshot().counter("rasn_remote_agent_admission_rejected_total"));
     EXPECT_EQ(remote_rate_before + 1, registry.snapshot().counter("rasn_remote_agent_rate_limited_total"));
+    EXPECT_EQ(remote_endpoint_before + 1,
+              registry.snapshot().counter("rasn_remote_agent_endpoint_invalid_total"));
 
     // Observing a latency value must never crash, even though percentiles are
     // computed asynchronously by rDSN counter timers.

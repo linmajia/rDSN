@@ -1180,13 +1180,14 @@ breaker/admission/rate trio. Only retryable dependency outcomes --- transport
 errors and retryable remote responses --- count against the breaker; deterministic
 application responses such as policy denials, validation failures, or tool errors
 do not poison the agent. The guards run only on the RPC-client path, so inline CLI
-behavior is unchanged. Six additional counters
+behavior is unchanged. Seven additional counters
 (\texttt{rasn\_remote\_agent\_breaker\_open\_total},
 \texttt{rasn\_remote\_agent\_breaker\_short\_circuit\_total},
 \texttt{rasn\_remote\_agent\_admission\_rejected\_total},
 \texttt{rasn\_remote\_agent\_admission\_delayed\_total},
-\texttt{rasn\_remote\_agent\_rate\_limited\_total}, and
-\texttt{rasn\_remote\_agent\_rate\_delayed\_total}) and live per-agent state are
+\texttt{rasn\_remote\_agent\_rate\_limited\_total},
+\texttt{rasn\_remote\_agent\_rate\_delayed\_total}, and
+\texttt{rasn\_remote\_agent\_endpoint\_invalid\_total}) and live per-agent state are
 reported through \texttt{observe resilience} and \texttt{rasn.resilience}.
 
 \section{Implementation Details}
@@ -2087,7 +2088,12 @@ agent. \rasn therefore adds a per-agent guard around
 \texttt{agent\_id}, and the guarded operation is the outbound
 \texttt{RPC\_RASN\_AGENT\_INVOKE}.
 
-The guard reuses the same engines as the model gateway. A non-mutating breaker
+The guard reuses the same engines as the model gateway. Endpoint preflight
+(\texttt{coordinator\_router::validate\_remote\_endpoint}) resolves the descriptor
+address once and rejects malformed or unresolvable endpoints before any breaker
+probe, admission slot, or rate token is consumed, emitting a counted
+\texttt{remote\_agent.endpoint.invalid} event; the resolved address is then reused
+for dispatch to avoid a second resolution. A non-mutating breaker
 precheck runs first, then a per-agent admission slot and rate token are acquired,
 then the authoritative breaker check admits or short-circuits the call. If the
 breaker short-circuits after a rate token has been acquired, the token is refunded;
@@ -2111,13 +2117,14 @@ The configuration lives under \texttt{[rasn.remote\_agent]}:
 \texttt{max\_backpressure\_ms}, and \texttt{rate\_limit\_*}. Defaults are generous
 (\texttt{64} hard concurrency, \texttt{32} soft concurrency, \texttt{200ms}
 backpressure, rate unlimited) to preserve normal service-smoke behavior. Runtime
-events feed six counters:
+events feed seven counters:
 \texttt{rasn\_remote\_agent\_breaker\_open\_total},
 \texttt{rasn\_remote\_agent\_breaker\_short\_circuit\_total},
 \texttt{rasn\_remote\_agent\_admission\_rejected\_total},
 \texttt{rasn\_remote\_agent\_admission\_delayed\_total},
-\texttt{rasn\_remote\_agent\_rate\_limited\_total}, and
-\texttt{rasn\_remote\_agent\_rate\_delayed\_total}; live state appears in
+\texttt{rasn\_remote\_agent\_rate\_limited\_total},
+\texttt{rasn\_remote\_agent\_rate\_delayed\_total}, and
+\texttt{rasn\_remote\_agent\_endpoint\_invalid\_total}; live state appears in
 \texttt{observe resilience} and the \texttt{rasn.resilience} command alongside the
 model and tool sections.
 

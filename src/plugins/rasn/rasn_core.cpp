@@ -1060,6 +1060,13 @@ void nucleus_runtime::record_remote_agent_rate_delayed(const agent_task &task,
                  0);
 }
 
+void nucleus_runtime::record_remote_agent_endpoint_invalid(const agent_task &task,
+                                                           const std::string &agent,
+                                                           const std::string &reason)
+{
+    record_event(task, "remote_agent.endpoint.invalid", agent, reason, "", "", "", false, 0);
+}
+
 std::string nucleus_runtime::resolve_nondeterminism(const agent_task &task,
                                                     const std::string &name,
                                                     const std::string &source,
