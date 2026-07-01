@@ -50,6 +50,38 @@ treated as incident input for `diagnose`.
 service under the `srepilot/` key namespace. They also checkpoint state so a later
 `status` command can recover and summarize prior incident records.
 
+Before the first `diagnose` or `runbook` persist in each process, SREPilot
+recovers configured state once. This is important for direct one-shot CLI usage:
+each command starts a fresh process with an empty in-memory state store, so
+recovering before checkpointing prevents a new incident from overwriting prior
+records.
+
+Recovery sources are treated as authoritative and fail-safe:
+
+- `[rasn.state] recover_on_start` points to an explicit checkpoint path. If it is
+  set, SREPilot attempts that recovery path before writing new incident records;
+  recovery errors fail the command instead of checkpointing a partial store.
+- The default local checkpoint/journal from `[rasn.state] checkpoint_dir`,
+  `checkpoint_file`, and `journal_file` is auto-recovered when present.
+- `[rasn.state.replica] enabled = true` with `recover = true` lets recovery seed
+  missing primary checkpoint/journal files from a local replica directory before
+  trying NFS. Keep `directory` non-empty when enabling this; an empty replica
+  directory is a configuration error and should block persistence rather than
+  silently disabling the safeguard.
+- `[rasn.state.nfs] enabled = true` lets recovery import checkpoint/journal files
+  from an rDSN NFS source when no local or replica state is available. If the NFS
+  source is unreachable, direct `diagnose` and `runbook` commands wait up to
+  `[rasn.state.nfs] timeout_ms` and then fail rather than risk clobbering older
+  incident records.
+
+`[rasn.state.nfs] timeout_ms` is in milliseconds and defaults to `20000` (20
+seconds). That default is intentionally conservative for service startup or
+remote state seeding, where successful recovery is usually more important than a
+fast failure. For human-driven direct CLI use with a local or same-datacenter NFS
+source, `5000` is a good starting value; use `3000`-`5000` for fail-fast
+operations, and keep or raise `20000` when checkpoints are large, the source is
+remote, or avoiding false recovery failures matters more than CLI latency.
+
 ## Configuration
 
 SREPilot has an app-local `config.ini` in this folder. Its CMake target copies

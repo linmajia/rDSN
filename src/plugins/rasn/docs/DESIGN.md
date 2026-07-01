@@ -403,11 +403,17 @@ rDSN design:
 - Optional `[rasn.state.nfs]` settings let recovery first pull checkpoint files
   from an existing `dsn.tools.nfs` source when local state is absent. This reuses
   rDSN's NFS module for remote state seeding without making the default local
-  checkpoint path depend on a network service.
+  checkpoint path depend on a network service. The import timeout defaults to
+  `20000` ms; production or remote recovery paths should keep that conservative
+  budget, while interactive local/LAN CLI deployments can lower it to around
+  `5000` ms for faster fail-safe errors.
 - Optional `[rasn.state.replica]` settings mirror checkpoint and journal files to
   a local replica directory. When enabled, state writes fail explicitly if the
   mirror cannot be updated, and recovery can seed missing primary checkpoint or
-  journal files from the replica before attempting NFS import.
+  journal files from the replica before attempting NFS import. A configured but
+  invalid recovery source, such as an empty replica directory or unreachable NFS
+  source, is treated as a blocking error rather than a reason to checkpoint an
+  empty in-memory store over durable state.
 - Files and directories use `dsn::utils::filesystem`.
 - Future replicated mode can follow `replicated_service_app_type_1`.
 
