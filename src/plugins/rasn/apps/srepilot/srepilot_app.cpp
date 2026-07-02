@@ -13,16 +13,6 @@ namespace dsn {
 namespace rasn {
 namespace {
 
-rasn_cli_service_readiness_options srepilot_readiness_options()
-{
-    rasn_cli_service_readiness_options options;
-    options.state_probe_key = "__srepilot_readiness_probe__";
-    options.workflow_id = "srepilot-readiness";
-    options.workflow_source_name = "<srepilot-readiness>";
-    options.dependency_error = "SREPilot service dependencies not ready";
-    return options;
-}
-
 std::string join_args(const std::vector<std::string> &args, size_t begin)
 {
     std::ostringstream oss;
@@ -635,8 +625,10 @@ void srepilot_cli::print_help(bool interactive_mode) const
 void srepilot_app::run_cli_task()
 {
     std::string readiness_error;
+    rasn_cli_service_readiness_options readiness_options;
+    readiness_options.dependency_error = "SREPilot service dependencies not ready";
     const int rc =
-        wait_for_cli_service_dependencies(global_rasn_services(), srepilot_readiness_options(), &readiness_error)
+        wait_for_cli_service_dependencies(global_rasn_services(), readiness_options, &readiness_error)
             ? _cli.run(_args)
             : 1;
     if (!readiness_error.empty())

@@ -192,6 +192,8 @@ public:
     terminal_input_scope()
     {
 #if !defined(_WIN32)
+        // macOS terminals commonly send DEL for Backspace/Delete. Normalize the
+        // erase character while the REPL is active so std::getline stays usable.
         if (!::isatty(STDIN_FILENO))
         {
             return;
