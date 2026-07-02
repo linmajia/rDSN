@@ -43,6 +43,11 @@ srepilot.exe C:\path\to\service-repo
 srepilot.exe C:\path\to\incident.log
 ```
 
+```sh
+./srepilot ~/src/service-repo
+./srepilot ~/incidents/incident.log
+```
+
 A single existing directory or file argument starts interactive mode instead of
 being treated as an unknown command. A directory becomes the process workspace. A
 file makes its parent the workspace and loads the file as startup context for

@@ -86,6 +86,11 @@ inline bool read_context_prefix(const std::string &path,
     }
 
     content->clear();
+    if (max_bytes == 0)
+    {
+        return true;
+    }
+
     char buffer[4096];
     size_t total = 0;
     while (input && total < max_bytes)

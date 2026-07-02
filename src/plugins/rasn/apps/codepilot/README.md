@@ -38,6 +38,11 @@ codepilot.exe C:\path\to\repo
 codepilot.exe C:\path\to\file.cpp
 ```
 
+```sh
+./codepilot ~/src/repo
+./codepilot ~/src/repo/file.cpp
+```
+
 A single existing directory or file argument starts interactive mode instead of
 being sent as a prompt. A directory becomes the process workspace. A file makes
 its parent the workspace and loads the file as initial context.
@@ -47,7 +52,7 @@ ask prompt. For example:
 
 ```text
 /provider simulator
-/context src\plugins\rasn\apps\codepilot\codepilot_app.cpp
+/context src/plugins/rasn/apps/codepilot/codepilot_app.cpp
 /ask Summarize this file
 /exit
 ```

@@ -5,6 +5,7 @@
 #include "../agent_services.h"
 #include "../admission_gate.h"
 #include "../circuit_breaker.h"
+#include "../cli_support.h"
 #include "../coordinator_service.h"
 #include "../apps/codepilot/local_tools.h"
 #include "../metrics.h"
@@ -1088,6 +1089,22 @@ TEST(rasn_core, split_words_and_normalize_platform_paths)
 #else
     EXPECT_EQ("a/b/c", normalize_platform_path("a\\b/c"));
 #endif
+}
+
+TEST(rasn_cli_support, zero_context_budget_does_not_report_truncation)
+{
+    const std::string path = temp_file_path("rasn-cli-support-zero-context.txt");
+    write_text_file(path, "non-empty context");
+
+    std::string content;
+    std::string error;
+    bool truncated = true;
+    EXPECT_TRUE(cli_support_detail::read_context_prefix(path, 0, &content, &truncated, &error));
+    EXPECT_TRUE(error.empty()) << error;
+    EXPECT_TRUE(content.empty());
+    EXPECT_FALSE(truncated);
+
+    std::remove(path.c_str());
 }
 
 TEST(rasn_workflow, parses_metadata_and_rejects_cycles)
