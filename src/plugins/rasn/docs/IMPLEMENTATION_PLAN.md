@@ -3396,7 +3396,9 @@ Work items:
   slash while preserving direct CLI help without the slash.
 - [x] Add reusable bounded workspace source snapshots for directory startup:
   source-file index plus selected text excerpts, with generated/build
-  directories skipped.
+  directories and obvious secret-bearing files skipped.
+- [x] Degrade directory startup to workspace-only interactive mode when snapshot
+  enumeration fails instead of exiting before the REPL starts.
 - [x] Attach the workspace source snapshot to CodePilot prompts so one-shot
   `/ask` has concrete repository context after `codepilot <repo>`.
 - [x] Attach the same startup snapshot to SREPilot `diagnose` / `runbook`

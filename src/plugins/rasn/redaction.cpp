@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <limits>
 #include <mutex>
 #include <sstream>
 
@@ -16,6 +17,19 @@ namespace rasn {
 namespace {
 
 const char kRedactedSecret[] = "<redacted-secret>";
+
+size_t clamp_config_size(const std::string &key, uint64_t value)
+{
+    const uint64_t max_size = static_cast<uint64_t>((std::numeric_limits<size_t>::max)());
+    if (value > max_size)
+    {
+        dwarn("redaction config %s=%llu exceeds size_t range; using size_t max",
+              key.c_str(),
+              static_cast<unsigned long long>(value));
+        return (std::numeric_limits<size_t>::max)();
+    }
+    return static_cast<size_t>(value);
+}
 
 bool config_bool_compat(const std::string &key, bool fallback)
 {
@@ -425,7 +439,7 @@ std::string redact_sensitive_text(const std::string &text)
         return text;
     }
     const size_t min_secret_length =
-        static_cast<size_t>(config_uint64_compat("redact_min_secret_length", 8));
+        clamp_config_size("redact_min_secret_length", config_uint64_compat("redact_min_secret_length", 8));
     return redact_sensitive_text_internal(text, configured_secret_values(min_secret_length), min_secret_length);
 }
 

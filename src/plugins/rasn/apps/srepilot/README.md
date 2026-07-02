@@ -53,6 +53,11 @@ being treated as an unknown command. A directory becomes the process workspace. 
 directory also loads a bounded source-file index plus selected file excerpts as
 startup context. A file makes its parent the workspace and loads the file as
 startup context for future `diagnose` and `runbook` prompts.
+Directory snapshots skip generated/build output and obvious secret-bearing files
+such as `.env*`, credentials, private keys, and
+`secrets.{json,yml,yaml}` / `config.{json,yml,yaml}`. If source
+enumeration fails, SREPilot still enters interactive mode with the workspace set
+and reports that source context is unavailable.
 
 Inside interactive mode, prefix commands with `/`; text without `/` is treated
 as incident input for `diagnose`. For example:

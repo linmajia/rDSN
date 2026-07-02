@@ -139,11 +139,11 @@ bool agent_registry::register_agent(const agent_descriptor &descriptor, std::str
     entry.descriptor = descriptor;
     entry.last_heartbeat_ms = ::dsn_now_ms();
     entry.lease_tracked = entry.lease_tracked || lease_tracked;
-    dinfo("%s rASN agent id=%s role=%s capabilities=%u lease_tracked=%s",
+    dinfo("%s rASN agent id=%s role=%s capabilities=%llu lease_tracked=%s",
           existed ? "updated" : "registered",
           descriptor.agent_id.c_str(),
           descriptor.role.c_str(),
-          static_cast<unsigned int>(descriptor.capabilities.size()),
+          static_cast<unsigned long long>(descriptor.capabilities.size()),
           entry.lease_tracked ? "true" : "false");
     return true;
 }
@@ -611,7 +611,7 @@ void rasn_registry_app::sweep_leases()
     const size_t expired = global_agent_registry().expire_leases(::dsn_now_ms(), lease_ms);
     if (expired > 0)
     {
-        dinfo("swept %u expired rASN registry leases", static_cast<unsigned int>(expired));
+        dinfo("swept %llu expired rASN registry leases", static_cast<unsigned long long>(expired));
     }
 }
 

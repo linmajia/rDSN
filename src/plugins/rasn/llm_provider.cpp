@@ -323,7 +323,23 @@ bool write_private_file(const std::string &path, const std::string &content, std
         }
         return false;
     }
-    const int written = _write(fd, content.data(), static_cast<unsigned int>(content.size()));
+    size_t offset = 0;
+    bool write_ok = true;
+    while (offset < content.size())
+    {
+        const size_t remaining = content.size() - offset;
+        const unsigned int chunk =
+            remaining > static_cast<size_t>((std::numeric_limits<int>::max)())
+                ? static_cast<unsigned int>((std::numeric_limits<int>::max)())
+                : static_cast<unsigned int>(remaining);
+        const int written = _write(fd, content.data() + offset, chunk);
+        if (written <= 0)
+        {
+            write_ok = false;
+            break;
+        }
+        offset += static_cast<size_t>(written);
+    }
     _close(fd);
 #else
     const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
@@ -335,10 +351,26 @@ bool write_private_file(const std::string &path, const std::string &content, std
         }
         return false;
     }
-    const ssize_t written = ::write(fd, content.data(), content.size());
+    size_t offset = 0;
+    bool write_ok = true;
+    while (offset < content.size())
+    {
+        const size_t remaining = content.size() - offset;
+        const size_t chunk =
+            remaining > static_cast<size_t>((std::numeric_limits<ssize_t>::max)())
+                ? static_cast<size_t>((std::numeric_limits<ssize_t>::max)())
+                : remaining;
+        const ssize_t written = ::write(fd, content.data() + offset, chunk);
+        if (written <= 0)
+        {
+            write_ok = false;
+            break;
+        }
+        offset += static_cast<size_t>(written);
+    }
     ::close(fd);
 #endif
-    if (written < 0 || static_cast<size_t>(written) != content.size())
+    if (!write_ok || offset != content.size())
     {
         ::dsn::utils::filesystem::remove_path(path);
         if (error != nullptr)
@@ -1063,8 +1095,12 @@ void emit_llm_stream_chunks(const agent_task &task,
                             const llm_stream_callback &on_chunk,
                             size_t chunk_bytes)
 {
+    const uint64_t configured_chunk_u64 =
+        llm_config_uint64("stream_chunk_bytes", 96, "model response stream chunk size");
     const size_t configured_chunk_bytes =
-        static_cast<size_t>(llm_config_uint64("stream_chunk_bytes", 96, "model response stream chunk size"));
+        configured_chunk_u64 > static_cast<uint64_t>((std::numeric_limits<size_t>::max)())
+            ? (std::numeric_limits<size_t>::max)()
+            : static_cast<size_t>(configured_chunk_u64);
     const size_t effective_chunk_bytes = chunk_bytes == 0 ? (std::max)(static_cast<size_t>(1), configured_chunk_bytes)
                                                          : (std::max)(static_cast<size_t>(1), chunk_bytes);
     if (text.empty())

@@ -1127,6 +1127,12 @@ TEST(rasn_cli_support, workspace_source_context_includes_index_and_excerpts)
 
     write_text_file(::dsn::utils::filesystem::path_combine(root, "README.md"), "# demo workspace\n");
     write_text_file(::dsn::utils::filesystem::path_combine(src_dir, "main.c"), "int main() { return 0; }\n");
+    write_text_file(::dsn::utils::filesystem::path_combine(root, ".env.local"), "TOKEN=secret\n");
+    write_text_file(::dsn::utils::filesystem::path_combine(root, "config.json"), "{\"token\":\"secret\"}\n");
+    write_text_file(::dsn::utils::filesystem::path_combine(root, "secrets.json"), "{\"token\":\"secret\"}\n");
+    const std::string secrets_dir = ::dsn::utils::filesystem::path_combine(root, "secrets");
+    ASSERT_TRUE(::dsn::utils::filesystem::create_directory(secrets_dir));
+    write_text_file(::dsn::utils::filesystem::path_combine(secrets_dir, "config.yml"), "password: secret\n");
 
     cli_workspace_context_options options;
     options.max_files = 10;
@@ -1145,6 +1151,11 @@ TEST(rasn_cli_support, workspace_source_context_includes_index_and_excerpts)
     EXPECT_NE(std::string::npos, context.find("src"));
     EXPECT_NE(std::string::npos, context.find("main.c"));
     EXPECT_NE(std::string::npos, context.find("int main()"));
+    EXPECT_EQ(std::string::npos, context.find(".env.local"));
+    EXPECT_EQ(std::string::npos, context.find("config.json"));
+    EXPECT_EQ(std::string::npos, context.find("secrets.json"));
+    EXPECT_EQ(std::string::npos, context.find("TOKEN=secret"));
+    EXPECT_EQ(std::string::npos, context.find("password: secret"));
 
     ::dsn::utils::filesystem::remove_path(root);
 }
@@ -1490,22 +1501,11 @@ TEST(rasn_wire_limits, bounded_reserve_caps_untrusted_counts)
 
 TEST(rasn_state, recovers_past_a_torn_trailing_journal_record)
 {
-    // Reproduce a crash or injected fault that interrupts the final journal
-    // append, leaving an unterminated (newline-less) trailing record. Recovery
-    // must keep every fully-written record instead of failing closed and
-    // discarding all of them along with the atomically-written checkpoint.
-
-    // The journal and checkpoint paths are process-global (derived from the
-    // [rasn.state] config and its default runtime layout). Use the same public
-    // helpers state_store uses so the test seeds, cleans, and recovers the exact
-    // same files even if the default layout changes.
     const std::string journal_path = configured_state_journal_path();
     const std::string checkpoint_path = configured_state_checkpoint_path();
     ASSERT_FALSE(journal_path.empty());
     ASSERT_FALSE(checkpoint_path.empty());
 
-    // Clean slate so put() rebuilds the journal from scratch and recover() reads
-    // only the journal (no checkpoint present -> the journal branch is exercised).
     std::remove(checkpoint_path.c_str());
     std::remove((checkpoint_path + ".tmp").c_str());
     std::remove((checkpoint_path + ".bak").c_str());
@@ -1519,6 +1519,11 @@ TEST(rasn_state, recovers_past_a_torn_trailing_journal_record)
     first.value = "first-value";
     ASSERT_TRUE(writer.put(first).ok);
 
+    state_checkpoint_request checkpoint;
+    checkpoint.path = checkpoint_path;
+    ASSERT_TRUE(writer.checkpoint(checkpoint).ok);
+    ASSERT_FALSE(::dsn::utils::filesystem::file_exists(journal_path));
+
     state_record second;
     second.key = "unit/torn-b";
     second.kind = "observation";
@@ -1526,18 +1531,22 @@ TEST(rasn_state, recovers_past_a_torn_trailing_journal_record)
     second.value = "second-value";
     ASSERT_TRUE(writer.put(second).ok);
 
-    // Simulate the torn append: a partial, non-decodable record (too few fields)
-    // with no trailing newline -- exactly what a crash mid-write leaves behind.
-    {
-        std::ofstream torn(journal_path.c_str(), std::ios::binary | std::ios::app);
-        ASSERT_TRUE(torn.good());
-        torn << "1\t3\t756e69742f746f726e2d63";
-        torn.flush();
-    }
+    state_record third;
+    third.key = "unit/torn-c";
+    third.kind = "observation";
+    third.scope = "unit";
+    third.value = "third-value";
+    ASSERT_TRUE(writer.put(third).ok);
+
+    std::string journal = read_text_file(journal_path);
+    ASSERT_GT(journal.size(), 3u);
+    ASSERT_EQ('\n', journal[journal.size() - 1]);
+    journal.resize(journal.size() - 3);
+    write_text_file(journal_path, journal);
 
     state_store reader;
     state_checkpoint_request request;
-    request.path = checkpoint_path; // absent -> only the journal is replayed
+    request.path = checkpoint_path;
     const state_response recovered = reader.recover(request);
     ASSERT_TRUE(recovered.ok) << recovered.error;
 
@@ -1562,6 +1571,45 @@ TEST(rasn_state, recovers_past_a_torn_trailing_journal_record)
     EXPECT_TRUE(saw_first);
     EXPECT_TRUE(saw_second);
     EXPECT_FALSE(saw_torn);
+
+    std::remove(checkpoint_path.c_str());
+    std::remove((checkpoint_path + ".tmp").c_str());
+    std::remove((checkpoint_path + ".bak").c_str());
+    std::remove(journal_path.c_str());
+}
+
+TEST(rasn_state, rejects_corrupt_newline_terminated_journal_record)
+{
+    const std::string journal_path = configured_state_journal_path();
+    const std::string checkpoint_path = configured_state_checkpoint_path();
+    ASSERT_FALSE(journal_path.empty());
+    ASSERT_FALSE(checkpoint_path.empty());
+
+    std::remove(checkpoint_path.c_str());
+    std::remove((checkpoint_path + ".tmp").c_str());
+    std::remove((checkpoint_path + ".bak").c_str());
+    std::remove(journal_path.c_str());
+
+    state_store writer;
+    state_record record;
+    record.key = "unit/corrupt-a";
+    record.kind = "observation";
+    record.scope = "unit";
+    record.value = "value";
+    ASSERT_TRUE(writer.put(record).ok);
+
+    {
+        std::ofstream corrupt(journal_path.c_str(), std::ios::binary | std::ios::app);
+        ASSERT_TRUE(corrupt.good());
+        corrupt << "not-a-state-record\n";
+    }
+
+    state_store reader;
+    state_checkpoint_request request;
+    request.path = checkpoint_path;
+    const state_response recovered = reader.recover(request);
+    EXPECT_FALSE(recovered.ok);
+    EXPECT_NE(std::string::npos, recovered.error.find("invalid checkpoint record"));
 
     std::remove(checkpoint_path.c_str());
     std::remove((checkpoint_path + ".tmp").c_str());

@@ -47,6 +47,11 @@ A single existing directory or file argument starts interactive mode instead of
 being sent as a prompt. A directory becomes the process workspace and loads a
 bounded source-file index plus selected file excerpts as initial context. A file
 makes its parent the workspace and loads the file as initial context.
+Directory snapshots skip generated/build output and obvious secret-bearing files
+such as `.env*`, credentials, private keys, and
+`secrets.{json,yml,yaml}` / `config.{json,yml,yaml}`. If source
+enumeration fails, CodePilot still enters interactive mode with the workspace set
+and reports that source context is unavailable.
 
 Inside interactive mode, prefix commands with `/`; text without `/` is sent as an
 ask prompt. For example:

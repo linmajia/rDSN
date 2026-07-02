@@ -1573,9 +1573,9 @@ workflow_response workflow_store::recover_from_state()
         }
     }
 
-    dinfo("recovered rASN workflow runs=%u skipped=%u",
-          static_cast<unsigned int>(recovered.size()),
-          static_cast<unsigned int>(skipped));
+    dinfo("recovered rASN workflow runs=%llu skipped=%llu",
+          static_cast<unsigned long long>(recovered.size()),
+          static_cast<unsigned long long>(skipped));
     workflow_response response;
     response.run.status = "recovered";
     response.run.result_text = "runs=" + std::to_string(recovered.size()) + " skipped=" + std::to_string(skipped);
@@ -1811,9 +1811,9 @@ bool workflow_store::recover_resume_state_from_state(const std::string &run_id,
     {
         *resume_state = recovered;
     }
-    dinfo("recovered rASN workflow resume nodes run=%s nodes=%u",
+    dinfo("recovered rASN workflow resume nodes run=%s nodes=%llu",
           run_id.c_str(),
-          static_cast<unsigned int>(recovered.size()));
+          static_cast<unsigned long long>(recovered.size()));
     return true;
 }
 

@@ -61,8 +61,17 @@ std::string config_string_or_default(const std::string &section,
 
 uint16_t config_port_or_default(const std::string &key, uint16_t default_port)
 {
-    return static_cast<uint16_t>(
-        ::dsn_config_get_value_uint64("rasn.service", key.c_str(), default_port, "rASN service RPC port"));
+    const uint64_t configured =
+        ::dsn_config_get_value_uint64("rasn.service", key.c_str(), default_port, "rASN service RPC port");
+    if (configured > (std::numeric_limits<uint16_t>::max)())
+    {
+        dwarn("rasn.service.%s=%llu exceeds uint16_t port range; using default %u",
+              key.c_str(),
+              static_cast<unsigned long long>(configured),
+              static_cast<unsigned int>(default_port));
+        return default_port;
+    }
+    return static_cast<uint16_t>(configured);
 }
 
 service_endpoint_config config_service_endpoint(const std::string &service_name, uint16_t default_port)

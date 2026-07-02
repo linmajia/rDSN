@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <sstream>
 
 #if defined(_WIN32)
@@ -45,8 +46,17 @@ size_t config_size_compat(const std::string &key, size_t fallback)
 {
     const uint64_t compat_value =
         ::dsn_config_get_value_uint64("rasn.codepilot.tools", key.c_str(), fallback, "CodePilot compatibility policy size setting");
-    return static_cast<size_t>(
-        ::dsn_config_get_value_uint64("rasn.policy", key.c_str(), compat_value, "rASN policy size setting"));
+    const uint64_t value =
+        ::dsn_config_get_value_uint64("rasn.policy", key.c_str(), compat_value, "rASN policy size setting");
+    const uint64_t max_size = static_cast<uint64_t>((std::numeric_limits<size_t>::max)());
+    if (value > max_size)
+    {
+        dwarn("rasn.policy.%s=%llu exceeds size_t range; using size_t max",
+              key.c_str(),
+              static_cast<unsigned long long>(value));
+        return (std::numeric_limits<size_t>::max)();
+    }
+    return static_cast<size_t>(value);
 }
 
 std::string config_string_compat(const std::string &key, const std::string &fallback)

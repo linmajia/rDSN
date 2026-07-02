@@ -575,7 +575,44 @@ agent_context_entry make_text_context(const std::string &kind,
 std::string codepilot_system_prompt()
 {
     return "You are CodePilot, the rASN coding agent CLI. "
-           "State assumptions, preserve determinism where possible, and produce actionable output.";
+           "State assumptions, preserve determinism where possible, and produce actionable output. "
+           "When context entries are attached, treat them as source/context supplied by the CLI; "
+           "do not claim no source code was provided.";
+}
+
+bool codepilot_context_has_workspace_snapshot(const std::vector<std::string> &context)
+{
+    for (const std::string &entry : context)
+    {
+        if (entry.find("workspace source snapshot:") != std::string::npos)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string codepilot_prompt_with_context_contract(const std::string &prompt,
+                                                   const std::vector<std::string> &context)
+{
+    if (context.empty())
+    {
+        return prompt;
+    }
+
+    std::ostringstream output;
+    output << "The CLI has attached " << context.size() << " context "
+           << (context.size() == 1 ? "entry" : "entries");
+    if (codepilot_context_has_workspace_snapshot(context))
+    {
+        output << ", including a bounded workspace source snapshot";
+    }
+    output << ". Treat the attached context as the source/context supplied for this request. "
+           << "Base the answer on concrete file names and excerpts from that context. "
+           << "Do not say that no source code was provided; if the bounded snapshot is insufficient, "
+           << "state what additional files or tool output are needed.\n\nUser request:\n"
+           << prompt;
+    return output.str();
 }
 
 agent_request make_codepilot_model_request(const agent_task &task,
@@ -590,7 +627,7 @@ agent_request make_codepilot_model_request(const agent_task &task,
     request.trace_id = trace_id;
     request.task = task;
     request.capability = "model.complete";
-    request.input = prompt;
+    request.input = codepilot_prompt_with_context_contract(prompt, context);
     if (!system_prompt.empty())
     {
         request.context.push_back(make_text_context("system_prompt", "system", system_prompt));

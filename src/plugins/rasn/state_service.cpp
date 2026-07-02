@@ -382,8 +382,17 @@ nfs_state_import_config load_nfs_state_import_config(const std::string &checkpoi
     nfs_state_import_config config;
     config.enabled = config_bool("rasn.state.nfs", "enabled", false, "Enable rDSN NFS import before state recovery");
     config.remote_host = config_string("rasn.state.nfs", "remote_host", "", "Remote rDSN NFS host");
-    config.remote_port =
-        static_cast<uint16_t>(config_uint64("rasn.state.nfs", "remote_port", 0, "Remote rDSN NFS port"));
+    const uint64_t remote_port = config_uint64("rasn.state.nfs", "remote_port", 0, "Remote rDSN NFS port");
+    if (remote_port > (std::numeric_limits<uint16_t>::max)())
+    {
+        dwarn("rasn.state.nfs.remote_port=%llu exceeds uint16_t port range; disabling NFS import",
+              static_cast<unsigned long long>(remote_port));
+        config.enabled = false;
+    }
+    else
+    {
+        config.remote_port = static_cast<uint16_t>(remote_port);
+    }
     config.remote_checkpoint_dir =
         config_string("rasn.state.nfs", "remote_checkpoint_dir", "", "Remote rASN checkpoint directory");
     config.remote_checkpoint_file = config_string("rasn.state.nfs",
@@ -399,8 +408,18 @@ nfs_state_import_config load_nfs_state_import_config(const std::string &checkpoi
         config.local_import_dir = path_parent_or_current(checkpoint_path);
     }
     config.overwrite = config_bool("rasn.state.nfs", "overwrite", true, "Overwrite existing local NFS imports");
-    config.timeout_ms =
-        static_cast<int>(config_uint64("rasn.state.nfs", "timeout_ms", 20000, "NFS state import timeout in milliseconds"));
+    const uint64_t timeout_ms =
+        config_uint64("rasn.state.nfs", "timeout_ms", 20000, "NFS state import timeout in milliseconds");
+    if (timeout_ms > static_cast<uint64_t>((std::numeric_limits<int>::max)()))
+    {
+        dwarn("rasn.state.nfs.timeout_ms=%llu exceeds int range; using INT_MAX",
+              static_cast<unsigned long long>(timeout_ms));
+        config.timeout_ms = (std::numeric_limits<int>::max)();
+    }
+    else
+    {
+        config.timeout_ms = static_cast<int>(timeout_ms);
+    }
 
     if (config.remote_journal_file.empty() && config_bool("rasn.state.nfs", "import_journal", false, "Import journal from NFS"))
     {
@@ -528,11 +547,11 @@ bool import_state_recovery_files_from_nfs(const std::string &checkpoint_path,
         }
     }
 
-    dinfo("imported rASN state recovery files via rDSN NFS source=%s:%u dir=%s bytes=%u",
+    dinfo("imported rASN state recovery files via rDSN NFS source=%s:%u dir=%s bytes=%llu",
           config.remote_host.c_str(),
           static_cast<unsigned int>(config.remote_port),
           config.remote_checkpoint_dir.c_str(),
-          static_cast<unsigned int>(copy_result->size));
+          static_cast<unsigned long long>(copy_result->size));
     return true;
 }
 
@@ -1015,8 +1034,8 @@ state_response state_store::checkpoint(const state_checkpoint_request &request) 
     {
         response.records.push_back(entry.second);
     }
-    dinfo("checkpointed rASN state records=%u path=%s",
-          static_cast<unsigned int>(response.records.size()),
+    dinfo("checkpointed rASN state records=%llu path=%s",
+          static_cast<unsigned long long>(response.records.size()),
           path.c_str());
     return response;
 }
@@ -1124,27 +1143,24 @@ state_response state_store::recover(const state_checkpoint_request &request)
                 continue;
             }
 
+            if (journal.eof())
+            {
+                // write_state_record_line always terminates complete journal
+                // records with '\n'. A non-empty line read with eofbit already set
+                // is therefore an unterminated append tail, even if the bytes form
+                // a decodable prefix. Drop only that tail; newline-terminated
+                // corrupt records are still decoded below and fail recovery.
+                dwarn("dropping unterminated trailing record in state journal %s",
+                      journal_path.c_str());
+                break;
+            }
+
             state_record record;
             std::string decode_error;
             if (!decode_state_record_fields(split_tab_fields(line), journal_path, &record, &decode_error))
             {
-                if (journal.eof())
-                {
-                    // Torn tail: the process crashed (or an injected fault
-                    // interrupted the write) partway through appending the final
-                    // journal record, leaving an unterminated last line. std::getline
-                    // sets eofbit (not failbit) when it extracts characters and then
-                    // hits end-of-stream without a terminating newline, so eof() here
-                    // means this is the trailing partial record. Every prior record was
-                    // flushed and newline-terminated, so drop only the torn tail and keep
-                    // the state recovered so far instead of failing the whole recovery.
-                    dwarn("dropping torn trailing record in state journal %s: %s",
-                          journal_path.c_str(),
-                          decode_error.c_str());
-                    break;
-                }
-                // A complete, newline-terminated line that fails to decode is genuine
-                // mid-journal corruption (there is more data after it), so stay strict.
+                // A newline-terminated line that fails to decode is a complete
+                // corrupt record, so stay strict even when it is the final record.
                 return error_response(decode_error);
             }
             recovered[record.key] = record;
@@ -1177,8 +1193,8 @@ state_response state_store::recover(const state_checkpoint_request &request)
     // response.last_sequence (which would happen if we returned the pre-merge
     // on-disk last_sequence while records came from the merged in-memory store).
     state_response response = query(state_query_request());
-    dinfo("recovered rASN state records=%u path=%s",
-          static_cast<unsigned int>(response.records.size()),
+    dinfo("recovered rASN state records=%llu path=%s",
+          static_cast<unsigned long long>(response.records.size()),
           path.c_str());
     return response;
 }
@@ -1406,7 +1422,8 @@ rasn_state_client::recover_sync(const state_checkpoint_request &request,
             derror("failed to auto-recover rASN state: %s", response.error.c_str());
             return ::dsn::ERR_INVALID_PARAMETERS;
         }
-        dinfo("auto-recovered rASN state records=%u", static_cast<unsigned int>(response.records.size()));
+        dinfo("auto-recovered rASN state records=%llu",
+              static_cast<unsigned long long>(response.records.size()));
     }
     else
     {

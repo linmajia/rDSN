@@ -153,10 +153,22 @@ inline size_t capped_count(uint64_t configured_limit, size_t available)
 inline const std::unordered_set<std::string> &workspace_ignored_components()
 {
     static const std::unordered_set<std::string> components = {
-        ".git", ".svn", ".hg", "builder", "builder-rasn", "build", "node_modules",
-        ".venv", "venv", "__pycache__", "target", "dist", "out",
+        ".git", ".svn", ".hg", "builder", "builder-rasn", "build", "node_modules", ".venv", "venv",
+        "__pycache__", "target", "dist", "out", ".aws", ".azure", ".config", ".gnupg", ".kube", ".ssh",
+        "certs", "credentials", "secrets",
     };
     return components;
+}
+
+inline const std::unordered_set<std::string> &workspace_sensitive_file_names()
+{
+    static const std::unordered_set<std::string> names = {
+        ".env",        ".envrc",       ".npmrc",       ".pypirc",      ".netrc",
+        "config.json", "config.yml",   "config.yaml",  "credentials",
+        "id_rsa",      "id_dsa",       "id_ecdsa",     "id_ed25519",
+        "known_hosts", "secrets.json", "secrets.yml",  "secrets.yaml",
+    };
+    return names;
 }
 
 inline const std::unordered_map<std::string, int> &workspace_file_priorities()
@@ -182,6 +194,26 @@ inline const std::unordered_map<std::string, int> &workspace_extension_prioritie
         {".yaml", 3}, {".json", 3}, {".md", 4},   {".txt", 4},
     };
     return priorities;
+}
+
+inline bool is_sensitive_workspace_file(const std::string &path)
+{
+    const std::string file_name = lower_ascii(::dsn::utils::filesystem::get_file_name(path));
+    if (workspace_sensitive_file_names().find(file_name) != workspace_sensitive_file_names().end())
+    {
+        return true;
+    }
+    if (file_name.find(".env.") == 0)
+    {
+        return true;
+    }
+    return file_name.find("secret") != std::string::npos ||
+           file_name.find("credential") != std::string::npos ||
+           file_name.find("password") != std::string::npos ||
+           file_name.find("private") != std::string::npos ||
+           file_name.find("token") != std::string::npos ||
+           file_name.find("apikey") != std::string::npos ||
+           file_name.find("api_key") != std::string::npos;
 }
 
 inline bool path_has_ignored_component(const std::string &path)
@@ -310,6 +342,7 @@ inline bool build_workspace_source_context(const std::string &workspace_root,
         const std::string normalized = normalize_platform_path(file);
         const std::string relative = cli_support_detail::relative_workspace_path(absolute, normalized);
         if (!cli_support_detail::path_has_ignored_component(relative) &&
+            !cli_support_detail::is_sensitive_workspace_file(relative) &&
             cli_support_detail::is_workspace_source_candidate(relative))
         {
             candidates.push_back(normalized);
@@ -448,10 +481,14 @@ inline bool bootstrap_single_path_argument(const std::vector<std::string> &args,
         context->context_path = absolute;
         if (workspace_options != nullptr)
         {
+            std::string snapshot_error;
             if (!build_workspace_source_context(
-                    absolute, *workspace_options, &context->context_text, &context->context_truncated, &context->error))
+                    absolute, *workspace_options, &context->context_text, &context->context_truncated, &snapshot_error))
             {
-                return false;
+                context->message += "\nworkspace source context unavailable: " + snapshot_error;
+                context->context_text.clear();
+                context->context_truncated = false;
+                return true;
             }
             context->message += "\nloaded workspace source context";
             if (context->context_truncated)

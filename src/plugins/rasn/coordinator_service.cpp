@@ -263,6 +263,14 @@ coordinator_route coordinator_router::route_error(const agent_request &request,
         }
         return address;
     }
+    if (agent.port > (std::numeric_limits<uint16_t>::max)())
+    {
+        if (error != nullptr)
+        {
+            *error = "agent descriptor port is out of range: " + agent.agent_id;
+        }
+        return address;
+    }
     address.assign_ipv4(ip, static_cast<uint16_t>(agent.port));
     return address;
 }

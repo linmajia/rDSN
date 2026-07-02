@@ -13,6 +13,7 @@
 #include <ctime>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 
 namespace dsn {
@@ -25,11 +26,21 @@ namespace {
 // startup for the lifetime of the process.
 size_t event_log_memory_capacity()
 {
-    static const size_t capacity = static_cast<size_t>(::dsn_config_get_value_uint64(
-        "rasn.observability",
-        "max_in_memory_events",
-        100000,
-        "maximum runtime events retained in memory for observability queries (0 = unbounded)"));
+    static const size_t capacity = []() {
+        const uint64_t configured = ::dsn_config_get_value_uint64(
+            "rasn.observability",
+            "max_in_memory_events",
+            100000,
+            "maximum runtime events retained in memory for observability queries (0 = unbounded)");
+        const uint64_t max_size = static_cast<uint64_t>((std::numeric_limits<size_t>::max)());
+        if (configured > max_size)
+        {
+            dwarn("rasn.observability.max_in_memory_events=%llu exceeds size_t range; using size_t max",
+                  static_cast<unsigned long long>(configured));
+            return (std::numeric_limits<size_t>::max)();
+        }
+        return static_cast<size_t>(configured);
+    }();
     return capacity;
 }
 

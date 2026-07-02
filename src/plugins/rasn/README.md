@@ -95,8 +95,13 @@ Standalone one-shot CLI mode still initializes the rDSN runtime with the plugin 
 Application CLIs share the same path-startup convention through the reusable
 `cli_support` helper: a single existing directory argument switches the process
 workspace, loads a bounded source-file index plus selected file excerpts as
-startup context, and enters interactive mode. A single existing file argument
-uses the file parent as the workspace and loads the file as startup context. In
+startup context, and enters interactive mode. The directory snapshot skips
+generated/build output and obvious secret-bearing paths such as `.env*`,
+credential stores, keys, and `secrets.{json,yml,yaml}` /
+`config.{json,yml,yaml}` files; if enumeration fails,
+the CLI still opens the workspace and reports that source context is unavailable.
+A single existing file argument uses the file parent as the workspace and loads
+the file as startup context. In
 interactive mode, slash-prefixed commands (`/help`, `/exit`, `/diagnose`,
 `/ask`, etc.) are commands; `/help` renders command items with the leading slash,
 and plain text without a slash is handled by the application's default prompt

@@ -257,13 +257,12 @@ bool parse_uint32(const std::string &text, uint32_t *value)
     }
 
     char *end = nullptr;
-    const unsigned long parsed = std::strtoul(text.c_str(), &end, 10);
+    const unsigned long long parsed = std::strtoull(text.c_str(), &end, 10);
     if (end == text.c_str() || *end != '\0')
     {
         return false;
     }
-
-    *value = static_cast<uint32_t>(std::min<unsigned long>(parsed, 1000UL));
+    *value = static_cast<uint32_t>((std::min)(parsed, 1000ull));
     return true;
 }
 
