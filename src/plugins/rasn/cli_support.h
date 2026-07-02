@@ -674,6 +674,11 @@ inline bool cli_argument_is_command(const std::string &arg, const std::vector<st
     return std::find(commands.begin(), commands.end(), arg) != commands.end();
 }
 
+inline bool switch_cli_workspace(const std::string &path, std::string *error)
+{
+    return cli_support_detail::change_process_directory(path, error);
+}
+
 inline bool bootstrap_single_path_argument(const std::vector<std::string> &args,
                                            const std::vector<std::string> &commands,
                                            cli_startup_context *context,

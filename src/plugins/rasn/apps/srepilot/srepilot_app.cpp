@@ -107,17 +107,17 @@ std::vector<std::string> srepilot_cli::commands() const
     return srepilot_commands();
 }
 
-const char *srepilot_cli::repl_title() const
+std::string srepilot_cli::repl_title() const
 {
     return "rASN SREPilot prototype";
 }
 
-const char *srepilot_cli::repl_prompt() const
+std::string srepilot_cli::repl_prompt() const
 {
     return "srepilot> ";
 }
 
-const char *srepilot_cli::repl_plain_text_behavior() const
+std::string srepilot_cli::repl_plain_text_behavior() const
 {
     return "treated as diagnose input";
 }
@@ -141,6 +141,37 @@ int srepilot_cli::handle_empty_args()
 void srepilot_cli::handle_plain_text(const std::string &line)
 {
     (void)diagnose(std::vector<std::string>{line});
+}
+
+int srepilot_cli::run_compat_prompt(const std::string &prompt, bool stream)
+{
+    (void)stream;
+    return diagnose(std::vector<std::string>{prompt});
+}
+
+void srepilot_cli::print_compat_help() const
+{
+    print_help(false);
+}
+
+std::string srepilot_cli::version_string() const
+{
+    return "rASN SREPilot prototype";
+}
+
+std::string srepilot_cli::compat_prompt_usage() const
+{
+    return "usage: --print <incident>";
+}
+
+std::string srepilot_cli::compat_dry_run_message() const
+{
+    return "dry-run: no diagnosis request executed";
+}
+
+std::string srepilot_cli::compat_resume_continue_message() const
+{
+    return "--resume/--continue are accepted for compatibility; SREPilot persists incidents automatically";
 }
 
 int srepilot_cli::run_command(const std::vector<std::string> &args, bool interactive_mode)
@@ -573,6 +604,13 @@ void srepilot_cli::print_help(bool interactive_mode) const
 {
     std::cout << "rASN SREPilot commands:\n"
               << cli_help_intro(interactive_mode, "treated as diagnose input")
+              << cli_help_item(interactive_mode, "-p, --print [incident]", "run one diagnosis and print the answer")
+              << cli_help_item(interactive_mode, "--prompt <incident>", "run one diagnosis without entering the REPL")
+              << cli_help_item(interactive_mode, "-m, --model <model>", "select a provider model")
+              << cli_help_item(interactive_mode, "--provider <name>", "select an LLM provider")
+              << cli_help_item(interactive_mode, "--cwd|--workspace|--dir <path>", "run from a workspace directory")
+              << cli_help_item(interactive_mode, "--resume, --continue", "accepted compatibility aliases; incidents are persisted automatically")
+              << cli_help_item(interactive_mode, "--dry-run", "parse options without executing a diagnosis")
               << cli_help_item(interactive_mode, "diagnose <incident>", "triage an incident and persist the diagnosis")
               << cli_help_item(interactive_mode, "runbook <symptom>", "generate and persist an SRE runbook")
               << cli_help_item(interactive_mode, "status", "summarize provider, state, and observability health")
@@ -589,16 +627,13 @@ void srepilot_cli::print_help(bool interactive_mode) const
 ::dsn::error_code srepilot_app::start(int argc, char **argv)
 {
     global_rasn_services().acquire();
-    _args.clear();
-    int begin = 0;
-    if (argc > 0 && argv[0] != nullptr && std::string(argv[0]) == "rasn.srepilot")
+    std::vector<std::string> args = cli_args_from_argv(argc, argv);
+    size_t begin = 0;
+    if (!args.empty() && args[0] == "rasn.srepilot")
     {
         begin = 1;
     }
-    for (int i = begin; i < argc; ++i)
-    {
-        _args.push_back(argv[i] == nullptr ? "" : argv[i]);
-    }
+    _args.assign(args.begin() + begin, args.end());
 
     _cli_task = ::dsn::tasking::enqueue(
         LPC_RASN_SREPILOT_START, nullptr, [this] { run_cli_task(); }, 0, std::chrono::milliseconds(100));

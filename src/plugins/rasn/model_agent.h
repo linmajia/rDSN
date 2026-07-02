@@ -30,6 +30,7 @@ struct model_provider_request
 {
     uint32_t schema_version = RASN_AGENT_SCHEMA_VERSION;
     std::string provider;
+    std::string model;
 };
 
 struct model_gateway_response
@@ -76,12 +77,14 @@ inline void marshall(::dsn::binary_writer &writer, const model_provider_request 
 {
     writer.write(value.schema_version);
     writer.write(value.provider);
+    writer.write(value.model);
 }
 
 inline void unmarshall(::dsn::binary_reader &reader, model_provider_request &value, ::dsn_msg_serialize_format fmt)
 {
     reader.read(value.schema_version);
     reader.read(value.provider);
+    reader.read(value.model);
 }
 
 inline void marshall(::dsn::binary_writer &writer, const model_gateway_response &value, ::dsn_msg_serialize_format fmt)

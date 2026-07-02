@@ -29,6 +29,9 @@ set PATH=C:\Users\haoxlin\source\repos\rdsn\rb-rasn\bin\Debug;%PATH%
 ```bat
 codepilot.exe selftest
 codepilot.exe ask "Explain how to add a new rDSN plugin"
+codepilot.exe -p "Explain the current workspace"
+codepilot.exe --provider ollama --model llama3.1 --print "Summarize src/plugins/rasn"
+codepilot.exe --cwd C:\path\to\repo --prompt "Find likely build issues"
 codepilot.exe plan "Add a retry budget to an rASN workflow"
 codepilot.exe agent "Inspect the rASN state service and suggest tests"
 codepilot.exe tools
@@ -52,6 +55,13 @@ such as `.env*`, credentials, private keys, and
 `secrets.{json,yml,yaml}` / `config.{json,yml,yaml}`. If source
 enumeration fails, CodePilot still enters interactive mode with the workspace set
 and reports that source context is unavailable.
+
+CodePilot also accepts common coding-CLI aliases inspired by OpenCode, Codex CLI,
+GitHub Copilot CLI, and Claude Code CLI: `-p` / `--print`, `--prompt`, `-m` /
+`--model`, `--provider`, `--cwd` / `--workspace` / `--dir`, `--resume`,
+`--continue`, `--approval`, `--sandbox`, `--yes`, `--dry-run`, `--help`, and
+`--version`. Compatibility aliases are normalized onto rASN commands and service
+graph state rather than bypassing the rASN runtime.
 
 Inside interactive mode, prefix commands with `/`; text without `/` is sent as an
 ask prompt. For example:

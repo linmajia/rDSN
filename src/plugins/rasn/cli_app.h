@@ -32,9 +32,38 @@ struct rasn_cli_service_readiness_options
     std::string dependency_error = "rASN service dependencies are not ready";
 };
 
+struct rasn_cli_compat_options
+{
+    bool help = false;
+    bool version = false;
+    bool print = false;
+    bool prompt_set = false;
+    bool stream = false;
+    bool no_interactive = false;
+    bool yes = false;
+    bool dry_run = false;
+    bool continue_latest = false;
+    bool resume_set = false;
+    bool provider_set = false;
+    bool model_set = false;
+    bool workspace_set = false;
+    bool approval_set = false;
+    bool sandbox_set = false;
+    std::string prompt;
+    std::string resume_id;
+    std::string provider;
+    std::string model;
+    std::string workspace;
+    std::string approval;
+    std::string sandbox;
+};
+
 bool wait_for_cli_service_dependencies(const rasn_service_graph &services,
                                        const rasn_cli_service_readiness_options &options,
                                        std::string *error);
+
+std::vector<std::string> cli_args_from_argv(int argc, char **argv, int begin = 0);
+void run_dsn_with_cli_args(const std::vector<std::string> &args, bool sleep_after_init);
 
 class rasn_cli_app_base
 {
@@ -48,11 +77,21 @@ public:
 
 protected:
     virtual std::vector<std::string> commands() const = 0;
-    virtual const char *repl_title() const = 0;
-    virtual const char *repl_prompt() const = 0;
-    virtual const char *repl_plain_text_behavior() const = 0;
+    virtual std::string repl_title() const = 0;
+    virtual std::string repl_prompt() const = 0;
+    virtual std::string repl_plain_text_behavior() const = 0;
     virtual int run_command(const std::vector<std::string> &args, bool interactive_mode = false) = 0;
     virtual void handle_plain_text(const std::string &line) = 0;
+    virtual int run_compat_prompt(const std::string &prompt, bool stream) = 0;
+    virtual bool handle_compat_options(const rasn_cli_compat_options &options, int *exit_code);
+    virtual void print_compat_help() const;
+    virtual std::string version_string() const;
+    virtual std::string compat_prompt_usage() const;
+    virtual std::string compat_dry_run_message() const;
+    virtual std::string compat_resume_continue_message() const;
+    virtual bool handle_compat_resume(const rasn_cli_compat_options &options, int *exit_code);
+    virtual bool supports_compat_safety_options() const;
+    virtual void print_compat_provider(const model_gateway_response &response) const;
     virtual int handle_empty_args();
     virtual void on_startup_context(const cli_startup_context &startup);
     virtual size_t max_context_bytes() const;

@@ -879,7 +879,7 @@ model_gateway_response rasn_llm_agent_service::set_model_provider(const model_pr
         return model_error_response("model provider request missing provider");
     }
 
-    set_provider(provider);
+    _provider = create_provider(provider, trim(request.model));
     model_gateway_response response = describe_model_provider();
     dinfo("set rASN model provider=%s model=%s endpoint=%s",
           response.provider.provider.c_str(),
@@ -2616,11 +2616,12 @@ void rasn_service_graph::cancel_registry_heartbeat_timer()
     }
 }
 
-model_gateway_response rasn_service_graph::set_provider(const std::string &provider_name)
+model_gateway_response rasn_service_graph::set_provider(const std::string &provider_name, const std::string &model_name)
 {
     start();
     model_provider_request request;
     request.provider = provider_name;
+    request.model = model_name;
     if (_rpc_clients_enabled)
     {
         rasn_llm_agent_client client(_llm_agent_address);

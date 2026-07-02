@@ -444,7 +444,8 @@ std::vector<schema_type_descriptor> rasn_schema_manifest()
         "Request to switch the active model provider.",
         std::vector<schema_field_descriptor>{
             field("schema_version", "uint32", true),
-            field("provider", "string", true)}));
+            field("provider", "string", true),
+            field("model", "string", false)}));
     manifest.push_back(schema(
         "model_gateway_response",
         RASN_AGENT_SCHEMA_VERSION,

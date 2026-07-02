@@ -22,11 +22,18 @@ public:
 
 private:
     std::vector<std::string> commands() const override;
-    const char *repl_title() const override;
-    const char *repl_prompt() const override;
-    const char *repl_plain_text_behavior() const override;
+    std::string repl_title() const override;
+    std::string repl_prompt() const override;
+    std::string repl_plain_text_behavior() const override;
     int run_command(const std::vector<std::string> &args, bool interactive_mode = false) override;
     void handle_plain_text(const std::string &line) override;
+    int run_compat_prompt(const std::string &prompt, bool stream) override;
+    void print_compat_help() const override;
+    std::string version_string() const override;
+    std::string compat_dry_run_message() const override;
+    bool handle_compat_resume(const rasn_cli_compat_options &options, int *exit_code) override;
+    bool supports_compat_safety_options() const override;
+    void print_compat_provider(const model_gateway_response &response) const override;
     void on_startup_context(const cli_startup_context &startup) override;
     int ask(const std::string &prompt, bool planning_mode);
     int stream(const std::string &prompt);

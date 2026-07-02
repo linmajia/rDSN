@@ -31,6 +31,9 @@ set PATH=C:\Users\haoxlin\source\repos\rdsn\rb-rasn\bin\Debug;%PATH%
 srepilot.exe selftest
 srepilot.exe status
 srepilot.exe diagnose "checkout latency p95 doubled after the last deployment"
+srepilot.exe -p "checkout latency p95 doubled after the last deployment"
+srepilot.exe --provider ollama --model llama3.1 --prompt "api error rate elevated"
+srepilot.exe --cwd C:\path\to\service-repo --print "deployment rollback is stuck"
 srepilot.exe runbook "database connection pool exhaustion"
 srepilot.exe observe snapshot
 srepilot.exe observe events
@@ -58,6 +61,12 @@ such as `.env*`, credentials, private keys, and
 `secrets.{json,yml,yaml}` / `config.{json,yml,yaml}`. If source
 enumeration fails, SREPilot still enters interactive mode with the workspace set
 and reports that source context is unavailable.
+
+SREPilot shares the rASN common CLI aliases: `-p` / `--print`, `--prompt`, `-m` /
+`--model`, `--provider`, `--cwd` / `--workspace` / `--dir`, `--resume`,
+`--continue`, `--dry-run`, `--help`, and `--version`. The prompt aliases run a
+one-shot diagnosis, while provider/model aliases update the shared rASN model
+gateway before the command runs.
 
 Inside interactive mode, prefix commands with `/`; text without `/` is treated
 as incident input for `diagnose`. For example:

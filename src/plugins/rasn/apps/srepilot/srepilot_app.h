@@ -19,11 +19,17 @@ public:
 
 private:
     std::vector<std::string> commands() const override;
-    const char *repl_title() const override;
-    const char *repl_prompt() const override;
-    const char *repl_plain_text_behavior() const override;
+    std::string repl_title() const override;
+    std::string repl_prompt() const override;
+    std::string repl_plain_text_behavior() const override;
     int run_command(const std::vector<std::string> &args, bool interactive_mode = false) override;
     void handle_plain_text(const std::string &line) override;
+    int run_compat_prompt(const std::string &prompt, bool stream) override;
+    void print_compat_help() const override;
+    std::string version_string() const override;
+    std::string compat_prompt_usage() const override;
+    std::string compat_dry_run_message() const override;
+    std::string compat_resume_continue_message() const override;
     int handle_empty_args() override;
     void on_startup_context(const cli_startup_context &startup) override;
     int diagnose(const std::vector<std::string> &args);

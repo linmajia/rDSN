@@ -488,17 +488,17 @@ std::vector<std::string> codepilot_cli::commands() const
     return codepilot_commands();
 }
 
-const char *codepilot_cli::repl_title() const
+std::string codepilot_cli::repl_title() const
 {
     return "rASN CodePilot prototype";
 }
 
-const char *codepilot_cli::repl_prompt() const
+std::string codepilot_cli::repl_prompt() const
 {
     return "codepilot> ";
 }
 
-const char *codepilot_cli::repl_plain_text_behavior() const
+std::string codepilot_cli::repl_plain_text_behavior() const
 {
     return "sent as an ask prompt";
 }
@@ -515,6 +515,67 @@ void codepilot_cli::on_startup_context(const cli_startup_context &startup)
 void codepilot_cli::handle_plain_text(const std::string &line)
 {
     (void)ask(line, false);
+}
+
+int codepilot_cli::run_compat_prompt(const std::string &prompt, bool stream_output)
+{
+    return stream_output ? stream(prompt) : ask(prompt, false);
+}
+
+void codepilot_cli::print_compat_help() const
+{
+    print_help(false);
+}
+
+std::string codepilot_cli::version_string() const
+{
+    return "rASN CodePilot prototype";
+}
+
+std::string codepilot_cli::compat_dry_run_message() const
+{
+    return "dry-run: no model request executed";
+}
+
+bool codepilot_cli::handle_compat_resume(const rasn_cli_compat_options &options, int *exit_code)
+{
+    if (options.resume_set)
+    {
+        if (options.resume_id.empty())
+        {
+            std::cout << "--resume requires a trace file or workflow/run command in this prototype\n";
+            if (exit_code != nullptr)
+            {
+                *exit_code = 1;
+            }
+            return true;
+        }
+        const int rc = enable_replay(options.resume_id);
+        if (rc != 0)
+        {
+            if (exit_code != nullptr)
+            {
+                *exit_code = rc;
+            }
+            return true;
+        }
+    }
+    if (options.continue_latest)
+    {
+        std::cout << compat_resume_continue_message() << "\n";
+    }
+    return false;
+}
+
+bool codepilot_cli::supports_compat_safety_options() const
+{
+    return true;
+}
+
+void codepilot_cli::print_compat_provider(const model_gateway_response &response) const
+{
+    (void)response;
+    std::cout << provider_summary() << "\n";
 }
 
 int codepilot_cli::run_command(const std::vector<std::string> &args, bool interactive_mode)
@@ -2004,6 +2065,17 @@ void codepilot_cli::print_help(bool interactive_mode) const
 {
     std::cout << "rASN CodePilot commands:\n"
               << cli_help_intro(interactive_mode, "sent as an ask prompt")
+              << cli_help_item(interactive_mode, "-p, --print [prompt]", "run one prompt and print the answer")
+              << cli_help_item(interactive_mode, "--prompt <prompt>", "run one prompt without entering the REPL")
+              << cli_help_item(interactive_mode, "-m, --model <model>", "select a provider model")
+              << cli_help_item(interactive_mode, "--provider <name>", "select an LLM provider")
+              << cli_help_item(interactive_mode, "--cwd|--workspace|--dir <path>", "run from a workspace directory")
+              << cli_help_item(interactive_mode, "--resume <trace-jsonl>", "load replay choices before running")
+              << cli_help_item(interactive_mode, "--continue", "accept coding-CLI continue flag when no session store is configured")
+              << cli_help_item(interactive_mode, "--approval <policy>", "record an approval policy alias for CLI compatibility")
+              << cli_help_item(interactive_mode, "--sandbox <mode>", "record a sandbox alias for CLI compatibility")
+              << cli_help_item(interactive_mode, "--yes", "accept approval prompts for compatible commands")
+              << cli_help_item(interactive_mode, "--dry-run", "parse options without executing a model request")
               << cli_help_item(interactive_mode, "ask <prompt>", "send a coding prompt")
               << cli_help_item(interactive_mode, "stream <prompt>", "stream model-response chunks with trace events")
               << cli_help_item(interactive_mode, "agent <prompt>", "run an agent loop that can request local tools")
@@ -2049,16 +2121,13 @@ void codepilot_cli::print_help(bool interactive_mode) const
 ::dsn::error_code codepilot_app::start(int argc, char **argv)
 {
     global_rasn_services().acquire();
-    _args.clear();
-    int begin = 0;
-    if (argc > 0 && argv[0] != nullptr && std::string(argv[0]) == "rasn.codepilot")
+    std::vector<std::string> args = cli_args_from_argv(argc, argv);
+    size_t begin = 0;
+    if (!args.empty() && args[0] == "rasn.codepilot")
     {
         begin = 1;
     }
-    for (int i = begin; i < argc; ++i)
-    {
-        _args.push_back(argv[i] == nullptr ? "" : argv[i]);
-    }
+    _args.assign(args.begin() + begin, args.end());
 
     _cli_task = ::dsn::tasking::enqueue(
         LPC_RASN_CODEPILOT_START, nullptr, [this] { run_cli_task(); }, 0, std::chrono::milliseconds(100));

@@ -70,19 +70,19 @@ std::string find_config_path(const std::string &program)
     return "config.ini";
 }
 
-int maybe_run_direct_schema_command(int argc, char **argv)
+int maybe_run_direct_schema_command(const std::vector<std::string> &args)
 {
-    if (argc < 2 || argv[1] == nullptr || std::string(argv[1]) != "schema")
+    if (args.empty() || args[0] != "schema")
     {
         return -1;
     }
-    if (argc > 3)
+    if (args.size() > 2)
     {
         std::cout << "usage: schema [text|json|idl|cpp|clients-cpp|ts|clients-ts|py|clients-py]\n";
         return 1;
     }
 
-    const std::string format = argc == 3 && argv[2] != nullptr ? argv[2] : "text";
+    const std::string format = args.size() == 2 ? args[1] : "text";
     if (format == "json" || format == "--json")
     {
         std::cout << ::dsn::rasn::rasn_schema_manifest_json();
@@ -138,34 +138,27 @@ int maybe_run_direct_schema_command(int argc, char **argv)
 
 int main(int argc, char **argv)
 {
-    const int schema_result = maybe_run_direct_schema_command(argc, argv);
+    const std::vector<std::string> process_args = ::dsn::rasn::cli_args_from_argv(argc, argv);
+    const std::vector<std::string> command_args = ::dsn::rasn::cli_args_from_argv(argc, argv, 1);
+    const int schema_result = maybe_run_direct_schema_command(command_args);
     if (schema_result != -1)
     {
         return schema_result;
     }
 
     register_rasn_apps();
-    const std::string program = (argc > 0 && argv[0] != nullptr) ? argv[0] : "";
-    const bool dsn_mode = argc > 1 && argv[1] != nullptr && std::string(argv[1]) == "--dsn";
-    const std::string explicit_dsn_config = (dsn_mode && argc > 2 && argv[2] != nullptr) ? argv[2] : "";
+    const std::string program = process_args.empty() ? "" : process_args[0];
+    const bool dsn_mode = !command_args.empty() && command_args[0] == "--dsn";
+    const std::string explicit_dsn_config = (dsn_mode && command_args.size() > 1) ? command_args[1] : "";
 
     if (!dsn_mode)
     {
         const std::string config_path = find_config_path(program);
         const std::string empty_app_list = "__rasn_direct_cli__";
-        std::vector<char *> dsn_args;
-        dsn_args.push_back(argv[0]);
-        dsn_args.push_back(const_cast<char *>(config_path.c_str()));
-        dsn_args.push_back(const_cast<char *>("-app_list"));
-        dsn_args.push_back(const_cast<char *>(empty_app_list.c_str()));
-        ::dsn_run(static_cast<int>(dsn_args.size()), dsn_args.data(), false);
+        ::dsn::rasn::run_dsn_with_cli_args(
+            std::vector<std::string>{program, config_path, "-app_list", empty_app_list}, false);
 
         ::dsn::rasn::codepilot_cli cli;
-        std::vector<std::string> command_args;
-        for (int i = 1; i < argc; ++i)
-        {
-            command_args.push_back(argv[i] == nullptr ? "" : argv[i]);
-        }
         return cli.run(command_args);
     }
 
@@ -173,11 +166,7 @@ int main(int argc, char **argv)
     const std::string codepilot_app_list =
         "rasn.registry;rasn.llm.agent;rasn.tool.agent;rasn.state;rasn.coordinator;rasn.workflow;"
         "rasn.observability;rasn.codepilot";
-    std::vector<char *> dsn_args;
-    dsn_args.push_back(argv[0]);
-    dsn_args.push_back(const_cast<char *>(config_path.c_str()));
-    dsn_args.push_back(const_cast<char *>("-app_list"));
-    dsn_args.push_back(const_cast<char *>(codepilot_app_list.c_str()));
-    ::dsn_run(static_cast<int>(dsn_args.size()), dsn_args.data(), true);
+    ::dsn::rasn::run_dsn_with_cli_args(
+        std::vector<std::string>{program, config_path, "-app_list", codepilot_app_list}, true);
     return 0;
 }

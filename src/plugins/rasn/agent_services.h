@@ -333,7 +333,7 @@ public:
     nucleus_runtime &runtime() { return _runtime; }
     const nucleus_runtime &runtime() const { return _runtime; }
 
-    model_gateway_response set_provider(const std::string &provider_name);
+    model_gateway_response set_provider(const std::string &provider_name, const std::string &model_name = "");
     model_gateway_response model_provider() const;
     model_gateway_response model_health() const;
     std::string provider_summary() const;

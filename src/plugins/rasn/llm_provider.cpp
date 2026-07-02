@@ -804,7 +804,7 @@ std::string extract_json_string(const std::string &json, const std::string &fiel
 class simulator_provider : public llm_provider
 {
 public:
-    simulator_provider() : _model("rasn-random-simulator") {}
+    explicit simulator_provider(const std::string &model = "") : _model(model.empty() ? "rasn-random-simulator" : model) {}
 
     std::string name() const override { return "simulator"; }
     std::string model() const override { return _model; }
@@ -1153,11 +1153,17 @@ std::unique_ptr<llm_provider> create_provider_from_environment()
 
 std::unique_ptr<llm_provider> create_provider(const std::string &provider_name)
 {
+    return create_provider(provider_name, "");
+}
+
+std::unique_ptr<llm_provider> create_provider(const std::string &provider_name, const std::string &model_name)
+{
     const std::string provider = trim(provider_name.empty() ? "simulator" : provider_name);
+    const std::string model_override = trim(model_name);
 
     if (provider == "simulator" || provider == "mock" || provider == "random")
     {
-        return std::unique_ptr<llm_provider>(new simulator_provider());
+        return std::unique_ptr<llm_provider>(new simulator_provider(model_override));
     }
 
     if (provider == "ollama")
@@ -1166,6 +1172,10 @@ std::unique_ptr<llm_provider> create_provider(const std::string &provider_name)
         profile.name = "ollama";
         profile.endpoint = provider_config("ollama", "endpoint", "http://localhost:11434/api/chat", "Ollama endpoint");
         profile.model = provider_config("ollama", "model", "llama3.1", "Ollama model name");
+        if (!model_override.empty())
+        {
+            profile.model = model_override;
+        }
         profile.payload_format = provider_config("ollama", "payload", "ollama.chat", "Ollama payload format");
         profile.local = true;
         return make_profile_provider(profile);
@@ -1177,6 +1187,10 @@ std::unique_ptr<llm_provider> create_provider(const std::string &provider_name)
         profile.name = "llama.cpp";
         profile.endpoint = provider_config("llama_cpp", "endpoint", "http://localhost:8080/v1/chat/completions", "llama.cpp endpoint");
         profile.model = provider_config("llama_cpp", "model", "local-model", "llama.cpp model name");
+        if (!model_override.empty())
+        {
+            profile.model = model_override;
+        }
         profile.payload_format = "openai.chat";
         profile.local = true;
         return make_profile_provider(profile);
@@ -1188,6 +1202,10 @@ std::unique_ptr<llm_provider> create_provider(const std::string &provider_name)
         profile.name = "lmstudio";
         profile.endpoint = provider_config("lmstudio", "endpoint", "http://localhost:1234/v1/chat/completions", "LM Studio endpoint");
         profile.model = provider_config("lmstudio", "model", "local-model", "LM Studio model name");
+        if (!model_override.empty())
+        {
+            profile.model = model_override;
+        }
         profile.payload_format = "openai.chat";
         profile.local = true;
         return make_profile_provider(profile);
@@ -1199,6 +1217,10 @@ std::unique_ptr<llm_provider> create_provider(const std::string &provider_name)
         profile.name = "copilot";
         profile.endpoint = provider_config("copilot", "endpoint", "https://api.githubcopilot.com/chat/completions", "GitHub Copilot-compatible endpoint");
         profile.model = provider_config("copilot", "model", "gpt-4o-copilot", "GitHub Copilot-compatible model name");
+        if (!model_override.empty())
+        {
+            profile.model = model_override;
+        }
         profile.credential_ref = provider_config(
             "copilot", "token_ref", "", "Copilot credential reference such as env:RASN_COPILOT_TOKEN or file:path");
         profile.token_env = provider_config(
@@ -1215,6 +1237,10 @@ std::unique_ptr<llm_provider> create_provider(const std::string &provider_name)
     profile.name = provider;
     profile.endpoint = provider_config(provider, "endpoint", "http://localhost:8000/v1/chat/completions", "OpenAI-compatible endpoint");
     profile.model = provider_config(provider, "model", "local-model", "OpenAI-compatible model name");
+    if (!model_override.empty())
+    {
+        profile.model = model_override;
+    }
     profile.credential_ref = provider_config(provider, "token_ref", "", "credential reference such as env:RASN_API_KEY or file:path");
     profile.token_env = provider_config(provider, "token_env", "RASN_API_KEY", "environment variable containing the provider token");
     profile.payload_format = "openai.chat";

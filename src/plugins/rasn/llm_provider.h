@@ -63,6 +63,7 @@ void emit_llm_stream_chunks(const agent_task &task,
 
 std::unique_ptr<llm_provider> create_provider_from_environment();
 std::unique_ptr<llm_provider> create_provider(const std::string &provider_name);
+std::unique_ptr<llm_provider> create_provider(const std::string &provider_name, const std::string &model_name);
 std::string describe_provider_environment();
 
 } // namespace rasn
