@@ -22,6 +22,8 @@
 #if defined(_WIN32)
 #include <direct.h>
 #else
+#include <dirent.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -150,6 +152,30 @@ inline size_t capped_count(uint64_t configured_limit, size_t available)
     return clamp_to_size_t((std::min)(configured_limit, static_cast<uint64_t>(available)));
 }
 
+inline uint64_t saturating_multiply(uint64_t value, uint64_t multiplier)
+{
+    if (multiplier != 0 && value > (std::numeric_limits<uint64_t>::max)() / multiplier)
+    {
+        return (std::numeric_limits<uint64_t>::max)();
+    }
+    return value * multiplier;
+}
+
+inline uint64_t workspace_candidate_scan_limit(const cli_workspace_context_options &options)
+{
+    const uint64_t requested = (std::max)(options.max_files, options.max_sampled_files);
+    if (requested == 0)
+    {
+        return 0;
+    }
+    return (std::max)(saturating_multiply(requested, 16), static_cast<uint64_t>(256));
+}
+
+inline uint64_t workspace_entry_scan_limit(const cli_workspace_context_options &options)
+{
+    return (std::max)(saturating_multiply(workspace_candidate_scan_limit(options), 16), static_cast<uint64_t>(4096));
+}
+
 inline const std::unordered_set<std::string> &workspace_ignored_components()
 {
     static const std::unordered_set<std::string> components = {
@@ -216,6 +242,20 @@ inline bool is_sensitive_workspace_file(const std::string &path)
            file_name.find("api_key") != std::string::npos;
 }
 
+inline bool path_component_is_ignored(const std::string &previous_component, const std::string &component)
+{
+    if (component.empty())
+    {
+        return false;
+    }
+    const std::string lower = lower_ascii(component);
+    if (previous_component == "rasn" && (lower == "state" || lower == "artifacts" || lower == "traces"))
+    {
+        return true;
+    }
+    return workspace_ignored_components().find(lower) != workspace_ignored_components().end();
+}
+
 inline bool path_has_ignored_component(const std::string &path)
 {
     std::string component;
@@ -225,11 +265,7 @@ inline bool path_has_ignored_component(const std::string &path)
         if (ch == '\\' || ch == '/')
         {
             const std::string lower = lower_ascii(component);
-            if (previous_component == "rasn" && (lower == "state" || lower == "artifacts" || lower == "traces"))
-            {
-                return true;
-            }
-            if (workspace_ignored_components().find(lower) != workspace_ignored_components().end())
+            if (path_component_is_ignored(previous_component, lower))
             {
                 return true;
             }
@@ -239,7 +275,7 @@ inline bool path_has_ignored_component(const std::string &path)
         }
         component.push_back(ch);
     }
-    return false;
+    return path_component_is_ignored(previous_component, component);
 }
 
 inline std::string file_extension_lower(const std::string &path)
@@ -308,6 +344,190 @@ inline bool content_looks_binary(const std::string &content)
     return content.find('\0') != std::string::npos;
 }
 
+inline bool path_is_symlink(const std::string &path)
+{
+#if defined(_WIN32)
+    (void)path;
+    return false;
+#else
+    struct stat st;
+    return ::lstat(path.c_str(), &st) == 0 && S_ISLNK(st.st_mode);
+#endif
+}
+
+inline std::string scan_child_path(const std::string &directory, const char *name)
+{
+    if (directory.empty())
+    {
+        return name == nullptr ? "" : std::string(name);
+    }
+    const char last = directory[directory.size() - 1];
+    if (last == '/' || last == '\\')
+    {
+        return directory + (name == nullptr ? "" : std::string(name));
+    }
+#if defined(_WIN32)
+    return directory + "\\" + (name == nullptr ? "" : std::string(name));
+#else
+    return directory + "/" + (name == nullptr ? "" : std::string(name));
+#endif
+}
+
+inline bool list_workspace_directory_once(const std::string &directory,
+                                          std::vector<std::string> *files,
+                                          std::vector<std::string> *directories)
+{
+    files->clear();
+    directories->clear();
+#if defined(_WIN32)
+    return ::dsn::utils::filesystem::get_subfiles(directory, *files, false) &&
+           ::dsn::utils::filesystem::get_subdirectories(directory, *directories, false);
+#else
+    DIR *dir = ::opendir(directory.c_str());
+    if (dir == nullptr)
+    {
+        return false;
+    }
+    while (dirent *entry = ::readdir(dir))
+    {
+        if (entry->d_name == nullptr ||
+            std::strcmp(entry->d_name, ".") == 0 ||
+            std::strcmp(entry->d_name, "..") == 0)
+        {
+            continue;
+        }
+        const std::string path = scan_child_path(directory, entry->d_name);
+        struct stat st;
+        if (::lstat(path.c_str(), &st) != 0 || S_ISLNK(st.st_mode))
+        {
+            continue;
+        }
+        if (S_ISDIR(st.st_mode))
+        {
+            directories->push_back(path);
+        }
+        else if (S_ISREG(st.st_mode))
+        {
+            files->push_back(path);
+        }
+    }
+    ::closedir(dir);
+    return true;
+#endif
+}
+
+inline void set_truncated(bool *truncated)
+{
+    if (truncated != nullptr)
+    {
+        *truncated = true;
+    }
+}
+
+inline bool collect_workspace_source_candidates(const std::string &absolute,
+                                                const cli_workspace_context_options &options,
+                                                std::vector<std::string> *candidates,
+                                                bool *truncated,
+                                                std::string *error)
+{
+    candidates->clear();
+    const uint64_t candidate_limit = workspace_candidate_scan_limit(options);
+    const uint64_t entry_limit = workspace_entry_scan_limit(options);
+    if (candidate_limit == 0)
+    {
+        return true;
+    }
+
+    std::vector<std::string> pending_dirs;
+    pending_dirs.push_back(absolute);
+    std::unordered_set<std::string> visited_dirs;
+    uint64_t entries_seen = 0;
+    bool root_enumerated = false;
+    bool skipped_unreadable = false;
+
+    while (!pending_dirs.empty())
+    {
+        const std::string dir = pending_dirs.back();
+        pending_dirs.pop_back();
+        const std::string normalized_dir = normalize_platform_path(dir);
+        const std::string relative_dir = relative_workspace_path(absolute, normalized_dir);
+        const bool is_root = normalized_dir == absolute;
+        if (path_has_ignored_component(relative_dir) || (!is_root && path_is_symlink(normalized_dir)))
+        {
+            continue;
+        }
+        if (!visited_dirs.insert(normalized_dir).second)
+        {
+            continue;
+        }
+
+        std::vector<std::string> files;
+        std::vector<std::string> directories;
+        if (!list_workspace_directory_once(normalized_dir, &files, &directories))
+        {
+            skipped_unreadable = true;
+            continue;
+        }
+        root_enumerated = root_enumerated || is_root;
+        std::sort(files.begin(), files.end());
+        for (const std::string &file : files)
+        {
+            if (entries_seen >= entry_limit)
+            {
+                set_truncated(truncated);
+                return true;
+            }
+            ++entries_seen;
+
+            const std::string normalized = normalize_platform_path(file);
+            const std::string relative = relative_workspace_path(absolute, normalized);
+            if (!path_has_ignored_component(relative) &&
+                !is_sensitive_workspace_file(relative) &&
+                is_workspace_source_candidate(relative))
+            {
+                candidates->push_back(normalized);
+                if (static_cast<uint64_t>(candidates->size()) >= candidate_limit)
+                {
+                    set_truncated(truncated);
+                    return true;
+                }
+            }
+        }
+
+        std::sort(directories.begin(), directories.end(), std::greater<std::string>());
+        for (const std::string &directory : directories)
+        {
+            if (entries_seen >= entry_limit)
+            {
+                set_truncated(truncated);
+                return true;
+            }
+            ++entries_seen;
+
+            const std::string normalized = normalize_platform_path(directory);
+            const std::string relative = relative_workspace_path(absolute, normalized);
+            if (!path_has_ignored_component(relative) && !path_is_symlink(normalized))
+            {
+                pending_dirs.push_back(normalized);
+            }
+        }
+    }
+
+    if (!root_enumerated)
+    {
+        if (error != nullptr)
+        {
+            *error = "cannot enumerate workspace files: " + absolute;
+        }
+        return false;
+    }
+    if (skipped_unreadable)
+    {
+        set_truncated(truncated);
+    }
+    return true;
+}
+
 } // namespace cli_support_detail
 
 inline bool build_workspace_source_context(const std::string &workspace_root,
@@ -326,27 +546,16 @@ inline bool build_workspace_source_context(const std::string &workspace_root,
     }
 
     const std::string absolute = cli_support_detail::absolute_or_original(workspace_root);
-    std::vector<std::string> files;
-    if (!::dsn::utils::filesystem::get_subfiles(absolute, files, true))
+    std::vector<std::string> candidates;
+    bool scan_truncated = false;
+    if (!cli_support_detail::collect_workspace_source_candidates(
+            absolute, options, &candidates, &scan_truncated, error))
     {
-        if (error != nullptr)
-        {
-            *error = "cannot enumerate workspace files: " + absolute;
-        }
         return false;
     }
-
-    std::vector<std::string> candidates;
-    for (const std::string &file : files)
+    if (scan_truncated)
     {
-        const std::string normalized = normalize_platform_path(file);
-        const std::string relative = cli_support_detail::relative_workspace_path(absolute, normalized);
-        if (!cli_support_detail::path_has_ignored_component(relative) &&
-            !cli_support_detail::is_sensitive_workspace_file(relative) &&
-            cli_support_detail::is_workspace_source_candidate(relative))
-        {
-            candidates.push_back(normalized);
-        }
+        cli_support_detail::set_truncated(truncated);
     }
 
     std::sort(candidates.begin(), candidates.end(), [&absolute](const std::string &left, const std::string &right) {
@@ -370,7 +579,7 @@ inline bool build_workspace_source_context(const std::string &workspace_root,
     std::ostringstream output;
     output << "workspace source snapshot: " << absolute
            << "\nThis is a bounded automatic snapshot for repository questions; it may be partial.\n"
-           << "source files matched: " << candidates.size() << "\n";
+           << "source files matched: " << (scan_truncated ? "at least " : "") << candidates.size() << "\n";
 
     const size_t files_to_list = cli_support_detail::capped_count(options.max_files, candidates.size());
     output << "source file index";
