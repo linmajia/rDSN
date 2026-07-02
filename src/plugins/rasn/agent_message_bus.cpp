@@ -105,6 +105,14 @@ bool agent_message_bus::ack(const std::string &message_id, std::string *error)
         }
         return false;
     }
+    if (terminal(it->second))
+    {
+        if (error != nullptr)
+        {
+            *error = "cannot ack terminal message: " + message_id;
+        }
+        return false;
+    }
     it->second.state = "acked";
     it->second.updated_at_ms = ::dsn_now_ms();
     return true;
@@ -146,6 +154,14 @@ bool agent_message_bus::dead_letter(const std::string &message_id, const std::st
         if (error != nullptr)
         {
             *error = "unknown message: " + message_id;
+        }
+        return false;
+    }
+    if (terminal(it->second))
+    {
+        if (error != nullptr)
+        {
+            *error = "cannot dead-letter terminal message: " + message_id;
         }
         return false;
     }

@@ -81,6 +81,14 @@ bool task_orchestration_kernel::start(const std::string &task_id, const std::str
         }
         return false;
     }
+    if (terminal_state(it->second.state))
+    {
+        if (error != nullptr)
+        {
+            *error = "cannot start terminal task: " + task_id;
+        }
+        return false;
+    }
     if (!dependencies_complete(it->second))
     {
         if (error != nullptr)

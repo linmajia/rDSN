@@ -189,4 +189,3 @@ bool human_interaction_queue::choice_allowed(const human_interaction_request &re
 
 } // namespace rasn
 } // namespace dsn
-

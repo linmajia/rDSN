@@ -223,4 +223,3 @@ int64_t capability_directory::score_match(const capability_provider &provider, c
 
 } // namespace rasn
 } // namespace dsn
-

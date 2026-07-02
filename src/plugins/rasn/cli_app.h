@@ -153,6 +153,7 @@ private:
     struct runtime_execution
     {
         bool active = false;
+        bool budget_reserved = false;
         std::string task_id;
         std::string message_id;
         resource_request budget;

@@ -206,4 +206,3 @@ bool contract_verifier::contains_all(const std::string &text,
 
 } // namespace rasn
 } // namespace dsn
-

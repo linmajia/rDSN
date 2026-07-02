@@ -112,7 +112,8 @@ agent_control_lease agent_control_plane::acquire_lease(const std::string &agent_
         return lease;
     }
     agent_control_record &record = it->second;
-    if (!record.owner.empty() && record.owner != owner && record.lease_expires_ms > now_ms)
+    if (!record.owner.empty() && record.owner != owner &&
+        (record.lease_expires_ms == 0 || record.lease_expires_ms > now_ms))
     {
         lease.error = "agent lease is held by " + record.owner;
         return lease;

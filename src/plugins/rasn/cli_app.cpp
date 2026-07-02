@@ -1098,6 +1098,10 @@ rasn_cli_app_base::runtime_execution rasn_cli_app_base::begin_runtime_execution(
     {
         warn_runtime_module_failure("resource_budget", budget.reason);
     }
+    else
+    {
+        execution.budget_reserved = true;
+    }
 
     orchestration_task task;
     task.task_id = execution.task_id;
@@ -1220,6 +1224,10 @@ void rasn_cli_app_base::finish_runtime_execution(const runtime_execution &execut
     if (!output_contract.ok)
     {
         warn_runtime_module_failure("contract_verifier", "output contract violation for " + execution.task_id);
+    }
+    if (execution.budget_reserved && !_budget_manager.release(execution.budget, &error))
+    {
+        warn_runtime_module_failure("resource_budget", error);
     }
     heartbeat_runtime_modules();
 }

@@ -145,4 +145,3 @@ recovery_policy recovery_supervisor::policy_for(const std::string &failure_class
 
 } // namespace rasn
 } // namespace dsn
-

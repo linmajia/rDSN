@@ -170,4 +170,3 @@ void resource_budget_manager::subtract(uint64_t amount, uint64_t *value) const
 
 } // namespace rasn
 } // namespace dsn
-

@@ -1268,7 +1268,14 @@ TEST(rasn_agent_control_plane, manages_lifecycle_capabilities_and_leases)
     std::string error;
     ASSERT_TRUE(plane.upsert_agent(record, &error)) << error;
 
-    agent_control_lease lease = plane.acquire_lease("agent-a", "owner-a", 1000, 100);
+    agent_control_lease lease;
+    lease = plane.acquire_lease("agent-a", "owner-a", 900, 0);
+    ASSERT_TRUE(lease.ok) << lease.error;
+    EXPECT_FALSE(plane.acquire_lease("agent-a", "owner-b", 950, 100).ok);
+    EXPECT_EQ(0u, plane.expire_leases(1000));
+    EXPECT_TRUE(plane.release_lease("agent-a", "owner-a", &error)) << error;
+
+    lease = plane.acquire_lease("agent-a", "owner-a", 1000, 100);
     ASSERT_TRUE(lease.ok) << lease.error;
     EXPECT_EQ("owner-a", lease.owner);
     EXPECT_FALSE(plane.acquire_lease("agent-a", "owner-b", 1050, 100).ok);
@@ -1312,6 +1319,10 @@ TEST(rasn_agent_message_bus, delivers_defers_acks_and_deadletters_messages)
     ASSERT_EQ(1u, pulled.size());
     EXPECT_EQ(2u, pulled[0].attempt);
     EXPECT_TRUE(bus.ack("msg-1", &error)) << error;
+    EXPECT_FALSE(bus.dead_letter("msg-1", "after ack", &error));
+    agent_message terminal;
+    ASSERT_TRUE(bus.find("msg-1", &terminal));
+    EXPECT_EQ("acked", terminal.state);
 
     message.message_id = "msg-2";
     message.deadline_ms = 1600;
@@ -1320,11 +1331,15 @@ TEST(rasn_agent_message_bus, delivers_defers_acks_and_deadletters_messages)
     agent_message expired;
     ASSERT_TRUE(bus.find("msg-2", &expired));
     EXPECT_EQ("deadline_expired", expired.state);
+    EXPECT_FALSE(bus.ack("msg-2", &error));
 
     message.message_id = "msg-3";
     message.deadline_ms = 0;
     ASSERT_TRUE(bus.publish(message, nullptr, &error)) << error;
     EXPECT_TRUE(bus.dead_letter("msg-3", "failed", &error)) << error;
+    ASSERT_TRUE(bus.find("msg-3", &expired));
+    EXPECT_EQ("dead_letter", expired.state);
+    EXPECT_FALSE(bus.ack("msg-3", &error));
     ASSERT_TRUE(bus.find("msg-3", &expired));
     EXPECT_EQ("dead_letter", expired.state);
 }
@@ -1350,6 +1365,10 @@ TEST(rasn_task_orchestration, schedules_dependencies_and_terminal_transitions)
 
     EXPECT_TRUE(kernel.start("inspect", "agent-a", &error)) << error;
     EXPECT_TRUE(kernel.complete("inspect", "files", &error)) << error;
+    EXPECT_FALSE(kernel.start("inspect", "agent-a", &error));
+    orchestration_task loaded;
+    ASSERT_TRUE(kernel.find("inspect", &loaded));
+    EXPECT_EQ("completed", loaded.state);
     ready = kernel.ready_tasks();
     ASSERT_EQ(1u, ready.size());
     EXPECT_EQ("summarize", ready[0].task_id);
@@ -1357,7 +1376,6 @@ TEST(rasn_task_orchestration, schedules_dependencies_and_terminal_transitions)
     EXPECT_TRUE(kernel.assign("summarize", "agent-b", &error)) << error;
     EXPECT_TRUE(kernel.start("summarize", "agent-b", &error)) << error;
     EXPECT_TRUE(kernel.fail("summarize", "retry", true, &error)) << error;
-    orchestration_task loaded;
     ASSERT_TRUE(kernel.find("summarize", &loaded));
     EXPECT_EQ("pending", loaded.state);
 }
