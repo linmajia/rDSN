@@ -1,4 +1,5 @@
 #include "../agent_types.h"
+#include "../agent_executor.h"
 #include "../agent_messages.h"
 #include "../agent_registry.h"
 #include "../agent_runtime.h"
@@ -833,6 +834,134 @@ TEST(rasn_coordinator, retries_retryable_model_invocations_with_trace)
     }
     EXPECT_EQ(1u, retry_events);
     EXPECT_EQ(1u, retryable_failures);
+}
+
+TEST(rasn_agent_executor, parses_tool_directive)
+{
+    agent_executor_tool_call tool;
+    ASSERT_TRUE(parse_agent_tool_directive("thinking\nRASN_TOOL read_file src/main.cpp\n", "RASN_TOOL ", &tool));
+    EXPECT_EQ("read_file", tool.name);
+    ASSERT_EQ(1u, tool.args.size());
+    EXPECT_EQ("src/main.cpp", tool.args[0]);
+
+    EXPECT_FALSE(parse_agent_tool_directive("no tool needed", "RASN_TOOL ", &tool));
+    EXPECT_FALSE(parse_agent_tool_directive("RASN_TOOL   \n", "RASN_TOOL ", &tool));
+}
+
+TEST(rasn_agent_executor, executes_tool_then_final_answer)
+{
+    agent_executor_request request;
+    request.task.id = "executor-task";
+    request.task.name = "unit.executor";
+    request.trace_id = "trace-executor";
+    request.prompt = "inspect the repo";
+    request.system_prompt = "system";
+    request.context.push_back("initial context");
+
+    agent_executor_options options;
+    options.max_tool_calls = 3;
+    options.tool_instruction = "tool instructions";
+
+    int model_calls = 0;
+    std::string second_model_context;
+    agent_plan_executor executor;
+    const agent_executor_result result = executor.execute(
+        request,
+        options,
+        [&model_calls, &second_model_context](const agent_executor_model_request &model_request) {
+            ++model_calls;
+            agent_response response;
+            response.request_id = model_request.request_id;
+            response.trace_id = "trace-executor";
+            response.ok = true;
+            if (model_calls == 1)
+            {
+                EXPECT_EQ("executor-task/model/0", model_request.request_id);
+                EXPECT_NE(std::string::npos, model_request.system_prompt.find("system tool instructions"));
+                response.output = "RASN_TOOL read_file src/main.cpp";
+            }
+            else
+            {
+                EXPECT_EQ("executor-task/model/1", model_request.request_id);
+                EXPECT_FALSE(model_request.context.empty());
+                if (!model_request.context.empty())
+                {
+                    second_model_context = model_request.context.back();
+                }
+                response.output = "final answer";
+            }
+            return response;
+        },
+        [](const agent_executor_tool_call &tool, std::vector<std::string> *policy_labels) {
+            EXPECT_EQ("read_file", tool.name);
+            if (policy_labels != nullptr)
+            {
+                policy_labels->push_back("approved");
+            }
+            return true;
+        },
+        [](const agent_executor_tool_request &tool_request) {
+            EXPECT_EQ("executor-task/tool/0", tool_request.request_id);
+            EXPECT_EQ("read_file", tool_request.tool.name);
+            EXPECT_EQ(1u, tool_request.policy_labels.size());
+            if (!tool_request.policy_labels.empty())
+            {
+                EXPECT_EQ("approved", tool_request.policy_labels[0]);
+            }
+            tool_result result;
+            result.ok = true;
+            result.output = "file contents";
+            return result;
+        });
+
+    EXPECT_TRUE(result.ok) << result.error;
+    EXPECT_EQ("ok", result.status);
+    EXPECT_EQ("final answer", result.output);
+    EXPECT_EQ(2, model_calls);
+    ASSERT_EQ(2u, result.steps.size());
+    EXPECT_TRUE(result.steps[0].requested_tool);
+    EXPECT_EQ("read_file", result.steps[0].tool.name);
+    EXPECT_FALSE(result.steps[1].requested_tool);
+    EXPECT_NE(std::string::npos, second_model_context.find("Tool read_file succeeded"));
+    EXPECT_NE(std::string::npos, second_model_context.find("file contents"));
+}
+
+TEST(rasn_agent_executor, stops_at_tool_limit)
+{
+    agent_executor_request request;
+    request.task.id = "executor-limit";
+    request.trace_id = "trace-limit";
+    request.prompt = "loop";
+
+    agent_executor_options options;
+    options.max_tool_calls = 2;
+
+    agent_plan_executor executor;
+    const agent_executor_result result = executor.execute(
+        request,
+        options,
+        [](const agent_executor_model_request &model_request) {
+            agent_response response;
+            response.request_id = model_request.request_id;
+            response.trace_id = "trace-limit";
+            response.ok = true;
+            response.output = "RASN_TOOL echo hi";
+            return response;
+        },
+        agent_plan_executor::approval_callback(),
+        [](const agent_executor_tool_request &) {
+            tool_result result;
+            result.ok = true;
+            result.output = "hi";
+            return result;
+        });
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_EQ("tool-limit", result.status);
+    EXPECT_EQ("agent stopped after reaching the tool-call limit", result.error);
+    ASSERT_EQ(2u, result.steps.size());
+    EXPECT_TRUE(result.steps[0].requested_tool);
+    EXPECT_TRUE(result.steps[1].requested_tool);
 }
 
 TEST(rasn_coordinator, does_not_retry_tool_invocations)

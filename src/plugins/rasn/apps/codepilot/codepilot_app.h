@@ -1,8 +1,8 @@
 #pragma once
 
-#include "../../cli_app.h"
-#include "../../rasn.code.definition.h"
-#include "../../workflow.h"
+#include <rasn/cli_app.h>
+#include <rasn/rasn.code.definition.h>
+#include <rasn/workflow.h>
 #include "skills.h"
 
 #include <dsn/service_api_cpp.h>

@@ -870,5 +870,40 @@ std::string rasn_cli_app_base::provider_summary() const
     return _services.provider_summary();
 }
 
+int rasn_cli_app_base::run_agent_plan(const rasn_cli_agent_plan &plan,
+                                      const agent_plan_executor::model_callback &model,
+                                      const agent_plan_executor::approval_callback &approve,
+                                      const agent_plan_executor::tool_callback &tool)
+{
+    _services.runtime().begin_task(plan.task);
+
+    agent_executor_request request;
+    request.task = plan.task;
+    request.trace_id = _services.runtime().trace_id();
+    request.prompt = plan.prompt;
+    request.system_prompt = plan.system_prompt;
+    request.context = plan.context;
+
+    agent_plan_executor executor;
+    const agent_executor_result result = executor.execute(request, plan.executor_options, model, approve, tool);
+    const std::string status = result.status.empty() ? (result.ok ? "ok" : "failed") : result.status;
+    _services.runtime().finish_task(plan.task, status);
+
+    if (result.ok)
+    {
+        std::cout << result.output << "\n";
+        return 0;
+    }
+
+    const std::string error = result.error.empty() ? "agent plan execution failed" : result.error;
+    if (status == "approval-denied" && !plan.approval_failure_source.empty())
+    {
+        _services.runtime().record_failure(
+            plan.task, plan.approval_failure_category, plan.approval_failure_code, error, false, plan.approval_failure_source);
+    }
+    std::cout << error << "\n";
+    return 1;
+}
+
 } // namespace rasn
 } // namespace dsn

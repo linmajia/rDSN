@@ -1,12 +1,13 @@
 #include "codepilot_app.h"
 
-#include "../../agent_clients.h"
-#include "../../agent_registry.h"
-#include "../../cli_support.h"
-#include "../../metrics.h"
-#include "../../observability.h"
-#include "../../policy_manager.h"
-#include "../../schema_manifest.h"
+#include <rasn/agent_clients.h>
+#include <rasn/agent_executor.h>
+#include <rasn/agent_registry.h>
+#include <rasn/cli_support.h>
+#include <rasn/metrics.h>
+#include <rasn/observability.h>
+#include <rasn/policy_manager.h>
+#include <rasn/schema_manifest.h>
 #include "local_tools.h"
 
 #include <dsn/c/app_model.h>
@@ -254,31 +255,6 @@ std::string side_effect_approval_config_key(tool_side_effect side_effect)
         return "require_shell_approval";
     }
     return "";
-}
-
-bool parse_tool_request(const std::string &text, std::string *tool_name, std::vector<std::string> *tool_args)
-{
-    std::istringstream input(text);
-    std::string line;
-    while (std::getline(input, line))
-    {
-        line = trim(line);
-        if (line.find("RASN_TOOL ") != 0)
-        {
-            continue;
-        }
-
-        std::vector<std::string> words = split_words(line.substr(10));
-        if (words.empty())
-        {
-            return false;
-        }
-
-        *tool_name = words[0];
-        tool_args->assign(words.begin() + 1, words.end());
-        return true;
-    }
-    return false;
 }
 
 bool codepilot_approval_answer_is_yes(const std::string &answer)
@@ -1025,72 +1001,41 @@ int codepilot_cli::agent(const std::string &prompt)
     task.id = make_trace_id();
     task.name = "codepilot.agent";
     task.input = prompt;
-    _services.runtime().begin_task(task);
 
-    std::vector<std::string> context = _context;
-    std::string conversation = prompt;
+    rasn_cli_agent_plan plan;
+    plan.task = task;
+    plan.prompt = prompt;
+    plan.system_prompt = codepilot_system_prompt();
+    plan.context = _context;
+    plan.approval_failure_source = "codepilot.cli";
+    plan.executor_options.max_tool_calls = 4;
+    plan.executor_options.tool_instruction =
+        "You may request exactly one tool call by writing a line: RASN_TOOL <tool> <args>. "
+        "Use tools only when needed, then produce the final answer without RASN_TOOL. " +
+        _services.tools_summary();
 
-    for (int step = 0; step < 4; ++step)
-    {
-        const std::string system_prompt =
-            codepilot_system_prompt() +
-            " You may request exactly one tool call by writing a line: RASN_TOOL <tool> <args>. "
-            "Use tools only when needed, then produce the final answer without RASN_TOOL. " +
-            _services.tools_summary();
-        const agent_request request = make_codepilot_model_request(task,
-                                                                   task.id + "/model/" + std::to_string(step),
-                                                                   conversation,
-                                                                   system_prompt,
-                                                                   context,
-                                                                   _services.runtime().trace_id());
-        const agent_response response = _services.invoke(request);
-        if (!response.ok)
-        {
-            _services.runtime().finish_task(task, "failed");
-            std::cout << agent_error_message(response) << "\n";
-            return 1;
-        }
-
-        std::string tool_name;
-        std::vector<std::string> tool_args;
-        if (!parse_tool_request(response.output, &tool_name, &tool_args))
-        {
-            _services.runtime().finish_task(task, "ok");
-            std::cout << response.output << "\n";
-            return 0;
-        }
-
-        std::vector<std::string> policy_labels;
-        if (!approve_tool_invocation(tool_name, tool_args, false, &policy_labels))
-        {
-            _services.runtime().record_failure(
-                task, "policy", "tool_approval_denied", "tool denied by user approval", false, "codepilot.cli");
-            _services.runtime().finish_task(task, "approval-denied");
-            std::cout << "tool denied by user approval\n";
-            return 1;
-        }
-
-        const agent_request tool_request = make_codepilot_tool_request(task,
-                                                                       task.id + "/tool/" + std::to_string(step),
-                                                                       tool_name,
-                                                                       tool_args,
-                                                                       _services.runtime().trace_id(),
-                                                                       policy_labels);
-        const tool_result tool = make_tool_result_from_agent(_services.invoke(tool_request));
-        std::ostringstream tool_context;
-        tool_context << "Tool " << tool_name << (tool.ok ? " succeeded" : " failed") << ":\n"
-                     << (tool.ok ? tool.output : tool.error);
-        if (!tool.output.empty() && !tool.ok)
-        {
-            tool_context << "\nstdout/stderr:\n" << tool.output;
-        }
-        context.push_back(tool_context.str());
-        conversation = prompt + "\n\nThe requested tool was executed. Continue with the answer.";
-    }
-
-    _services.runtime().finish_task(task, "tool-limit");
-    std::cout << "agent stopped after reaching the tool-call limit\n";
-    return 1;
+    return run_agent_plan(
+        plan,
+        [this, &task](const agent_executor_model_request &request) {
+            return _services.invoke(make_codepilot_model_request(task,
+                                                                 request.request_id,
+                                                                 request.conversation,
+                                                                 request.system_prompt,
+                                                                 request.context,
+                                                                 _services.runtime().trace_id()));
+        },
+        [this](const agent_executor_tool_call &tool, std::vector<std::string> *policy_labels) {
+            return approve_tool_invocation(tool.name, tool.args, false, policy_labels);
+        },
+        [this, &task](const agent_executor_tool_request &request) {
+            const agent_request tool_request = make_codepilot_tool_request(task,
+                                                                           request.request_id,
+                                                                           request.tool.name,
+                                                                           request.tool.args,
+                                                                           _services.runtime().trace_id(),
+                                                                           request.policy_labels);
+            return make_tool_result_from_agent(_services.invoke(tool_request));
+        });
 }
 
 int codepilot_cli::run_eval(const std::vector<std::string> &args)

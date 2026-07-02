@@ -1,5 +1,6 @@
 #pragma once
 
+#include "agent_executor.h"
 #include "agent_services.h"
 #include "cli_support.h"
 
@@ -58,6 +59,18 @@ struct rasn_cli_compat_options
     std::string sandbox;
 };
 
+struct rasn_cli_agent_plan
+{
+    agent_task task;
+    std::string prompt;
+    std::string system_prompt;
+    std::vector<std::string> context;
+    agent_executor_options executor_options;
+    std::string approval_failure_source = "rasn.cli";
+    std::string approval_failure_category = "policy";
+    std::string approval_failure_code = "tool_approval_denied";
+};
+
 bool wait_for_cli_service_dependencies(const rasn_service_graph &services,
                                        const rasn_cli_service_readiness_options &options,
                                        std::string *error);
@@ -97,6 +110,10 @@ protected:
     virtual size_t max_context_bytes() const;
     virtual cli_workspace_context_options workspace_context_options() const;
     virtual std::string provider_summary() const;
+    int run_agent_plan(const rasn_cli_agent_plan &plan,
+                       const agent_plan_executor::model_callback &model,
+                       const agent_plan_executor::approval_callback &approve,
+                       const agent_plan_executor::tool_callback &tool);
 
     rasn_service_graph &_services;
 

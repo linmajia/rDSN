@@ -1,7 +1,7 @@
 #pragma once
 
-#include "../../cli_app.h"
-#include "../../rasn.code.definition.h"
+#include <rasn/cli_app.h>
+#include <rasn/rasn.code.definition.h>
 
 #include <dsn/cpp/task_helper.h>
 #include <dsn/service_api_cpp.h>

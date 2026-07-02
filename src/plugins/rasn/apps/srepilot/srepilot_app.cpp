@@ -1,7 +1,7 @@
 #include "srepilot_app.h"
 
-#include "../../cli_support.h"
-#include "../../observability.h"
+#include <rasn/cli_support.h>
+#include <rasn/observability.h>
 
 #include <algorithm>
 #include <chrono>

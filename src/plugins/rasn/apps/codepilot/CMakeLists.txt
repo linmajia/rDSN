@@ -20,9 +20,8 @@ set(MY_PROJ_SRC "")
 
 set(MY_SRC_SEARCH_MODE "GLOB")
 
-# Allow `#include "../../<engine_header>.h"` and `#include "<engine_header>.h"`
-# to resolve against the engine sources two levels up.
-set(MY_PROJ_INC_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+# Allow app sources to include reusable rASN headers as `<rasn/<header>.h>`.
+set(MY_PROJ_INC_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../..")
 
 # Only the rasn static library is needed here. rDSN already links the platform
 # thread library into every executable (CMAKE_THREAD_LIBS_INIT, carried in
