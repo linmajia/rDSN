@@ -2,6 +2,7 @@
 
 #include "../../agent_clients.h"
 #include "../../agent_registry.h"
+#include "../../cli_support.h"
 #include "../../metrics.h"
 #include "../../observability.h"
 #include "../../policy_manager.h"
@@ -434,6 +435,18 @@ bool policy_config_bool_or_default(const std::string &key, bool default_value, c
     return config_bool_or_default("rasn.policy", key, compat_value, description);
 }
 
+std::vector<std::string> codepilot_commands()
+{
+    static const std::vector<std::string> commands = {
+        "help",        "-h",       "--help",    "interactive", "repl",     "providers",
+        "tools",       "schema",   "topology",  "selftest",    "tool",     "state",
+        "registry",    "agentctl", "observe",   "skills",      "skill",    "provider",
+        "trace",       "context",  "replay",    "workflow",    "plan",     "agent",
+        "eval",        "ask",      "stream",    "simulate",
+    };
+    return commands;
+}
+
 std::string side_effect_approval_config_key(tool_side_effect side_effect)
 {
     if (side_effect == tool_side_effect::write)
@@ -633,7 +646,28 @@ codepilot_cli::codepilot_cli() : _services(global_rasn_services())
 
 int codepilot_cli::run(const std::vector<std::string> &args)
 {
+    cli_startup_context startup;
+    if (!bootstrap_single_path_argument(args, codepilot_commands(), &startup))
+    {
+        std::cout << startup.error << "\n";
+        return 1;
+    }
+    if (startup.matched)
+    {
+        _context.push_back("workspace: " + startup.workspace_root);
+        if (!startup.context_text.empty())
+        {
+            _context.push_back(startup.context_text);
+        }
+    }
+
     service_graph_lifecycle_scope lifecycle(_services);
+    if (startup.matched)
+    {
+        std::cout << startup.message << "\n";
+        return repl();
+    }
+
     if (args.empty() || args[0] == "interactive" || args[0] == "repl")
     {
         return repl();
@@ -2165,10 +2199,11 @@ bool codepilot_cli::load_context_file(const std::string &path, std::string *erro
 void codepilot_cli::print_help() const
 {
     std::cout << "rASN CodePilot commands:\n"
-              << "  ask <prompt>             send a coding prompt\n"
-              << "  stream <prompt>          stream model-response chunks with trace events\n"
-              << "  agent <prompt>           run an agent loop that can request local tools\n"
-              << "  plan <goal>              request an implementation plan\n"
+              << interactive_help_intro("sent as an ask prompt")
+              << "  ask <prompt>             send a coding prompt (/ask inside interactive mode)\n"
+              << "  stream <prompt>          stream model-response chunks with trace events (/stream)\n"
+              << "  agent <prompt>           run an agent loop that can request local tools (/agent)\n"
+              << "  plan <goal>              request an implementation plan (/plan)\n"
               << "  eval [suite]             run CodePilot eval tasks and latency/failure metrics\n"
               << "  eval external <template> [suite] run an external CLI command template with {prompt}\n"
               << "  workflow <file>          execute a declarative task graph\n"
@@ -2179,7 +2214,7 @@ void codepilot_cli::print_help() const
               << "  workflow query <run-id>  query a workflow run\n"
               << "  workflow cancel <run-id> cancel a non-terminal workflow run\n"
               << "  workflow nodes <run-id>  list latest per-node workflow state\n"
-              << "  context <file>           attach a source file to future prompts\n"
+              << "  context <file>           attach a source file to future prompts (/context)\n"
               << "  schema [text|json|idl|cpp|clients-cpp|ts|clients-ts|py|clients-py] export schemas and RPC clients\n"
               << "  tools                    list local tools\n"
               << "  tool [--yes] <name> <args> run a local tool directly\n"

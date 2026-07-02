@@ -39,10 +39,24 @@ srepilot.exe observe metrics text
 srepilot.exe observe resilience
 srepilot.exe provider simulator
 srepilot.exe interactive
+srepilot.exe C:\path\to\service-repo
+srepilot.exe C:\path\to\incident.log
 ```
 
-Inside interactive mode, prefix commands with `/`. Plain text without a slash is
-treated as incident input for `diagnose`.
+A single existing directory or file argument starts interactive mode instead of
+being treated as an unknown command. A directory becomes the process workspace. A
+file makes its parent the workspace and loads the file as startup context for
+future `diagnose` and `runbook` prompts.
+
+Inside interactive mode, prefix commands with `/`; text without `/` is treated
+as incident input for `diagnose`. For example:
+
+```text
+/provider simulator
+/diagnose checkout latency p95 doubled after deploy
+/runbook database connection pool exhaustion
+/exit
+```
 
 ## Incident records
 

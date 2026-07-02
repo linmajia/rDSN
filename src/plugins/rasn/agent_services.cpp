@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cmath>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -529,9 +530,9 @@ state_response service_graph_observability_state_writer(const state_record &reco
     return global_rasn_services().put_state(record);
 }
 
-// Read a [section] key as a uint32_t, clamping out-of-range values to UINT32_MAX
-// instead of silently wrapping. dsn_config returns uint64_t; a value above
-// UINT32_MAX would otherwise truncate on the narrowing cast -- e.g. 2^32 -> 0,
+// Read a [section] key as a uint32_t, clamping out-of-range values to the type
+// max instead of silently wrapping. dsn_config returns uint64_t; a value above
+// the type max would otherwise truncate on the narrowing cast -- e.g. 2^32 -> 0,
 // which for a concurrency cap means "unlimited" and would disable the bulkhead.
 // An explicit 0 is preserved (0 keeps its documented meaning).
 uint32_t read_config_u32(const char *section,
@@ -540,7 +541,8 @@ uint32_t read_config_u32(const char *section,
                          const char *dsptr)
 {
     const uint64_t raw = ::dsn_config_get_value_uint64(section, key, default_value, dsptr);
-    return raw > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(raw);
+    const uint32_t max_u32 = (std::numeric_limits<uint32_t>::max)();
+    return raw > max_u32 ? max_u32 : static_cast<uint32_t>(raw);
 }
 
 breaker_config read_model_breaker_config()

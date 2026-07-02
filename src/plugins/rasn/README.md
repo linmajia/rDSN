@@ -92,6 +92,14 @@ resolved by `dsn.dist.uri.resolver`; otherwise it falls back to `<name>_host` an
 
 Standalone one-shot CLI mode still initializes the rDSN runtime with the plugin `config.ini`, but starts no rDSN service apps. It lazily starts the shared graph for the duration of the command and uses the same service implementations inline for fast local commands, while service mode starts the full rDSN app graph and routes through RPC.
 
+Application CLIs share the same path-startup convention through the reusable
+`cli_support` helper: a single existing directory argument switches the process
+workspace and enters interactive mode, while a single existing file argument uses
+the file parent as the workspace and loads the file as startup context. In
+interactive mode, slash-prefixed commands (`/help`, `/exit`, `/diagnose`,
+`/ask`, etc.) are commands; plain text without a slash is handled by the
+application's default prompt action.
+
 This keeps the prototype close to rDSN principles: explicit service roles, lifecycle-managed apps, config-driven ports, typed task-code RPC dispatch, rDSN config, rDSN logging, rDSN locks, traceable runtime events, and replaceable providers/tools.
 
 `rasn.registry` also scans static `[rasn.agent.*]` sections at startup, so external

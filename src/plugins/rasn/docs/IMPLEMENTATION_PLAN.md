@@ -3341,6 +3341,42 @@ Validation:
 - [x] Run filtered `rasn_*.*:codepilot_*.*` unit tests.
 - [x] `git diff --check`.
 
+## Phase 80: shared application CLI startup UX
+
+Status: `[x]`
+
+Goal: make the coding/SRE CLI startup behavior reusable across rASN
+applications. A single existing path argument should mean "open this workspace"
+instead of being silently treated as a model prompt or rejected as an unknown
+command, and interactive help should make the slash-command convention obvious.
+
+Files:
+
+- `cli_support.h` (shared path bootstrap and help intro)
+- `apps/codepilot/codepilot_app.cpp`, `apps/codepilot/codepilot_app.h`
+- `apps/srepilot/srepilot_app.cpp`, `apps/srepilot/srepilot_app.h`
+- `README.md`, `apps/codepilot/README.md`, `apps/srepilot/README.md`,
+  `docs/DESIGN.md`, `docs/IMPLEMENTATION_PLAN.md`
+
+Work items:
+
+- [x] Move the single-path argument detection and workspace switch into a shared
+  rASN helper.
+- [x] Return bounded startup file context from the shared helper so applications
+  can attach it to their domain prompts.
+- [x] Migrate CodePilot to use the shared helper for workspace and file-context
+  startup.
+- [x] Migrate SREPilot to use the shared helper and include startup context in
+  `diagnose` / `runbook` prompts.
+- [x] Use a shared interactive help intro that explains `/command` versus plain
+  text behavior.
+- [x] Document the shared behavior for platform, CodePilot, and SREPilot users.
+
+Validation:
+
+- [x] Build `codepilot` and `srepilot`.
+- [x] `git diff --check`.
+
 ## Dependency order
 
 ```text
@@ -3423,6 +3459,7 @@ Phase 1 task model
   -> Phase 77 model gateway token/cost budget
   -> Phase 78 unified local runtime output layout
   -> Phase 79 model cost-budget arithmetic hardening
+  -> Phase 80 shared application CLI startup UX
 ```
 
 Some phases can overlap after Phase 3, but the public message model and generic

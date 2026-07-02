@@ -1270,6 +1270,10 @@ rDSN design:
   `rasn.unit_tests` binary are thin consumers that link it. This keeps the
   platform reusable by other applications and avoids recompiling the engine per
   consumer.
+- Common CLI behavior lives in shared `cli_support` helpers rather than in one
+  application adapter: a single existing path argument bootstraps interactive
+  mode with a workspace/context, and interactive help text explains the
+  slash-command convention consistently across apps.
 - The CLI is an adapter over generic rASN APIs and should not introduce hidden
   direct provider/tool paths.
 - `codepilot eval` runs built-in or file-backed task suites and can invoke an

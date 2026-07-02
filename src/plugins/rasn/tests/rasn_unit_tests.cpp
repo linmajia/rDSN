@@ -2384,15 +2384,15 @@ TEST(rasn_admission_gate, backpressure_is_zero_below_soft_then_grows_and_clamps)
 
 TEST(rasn_admission_gate, oversized_backpressure_does_not_overflow)
 {
-    // A near-UINT32_MAX max_backpressure_ms (read_config_u32 admits up to
-    // UINT32_MAX) must not overflow the signed-int delay curve into a negative or
+    // A near type-max max_backpressure_ms (read_config_u32 admits up to uint32_t's
+    // maximum) must not overflow the signed-int delay curve into a negative or
     // garbage value: the resulting delay stays non-negative and bounded by an
     // int-safe ceiling rather than wrapping.
     admission_config cfg;
     cfg.enabled = true;
     cfg.max_concurrency = 10;
     cfg.soft_concurrency = 2;
-    cfg.max_backpressure_ms = 0xFFFFFFFFu; // intentionally absurd / out of range
+    cfg.max_backpressure_ms = (std::numeric_limits<uint32_t>::max)(); // intentionally absurd / out of range
     admission_gate gate(cfg);
 
     std::vector<admission_slot> held;
@@ -2731,6 +2731,20 @@ TEST(rasn_rate_limiter, oversized_weighted_wait_rejects_without_overflow)
     EXPECT_EQ(0u, rejected.delay_ms);
 }
 
+TEST(rasn_rate_limiter, nonfinite_weighted_wait_rejects_without_overflow)
+{
+    rate_limit_config cfg;
+    cfg.requests_per_min = 1;
+    cfg.burst = 1;
+    cfg.max_wait_ms = (std::numeric_limits<uint32_t>::max)();
+    rate_limiter limiter(cfg);
+
+    EXPECT_TRUE(limiter.try_acquire(0).allowed); // drain the initial token
+    const rate_decision rejected = limiter.try_acquire(0, std::numeric_limits<double>::infinity());
+    EXPECT_FALSE(rejected.allowed);
+    EXPECT_EQ(0u, rejected.delay_ms);
+}
+
 TEST(rasn_model_cost, estimate_scales_with_prompt_and_floors_at_one_token)
 {
     model_cost_config cfg; // defaults: chars_per_token = 4, completion_percent = 150
@@ -2778,6 +2792,8 @@ TEST(rasn_model_cost, token_count_diagnostics_saturate_oversized_estimates)
     EXPECT_EQ((std::numeric_limits<uint32_t>::max)(), saturating_estimated_token_count(1.0e300));
     EXPECT_EQ((std::numeric_limits<uint32_t>::max)(),
               saturating_estimated_token_count(std::numeric_limits<double>::infinity()));
+    EXPECT_EQ((std::numeric_limits<uint32_t>::max)(),
+              saturating_estimated_token_count(-std::numeric_limits<double>::infinity()));
 
     model_cost_config cfg;
     cfg.chars_per_token = 1;

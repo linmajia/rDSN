@@ -34,8 +34,8 @@ uint32_t backpressure_delay_ms(uint32_t in_flight, const admission_config &cfg)
     std::vector<int> delays(DELAY_COUNT, 0);
     // exp_delay operates entirely in signed int. Clamp the configured peak to a
     // bound where scaling it by the s_default_delay shape (max factor 10) cannot
-    // overflow int, so an out-of-range config value (read_config_u32 admits up to
-    // UINT32_MAX) degrades to a large-but-valid delay instead of narrowing to a
+    // overflow int, so an out-of-range config value that was clamped to uint32_t's
+    // maximum degrades to a large-but-valid delay instead of narrowing to a
     // negative/garbage value and corrupting the curve.
     static const uint32_t k_max_peak_ms = static_cast<uint32_t>(INT_MAX) / 10;
     const int peak = static_cast<int>((std::min)(cfg.max_backpressure_ms, k_max_peak_ms));

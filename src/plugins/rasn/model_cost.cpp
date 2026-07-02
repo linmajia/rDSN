@@ -33,13 +33,13 @@ double estimate_prompt_cost_tokens(size_t prompt_chars, const model_cost_config 
 
 uint32_t saturating_estimated_token_count(double estimated_tokens)
 {
-    if (estimated_tokens <= 0.0)
-    {
-        return 0;
-    }
     if (!std::isfinite(estimated_tokens))
     {
         return (std::numeric_limits<uint32_t>::max)();
+    }
+    if (estimated_tokens <= 0.0)
+    {
+        return 0;
     }
     const double rounded = std::ceil(estimated_tokens);
     const double max_u32 = static_cast<double>((std::numeric_limits<uint32_t>::max)());

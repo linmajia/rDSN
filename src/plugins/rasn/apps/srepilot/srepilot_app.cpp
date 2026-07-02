@@ -2,6 +2,7 @@
 
 #include "../../agent_clients.h"
 #include "../../agent_registry.h"
+#include "../../cli_support.h"
 #include "../../observability.h"
 
 #include <algorithm>
@@ -239,6 +240,15 @@ std::string join_args(const std::vector<std::string> &args, size_t begin)
     return trim(oss.str());
 }
 
+std::vector<std::string> srepilot_commands()
+{
+    static const std::vector<std::string> commands = {
+        "help", "-h", "--help", "interactive", "repl", "diagnose", "runbook",
+        "status", "observe", "selftest", "provider",
+    };
+    return commands;
+}
+
 bool parse_uint32(const std::string &text, uint32_t *value)
 {
     if (text.empty())
@@ -308,7 +318,29 @@ srepilot_cli::srepilot_cli() : _services(global_rasn_services()) {}
 
 int srepilot_cli::run(const std::vector<std::string> &args)
 {
+    cli_startup_context startup;
+    if (!bootstrap_single_path_argument(args, srepilot_commands(), &startup))
+    {
+        std::cout << startup.error << "\n";
+        return 1;
+    }
+    if (startup.matched)
+    {
+        _startup_context.clear();
+        _startup_context.push_back("workspace: " + startup.workspace_root);
+        if (!startup.context_text.empty())
+        {
+            _startup_context.push_back(startup.context_text);
+        }
+    }
+
     service_graph_lifecycle_scope lifecycle(_services);
+    if (startup.matched)
+    {
+        std::cout << startup.message << "\n";
+        return repl();
+    }
+
     if (args.empty())
     {
         print_help();
@@ -410,11 +442,12 @@ int srepilot_cli::diagnose(const std::vector<std::string> &args)
         return 1;
     }
 
+    const std::string context = startup_context_block();
     const std::string prompt =
         "Triage this production incident. Return: severity, blast radius, likely causes, "
         "safe validation checks, immediate mitigation, rollback criteria, and follow-up tasks.\n\nIncident:\n" +
-        incident;
-    agent_completion_request request = make_incident_request("diagnose", incident, prompt);
+        incident + context;
+    agent_completion_request request = make_incident_request("diagnose", incident + context, prompt);
     const llm_response response = _services.complete(request);
     if (!response.ok)
     {
@@ -441,12 +474,13 @@ int srepilot_cli::runbook(const std::vector<std::string> &args)
         return 1;
     }
 
+    const std::string context = startup_context_block();
     const std::string prompt =
         "Generate an executable SRE runbook for this service or symptom. Include preflight "
         "checks, observability queries, mitigation steps, rollback, escalation triggers, "
         "and post-incident cleanup. Mark destructive actions as operator-approved only.\n\nTarget:\n" +
-        symptom;
-    agent_completion_request request = make_incident_request("runbook", symptom, prompt);
+        symptom + context;
+    agent_completion_request request = make_incident_request("runbook", symptom + context, prompt);
     const llm_response response = _services.complete(request);
     if (!response.ok)
     {
@@ -692,6 +726,26 @@ int srepilot_cli::set_provider(const std::vector<std::string> &args)
     return 0;
 }
 
+std::string srepilot_cli::startup_context_block() const
+{
+    if (_startup_context.empty())
+    {
+        return "";
+    }
+
+    std::ostringstream oss;
+    oss << "\n\nStartup context:\n";
+    for (size_t i = 0; i < _startup_context.size(); ++i)
+    {
+        if (i != 0)
+        {
+            oss << "\n\n";
+        }
+        oss << _startup_context[i];
+    }
+    return oss.str();
+}
+
 bool srepilot_cli::recover_state_for_persist(std::string *error)
 {
     if (_state_recovered_for_persist)
@@ -762,8 +816,9 @@ bool srepilot_cli::persist_response(const std::string &kind,
 void srepilot_cli::print_help() const
 {
     std::cout << "rASN SREPilot commands:\n"
-              << "  diagnose <incident>      triage an incident and persist the diagnosis\n"
-              << "  runbook <symptom>        generate and persist an SRE runbook\n"
+              << interactive_help_intro("treated as diagnose input")
+              << "  diagnose <incident>      triage an incident and persist the diagnosis (/diagnose)\n"
+              << "  runbook <symptom>        generate and persist an SRE runbook (/runbook)\n"
               << "  status                   summarize provider, state, and observability health\n"
               << "  observe snapshot         show observability counts\n"
               << "  observe events [kind] [limit] show recent runtime events\n"

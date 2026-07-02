@@ -31,6 +31,7 @@ private:
     int observe(const std::vector<std::string> &args);
     int selftest();
     int set_provider(const std::vector<std::string> &args);
+    std::string startup_context_block() const;
     bool recover_state_for_persist(std::string *error);
     bool persist_response(const std::string &kind,
                           const agent_task &task,
@@ -40,6 +41,7 @@ private:
     void print_help() const;
 
     rasn_service_graph &_services;
+    std::vector<std::string> _startup_context;
     std::atomic<bool> _shutdown_requested{false};
     bool _state_recovered_for_persist = false;
 };
