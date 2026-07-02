@@ -36,6 +36,8 @@ private:
     std::string compat_resume_continue_message() const override;
     bool supports_compat_safety_options() const override;
     void print_compat_provider(const model_gateway_response &response) const override;
+    void on_compat_prompt_start(const rasn_cli_compat_options &options) override;
+    void on_compat_prompt_finish(const rasn_cli_compat_options &options) override;
     void on_startup_context(const cli_startup_context &startup) override;
     int ask(const std::string &prompt, bool planning_mode);
     int stream(const std::string &prompt);
@@ -54,6 +56,7 @@ private:
     bool resume_latest_session_context(std::string *error);
     bool ensure_session(std::string *error);
     void record_session_event(const std::string &kind, const std::string &name, const std::string &value);
+    void set_session_persistence_enabled(bool enabled);
     int set_provider(const std::string &provider_name);
     bool load_context_file(const std::string &path, std::string *error);
     bool approve_tool_invocation(const std::string &tool_name,
@@ -65,6 +68,9 @@ private:
     std::vector<std::string> _context;
     std::string _session_id;
     std::string _workspace_root;
+    bool _session_persistence_enabled = true;
+    bool _compat_prompt_previous_persistence = true;
+    bool _compat_prompt_persistence_overridden = false;
     rasn_session_store _session_store;
 };
 

@@ -773,7 +773,9 @@ bool rasn_cli_app_base::handle_compat_options(const rasn_cli_compat_options &opt
     }
     if (options.prompt_set)
     {
+        on_compat_prompt_start(options);
         const int rc = run_compat_prompt(options.prompt, options.stream);
+        on_compat_prompt_finish(options);
         if (exit_code != nullptr)
         {
             *exit_code = rc;
@@ -848,6 +850,16 @@ bool rasn_cli_app_base::supports_compat_safety_options() const
 void rasn_cli_app_base::print_compat_provider(const model_gateway_response &response) const
 {
     std::cout << "provider=" << response.provider.provider << " model=" << response.provider.model << "\n";
+}
+
+void rasn_cli_app_base::on_compat_prompt_start(const rasn_cli_compat_options &options)
+{
+    (void)options;
+}
+
+void rasn_cli_app_base::on_compat_prompt_finish(const rasn_cli_compat_options &options)
+{
+    (void)options;
 }
 
 void rasn_cli_app_base::on_startup_context(const cli_startup_context &startup)

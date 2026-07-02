@@ -566,6 +566,27 @@ void codepilot_cli::print_compat_provider(const model_gateway_response &response
     std::cout << provider_summary() << "\n";
 }
 
+void codepilot_cli::on_compat_prompt_start(const rasn_cli_compat_options &options)
+{
+    (void)options;
+    _compat_prompt_previous_persistence = _session_persistence_enabled;
+    _compat_prompt_persistence_overridden = _session_id.empty();
+    if (_compat_prompt_persistence_overridden)
+    {
+        set_session_persistence_enabled(false);
+    }
+}
+
+void codepilot_cli::on_compat_prompt_finish(const rasn_cli_compat_options &options)
+{
+    (void)options;
+    if (_compat_prompt_persistence_overridden)
+    {
+        set_session_persistence_enabled(_compat_prompt_previous_persistence);
+    }
+    _compat_prompt_persistence_overridden = false;
+}
+
 int codepilot_cli::run_command(const std::vector<std::string> &args, bool interactive_mode)
 {
     if (args.empty() || args[0] == "help" || args[0] == "-h" || args[0] == "--help")
@@ -2045,11 +2066,20 @@ bool codepilot_cli::ensure_session(std::string *error)
 
 void codepilot_cli::record_session_event(const std::string &kind, const std::string &name, const std::string &value)
 {
+    if (!_session_persistence_enabled)
+    {
+        return;
+    }
     std::string error;
     if (!ensure_session(&error) || !_session_store.append_event(_session_id, kind, name, value, &error))
     {
         std::cerr << "session persistence warning: " << error << "\n";
     }
+}
+
+void codepilot_cli::set_session_persistence_enabled(bool enabled)
+{
+    _session_persistence_enabled = enabled;
 }
 
 int codepilot_cli::set_provider(const std::string &provider_name)

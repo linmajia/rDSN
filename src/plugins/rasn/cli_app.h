@@ -105,6 +105,8 @@ protected:
     virtual bool handle_compat_resume(const rasn_cli_compat_options &options, int *exit_code);
     virtual bool supports_compat_safety_options() const;
     virtual void print_compat_provider(const model_gateway_response &response) const;
+    virtual void on_compat_prompt_start(const rasn_cli_compat_options &options);
+    virtual void on_compat_prompt_finish(const rasn_cli_compat_options &options);
     virtual int handle_empty_args();
     virtual void on_startup_context(const cli_startup_context &startup);
     virtual size_t max_context_bytes() const;

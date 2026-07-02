@@ -2,17 +2,77 @@
 
 #include "rasn_core.h"
 
+#include <dsn/cpp/zlocks.h>
 #include <dsn/cpp/utils.h>
 
 #include <algorithm>
 #include <cctype>
 #include <fstream>
+#include <map>
 #include <sstream>
 
 namespace dsn {
 namespace rasn {
 
 namespace {
+
+bool parse_hex4(const std::string &text, std::string::size_type pos, unsigned int *out)
+{
+    if (pos + 4 > text.size())
+    {
+        return false;
+    }
+    unsigned int value = 0;
+    for (int i = 0; i < 4; ++i)
+    {
+        const char c = text[pos + static_cast<std::string::size_type>(i)];
+        value <<= 4;
+        if (c >= '0' && c <= '9')
+        {
+            value |= static_cast<unsigned int>(c - '0');
+        }
+        else if (c >= 'a' && c <= 'f')
+        {
+            value |= static_cast<unsigned int>(c - 'a' + 10);
+        }
+        else if (c >= 'A' && c <= 'F')
+        {
+            value |= static_cast<unsigned int>(c - 'A' + 10);
+        }
+        else
+        {
+            return false;
+        }
+    }
+    *out = value;
+    return true;
+}
+
+void append_utf8(std::string *out, unsigned int code)
+{
+    if (code <= 0x7F)
+    {
+        out->push_back(static_cast<char>(code));
+    }
+    else if (code <= 0x7FF)
+    {
+        out->push_back(static_cast<char>(0xC0 | (code >> 6)));
+        out->push_back(static_cast<char>(0x80 | (code & 0x3F)));
+    }
+    else if (code <= 0xFFFF)
+    {
+        out->push_back(static_cast<char>(0xE0 | (code >> 12)));
+        out->push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
+        out->push_back(static_cast<char>(0x80 | (code & 0x3F)));
+    }
+    else
+    {
+        out->push_back(static_cast<char>(0xF0 | (code >> 18)));
+        out->push_back(static_cast<char>(0x80 | ((code >> 12) & 0x3F)));
+        out->push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
+        out->push_back(static_cast<char>(0x80 | (code & 0x3F)));
+    }
+}
 
 std::string extract_json_string_field(const std::string &json, const std::string &field)
 {
@@ -53,6 +113,36 @@ std::string extract_json_string_field(const std::string &json, const std::string
             case 't':
                 result.push_back('\t');
                 break;
+            case 'b':
+                result.push_back('\b');
+                break;
+            case 'f':
+                result.push_back('\f');
+                break;
+            case 'u':
+            {
+                unsigned int code = 0;
+                if (parse_hex4(json, quote + 1, &code))
+                {
+                    quote += 4;
+                    if (code >= 0xD800 && code <= 0xDBFF && quote + 2 < json.size() &&
+                        json[quote + 1] == '\\' && json[quote + 2] == 'u')
+                    {
+                        unsigned int low = 0;
+                        if (parse_hex4(json, quote + 3, &low) && low >= 0xDC00 && low <= 0xDFFF)
+                        {
+                            code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+                            quote += 6;
+                        }
+                    }
+                    append_utf8(&result, code);
+                }
+                else
+                {
+                    result.push_back('u');
+                }
+                break;
+            }
             default:
                 result.push_back(c);
                 break;
@@ -209,6 +299,7 @@ void apply_event_to_summary(const rasn_session_event &event, rasn_session_summar
     {
         summary->session_id = event.session_id;
     }
+
     if (summary->created_at.empty())
     {
         summary->created_at = event.timestamp;
@@ -226,6 +317,32 @@ void apply_event_to_summary(const rasn_session_event &event, rasn_session_summar
     {
         summary->last_prompt = event.value;
     }
+}
+
+::dsn::service::zlock &session_sequence_cache_lock()
+{
+    static ::dsn::service::zlock lock;
+    return lock;
+}
+
+std::map<std::string, uint64_t> &session_sequence_cache()
+{
+    static std::map<std::string, uint64_t> cache;
+    return cache;
+}
+
+uint64_t cached_session_sequence(const std::string &cache_key)
+{
+    ::dsn::service::zauto_lock guard(session_sequence_cache_lock());
+    const std::map<std::string, uint64_t>::const_iterator it = session_sequence_cache().find(cache_key);
+    return it == session_sequence_cache().end() ? 0 : it->second;
+}
+
+void update_cached_session_sequence(const std::string &cache_key, uint64_t sequence)
+{
+    ::dsn::service::zauto_lock guard(session_sequence_cache_lock());
+    uint64_t &cached = session_sequence_cache()[cache_key];
+    cached = (std::max)(cached, sequence);
 }
 
 std::string event_display_value(const rasn_session_event &event)
@@ -289,6 +406,7 @@ bool rasn_session_store::begin_session(const std::string &app_name,
         summary->file_path = session_file_path(session_id);
         apply_event_to_summary(event, summary);
     }
+    update_cached_session_sequence(session_file_path(session_id), event.sequence);
     return true;
 }
 
@@ -298,30 +416,38 @@ bool rasn_session_store::append_event(const std::string &session_id,
                                       const std::string &value,
                                       std::string *error) const
 {
-    rasn_session_summary summary;
-    if (!load_session(session_id, &summary, nullptr, error))
+    const std::string safe_id = sanitize_session_id(session_id);
+    const std::string path = session_file_path(safe_id);
+    uint64_t next_sequence = cached_session_sequence(path) + 1;
+    if (next_sequence == 1)
     {
-        return false;
+        rasn_session_summary summary;
+        if (!load_session(safe_id, &summary, nullptr, error))
+        {
+            return false;
+        }
+        next_sequence = summary.event_count + 1;
     }
 
     rasn_session_event event;
-    event.session_id = sanitize_session_id(session_id);
-    event.sequence = summary.event_count + 1;
+    event.session_id = safe_id;
+    event.sequence = next_sequence;
     event.kind = kind;
     event.name = name;
     event.value = value;
     event.timestamp = now_utc_string();
 
-    std::ofstream output(session_file_path(event.session_id).c_str(), std::ios::binary | std::ios::app);
+    std::ofstream output(path.c_str(), std::ios::binary | std::ios::app);
     if (!output)
     {
         if (error != nullptr)
         {
-            *error = "cannot open session log: " + session_file_path(event.session_id);
+            *error = "cannot open session log: " + path;
         }
         return false;
     }
     output << session_event_json(event) << "\n";
+    update_cached_session_sequence(path, event.sequence);
     return true;
 }
 
@@ -362,6 +488,7 @@ bool rasn_session_store::load_session(const std::string &session_id,
             event.session_id = safe_id;
         }
         apply_event_to_summary(event, &loaded);
+        update_cached_session_sequence(session_file_path(safe_id), event.sequence);
         if (events != nullptr)
         {
             events->push_back(event);

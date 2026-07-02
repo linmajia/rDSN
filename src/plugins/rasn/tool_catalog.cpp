@@ -25,6 +25,18 @@ size_t required_argument_count(const tool_descriptor &descriptor)
     return count;
 }
 
+std::string optional_argument_usage_name(std::string name)
+{
+    for (char &c : name)
+    {
+        if (c == '_')
+        {
+            c = '-';
+        }
+    }
+    return name;
+}
+
 std::string usage_for_tool(const tool_descriptor &descriptor)
 {
     std::ostringstream output;
@@ -34,12 +46,11 @@ std::string usage_for_tool(const tool_descriptor &descriptor)
         output << " ";
         if (!argument.required)
         {
-            output << "[";
+            output << "[" << optional_argument_usage_name(argument.name) << "]";
         }
-        output << "<" << argument.name << ">";
-        if (!argument.required)
+        else
         {
-            output << "]";
+            output << "<" << argument.name << ">";
         }
     }
     return output.str();

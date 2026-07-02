@@ -50,7 +50,7 @@ bool path_is_absolute(const std::string &path)
 
 std::string content_fingerprint(const std::string &content)
 {
-    uint64_t hash = 1469598103934665603ull;
+    uint64_t hash = 14695981039346656037ull;
     for (const char c : content)
     {
         hash ^= static_cast<unsigned char>(c);

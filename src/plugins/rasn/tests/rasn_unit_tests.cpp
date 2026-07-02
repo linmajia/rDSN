@@ -1249,6 +1249,7 @@ TEST(rasn_tool_catalog, describes_aliases_and_normalizes_invocations)
     const tool_invocation missing = normalize_tool_invocation(catalog, "read", std::vector<std::string>());
     EXPECT_FALSE(missing.ok);
     EXPECT_NE(std::string::npos, missing.error.find("usage: tool read"));
+    EXPECT_NE(std::string::npos, missing.error.find("[max-bytes]"));
 
     const tool_invocation unknown = normalize_tool_invocation(catalog, "unknown", std::vector<std::string>());
     EXPECT_FALSE(unknown.ok);
@@ -1393,6 +1394,9 @@ TEST(rasn_session_store, persists_loads_and_formats_resume_context)
         << error;
     EXPECT_TRUE(store.append_event(first.session_id, "prompt", "ask", "explain rASN", &error)) << error;
     EXPECT_TRUE(store.append_event(first.session_id, "response", "ok", "rASN summary", &error)) << error;
+    const std::string control_value = std::string("ansi ") + static_cast<char>(0x1b) + "[31m" +
+                                      static_cast<char>(0x01) + "\b\f done";
+    EXPECT_TRUE(store.append_event(first.session_id, "tool", "control", control_value, &error)) << error;
 
     rasn_session_summary second;
     ASSERT_TRUE(store.begin_session("codepilot", "workspace-b", "trace-b.jsonl", "unit-session-b", &second, &error))
@@ -1407,15 +1411,16 @@ TEST(rasn_session_store, persists_loads_and_formats_resume_context)
     EXPECT_EQ("workspace-a", loaded.workspace_root);
     EXPECT_EQ("trace-a.jsonl", loaded.trace_file);
     EXPECT_EQ("explain rASN", loaded.last_prompt);
-    ASSERT_EQ(3u, events.size());
+    ASSERT_EQ(4u, events.size());
     EXPECT_EQ("session", events[0].kind);
     EXPECT_EQ("prompt", events[1].kind);
+    EXPECT_EQ(control_value, events[3].value);
 
     rasn_session_summary latest;
     ASSERT_TRUE(store.latest_session(&latest, &error)) << error;
     EXPECT_EQ("unit-session-b", latest.session_id);
 
-    const std::string context = format_session_resume_context(loaded, events, 2);
+    const std::string context = format_session_resume_context(loaded, events, 3);
     EXPECT_NE(std::string::npos, context.find("resumed rASN session: unit-session-a"));
     EXPECT_NE(std::string::npos, context.find("last prompt: explain rASN"));
     EXPECT_NE(std::string::npos, context.find("prompt.ask"));
