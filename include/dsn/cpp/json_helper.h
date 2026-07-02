@@ -41,6 +41,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <stdexcept>
 #include <type_traits>
 #include <cctype>
 #include <utility>
@@ -145,7 +146,11 @@ public:
 public:
     string_tokenizer(const char* b, unsigned offset, unsigned len): buffer(b), pos(offset), length(len)
     {
-        dassert(pos<length, "");
+        // an offset beyond the buffer end is a programming error; an offset that
+        // equals the length (empty or fully-consumed buffer) is tolerated so that
+        // corrupt/empty input surfaces as a parse failure (thrown below) rather
+        // than a process abort here.
+        dassert(pos <= length, "invalid json tokenizer offset %u (length %u)", pos, length);
     }
     string_tokenizer(const dsn::blob& source, unsigned from): string_tokenizer(source.data(), from, source.length()) {}
     string_tokenizer(const dsn::blob& source): string_tokenizer(source.data(), 0, source.length()) {}
@@ -160,7 +165,9 @@ public:
             ++pos, ++j;
         if (token[j]!=0)
         {
-            dassert(false, "invalid buffer:%s at pos %d", buffer, pos);
+            // malformed input: report through the exception channel that the
+            // top-level decode() already handles, instead of aborting.
+            throw std::runtime_error("json parse error: unexpected token");
         }
     }
     void expect_token(char token)
@@ -170,14 +177,16 @@ public:
             ++pos;
         else
         {
-            dassert(false, "invalid buffer:%s at pos %d", buffer, pos);
+            throw std::runtime_error("json parse error: unexpected token");
         }
     }
     char peek_next() const
     {
-        int i = pos;
+        unsigned i = pos;
         while (i<length && isblank(buffer[i])) ++i;
-        return buffer[i];
+        // guard against reading past the end of the buffer on truncated input;
+        // returning a non-splitter sentinel lets the caller's decode throw.
+        return i<length ? buffer[i] : '\0';
     }
     void walk_until(char token)
     {
@@ -186,7 +195,7 @@ public:
             return;
         else
         {
-            dassert(false, "invalid buffer:%s at pos %d", buffer, pos);
+            throw std::runtime_error("json parse error: unterminated token");
         }
     }
     void walk_until_json_splitter()
@@ -263,9 +272,13 @@ inline void json_decode(dsn::json::string_tokenizer& in, dsn::gpid& pid)
     json_decode(in, gpid_message);
     dsn_global_partition_id c_gpid;
     c_gpid.value = 0;
-    dassert(sscanf(gpid_message.c_str(), "%d.%d", &c_gpid.u.app_id, &c_gpid.u.partition_index) == 2,
-            "invalid gpid format: %s",
-            gpid_message.c_str());
+    if (sscanf(gpid_message.c_str(), "%d.%d", &c_gpid.u.app_id, &c_gpid.u.partition_index) != 2)
+    {
+        // malformed gpid from (untrusted/corrupt) input: report through the
+        // exception channel that the top-level decode() already handles, instead
+        // of aborting the process via dassert.
+        throw std::runtime_error("json parse error: invalid gpid format");
+    }
     pid = dsn::gpid(c_gpid);
 }
 
@@ -277,7 +290,29 @@ inline void json_decode(dsn::json::string_tokenizer& in, dsn::rpc_address& addre
 {
     std::string rpc_address_string;
     json_decode(in, rpc_address_string);
-    address.from_string_ipv4(rpc_address_string.c_str());
+    // An unset/invalid address is legitimately encoded as "invalid address"
+    // (see dsn_address_to_string); accept that marker and leave the address
+    // invalid so e.g. a partition with no primary round-trips correctly. Any
+    // other string that fails to parse is malformed input: report it through the
+    // exception channel the top-level decode() handles, instead of silently
+    // storing an invalid address that a later invariant check (e.g. the
+    // secondaries assert in initialize_node_state) would abort on.
+    address.set_invalid();
+    if (rpc_address_string == "invalid address")
+    {
+        return;
+    }
+    // from_string_ipv4() returns true even when the host cannot be converted: it
+    // splits host:port and calls assign_ipv4(), which stores
+    // dsn_ipv4_from_host(host) -- and that yields 0 for a malformed/unresolvable
+    // host (e.g. "999.999.999.999:12345") or an empty host (":12345"). The result
+    // is a non-invalid 0.0.0.0:port that would slip past the is_invalid() checks
+    // downstream. A genuine serialized node address is never 0.0.0.0, so treat a
+    // false return OR a zero ip as malformed input and reject it.
+    if (!address.from_string_ipv4(rpc_address_string.c_str()) || address.ip() == 0)
+    {
+        throw std::runtime_error("json parse error: invalid rpc_address");
+    }
 }
 
 inline void json_encode(std::stringstream& out, const dsn::partition_configuration& config);
