@@ -30,7 +30,7 @@ public:
     void request_shutdown() { _shutdown_requested.store(true); }
 
 private:
-    int run_command(const std::vector<std::string> &args);
+    int run_command(const std::vector<std::string> &args, bool interactive_mode = false);
     int ask(const std::string &prompt, bool planning_mode);
     int stream(const std::string &prompt);
     int agent(const std::string &prompt);
@@ -50,7 +50,7 @@ private:
                                  const std::vector<std::string> &args,
                                  bool explicit_approval,
                                  std::vector<std::string> *policy_labels) const;
-    void print_help() const;
+    void print_help(bool interactive_mode) const;
     std::string provider_summary() const;
 
     rasn_service_graph &_services;

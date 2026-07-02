@@ -1107,6 +1107,48 @@ TEST(rasn_cli_support, zero_context_budget_does_not_report_truncation)
     std::remove(path.c_str());
 }
 
+TEST(rasn_cli_support, help_items_use_slash_prefix_in_interactive_mode)
+{
+    const std::string interactive = cli_help_item(true, "ask <prompt>", "send a coding prompt");
+    EXPECT_NE(std::string::npos, interactive.find("  /ask <prompt>"));
+
+    const std::string direct = cli_help_item(false, "ask <prompt>", "send a coding prompt");
+    EXPECT_NE(std::string::npos, direct.find("  ask <prompt>"));
+    EXPECT_EQ(std::string::npos, direct.find("  /ask <prompt>"));
+}
+
+TEST(rasn_cli_support, workspace_source_context_includes_index_and_excerpts)
+{
+    const std::string root = temp_file_path("rasn-cli-workspace-context");
+    ::dsn::utils::filesystem::remove_path(root);
+    ASSERT_TRUE(::dsn::utils::filesystem::create_directory(root));
+    const std::string src_dir = ::dsn::utils::filesystem::path_combine(root, "src");
+    ASSERT_TRUE(::dsn::utils::filesystem::create_directory(src_dir));
+
+    write_text_file(::dsn::utils::filesystem::path_combine(root, "README.md"), "# demo workspace\n");
+    write_text_file(::dsn::utils::filesystem::path_combine(src_dir, "main.c"), "int main() { return 0; }\n");
+
+    cli_workspace_context_options options;
+    options.max_files = 10;
+    options.max_sampled_files = 4;
+    options.max_file_bytes = 128;
+    options.max_total_bytes = 512;
+
+    std::string context;
+    std::string error;
+    bool truncated = true;
+    EXPECT_TRUE(build_workspace_source_context(root, options, &context, &truncated, &error));
+    EXPECT_TRUE(error.empty()) << error;
+    EXPECT_FALSE(truncated);
+    EXPECT_NE(std::string::npos, context.find("workspace source snapshot"));
+    EXPECT_NE(std::string::npos, context.find("README.md"));
+    EXPECT_NE(std::string::npos, context.find("src"));
+    EXPECT_NE(std::string::npos, context.find("main.c"));
+    EXPECT_NE(std::string::npos, context.find("int main()"));
+
+    ::dsn::utils::filesystem::remove_path(root);
+}
+
 TEST(rasn_workflow, parses_metadata_and_rejects_cycles)
 {
     workflow_graph graph;

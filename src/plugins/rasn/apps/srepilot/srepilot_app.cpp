@@ -319,7 +319,8 @@ srepilot_cli::srepilot_cli() : _services(global_rasn_services()) {}
 int srepilot_cli::run(const std::vector<std::string> &args)
 {
     cli_startup_context startup;
-    if (!bootstrap_single_path_argument(args, srepilot_commands(), &startup))
+    const cli_workspace_context_options workspace_context_options;
+    if (!bootstrap_single_path_argument(args, srepilot_commands(), &startup, 1024u * 1024u, &workspace_context_options))
     {
         std::cout << startup.error << "\n";
         return 1;
@@ -343,7 +344,7 @@ int srepilot_cli::run(const std::vector<std::string> &args)
 
     if (args.empty())
     {
-        print_help();
+        print_help(false);
         return 0;
     }
     if (args[0] == "interactive" || args[0] == "repl")
@@ -384,7 +385,7 @@ int srepilot_cli::repl()
         }
         if (line[0] == '/')
         {
-            const int rc = run_command(split_words(line.substr(1)));
+            const int rc = run_command(split_words(line.substr(1)), true);
             if (rc != 0)
             {
                 std::cout << "command failed: " << rc << "\n";
@@ -396,12 +397,21 @@ int srepilot_cli::repl()
     }
 }
 
-int srepilot_cli::run_command(const std::vector<std::string> &args)
+int srepilot_cli::run_command(const std::vector<std::string> &args, bool interactive_mode)
 {
     if (args.empty() || args[0] == "help" || args[0] == "-h" || args[0] == "--help")
     {
-        print_help();
+        print_help(interactive_mode);
         return 0;
+    }
+    if (args[0] == "interactive" || args[0] == "repl")
+    {
+        if (interactive_mode)
+        {
+            std::cout << "already in interactive mode\n";
+            return 0;
+        }
+        return repl();
     }
     if (args[0] == "diagnose")
     {
@@ -429,7 +439,7 @@ int srepilot_cli::run_command(const std::vector<std::string> &args)
     }
 
     std::cout << "unknown command: " << args[0] << "\n";
-    print_help();
+    print_help(interactive_mode);
     return 1;
 }
 
@@ -813,21 +823,21 @@ bool srepilot_cli::persist_response(const std::string &kind,
     return true;
 }
 
-void srepilot_cli::print_help() const
+void srepilot_cli::print_help(bool interactive_mode) const
 {
     std::cout << "rASN SREPilot commands:\n"
-              << interactive_help_intro("treated as diagnose input")
-              << "  diagnose <incident>      triage an incident and persist the diagnosis (/diagnose)\n"
-              << "  runbook <symptom>        generate and persist an SRE runbook (/runbook)\n"
-              << "  status                   summarize provider, state, and observability health\n"
-              << "  observe snapshot         show observability counts\n"
-              << "  observe events [kind] [limit] show recent runtime events\n"
-              << "  observe failures [limit] show classified failures\n"
-              << "  observe metrics [format] dump runtime metrics (text|prometheus|json)\n"
-              << "  observe resilience       dump overload/model/tool/remote-agent guards\n"
-              << "  provider [name]          show or switch model provider\n"
-              << "  selftest                 run model/state/observability checks\n"
-              << "  interactive              start REPL mode\n";
+              << cli_help_intro(interactive_mode, "treated as diagnose input")
+              << cli_help_item(interactive_mode, "diagnose <incident>", "triage an incident and persist the diagnosis")
+              << cli_help_item(interactive_mode, "runbook <symptom>", "generate and persist an SRE runbook")
+              << cli_help_item(interactive_mode, "status", "summarize provider, state, and observability health")
+              << cli_help_item(interactive_mode, "observe snapshot", "show observability counts")
+              << cli_help_item(interactive_mode, "observe events [kind] [limit]", "show recent runtime events")
+              << cli_help_item(interactive_mode, "observe failures [limit]", "show classified failures")
+              << cli_help_item(interactive_mode, "observe metrics [format]", "dump runtime metrics (text|prometheus|json)")
+              << cli_help_item(interactive_mode, "observe resilience", "dump overload/model/tool/remote-agent guards")
+              << cli_help_item(interactive_mode, "provider [name]", "show or switch model provider")
+              << cli_help_item(interactive_mode, "selftest", "run model/state/observability checks")
+              << cli_help_item(interactive_mode, "interactive", "start REPL mode");
 }
 
 ::dsn::error_code srepilot_app::start(int argc, char **argv)

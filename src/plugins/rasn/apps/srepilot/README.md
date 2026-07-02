@@ -50,8 +50,9 @@ srepilot.exe C:\path\to\incident.log
 
 A single existing directory or file argument starts interactive mode instead of
 being treated as an unknown command. A directory becomes the process workspace. A
-file makes its parent the workspace and loads the file as startup context for
-future `diagnose` and `runbook` prompts.
+directory also loads a bounded source-file index plus selected file excerpts as
+startup context. A file makes its parent the workspace and loads the file as
+startup context for future `diagnose` and `runbook` prompts.
 
 Inside interactive mode, prefix commands with `/`; text without `/` is treated
 as incident input for `diagnose`. For example:

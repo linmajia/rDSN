@@ -94,11 +94,13 @@ Standalone one-shot CLI mode still initializes the rDSN runtime with the plugin 
 
 Application CLIs share the same path-startup convention through the reusable
 `cli_support` helper: a single existing directory argument switches the process
-workspace and enters interactive mode, while a single existing file argument uses
-the file parent as the workspace and loads the file as startup context. In
+workspace, loads a bounded source-file index plus selected file excerpts as
+startup context, and enters interactive mode. A single existing file argument
+uses the file parent as the workspace and loads the file as startup context. In
 interactive mode, slash-prefixed commands (`/help`, `/exit`, `/diagnose`,
-`/ask`, etc.) are commands; plain text without a slash is handled by the
-application's default prompt action.
+`/ask`, etc.) are commands; `/help` renders command items with the leading slash,
+and plain text without a slash is handled by the application's default prompt
+action.
 
 This keeps the prototype close to rDSN principles: explicit service roles, lifecycle-managed apps, config-driven ports, typed task-code RPC dispatch, rDSN config, rDSN logging, rDSN locks, traceable runtime events, and replaceable providers/tools.
 
@@ -978,6 +980,9 @@ C:\Users\haoxlin\source\repos\rdsn\rb-rasn\bin\codepilot\Debug\codepilot.exe ask
 ```
 
 ## CLI command reference
+
+Direct CLI commands omit the slash. Inside interactive mode, `/help` shows the
+same command items with the required leading `/`.
 
 ```text
 ask <prompt>             send a coding prompt

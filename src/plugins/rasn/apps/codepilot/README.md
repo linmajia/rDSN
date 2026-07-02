@@ -44,8 +44,9 @@ codepilot.exe C:\path\to\file.cpp
 ```
 
 A single existing directory or file argument starts interactive mode instead of
-being sent as a prompt. A directory becomes the process workspace. A file makes
-its parent the workspace and loads the file as initial context.
+being sent as a prompt. A directory becomes the process workspace and loads a
+bounded source-file index plus selected file excerpts as initial context. A file
+makes its parent the workspace and loads the file as initial context.
 
 Inside interactive mode, prefix commands with `/`; text without `/` is sent as an
 ask prompt. For example:

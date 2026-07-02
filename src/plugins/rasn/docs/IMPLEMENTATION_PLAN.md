@@ -3377,6 +3377,42 @@ Validation:
 - [x] Build `codepilot` and `srepilot`.
 - [x] `git diff --check`.
 
+## Phase 81: Shared CLI help and workspace context refinement
+
+Status: Implemented.
+
+Scope:
+
+- `cli_support.h`
+- `apps/codepilot/codepilot_app.cpp`, `apps/codepilot/codepilot_app.h`
+- `apps/srepilot/srepilot_app.cpp`, `apps/srepilot/srepilot_app.h`
+- `tests/rasn_unit_tests.cpp`
+- `README.md`, `apps/codepilot/README.md`, `apps/srepilot/README.md`,
+  `docs/IMPLEMENTATION_PLAN.md`
+
+Work items:
+
+- [x] Make interactive `/help` render command items with their required leading
+  slash while preserving direct CLI help without the slash.
+- [x] Add reusable bounded workspace source snapshots for directory startup:
+  source-file index plus selected text excerpts, with generated/build
+  directories skipped.
+- [x] Attach the workspace source snapshot to CodePilot prompts so one-shot
+  `/ask` has concrete repository context after `codepilot <repo>`.
+- [x] Attach the same startup snapshot to SREPilot `diagnose` / `runbook`
+  context for service-repository incident analysis.
+- [x] Add focused regression coverage for slash help labels and workspace
+  snapshot generation.
+- [x] Update app and platform docs to describe the refined behavior.
+
+Validation:
+
+- [x] Build `rasn.unit_tests`, `codepilot`, and `srepilot`.
+- [x] Run focused `rasn_cli_support.*` tests.
+- [x] Smoke CodePilot and SREPilot interactive `/help` output.
+- [x] Smoke CodePilot and SREPilot directory startup context loading.
+- [x] `git diff --check`.
+
 ## Dependency order
 
 ```text

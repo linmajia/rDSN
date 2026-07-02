@@ -24,7 +24,7 @@ public:
     void request_shutdown() { _shutdown_requested.store(true); }
 
 private:
-    int run_command(const std::vector<std::string> &args);
+    int run_command(const std::vector<std::string> &args, bool interactive_mode = false);
     int diagnose(const std::vector<std::string> &args);
     int runbook(const std::vector<std::string> &args);
     int status();
@@ -38,7 +38,7 @@ private:
                           const std::string &input,
                           const std::string &output,
                           std::string *stored_key);
-    void print_help() const;
+    void print_help(bool interactive_mode) const;
 
     rasn_service_graph &_services;
     std::vector<std::string> _startup_context;

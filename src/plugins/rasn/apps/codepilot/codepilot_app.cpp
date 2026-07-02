@@ -647,7 +647,8 @@ codepilot_cli::codepilot_cli() : _services(global_rasn_services())
 int codepilot_cli::run(const std::vector<std::string> &args)
 {
     cli_startup_context startup;
-    if (!bootstrap_single_path_argument(args, codepilot_commands(), &startup))
+    const cli_workspace_context_options workspace_context_options;
+    if (!bootstrap_single_path_argument(args, codepilot_commands(), &startup, 1024u * 1024u, &workspace_context_options))
     {
         std::cout << startup.error << "\n";
         return 1;
@@ -710,7 +711,7 @@ int codepilot_cli::repl()
         if (line[0] == '/')
         {
             std::vector<std::string> args = split_words(line.substr(1));
-            const int rc = run_command(args);
+            const int rc = run_command(args, true);
             if (rc != 0)
             {
                 std::cout << "command failed: " << rc << "\n";
@@ -722,12 +723,21 @@ int codepilot_cli::repl()
     }
 }
 
-int codepilot_cli::run_command(const std::vector<std::string> &args)
+int codepilot_cli::run_command(const std::vector<std::string> &args, bool interactive_mode)
 {
     if (args.empty() || args[0] == "help" || args[0] == "-h" || args[0] == "--help")
     {
-        print_help();
+        print_help(interactive_mode);
         return 0;
+    }
+    if (args[0] == "interactive" || args[0] == "repl")
+    {
+        if (interactive_mode)
+        {
+            std::cout << "already in interactive mode\n";
+            return 0;
+        }
+        return repl();
     }
 
     if (args[0] == "providers")
@@ -864,7 +874,7 @@ int codepilot_cli::run_command(const std::vector<std::string> &args)
         {
             return rc;
         }
-        return run_command(std::vector<std::string>(args.begin() + 2, args.end()));
+        return run_command(std::vector<std::string>(args.begin() + 2, args.end()), interactive_mode);
     }
 
     if (args[0] == "trace")
@@ -880,7 +890,7 @@ int codepilot_cli::run_command(const std::vector<std::string> &args)
         {
             return 0;
         }
-        return run_command(std::vector<std::string>(args.begin() + 2, args.end()));
+        return run_command(std::vector<std::string>(args.begin() + 2, args.end()), interactive_mode);
     }
 
     if (args[0] == "context")
@@ -912,7 +922,7 @@ int codepilot_cli::run_command(const std::vector<std::string> &args)
         {
             return rc;
         }
-        return run_command(std::vector<std::string>(args.begin() + 2, args.end()));
+        return run_command(std::vector<std::string>(args.begin() + 2, args.end()), interactive_mode);
     }
 
     if (args[0] == "workflow")
@@ -2196,48 +2206,49 @@ bool codepilot_cli::load_context_file(const std::string &path, std::string *erro
     return true;
 }
 
-void codepilot_cli::print_help() const
+void codepilot_cli::print_help(bool interactive_mode) const
 {
     std::cout << "rASN CodePilot commands:\n"
-              << interactive_help_intro("sent as an ask prompt")
-              << "  ask <prompt>             send a coding prompt (/ask inside interactive mode)\n"
-              << "  stream <prompt>          stream model-response chunks with trace events (/stream)\n"
-              << "  agent <prompt>           run an agent loop that can request local tools (/agent)\n"
-              << "  plan <goal>              request an implementation plan (/plan)\n"
-              << "  eval [suite]             run CodePilot eval tasks and latency/failure metrics\n"
-              << "  eval external <template> [suite] run an external CLI command template with {prompt}\n"
-              << "  workflow <file>          execute a declarative task graph\n"
-              << "  workflow start <file> [run-id] execute a task graph\n"
-              << "  workflow resume <file> <run-id> resume from completed node state\n"
-              << "  workflow validate <file> validate a task graph through rasn.workflow\n"
-              << "  workflow compile <file>  compile a task graph into an executable plan\n"
-              << "  workflow query <run-id>  query a workflow run\n"
-              << "  workflow cancel <run-id> cancel a non-terminal workflow run\n"
-              << "  workflow nodes <run-id>  list latest per-node workflow state\n"
-              << "  context <file>           attach a source file to future prompts (/context)\n"
-              << "  schema [text|json|idl|cpp|clients-cpp|ts|clients-ts|py|clients-py] export schemas and RPC clients\n"
-              << "  tools                    list local tools\n"
-              << "  tool [--yes] <name> <args> run a local tool directly\n"
-              << "  selftest [checkpoint]    run model/tool/state/workflow/observability checks\n"
-              << "  state <cmd> [args]       use rASN state/checkpoint service\n"
-              << "  registry [cmd] [args]    inspect rASN agent registry entries\n"
-              << "  agentctl <cmd> <agent>   describe, heartbeat, query, or cancel an agent\n"
-              << "  observe events [kind]    query structured runtime events\n"
-              << "  observe timeline [trace] show ordered trace events\n"
-              << "  observe diagnose [trace] summarize failures and replay issues\n"
-              << "  observe failures         query classified failure records\n"
-              << "  observe replay <file>    load replay choices through rasn.observability\n"
-              << "  observe metrics [format] dump runtime metrics (text|prometheus|json)\n"
-              << "  observe resilience       dump overload/model/tool/remote-agent resilience state\n"
-              << "  observe snapshot         summarize observability state\n"
-              << "  skills                   list built-in skills\n"
-              << "  skill <name> [task]      show or apply a skill prompt\n"
-              << "  topology                 show the rDSN service graph\n"
-              << "  provider [name]          show or switch provider\n"
-              << "  trace [file]             show or set JSONL runtime trace file\n"
-              << "  replay <trace-jsonl>     replay captured nondeterministic choices\n"
-              << "  simulate <prompt>        force the random local simulator\n"
-              << "  interactive              start REPL mode\n\n"
+              << cli_help_intro(interactive_mode, "sent as an ask prompt")
+              << cli_help_item(interactive_mode, "ask <prompt>", "send a coding prompt")
+              << cli_help_item(interactive_mode, "stream <prompt>", "stream model-response chunks with trace events")
+              << cli_help_item(interactive_mode, "agent <prompt>", "run an agent loop that can request local tools")
+              << cli_help_item(interactive_mode, "plan <goal>", "request an implementation plan")
+              << cli_help_item(interactive_mode, "eval [suite]", "run CodePilot eval tasks and latency/failure metrics")
+              << cli_help_item(interactive_mode, "eval external <template> [suite]", "run an external CLI command template with {prompt}")
+              << cli_help_item(interactive_mode, "workflow <file>", "execute a declarative task graph")
+              << cli_help_item(interactive_mode, "workflow start <file> [run-id]", "execute a task graph")
+              << cli_help_item(interactive_mode, "workflow resume <file> <run-id>", "resume from completed node state")
+              << cli_help_item(interactive_mode, "workflow validate <file>", "validate a task graph through rasn.workflow")
+              << cli_help_item(interactive_mode, "workflow compile <file>", "compile a task graph into an executable plan")
+              << cli_help_item(interactive_mode, "workflow query <run-id>", "query a workflow run")
+              << cli_help_item(interactive_mode, "workflow cancel <run-id>", "cancel a non-terminal workflow run")
+              << cli_help_item(interactive_mode, "workflow nodes <run-id>", "list latest per-node workflow state")
+              << cli_help_item(interactive_mode, "context <file>", "attach a source file to future prompts")
+              << cli_help_item(interactive_mode, "schema [text|json|idl|cpp|clients-cpp|ts|clients-ts|py|clients-py]", "export schemas and RPC clients")
+              << cli_help_item(interactive_mode, "tools", "list local tools")
+              << cli_help_item(interactive_mode, "tool [--yes] <name> <args>", "run a local tool directly")
+              << cli_help_item(interactive_mode, "selftest [checkpoint]", "run model/tool/state/workflow/observability checks")
+              << cli_help_item(interactive_mode, "state <cmd> [args]", "use rASN state/checkpoint service")
+              << cli_help_item(interactive_mode, "registry [cmd] [args]", "inspect rASN agent registry entries")
+              << cli_help_item(interactive_mode, "agentctl <cmd> <agent>", "describe, heartbeat, query, or cancel an agent")
+              << cli_help_item(interactive_mode, "observe events [kind]", "query structured runtime events")
+              << cli_help_item(interactive_mode, "observe timeline [trace]", "show ordered trace events")
+              << cli_help_item(interactive_mode, "observe diagnose [trace]", "summarize failures and replay issues")
+              << cli_help_item(interactive_mode, "observe failures", "query classified failure records")
+              << cli_help_item(interactive_mode, "observe replay <file>", "load replay choices through rasn.observability")
+              << cli_help_item(interactive_mode, "observe metrics [format]", "dump runtime metrics (text|prometheus|json)")
+              << cli_help_item(interactive_mode, "observe resilience", "dump overload/model/tool/remote-agent resilience state")
+              << cli_help_item(interactive_mode, "observe snapshot", "summarize observability state")
+              << cli_help_item(interactive_mode, "skills", "list built-in skills")
+              << cli_help_item(interactive_mode, "skill <name> [task]", "show or apply a skill prompt")
+              << cli_help_item(interactive_mode, "topology", "show the rDSN service graph")
+              << cli_help_item(interactive_mode, "provider [name]", "show or switch provider")
+              << cli_help_item(interactive_mode, "trace [file]", "show or set JSONL runtime trace file")
+              << cli_help_item(interactive_mode, "replay <trace-jsonl>", "replay captured nondeterministic choices")
+              << cli_help_item(interactive_mode, "simulate <prompt>", "force the random local simulator")
+              << cli_help_item(interactive_mode, "interactive", "start REPL mode")
+              << "\n"
               << describe_provider_environment() << "\n";
 }
 
