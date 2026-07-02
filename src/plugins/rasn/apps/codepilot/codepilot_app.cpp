@@ -576,8 +576,8 @@ std::string codepilot_system_prompt()
 {
     return "You are CodePilot, the rASN coding agent CLI. "
            "State assumptions, preserve determinism where possible, and produce actionable output. "
-           "When context entries are attached, treat them as source/context supplied by the CLI; "
-           "do not claim no source code was provided.";
+           "When context entries are attached, treat them as context supplied by the CLI; "
+           "when that context contains a workspace source snapshot, do not claim no source code was provided.";
 }
 
 bool codepilot_context_has_workspace_snapshot(const std::vector<std::string> &context)
@@ -601,16 +601,22 @@ std::string codepilot_prompt_with_context_contract(const std::string &prompt,
     }
 
     std::ostringstream output;
+    const bool has_workspace_snapshot = codepilot_context_has_workspace_snapshot(context);
     output << "The CLI has attached " << context.size() << " context "
            << (context.size() == 1 ? "entry" : "entries");
-    if (codepilot_context_has_workspace_snapshot(context))
+    if (has_workspace_snapshot)
     {
-        output << ", including a bounded workspace source snapshot";
+        output << ", including a bounded workspace source snapshot. "
+               << "Treat the attached context as the source/context supplied for this request. "
+               << "Base the answer on concrete file names and excerpts from that snapshot. "
+               << "Do not say that no source code was provided; if the bounded snapshot is insufficient, "
+               << "state what additional files or tool output are needed.\n\nUser request:\n"
+               << prompt;
+        return output.str();
     }
-    output << ". Treat the attached context as the source/context supplied for this request. "
-           << "Base the answer on concrete file names and excerpts from that context. "
-           << "Do not say that no source code was provided; if the bounded snapshot is insufficient, "
-           << "state what additional files or tool output are needed.\n\nUser request:\n"
+
+    output << ". Treat the attached context as supplied context for this request. "
+           << "Use it when relevant, and if it is insufficient, state what additional input is needed.\n\nUser request:\n"
            << prompt;
     return output.str();
 }

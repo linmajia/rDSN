@@ -1127,6 +1127,8 @@ TEST(rasn_cli_support, workspace_source_context_includes_index_and_excerpts)
 
     write_text_file(::dsn::utils::filesystem::path_combine(root, "README.md"), "# demo workspace\n");
     write_text_file(::dsn::utils::filesystem::path_combine(src_dir, "main.c"), "int main() { return 0; }\n");
+    write_text_file(::dsn::utils::filesystem::path_combine(src_dir, "token_parser.cpp"), "int parse_token() { return 1; }\n");
+    write_text_file(::dsn::utils::filesystem::path_combine(src_dir, "private_impl.h"), "int private_impl();\n");
     write_text_file(::dsn::utils::filesystem::path_combine(root, ".env.local"), "TOKEN=secret\n");
     write_text_file(::dsn::utils::filesystem::path_combine(root, "config.json"), "{\"token\":\"secret\"}\n");
     write_text_file(::dsn::utils::filesystem::path_combine(root, "secrets.json"), "{\"token\":\"secret\"}\n");
@@ -1136,7 +1138,7 @@ TEST(rasn_cli_support, workspace_source_context_includes_index_and_excerpts)
 
     cli_workspace_context_options options;
     options.max_files = 10;
-    options.max_sampled_files = 4;
+    options.max_sampled_files = 6;
     options.max_file_bytes = 128;
     options.max_total_bytes = 512;
 
@@ -1151,6 +1153,9 @@ TEST(rasn_cli_support, workspace_source_context_includes_index_and_excerpts)
     EXPECT_NE(std::string::npos, context.find("src"));
     EXPECT_NE(std::string::npos, context.find("main.c"));
     EXPECT_NE(std::string::npos, context.find("int main()"));
+    EXPECT_NE(std::string::npos, context.find("token_parser.cpp"));
+    EXPECT_NE(std::string::npos, context.find("private_impl.h"));
+    EXPECT_NE(std::string::npos, context.find("parse_token"));
     EXPECT_EQ(std::string::npos, context.find(".env.local"));
     EXPECT_EQ(std::string::npos, context.find("config.json"));
     EXPECT_EQ(std::string::npos, context.find("secrets.json"));

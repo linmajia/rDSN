@@ -180,7 +180,7 @@ inline const std::unordered_set<std::string> &workspace_ignored_components()
 {
     static const std::unordered_set<std::string> components = {
         ".git", ".svn", ".hg", "builder", "builder-rasn", "build", "node_modules", ".venv", "venv",
-        "__pycache__", "target", "dist", "out", ".aws", ".azure", ".config", ".gnupg", ".kube", ".ssh",
+        "__pycache__", "target", "dist", "out", ".aws", ".azure", ".gnupg", ".kube", ".ssh",
         "certs", "credentials", "secrets",
     };
     return components;
@@ -222,6 +222,16 @@ inline const std::unordered_map<std::string, int> &workspace_extension_prioritie
     return priorities;
 }
 
+inline bool workspace_extension_is_source_code(const std::string &ext)
+{
+    static const std::unordered_set<std::string> code_extensions = {
+        ".h",    ".hh",   ".hpp", ".hxx", ".c",    ".cc",  ".cpp", ".cxx",
+        ".py",   ".rs",   ".go",  ".java", ".js",   ".jsx", ".ts",  ".tsx",
+        ".cs",   ".sh",   ".cmake",
+    };
+    return code_extensions.find(ext) != code_extensions.end();
+}
+
 inline bool is_sensitive_workspace_file(const std::string &path)
 {
     const std::string file_name = lower_ascii(::dsn::utils::filesystem::get_file_name(path));
@@ -232,6 +242,12 @@ inline bool is_sensitive_workspace_file(const std::string &path)
     if (file_name.find(".env.") == 0)
     {
         return true;
+    }
+    const size_t dot = file_name.find_last_of('.');
+    const std::string ext = dot == std::string::npos ? "" : file_name.substr(dot);
+    if (workspace_extension_is_source_code(ext))
+    {
+        return false;
     }
     return file_name.find("secret") != std::string::npos ||
            file_name.find("credential") != std::string::npos ||
@@ -390,8 +406,7 @@ inline bool list_workspace_directory_once(const std::string &directory,
     }
     while (dirent *entry = ::readdir(dir))
     {
-        if (entry->d_name == nullptr ||
-            std::strcmp(entry->d_name, ".") == 0 ||
+        if (std::strcmp(entry->d_name, ".") == 0 ||
             std::strcmp(entry->d_name, "..") == 0)
         {
             continue;
