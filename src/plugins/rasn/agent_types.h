@@ -197,7 +197,7 @@ inline void rasn_unmarshall_string_vector(::dsn::binary_reader &reader, std::vec
     uint32_t count = 0;
     reader.read(count);
     values.clear();
-    values.reserve(count);
+    values.reserve(rasn_bounded_reserve_count<std::string>(count));
     for (uint32_t i = 0; i < count; ++i)
     {
         std::string value;
@@ -320,7 +320,7 @@ inline void rasn_unmarshall_capabilities(::dsn::binary_reader &reader, std::vect
     uint32_t count = 0;
     reader.read(count);
     values.clear();
-    values.reserve(count);
+    values.reserve(rasn_bounded_reserve_count<agent_capability>(count));
     for (uint32_t i = 0; i < count; ++i)
     {
         agent_capability value;
@@ -371,7 +371,7 @@ inline void rasn_unmarshall_context(::dsn::binary_reader &reader, std::vector<ag
     uint32_t count = 0;
     reader.read(count);
     values.clear();
-    values.reserve(count);
+    values.reserve(rasn_bounded_reserve_count<agent_context_entry>(count));
     for (uint32_t i = 0; i < count; ++i)
     {
         agent_context_entry value;
@@ -430,7 +430,7 @@ inline void rasn_unmarshall_artifacts(::dsn::binary_reader &reader, std::vector<
     uint32_t count = 0;
     reader.read(count);
     values.clear();
-    values.reserve(count);
+    values.reserve(rasn_bounded_reserve_count<agent_artifact>(count));
     for (uint32_t i = 0; i < count; ++i)
     {
         agent_artifact value;

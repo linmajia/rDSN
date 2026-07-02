@@ -14,6 +14,40 @@
 namespace dsn {
 namespace rasn {
 
+// Bound the speculative up-front reserve for a length-prefixed sequence that is
+// unmarshalled from an untrusted or possibly-corrupt peer.
+//
+// Every rASN unmarshall_*() helper reads a uint32_t element count off the wire
+// and then reserves that many elements before decoding any of them. The count
+// is attacker-controllable, so reserving it directly -- values.reserve(count)
+// -- lets a single crafted or truncated message claim up to ~4 billion elements
+// and trigger a huge allocation (an out-of-memory abort) before a single
+// element is read.
+//
+// Mirror rDSN's own Thrift deserializer (see read_base() in
+// include/dsn/cpp/serialization_helper/thrift_helper.h): cap the reservation to
+// a fixed *byte* budget rather than a flat element count, because the memory
+// reserved is count * sizeof(T) and a flat count would reserve wildly different
+// amounts for different element types. This is the only speculative allocation
+// per call, so it directly caps per-message memory. The decode loop still runs
+// to the claimed count, but binary_reader::read() throws std::out_of_range at
+// end-of-stream the moment the peer's claim outruns the buffer, so a lying
+// count can drive neither a large allocation nor an unbounded loop -- it becomes
+// a clean parse error instead of an OOM abort. Realistic lists stay well under
+// the budget and so are unaffected; larger legitimate lists simply grow via the
+// vector's amortized O(1) reallocation.
+template <typename T>
+inline uint32_t rasn_bounded_reserve_count(uint32_t claimed_count)
+{
+    const uint32_t max_preallocate_bytes = 64 * 1024;
+    uint32_t cap = max_preallocate_bytes / static_cast<uint32_t>(sizeof(T));
+    if (cap == 0)
+    {
+        cap = 1;
+    }
+    return claimed_count < cap ? claimed_count : cap;
+}
+
 struct state_record;
 struct state_response;
 
@@ -208,7 +242,7 @@ inline void unmarshall_runtime_events(::dsn::binary_reader &reader,
     uint32_t count = 0;
     reader.read(count);
     values.clear();
-    values.reserve(count);
+    values.reserve(rasn_bounded_reserve_count<runtime_event>(count));
     for (uint32_t i = 0; i < count; ++i)
     {
         runtime_event value;
@@ -235,7 +269,7 @@ inline void unmarshall_failures(::dsn::binary_reader &reader,
     uint32_t count = 0;
     reader.read(count);
     values.clear();
-    values.reserve(count);
+    values.reserve(rasn_bounded_reserve_count<failure_record>(count));
     for (uint32_t i = 0; i < count; ++i)
     {
         failure_record value;

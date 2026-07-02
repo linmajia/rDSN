@@ -1128,6 +1128,23 @@ state_response state_store::recover(const state_checkpoint_request &request)
             std::string decode_error;
             if (!decode_state_record_fields(split_tab_fields(line), journal_path, &record, &decode_error))
             {
+                if (journal.eof())
+                {
+                    // Torn tail: the process crashed (or an injected fault
+                    // interrupted the write) partway through appending the final
+                    // journal record, leaving an unterminated last line. std::getline
+                    // sets eofbit (not failbit) when it extracts characters and then
+                    // hits end-of-stream without a terminating newline, so eof() here
+                    // means this is the trailing partial record. Every prior record was
+                    // flushed and newline-terminated, so drop only the torn tail and keep
+                    // the state recovered so far instead of failing the whole recovery.
+                    dwarn("dropping torn trailing record in state journal %s: %s",
+                          journal_path.c_str(),
+                          decode_error.c_str());
+                    break;
+                }
+                // A complete, newline-terminated line that fails to decode is genuine
+                // mid-journal corruption (there is more data after it), so stay strict.
                 return error_response(decode_error);
             }
             recovered[record.key] = record;

@@ -119,7 +119,7 @@ inline void unmarshall_state_records(::dsn::binary_reader &reader,
     uint32_t count = 0;
     reader.read(count);
     values.clear();
-    values.reserve(count);
+    values.reserve(rasn_bounded_reserve_count<state_record>(count));
     for (uint32_t i = 0; i < count; ++i)
     {
         state_record value;

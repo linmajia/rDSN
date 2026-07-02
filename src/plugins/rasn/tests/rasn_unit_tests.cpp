@@ -1463,6 +1463,112 @@ TEST(rasn_state, checkpoints_and_recovers_records)
     std::remove((checkpoint_path + ".bak").c_str());
 }
 
+TEST(rasn_wire_limits, bounded_reserve_caps_untrusted_counts)
+{
+    // Small, legitimate counts pass through unchanged.
+    EXPECT_EQ(0u, rasn_bounded_reserve_count<std::string>(0));
+    EXPECT_EQ(7u, rasn_bounded_reserve_count<std::string>(7));
+
+    // A hostile/corrupt length prefix is capped to a fixed 64 KiB byte budget
+    // instead of being reserved verbatim, so one crafted or truncated message
+    // cannot force a multi-gigabyte speculative allocation before any element is
+    // even read.
+    const uint32_t hostile = 0xFFFFFFFFu;
+    const uint32_t expected_string_cap =
+        static_cast<uint32_t>((64u * 1024u) / sizeof(std::string));
+    EXPECT_EQ(expected_string_cap, rasn_bounded_reserve_count<std::string>(hostile));
+    EXPECT_LT(rasn_bounded_reserve_count<std::string>(hostile), hostile);
+
+    // The budget is measured in bytes, so an element larger than the whole budget
+    // still reserves at least one slot (never zero, which would defeat reserve()).
+    struct huge_element
+    {
+        char bytes[128 * 1024];
+    };
+    EXPECT_EQ(1u, rasn_bounded_reserve_count<huge_element>(hostile));
+}
+
+TEST(rasn_state, recovers_past_a_torn_trailing_journal_record)
+{
+    // Reproduce a crash or injected fault that interrupts the final journal
+    // append, leaving an unterminated (newline-less) trailing record. Recovery
+    // must keep every fully-written record instead of failing closed and
+    // discarding all of them along with the atomically-written checkpoint.
+
+    // The journal and checkpoint paths are process-global (derived from the
+    // [rasn.state] config and its default runtime layout). Use the same public
+    // helpers state_store uses so the test seeds, cleans, and recovers the exact
+    // same files even if the default layout changes.
+    const std::string journal_path = configured_state_journal_path();
+    const std::string checkpoint_path = configured_state_checkpoint_path();
+    ASSERT_FALSE(journal_path.empty());
+    ASSERT_FALSE(checkpoint_path.empty());
+
+    // Clean slate so put() rebuilds the journal from scratch and recover() reads
+    // only the journal (no checkpoint present -> the journal branch is exercised).
+    std::remove(checkpoint_path.c_str());
+    std::remove((checkpoint_path + ".tmp").c_str());
+    std::remove((checkpoint_path + ".bak").c_str());
+    std::remove(journal_path.c_str());
+
+    state_store writer;
+    state_record first;
+    first.key = "unit/torn-a";
+    first.kind = "observation";
+    first.scope = "unit";
+    first.value = "first-value";
+    ASSERT_TRUE(writer.put(first).ok);
+
+    state_record second;
+    second.key = "unit/torn-b";
+    second.kind = "observation";
+    second.scope = "unit";
+    second.value = "second-value";
+    ASSERT_TRUE(writer.put(second).ok);
+
+    // Simulate the torn append: a partial, non-decodable record (too few fields)
+    // with no trailing newline -- exactly what a crash mid-write leaves behind.
+    {
+        std::ofstream torn(journal_path.c_str(), std::ios::binary | std::ios::app);
+        ASSERT_TRUE(torn.good());
+        torn << "1\t3\t756e69742f746f726e2d63";
+        torn.flush();
+    }
+
+    state_store reader;
+    state_checkpoint_request request;
+    request.path = checkpoint_path; // absent -> only the journal is replayed
+    const state_response recovered = reader.recover(request);
+    ASSERT_TRUE(recovered.ok) << recovered.error;
+
+    bool saw_first = false;
+    bool saw_second = false;
+    bool saw_torn = false;
+    for (const state_record &record : recovered.records)
+    {
+        if (record.key == "unit/torn-a")
+        {
+            saw_first = true;
+        }
+        else if (record.key == "unit/torn-b")
+        {
+            saw_second = true;
+        }
+        else if (record.key == "unit/torn-c")
+        {
+            saw_torn = true;
+        }
+    }
+    EXPECT_TRUE(saw_first);
+    EXPECT_TRUE(saw_second);
+    EXPECT_FALSE(saw_torn);
+
+    std::remove(checkpoint_path.c_str());
+    std::remove((checkpoint_path + ".tmp").c_str());
+    std::remove((checkpoint_path + ".bak").c_str());
+    std::remove(journal_path.c_str());
+}
+
 TEST(rasn_state, conditional_put_guards_create_and_expected_sequence)
 {
     state_store store;

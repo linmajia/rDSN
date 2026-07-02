@@ -92,7 +92,7 @@ inline void unmarshall_policy_string_vector(::dsn::binary_reader &reader, std::v
     uint32_t count = 0;
     reader.read(count);
     values.clear();
-    values.reserve(count);
+    values.reserve(rasn_bounded_reserve_count<std::string>(count));
     for (uint32_t i = 0; i < count; ++i)
     {
         std::string value;
