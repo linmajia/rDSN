@@ -149,7 +149,7 @@ int main(int argc, char **argv)
     const bool dsn_mode = argc > 1 && argv[1] != nullptr && std::string(argv[1]) == "--dsn";
     const std::string explicit_dsn_config = (dsn_mode && argc > 2 && argv[2] != nullptr) ? argv[2] : "";
 
-    if (argc > 1 && !dsn_mode)
+    if (!dsn_mode)
     {
         const std::string config_path = find_config_path(program);
         const std::string empty_app_list = "__rasn_direct_cli__";
