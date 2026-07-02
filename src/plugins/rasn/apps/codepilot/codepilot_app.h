@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../agent_services.h"
+#include "../../cli_app.h"
 #include "../../rasn.code.definition.h"
 #include "../../workflow.h"
 #include "skills.h"
@@ -8,7 +8,6 @@
 #include <dsn/service_api_cpp.h>
 #include <dsn/cpp/task_helper.h>
 
-#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -16,21 +15,19 @@
 namespace dsn {
 namespace rasn {
 
-class codepilot_cli
+class codepilot_cli : public rasn_cli_app_base
 {
 public:
     codepilot_cli();
 
-    int run(const std::vector<std::string> &args);
-    int repl();
-
-    // Ask a running interactive repl() to exit at its next loop iteration. Safe to
-    // call from another thread (e.g. service_app::stop) so shutdown need not block
-    // on the non-preemptible, stdin-parked CLI task.
-    void request_shutdown() { _shutdown_requested.store(true); }
-
 private:
-    int run_command(const std::vector<std::string> &args, bool interactive_mode = false);
+    std::vector<std::string> commands() const override;
+    const char *repl_title() const override;
+    const char *repl_prompt() const override;
+    const char *repl_plain_text_behavior() const override;
+    int run_command(const std::vector<std::string> &args, bool interactive_mode = false) override;
+    void handle_plain_text(const std::string &line) override;
+    void on_startup_context(const cli_startup_context &startup) override;
     int ask(const std::string &prompt, bool planning_mode);
     int stream(const std::string &prompt);
     int agent(const std::string &prompt);
@@ -51,11 +48,8 @@ private:
                                  bool explicit_approval,
                                  std::vector<std::string> *policy_labels) const;
     void print_help(bool interactive_mode) const;
-    std::string provider_summary() const;
 
-    rasn_service_graph &_services;
     std::vector<std::string> _context;
-    std::atomic<bool> _shutdown_requested{false};
 };
 
 class codepilot_app : public ::dsn::service_app

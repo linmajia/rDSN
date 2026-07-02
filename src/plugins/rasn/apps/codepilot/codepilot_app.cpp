@@ -165,210 +165,6 @@ void print_agent_descriptors(const std::vector<agent_descriptor> &agents)
     std::cout << "agents=" << agents.size() << "\n";
 }
 
-class service_graph_lifecycle_scope
-{
-public:
-    explicit service_graph_lifecycle_scope(rasn_service_graph &services) : _services(services) { _services.acquire(); }
-    ~service_graph_lifecycle_scope() { _services.release(); }
-
-private:
-    rasn_service_graph &_services;
-};
-
-void append_readiness_error(std::vector<std::string> *errors, const std::string &component, const std::string &detail)
-{
-    if (errors != nullptr)
-    {
-        errors->push_back(component + "=" + detail);
-    }
-}
-
-std::string readiness_errors_summary(const std::vector<std::string> &errors)
-{
-    std::ostringstream oss;
-    for (size_t i = 0; i < errors.size(); ++i)
-    {
-        if (i != 0)
-        {
-            oss << "; ";
-        }
-        oss << errors[i];
-    }
-    return oss.str();
-}
-
-bool probe_state_service(const rasn_service_graph &services, std::vector<std::string> *errors)
-{
-    rasn_state_client state(services.state_address());
-    state_query_request request;
-    request.key_prefix = "__rasn_readiness_probe__";
-    ::dsn::error_code err;
-    state_response response;
-    std::tie(err, response) = state.query_sync(request, std::chrono::milliseconds(500));
-    if (err != ::dsn::ERR_OK)
-    {
-        append_readiness_error(errors, "state", err.to_string());
-        return false;
-    }
-    if (!response.ok)
-    {
-        append_readiness_error(errors, "state", response.error);
-        return false;
-    }
-    return true;
-}
-
-bool probe_registry_service(const rasn_service_graph &services, std::vector<std::string> *errors)
-{
-    rasn_registry_client registry(services.registry_address());
-    ::dsn::error_code err;
-    registry_query_response response;
-    std::tie(err, response) = registry.list_sync("", std::chrono::milliseconds(500));
-    if (err != ::dsn::ERR_OK)
-    {
-        append_readiness_error(errors, "registry", err.to_string());
-        return false;
-    }
-    if (!response.ok)
-    {
-        append_readiness_error(errors, "registry", response.error);
-        return false;
-    }
-    return true;
-}
-
-bool probe_agent_service(const std::string &label,
-                         const ::dsn::rpc_address &address,
-                         const std::string &expected_agent_id,
-                         std::vector<std::string> *errors)
-{
-    rasn_agent_client client(address);
-    ::dsn::error_code err;
-    agent_descriptor descriptor;
-    std::tie(err, descriptor) = client.describe_sync("readiness", std::chrono::milliseconds(500));
-    if (err != ::dsn::ERR_OK)
-    {
-        append_readiness_error(errors, label, err.to_string());
-        return false;
-    }
-    if (descriptor.agent_id != expected_agent_id)
-    {
-        append_readiness_error(errors, label, "unexpected agent id: " + descriptor.agent_id);
-        return false;
-    }
-    return true;
-}
-
-bool probe_model_health(const rasn_service_graph &services, std::vector<std::string> *errors)
-{
-    rasn_llm_agent_client model(services.llm_agent_address());
-    ::dsn::error_code err;
-    model_gateway_response response;
-    std::tie(err, response) = model.health_sync("readiness", std::chrono::milliseconds(500));
-    if (err != ::dsn::ERR_OK)
-    {
-        append_readiness_error(errors, "model.health", err.to_string());
-        return false;
-    }
-    if (!response.ok)
-    {
-        append_readiness_error(errors, "model.health", response.error);
-        return false;
-    }
-    return true;
-}
-
-bool probe_workflow_service(const rasn_service_graph &services, std::vector<std::string> *errors)
-{
-    rasn_workflow_client workflow(services.workflow_address());
-    workflow_source source;
-    source.workflow_id = "readiness";
-    source.source_name = "<readiness>";
-    source.source_text = "task readiness ask \"ping\"\n";
-    ::dsn::error_code err;
-    workflow_response response;
-    std::tie(err, response) = workflow.validate_sync(source, std::chrono::milliseconds(500));
-    if (err != ::dsn::ERR_OK)
-    {
-        append_readiness_error(errors, "workflow", err.to_string());
-        return false;
-    }
-    if (!response.ok)
-    {
-        append_readiness_error(errors, "workflow", response.error);
-        return false;
-    }
-    return true;
-}
-
-bool probe_observability_service(const rasn_service_graph &services, std::vector<std::string> *errors)
-{
-    rasn_observability_client observability(services.observability_address());
-    observability_query_request request;
-    request.limit = 1;
-    ::dsn::error_code err;
-    observability_response response;
-    std::tie(err, response) = observability.query_sync(request, std::chrono::milliseconds(500));
-    if (err != ::dsn::ERR_OK)
-    {
-        append_readiness_error(errors, "observability", err.to_string());
-        return false;
-    }
-    if (!response.ok)
-    {
-        append_readiness_error(errors, "observability", response.error);
-        return false;
-    }
-    return true;
-}
-
-bool probe_service_dependencies_once(const rasn_service_graph &services, std::vector<std::string> *errors)
-{
-    bool ready = true;
-    ready = probe_state_service(services, errors) && ready;
-    ready = probe_registry_service(services, errors) && ready;
-    ready = probe_agent_service("coordinator", services.coordinator_address(), "rasn.coordinator", errors) && ready;
-    ready = probe_agent_service("model.agent", services.llm_agent_address(), "rasn.llm.agent", errors) && ready;
-    ready = probe_model_health(services, errors) && ready;
-    ready = probe_agent_service("tool.agent", services.tool_agent_address(), "rasn.tool.agent", errors) && ready;
-    ready = probe_workflow_service(services, errors) && ready;
-    ready = probe_observability_service(services, errors) && ready;
-    return ready;
-}
-
-bool wait_for_service_dependencies(const rasn_service_graph &services, std::string *error)
-{
-    if (!services.rpc_clients_enabled())
-    {
-        return true;
-    }
-
-    const std::chrono::steady_clock::time_point deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(15);
-    std::vector<std::string> last_errors;
-    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-    while (std::chrono::steady_clock::now() < deadline)
-    {
-        std::vector<std::string> errors;
-        if (probe_service_dependencies_once(services, &errors))
-        {
-            return true;
-        }
-        last_errors.swap(errors);
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-
-    if (error != nullptr)
-    {
-        *error = "rASN service dependencies are not ready";
-        if (!last_errors.empty())
-        {
-            *error += ": " + readiness_errors_summary(last_errors);
-        }
-    }
-    return false;
-}
-
 bool agent_target_id(const std::string &target, std::string *agent_id)
 {
     static const std::map<std::string, std::string> targets = {
@@ -681,89 +477,44 @@ std::string agent_error_message(const agent_response &response)
 
 } // namespace
 
-codepilot_cli::codepilot_cli() : _services(global_rasn_services())
+codepilot_cli::codepilot_cli() : rasn_cli_app_base(global_rasn_services())
 {
     register_default_tool_provider(&create_codepilot_tool_provider);
     _services.set_tool_provider(create_default_tool_provider());
 }
 
-int codepilot_cli::run(const std::vector<std::string> &args)
+std::vector<std::string> codepilot_cli::commands() const
 {
-    cli_startup_context startup;
-    const cli_workspace_context_options workspace_context_options;
-    if (!bootstrap_single_path_argument(args, codepilot_commands(), &startup, 1024u * 1024u, &workspace_context_options))
-    {
-        std::cout << startup.error << "\n";
-        return 1;
-    }
-    if (startup.matched)
-    {
-        _context.push_back("workspace: " + startup.workspace_root);
-        if (!startup.context_text.empty())
-        {
-            _context.push_back(startup.context_text);
-        }
-    }
-
-    service_graph_lifecycle_scope lifecycle(_services);
-    if (startup.matched)
-    {
-        std::cout << startup.message << "\n";
-        return repl();
-    }
-
-    if (args.empty() || args[0] == "interactive" || args[0] == "repl")
-    {
-        return repl();
-    }
-
-    return run_command(args);
+    return codepilot_commands();
 }
 
-int codepilot_cli::repl()
+const char *codepilot_cli::repl_title() const
 {
-    std::cout << "rASN CodePilot prototype\n";
-    std::cout << provider_summary() << "\n";
-    std::cout << "Type /help for commands. Plain text is sent as an ask prompt.\n";
+    return "rASN CodePilot prototype";
+}
 
-    std::string line;
-    while (true)
+const char *codepilot_cli::repl_prompt() const
+{
+    return "codepilot> ";
+}
+
+const char *codepilot_cli::repl_plain_text_behavior() const
+{
+    return "sent as an ask prompt";
+}
+
+void codepilot_cli::on_startup_context(const cli_startup_context &startup)
+{
+    _context.push_back("workspace: " + startup.workspace_root);
+    if (!startup.context_text.empty())
     {
-        if (_shutdown_requested.load())
-        {
-            return 0;
-        }
-
-        std::cout << "codepilot> ";
-        if (!std::getline(std::cin, line))
-        {
-            return 0;
-        }
-
-        line = trim(line);
-        if (line.empty())
-        {
-            continue;
-        }
-
-        if (line == "/exit" || line == "/quit")
-        {
-            return 0;
-        }
-
-        if (line[0] == '/')
-        {
-            std::vector<std::string> args = split_words(line.substr(1));
-            const int rc = run_command(args, true);
-            if (rc != 0)
-            {
-                std::cout << "command failed: " << rc << "\n";
-            }
-            continue;
-        }
-
-        ask(line, false);
+        _context.push_back(startup.context_text);
     }
+}
+
+void codepilot_cli::handle_plain_text(const std::string &line)
+{
+    (void)ask(line, false);
 }
 
 int codepilot_cli::run_command(const std::vector<std::string> &args, bool interactive_mode)
@@ -2295,11 +2046,6 @@ void codepilot_cli::print_help(bool interactive_mode) const
               << describe_provider_environment() << "\n";
 }
 
-std::string codepilot_cli::provider_summary() const
-{
-    return _services.provider_summary();
-}
-
 ::dsn::error_code codepilot_app::start(int argc, char **argv)
 {
     global_rasn_services().acquire();
@@ -2343,7 +2089,10 @@ std::string codepilot_cli::provider_summary() const
 void codepilot_app::run_cli_task()
 {
     std::string readiness_error;
-    const int rc = wait_for_service_dependencies(global_rasn_services(), &readiness_error) ? _cli.run(_args) : 1;
+    const int rc = wait_for_cli_service_dependencies(
+                       global_rasn_services(), rasn_cli_service_readiness_options(), &readiness_error)
+        ? _cli.run(_args)
+        : 1;
     if (!readiness_error.empty())
     {
         std::cerr << readiness_error << "\n";

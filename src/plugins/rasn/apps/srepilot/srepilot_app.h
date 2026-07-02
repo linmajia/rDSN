@@ -1,30 +1,31 @@
 #pragma once
 
-#include "../../agent_services.h"
+#include "../../cli_app.h"
 #include "../../rasn.code.definition.h"
 
 #include <dsn/cpp/task_helper.h>
 #include <dsn/service_api_cpp.h>
 
-#include <atomic>
 #include <string>
 #include <vector>
 
 namespace dsn {
 namespace rasn {
 
-class srepilot_cli
+class srepilot_cli : public rasn_cli_app_base
 {
 public:
     srepilot_cli();
 
-    int run(const std::vector<std::string> &args);
-    int repl();
-
-    void request_shutdown() { _shutdown_requested.store(true); }
-
 private:
-    int run_command(const std::vector<std::string> &args, bool interactive_mode = false);
+    std::vector<std::string> commands() const override;
+    const char *repl_title() const override;
+    const char *repl_prompt() const override;
+    const char *repl_plain_text_behavior() const override;
+    int run_command(const std::vector<std::string> &args, bool interactive_mode = false) override;
+    void handle_plain_text(const std::string &line) override;
+    int handle_empty_args() override;
+    void on_startup_context(const cli_startup_context &startup) override;
     int diagnose(const std::vector<std::string> &args);
     int runbook(const std::vector<std::string> &args);
     int status();
@@ -40,9 +41,7 @@ private:
                           std::string *stored_key);
     void print_help(bool interactive_mode) const;
 
-    rasn_service_graph &_services;
     std::vector<std::string> _startup_context;
-    std::atomic<bool> _shutdown_requested{false};
     bool _state_recovered_for_persist = false;
 };
 
