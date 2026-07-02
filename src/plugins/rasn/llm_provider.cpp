@@ -1,5 +1,6 @@
 #include "llm_provider.h"
 
+#include "provider_router.h"
 #include "redaction.h"
 
 #include <dsn/cpp/utils.h>
@@ -109,29 +110,6 @@ std::string effective_request_timeout_sec(uint32_t request_timeout_ms)
         effective_ms = (std::min)(effective_ms, configured_ms);
     }
     return seconds_from_milliseconds(effective_ms);
-}
-
-std::string provider_config(const std::string &provider,
-                            const std::string &key,
-                            const std::string &fallback,
-                            const std::string &help)
-{
-    std::string normalized = provider;
-    for (char &c : normalized)
-    {
-        if (c == '.' || c == '-')
-        {
-            c = '_';
-        }
-    }
-
-    const std::string provider_key = normalized + "_" + key;
-    const std::string specific = llm_config(provider_key, "", help);
-    if (!specific.empty())
-    {
-        return specific;
-    }
-    return llm_config(key, fallback, help);
 }
 
 std::string command_quote(const std::string &value)
@@ -1062,19 +1040,7 @@ private:
     std::vector<std::string> _headers;
 };
 
-struct provider_profile
-{
-    std::string name;
-    std::string endpoint;
-    std::string model;
-    std::string token_env;
-    std::string credential_ref;
-    std::string payload_format;
-    bool local;
-    std::vector<std::string> headers;
-};
-
-std::unique_ptr<llm_provider> make_profile_provider(const provider_profile &profile)
+std::unique_ptr<llm_provider> make_profile_provider(const model_provider_profile &profile)
 {
     return std::unique_ptr<llm_provider>(new curl_chat_provider(profile.name,
                                                                 profile.endpoint,
@@ -1148,7 +1114,7 @@ llm_provider::complete_streaming(const llm_request &request, nucleus_runtime &ru
 
 std::unique_ptr<llm_provider> create_provider_from_environment()
 {
-    return create_provider(llm_config("provider", "simulator", "LLM provider name"));
+    return create_provider(rasn_model_config_string("provider", "simulator", "LLM provider name"));
 }
 
 std::unique_ptr<llm_provider> create_provider(const std::string &provider_name)
@@ -1158,103 +1124,17 @@ std::unique_ptr<llm_provider> create_provider(const std::string &provider_name)
 
 std::unique_ptr<llm_provider> create_provider(const std::string &provider_name, const std::string &model_name)
 {
-    const std::string provider = trim(provider_name.empty() ? "simulator" : provider_name);
-    const std::string model_override = trim(model_name);
-
-    if (provider == "simulator" || provider == "mock" || provider == "random")
+    const model_provider_profile profile = resolve_model_provider_profile(provider_name, model_name);
+    if (profile.in_process && profile.payload_format == "simulator")
     {
-        return std::unique_ptr<llm_provider>(new simulator_provider(model_override));
+        return std::unique_ptr<llm_provider>(new simulator_provider(profile.model));
     }
-
-    if (provider == "ollama")
-    {
-        provider_profile profile;
-        profile.name = "ollama";
-        profile.endpoint = provider_config("ollama", "endpoint", "http://localhost:11434/api/chat", "Ollama endpoint");
-        profile.model = provider_config("ollama", "model", "llama3.1", "Ollama model name");
-        if (!model_override.empty())
-        {
-            profile.model = model_override;
-        }
-        profile.payload_format = provider_config("ollama", "payload", "ollama.chat", "Ollama payload format");
-        profile.local = true;
-        return make_profile_provider(profile);
-    }
-
-    if (provider == "llamacpp" || provider == "llama.cpp")
-    {
-        provider_profile profile;
-        profile.name = "llama.cpp";
-        profile.endpoint = provider_config("llama_cpp", "endpoint", "http://localhost:8080/v1/chat/completions", "llama.cpp endpoint");
-        profile.model = provider_config("llama_cpp", "model", "local-model", "llama.cpp model name");
-        if (!model_override.empty())
-        {
-            profile.model = model_override;
-        }
-        profile.payload_format = "openai.chat";
-        profile.local = true;
-        return make_profile_provider(profile);
-    }
-
-    if (provider == "lmstudio" || provider == "lm-studio")
-    {
-        provider_profile profile;
-        profile.name = "lmstudio";
-        profile.endpoint = provider_config("lmstudio", "endpoint", "http://localhost:1234/v1/chat/completions", "LM Studio endpoint");
-        profile.model = provider_config("lmstudio", "model", "local-model", "LM Studio model name");
-        if (!model_override.empty())
-        {
-            profile.model = model_override;
-        }
-        profile.payload_format = "openai.chat";
-        profile.local = true;
-        return make_profile_provider(profile);
-    }
-
-    if (provider == "copilot" || provider == "github-copilot")
-    {
-        provider_profile profile;
-        profile.name = "copilot";
-        profile.endpoint = provider_config("copilot", "endpoint", "https://api.githubcopilot.com/chat/completions", "GitHub Copilot-compatible endpoint");
-        profile.model = provider_config("copilot", "model", "gpt-4o-copilot", "GitHub Copilot-compatible model name");
-        if (!model_override.empty())
-        {
-            profile.model = model_override;
-        }
-        profile.credential_ref = provider_config(
-            "copilot", "token_ref", "", "Copilot credential reference such as env:RASN_COPILOT_TOKEN or file:path");
-        profile.token_env = provider_config(
-            "copilot", "token_env", "RASN_COPILOT_TOKEN,GITHUB_COPILOT_TOKEN,COPILOT_TOKEN,GH_TOKEN", "Copilot token environment variables");
-        profile.payload_format = "openai.chat";
-        profile.local = false;
-        profile.headers.push_back("Copilot-Integration-Id: rasn-codepilot");
-        profile.headers.push_back("Editor-Version: rASN-CodePilot/0.1");
-        profile.headers.push_back("OpenAI-Intent: conversation-panel");
-        return make_profile_provider(profile);
-    }
-
-    provider_profile profile;
-    profile.name = provider;
-    profile.endpoint = provider_config(provider, "endpoint", "http://localhost:8000/v1/chat/completions", "OpenAI-compatible endpoint");
-    profile.model = provider_config(provider, "model", "local-model", "OpenAI-compatible model name");
-    if (!model_override.empty())
-    {
-        profile.model = model_override;
-    }
-    profile.credential_ref = provider_config(provider, "token_ref", "", "credential reference such as env:RASN_API_KEY or file:path");
-    profile.token_env = provider_config(provider, "token_env", "RASN_API_KEY", "environment variable containing the provider token");
-    profile.payload_format = "openai.chat";
-    profile.local = false;
     return make_profile_provider(profile);
 }
 
 std::string describe_provider_environment()
 {
-    return "[rasn.model] provider=simulator|copilot|ollama|llamacpp|lmstudio|openai-compatible "
-           "(or compatibility alias [rasn.llm]), endpoint=<url>, model=<model>, "
-           "token_ref=env:<env[,env2]>|file:<path>|cmd:<command> or token_env=<env[,env2]>; provider-specific keys such as copilot_endpoint, "
-           "ollama_model, llama_cpp_endpoint, and lmstudio_model override shared defaults; "
-           "use token_ref, token_env, or token_command for secrets instead of storing tokens in config files";
+    return describe_model_provider_routing();
 }
 
 } // namespace rasn

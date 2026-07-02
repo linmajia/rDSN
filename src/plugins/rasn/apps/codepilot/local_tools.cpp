@@ -1,6 +1,8 @@
 #include "local_tools.h"
 
 #include <rasn/policy_manager.h>
+#include <rasn/tool_catalog.h>
+#include <rasn/workspace_change.h>
 
 #include <dsn/cpp/utils.h>
 #include <dsn/service_api_cpp.h>
@@ -34,20 +36,6 @@ namespace dsn {
 namespace rasn {
 
 namespace {
-
-std::string join_tool_args(const std::vector<std::string> &args, size_t begin)
-{
-    std::ostringstream oss;
-    for (size_t i = begin; i < args.size(); ++i)
-    {
-        if (i != begin)
-        {
-            oss << " ";
-        }
-        oss << args[i];
-    }
-    return oss.str();
-}
 
 bool parse_size(const std::string &value, size_t *parsed)
 {
@@ -850,32 +838,54 @@ tool_result make_tool_result(bool ok, const std::string &output, const std::stri
     return result;
 }
 
-tool_argument_descriptor tool_argument(const std::string &name, bool required, const std::string &description)
+const tool_catalog &codepilot_tool_catalog()
 {
-    tool_argument_descriptor argument;
-    argument.name = name;
-    argument.required = required;
-    argument.description = description;
-    return argument;
-}
-
-tool_descriptor tool_schema(const std::string &name,
-                            const std::string &side_effect,
-                            const std::string &description,
-                            const std::vector<tool_argument_descriptor> &arguments)
-{
-    tool_descriptor descriptor;
-    descriptor.name = name;
-    descriptor.side_effect = side_effect;
-    descriptor.description = description;
-    descriptor.arguments = arguments;
-    return descriptor;
-}
-
-bool known_tool_name(const std::string &name)
-{
-    return name == "list" || name == "read" || name == "search" || name == "write" || name == "replace" ||
-           name == "shell";
+    static const tool_catalog catalog = []() {
+        tool_catalog tools;
+        tools.add(make_tool_descriptor(
+            "list",
+            "read_only",
+            "List immediate files and directories.",
+            std::vector<tool_argument_descriptor>{
+                make_tool_argument("path", false, "Directory to list; defaults to current directory.")}));
+        tools.add(make_tool_descriptor(
+            "read",
+            "read_only",
+            "Read a bounded file prefix.",
+            std::vector<tool_argument_descriptor>{
+                make_tool_argument("path", true, "File to read."),
+                make_tool_argument("max_bytes", false, "Maximum bytes to read.")}));
+        tools.add(make_tool_descriptor(
+            "search",
+            "read_only",
+            "Recursively search text files for a substring.",
+            std::vector<tool_argument_descriptor>{
+                make_tool_argument("path", true, "File or directory to search."),
+                make_tool_argument("text", true, "Substring to find.")}));
+        tools.add(make_tool_descriptor(
+            "write",
+            "write",
+            "Atomically write a file when policy allows write side effects.",
+            std::vector<tool_argument_descriptor>{
+                make_tool_argument("path", true, "File to write."),
+                make_tool_argument("content", true, "Content to write; pass as a single quoted argument so tabs, repeated spaces, and newlines are preserved (unquoted content is joined with single spaces).")}));
+        tools.add(make_tool_descriptor(
+            "replace",
+            "write",
+            "Atomically replace the first text occurrence when policy allows write side effects.",
+            std::vector<tool_argument_descriptor>{
+                make_tool_argument("path", true, "File to edit."),
+                make_tool_argument("old", true, "Text to replace; pass as a single quoted argument to match interior whitespace exactly."),
+                make_tool_argument("new", true, "Replacement text; pass as a single quoted argument so tabs, repeated spaces, and newlines are preserved (unquoted text is joined with single spaces).")}));
+        tools.add(make_tool_descriptor(
+            "shell",
+            "shell",
+            "Run a local command only when policy, approval, and shell sandbox controls allow it.",
+            std::vector<tool_argument_descriptor>{
+                make_tool_argument("command", true, "Command and arguments to execute.")}));
+        return tools;
+    }();
+    return catalog;
 }
 
 } // namespace
@@ -995,112 +1005,17 @@ tool_result codepilot_run_shell_command(const std::string &command, uint64_t tim
 
 bool codepilot_write_file_atomically(const std::string &path, const std::string &content, std::string *error)
 {
-    if (path.empty())
-    {
-        if (error != nullptr)
-        {
-            *error = "cannot write file with empty path";
-        }
-        return false;
-    }
-
-    const std::string parent = ::dsn::utils::filesystem::remove_file_name(path);
-    if (!parent.empty() && !::dsn::utils::filesystem::directory_exists(parent) &&
-        !::dsn::utils::filesystem::create_directory(parent))
-    {
-        if (error != nullptr)
-        {
-            *error = "cannot create parent directory: " + parent;
-        }
-        return false;
-    }
-
-    const std::string file_name = ::dsn::utils::filesystem::get_file_name(path);
-    const std::string temp_name = "." + (file_name.empty() ? "codepilot-write" : file_name) + ".tmp." + make_trace_id();
-    const std::string temp_path = parent.empty() ? temp_name : ::dsn::utils::filesystem::path_combine(parent, temp_name);
-
-    std::ofstream output(temp_path.c_str(), std::ios::binary | std::ios::trunc);
-    if (!output)
-    {
-        if (error != nullptr)
-        {
-            *error = "cannot open temporary file: " + temp_path;
-        }
-        return false;
-    }
-    output << content;
-    output.close();
-    if (!output)
-    {
-        ::dsn::utils::filesystem::remove_path(temp_path);
-        if (error != nullptr)
-        {
-            *error = "cannot flush temporary file: " + temp_path;
-        }
-        return false;
-    }
-
-    if (!::dsn::utils::filesystem::rename_path(temp_path, path))
-    {
-        ::dsn::utils::filesystem::remove_path(temp_path);
-        if (error != nullptr)
-        {
-            *error = "cannot atomically replace file: " + path;
-        }
-        return false;
-    }
-    return true;
+    return write_workspace_file_atomically(path, content, "codepilot-write", error);
 }
 
 std::string codepilot_tool_provider::describe_tools() const
 {
-    std::ostringstream output;
-    output << "Available tools:\n";
-    for (const tool_descriptor &tool : describe_tool_schemas())
-    {
-        output << "- " << tool.name;
-        for (const tool_argument_descriptor &argument : tool.arguments)
-        {
-            output << " <" << argument.name << (argument.required ? "" : "?") << ">";
-        }
-        output << ": " << tool.description << " [" << tool.side_effect << "]\n";
-    }
-    return output.str();
+    return codepilot_tool_catalog().describe("Available tools:");
 }
 
 std::vector<tool_descriptor> codepilot_tool_provider::describe_tool_schemas() const
 {
-    std::vector<tool_descriptor> tools;
-    tools.push_back(tool_schema("list",
-                                "read_only",
-                                "List immediate files and directories.",
-                                std::vector<tool_argument_descriptor>{tool_argument("path", false, "Directory to list; defaults to current directory.")}));
-    tools.push_back(tool_schema("read",
-                                "read_only",
-                                "Read a bounded file prefix.",
-                                std::vector<tool_argument_descriptor>{tool_argument("path", true, "File to read."),
-                                                                       tool_argument("max_bytes", false, "Maximum bytes to read.")}));
-    tools.push_back(tool_schema("search",
-                                "read_only",
-                                "Recursively search text files for a substring.",
-                                std::vector<tool_argument_descriptor>{tool_argument("path", true, "File or directory to search."),
-                                                                       tool_argument("text", true, "Substring to find.")}));
-    tools.push_back(tool_schema("write",
-                                "write",
-                                "Atomically write a file when policy allows write side effects.",
-                                std::vector<tool_argument_descriptor>{tool_argument("path", true, "File to write."),
-                                                                       tool_argument("content", true, "Content to write; pass as a single quoted argument so tabs, repeated spaces, and newlines are preserved (unquoted content is joined with single spaces).")}));
-    tools.push_back(tool_schema("replace",
-                                "write",
-                                "Atomically replace the first text occurrence when policy allows write side effects.",
-                                std::vector<tool_argument_descriptor>{tool_argument("path", true, "File to edit."),
-                                                                       tool_argument("old", true, "Text to replace; pass as a single quoted argument to match interior whitespace exactly."),
-                                                                       tool_argument("new", true, "Replacement text; pass as a single quoted argument so tabs, repeated spaces, and newlines are preserved (unquoted text is joined with single spaces).")}));
-    tools.push_back(tool_schema("shell",
-                                "shell",
-                                "Run a local command only when policy, approval, and shell sandbox controls allow it.",
-                                std::vector<tool_argument_descriptor>{tool_argument("command", true, "Command and arguments to execute.")}));
-    return tools;
+    return codepilot_tool_catalog().descriptors();
 }
 
 tool_result codepilot_tool_provider::run(const std::string &name,
@@ -1126,20 +1041,23 @@ tool_result codepilot_tool_provider::run_checked(const std::string &name,
                                              nucleus_runtime &runtime,
                                              const agent_task &task) const
 {
-    if (!known_tool_name(name))
+    const tool_invocation invocation = normalize_tool_invocation(codepilot_tool_catalog(), name, args);
+    if (!invocation.ok)
     {
-        return make_tool_result(false, "", "unknown tool: " + name);
+        return make_tool_result(false, "", invocation.error);
     }
 
-    const std::string arguments = join_tool_args(args, 0);
+    const std::string tool_name = invocation.name;
+    const std::vector<std::string> &tool_args = invocation.args;
+    const std::string arguments = join_tool_arguments(tool_args, 0);
     // Only fingerprint the filesystem when a deterministic trace is actually being
     // recorded or replayed. Otherwise computing the snapshot (hashing whole files
     // / walking whole trees on every read/list/search) is pure overhead and a
     // model-reachable CPU/time sink even with no trace configured.
-    const std::string snapshot_key = filesystem_snapshot_key_for_tool(name, args);
+    const std::string snapshot_key = filesystem_snapshot_key_for_tool(tool_name, tool_args);
     if (!snapshot_key.empty() && (runtime.replay_enabled() || !runtime.trace_file().empty()))
     {
-        const std::string snapshot = filesystem_snapshot_for_tool(name, args);
+        const std::string snapshot = filesystem_snapshot_for_tool(tool_name, tool_args);
         std::string snapshot_error;
         if (!runtime.replay_filesystem_snapshot(task, snapshot_key, snapshot, &snapshot_error))
         {
@@ -1151,52 +1069,52 @@ tool_result codepilot_tool_provider::run_checked(const std::string &name,
 
     bool replay_ok = false;
     std::string replay_result;
-    if (runtime.replay_tool_call(task, name, arguments, &replay_ok, &replay_result))
+    if (runtime.replay_tool_call(task, tool_name, arguments, &replay_ok, &replay_result))
     {
         return replay_ok ? make_tool_result(true, replay_result, "") : make_tool_result(false, "", replay_result);
     }
-    if (runtime.replay_enabled() && classify_tool_side_effect(name) != tool_side_effect::read_only)
+    if (runtime.replay_enabled() && classify_tool_side_effect(tool_name) != tool_side_effect::read_only)
     {
         const std::string error = "replay missing recorded side-effect tool result";
         runtime.record_failure(task, "replay", "missing_tool_result", error, false, "codepilot.tool");
         return make_tool_result(false, "", error);
     }
 
-    const policy_request policy = make_policy_request(name, args, task, policy_labels);
+    const policy_request policy = make_policy_request(tool_name, tool_args, task, policy_labels);
     const policy_decision decision = global_policy_manager().evaluate(policy);
     if (!decision.allowed)
     {
         runtime.record_failure(
-            task, "policy", "tool_denied", "policy denied tool '" + name + "': " + decision.reason, false, "codepilot.tool");
-        return make_tool_result(false, "", "policy denied tool '" + name + "': " + decision.reason);
+            task, "policy", "tool_denied", "policy denied tool '" + tool_name + "': " + decision.reason, false, "codepilot.tool");
+        return make_tool_result(false, "", "policy denied tool '" + tool_name + "': " + decision.reason);
     }
 
     tool_result result;
-    if (name == "list")
+    if (tool_name == "list")
     {
-        result = run_list(args);
+        result = run_list(tool_args);
     }
-    else if (name == "read")
+    else if (tool_name == "read")
     {
-        result = run_read(args);
+        result = run_read(tool_args);
     }
-    else if (name == "search")
+    else if (tool_name == "search")
     {
-        result = run_search(args);
+        result = run_search(tool_args);
     }
-    else if (name == "write")
+    else if (tool_name == "write")
     {
-        result = run_write(args);
+        result = run_write(tool_args);
     }
-    else if (name == "replace")
+    else if (tool_name == "replace")
     {
-        result = run_replace(args);
+        result = run_replace(tool_args);
     }
-    else if (name == "shell")
+    else if (tool_name == "shell")
     {
-        result = run_shell(args);
+        result = run_shell(tool_args);
     }
-    return global_policy_manager().apply_tool_output_bounds(name, task, result);
+    return global_policy_manager().apply_tool_output_bounds(tool_name, task, result);
 }
 
 tool_result codepilot_tool_provider::run_list(const std::vector<std::string> &args) const
@@ -1345,14 +1263,24 @@ tool_result codepilot_tool_provider::run_write(const std::vector<std::string> &a
     }
 
     const std::string path = normalize_platform_path(args[0]);
-    const std::string content = join_tool_args(args, 1);
+    const std::string content = join_tool_arguments(args, 1);
+    workspace_change_request request;
+    request.kind = workspace_change_kind::write_file;
+    request.path = path;
+    request.content = content;
+    request.temp_prefix = "codepilot-write";
+    const workspace_change_plan plan = plan_workspace_change(request);
+    if (!plan.ok)
+    {
+        return make_tool_result(false, "", plan.error);
+    }
     std::string error;
-    if (!codepilot_write_file_atomically(path, content, &error))
+    if (!apply_workspace_change_plan(plan, &error))
     {
         return make_tool_result(false, "", error);
     }
 
-    return make_tool_result(true, "wrote " + std::to_string(content.size()) + " bytes to " + path, "");
+    return make_tool_result(true, "wrote " + std::to_string(content.size()) + " bytes to " + plan.path, "");
 }
 
 tool_result codepilot_tool_provider::run_replace(const std::vector<std::string> &args) const
@@ -1362,39 +1290,26 @@ tool_result codepilot_tool_provider::run_replace(const std::vector<std::string> 
         return make_tool_result(false, "", "usage: tool replace <path> <old> <new>");
     }
 
-    std::string content;
-    std::string error;
-    bool truncated = false;
     const std::string path = normalize_platform_path(args[0]);
-    // Read the entire file (up to the safety ceiling). Never edit a truncated
-    // buffer: previously replace read only the first 1 MiB and wrote that back,
-    // silently discarding everything past the cap and corrupting the source file.
-    if (!read_text_prefix(path, k_max_file_read_bytes, &content, &error, &truncated))
+    workspace_change_request request;
+    request.kind = workspace_change_kind::replace_text;
+    request.path = path;
+    request.old_text = args[1];
+    request.new_text = join_tool_arguments(args, 2);
+    request.max_edit_bytes = k_max_file_read_bytes;
+    request.temp_prefix = "codepilot-write";
+    const workspace_change_plan plan = plan_workspace_change(request);
+    if (!plan.ok)
     {
-        return make_tool_result(false, "", error);
+        return make_tool_result(false, "", plan.error);
     }
-    if (truncated)
-    {
-        return make_tool_result(
-            false,
-            "",
-            "file too large to edit safely (exceeds " + std::to_string(k_max_file_read_bytes) + " bytes): " + path);
-    }
-
-    const std::string::size_type pos = content.find(args[1]);
-    if (pos == std::string::npos)
-    {
-        return make_tool_result(false, "", "old text not found in " + path);
-    }
-
-    content.replace(pos, args[1].size(), join_tool_args(args, 2));
-
-    if (!codepilot_write_file_atomically(path, content, &error))
+    std::string error;
+    if (!apply_workspace_change_plan(plan, &error))
     {
         return make_tool_result(false, "", error);
     }
 
-    return make_tool_result(true, "replaced first occurrence in " + path, "");
+    return make_tool_result(true, "replaced first occurrence in " + plan.path, "");
 }
 
 tool_result codepilot_tool_provider::run_shell(const std::vector<std::string> &args) const
@@ -1404,7 +1319,7 @@ tool_result codepilot_tool_provider::run_shell(const std::vector<std::string> &a
         return make_tool_result(false, "", "usage: tool shell <command>");
     }
 
-    const std::string command = join_tool_args(args, 0);
+    const std::string command = join_tool_arguments(args, 0);
     std::string error;
     if (!codepilot_shell_command_allowed(command, split_config_list(config_string_compat("shell_allowed_commands", "")), &error))
     {

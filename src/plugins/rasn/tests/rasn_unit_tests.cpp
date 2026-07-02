@@ -13,13 +13,16 @@
 #include "../metrics.h"
 #include "../model_cost.h"
 #include "../policy_manager.h"
+#include "../provider_router.h"
 #include "../rate_limiter.h"
 #include "../redaction.h"
 #include "../state_service.h"
 #include "../schema_manifest.h"
 #include "../session_store.h"
+#include "../tool_catalog.h"
 #include "../workflow.h"
 #include "../workflow_service.h"
+#include "../workspace_change.h"
 #include "../workspace_index.h"
 
 #include <dsn/cpp/utils.h>
@@ -1221,6 +1224,68 @@ TEST(rasn_core, split_words_and_normalize_platform_paths)
 #endif
 }
 
+TEST(rasn_tool_catalog, describes_aliases_and_normalizes_invocations)
+{
+    tool_catalog catalog;
+    catalog.add(make_tool_descriptor("read",
+                                     "read_only",
+                                     "Read a file.",
+                                     std::vector<tool_argument_descriptor>{
+                                         make_tool_argument("path", true, "File to read."),
+                                         make_tool_argument("max_bytes", false, "Maximum bytes.")}),
+                std::vector<std::string>{"cat"});
+
+    EXPECT_TRUE(catalog.contains("read"));
+    EXPECT_TRUE(catalog.contains("cat"));
+    EXPECT_EQ("read", catalog.canonical_name("cat"));
+    EXPECT_NE(std::string::npos, catalog.describe().find("aliases=cat"));
+
+    const tool_invocation ok = normalize_tool_invocation(catalog, "cat", std::vector<std::string>{"a.txt"});
+    ASSERT_TRUE(ok.ok) << ok.error;
+    EXPECT_EQ("read", ok.name);
+    ASSERT_EQ(1u, ok.args.size());
+    EXPECT_EQ("a.txt", ok.args[0]);
+
+    const tool_invocation missing = normalize_tool_invocation(catalog, "read", std::vector<std::string>());
+    EXPECT_FALSE(missing.ok);
+    EXPECT_NE(std::string::npos, missing.error.find("usage: tool read"));
+
+    const tool_invocation unknown = normalize_tool_invocation(catalog, "unknown", std::vector<std::string>());
+    EXPECT_FALSE(unknown.ok);
+    EXPECT_NE(std::string::npos, unknown.error.find("unknown tool"));
+}
+
+TEST(rasn_provider_router, resolves_known_and_generic_provider_profiles)
+{
+    EXPECT_EQ("simulator", normalize_model_provider_name("random"));
+    EXPECT_EQ("copilot", normalize_model_provider_name("github-copilot"));
+    EXPECT_EQ("llama.cpp", normalize_model_provider_name("llamacpp"));
+    EXPECT_EQ("llama_cpp_endpoint", model_provider_config_key("llama.cpp", "endpoint"));
+
+    const model_provider_profile simulator = resolve_model_provider_profile("mock", "unit-model");
+    EXPECT_EQ("simulator", simulator.name);
+    EXPECT_TRUE(simulator.in_process);
+    EXPECT_EQ("unit-model", simulator.model);
+
+    const model_provider_profile copilot = resolve_model_provider_profile("github-copilot", "gpt-review");
+    EXPECT_EQ("copilot", copilot.name);
+    EXPECT_FALSE(copilot.local);
+    EXPECT_EQ("gpt-review", copilot.model);
+    EXPECT_NE(std::string::npos, copilot.token_env.find("GH_TOKEN"));
+    ASSERT_FALSE(copilot.headers.empty());
+
+    const model_provider_profile llama = resolve_model_provider_profile("llama-cpp");
+    EXPECT_EQ("llama.cpp", llama.name);
+    EXPECT_TRUE(llama.local);
+    EXPECT_EQ("openai.chat", llama.payload_format);
+
+    const model_provider_profile custom = resolve_model_provider_profile("custom-provider", "custom-model");
+    EXPECT_EQ("custom-provider", custom.name);
+    EXPECT_FALSE(custom.local);
+    EXPECT_EQ("custom-model", custom.model);
+    EXPECT_EQ("openai.chat", custom.payload_format);
+}
+
 TEST(rasn_cli_support, zero_context_budget_does_not_report_truncation)
 {
     const std::string path = temp_file_path("rasn-cli-support-zero-context.txt");
@@ -1355,6 +1420,49 @@ TEST(rasn_session_store, persists_loads_and_formats_resume_context)
     EXPECT_NE(std::string::npos, context.find("last prompt: explain rASN"));
     EXPECT_NE(std::string::npos, context.find("prompt.ask"));
     EXPECT_EQ(std::string::npos, context.find("session.begin"));
+
+    ::dsn::utils::filesystem::remove_path(root);
+}
+
+TEST(rasn_workspace_change, plans_and_applies_write_and_replace)
+{
+    const std::string root = temp_file_path("rasn-workspace-change-unit");
+    ::dsn::utils::filesystem::remove_path(root);
+    ASSERT_TRUE(::dsn::utils::filesystem::create_directory(root));
+
+    workspace_change_request write_request;
+    write_request.kind = workspace_change_kind::write_file;
+    write_request.workspace_root = root;
+    write_request.path = "notes.txt";
+    write_request.content = "alpha beta\n";
+    workspace_change_plan write_plan = plan_workspace_change(write_request);
+    ASSERT_TRUE(write_plan.ok) << write_plan.error;
+    EXPECT_TRUE(write_plan.creates_file);
+    EXPECT_EQ(workspace_change_kind::write_file, write_plan.kind);
+    EXPECT_NE(std::string::npos, write_plan.path.find("notes.txt"));
+    EXPECT_NE(std::string::npos, describe_workspace_change_plan(write_plan).find("create"));
+
+    std::string error;
+    ASSERT_TRUE(apply_workspace_change_plan(write_plan, &error)) << error;
+    EXPECT_EQ("alpha beta\n", read_text_file(write_plan.path));
+
+    workspace_change_request replace_request;
+    replace_request.kind = workspace_change_kind::replace_text;
+    replace_request.path = write_plan.path;
+    replace_request.old_text = "beta";
+    replace_request.new_text = "gamma";
+    workspace_change_plan replace_plan = plan_workspace_change(replace_request);
+    ASSERT_TRUE(replace_plan.ok) << replace_plan.error;
+    EXPECT_EQ(workspace_change_kind::replace_text, replace_plan.kind);
+    EXPECT_EQ(write_plan.path, replace_plan.path);
+    EXPECT_NE(std::string::npos, replace_plan.summary.find("replace first occurrence"));
+    ASSERT_TRUE(apply_workspace_change_plan(replace_plan, &error)) << error;
+    EXPECT_EQ("alpha gamma\n", read_text_file(write_plan.path));
+
+    replace_request.old_text.clear();
+    const workspace_change_plan invalid = plan_workspace_change(replace_request);
+    EXPECT_FALSE(invalid.ok);
+    EXPECT_NE(std::string::npos, invalid.error.find("old text cannot be empty"));
 
     ::dsn::utils::filesystem::remove_path(root);
 }
