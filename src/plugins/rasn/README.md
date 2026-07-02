@@ -308,6 +308,12 @@ replay-safe. `cost_tokens_per_min` becomes the bucket's refill rate and
 `cost_burst_tokens` at least as large as the biggest single-request estimate you
 intend to admit.
 
+The budget is hardened for operator-supplied configuration extremes. Oversized
+estimated token counts are saturated before they are written to events or error
+messages, and the shared token bucket rejects unrepresentably large projected
+waits before any floating-point-to-integer conversion. This keeps malformed but
+valid config from turning an intended fast-fail into undefined behavior.
+
 The budget slots into the gateway chain right after the request-count rate limiter
 and before the breaker, so a cost-rejected request never strands a half-open probe;
 its pacing delay joins the single coalesced wait. Refunds compose: a cost rejection
@@ -768,7 +774,7 @@ rasn/
 | `[rasn.model] cost_burst_tokens` | Cost-budget burst capacity in estimated tokens (default `0` = about one second of the sustained budget, minimum 1). Size this at least as large as the biggest single-request estimate you intend to admit. |
 | `[rasn.model] cost_max_wait_ms` | Max milliseconds a request may be paced waiting for token budget before it is rejected instead (default `1000`; `0` = reject immediately when the budget is exhausted). Inspect live tokens/min, burst, and available budget with `rasn.resilience`. |
 | `[rasn.model] cost_chars_per_token` | Prompt characters per estimated token (default `0` = 4, the common ~4-chars/token heuristic for byte-pair tokenizers). |
-| `[rasn.model] cost_completion_percent` | Completion allowance as a percent of estimated input tokens added to the charge (default `0` = 150 = +50% for the completion; `100` = charge input tokens only). |
+| `[rasn.model] cost_completion_percent` | Completion allowance as a percent of estimated input tokens added to the charge (default `0` = 150 = +50% for the completion; `100` = charge input tokens only). Oversized derived estimates are saturated in diagnostics/events. |
 | `[rasn.tool] admission_enabled` | Enables the per-tool admission gate (default `true`). Replayed tool results and policy-denied calls bypass the gate. |
 | `[rasn.tool] max_concurrent_requests` | Hard cap on concurrent in-flight tool invocations per tool name (default `16`; `0` = unlimited). Excess invocations fast-fail. |
 | `[rasn.tool] soft_concurrent_requests` | Per-tool in-flight level at which graceful backpressure begins (default `8`; `0` = no backpressure). |

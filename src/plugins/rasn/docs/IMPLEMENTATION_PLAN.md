@@ -3304,6 +3304,43 @@ Validation:
   trace files under `rasn/state` and `rasn/traces`.
 - [x] `git diff --check`.
 
+## Phase 79: model cost-budget arithmetic hardening
+
+Status: `[x]`
+
+Goal: make the model token/cost budget safe under extreme but valid operator
+configuration and prompt sizes. The budget already bounds tokens-per-minute by
+reusing the shared token bucket; this phase closes the arithmetic edge cases at
+the float/integer boundary so malformed cost knobs produce normal fast-fail
+admission decisions instead of undefined behavior or wrapped diagnostics.
+
+Files:
+
+- `model_cost.h`, `model_cost.cpp` (saturating diagnostic token conversion)
+- `rate_limiter.cpp` (reject unrepresentably large projected waits before
+  integer conversion)
+- `agent_services.cpp` (cost-rejection diagnostics use the saturating helper)
+- `tests/rasn_unit_tests.cpp` (overflow/saturation regressions)
+- `README.md`, `docs/DESIGN.md`, `docs/IMPLEMENTATION_PLAN.md`,
+  `docs/report/main.tex`
+
+Work items:
+
+- [x] Add a shared `saturating_estimated_token_count()` helper for cost-budget
+  diagnostics and structured events.
+- [x] Reject non-finite or over-limit projected token-bucket waits before
+  converting the wait to the millisecond API type.
+- [x] Use the shared helper from the model gateway's cost-rejection path.
+- [x] Add regression coverage for oversized estimates and oversized weighted
+  token-bucket waits.
+- [x] Update operator docs, design notes, and the technical report.
+
+Validation:
+
+- [x] Build `rasn.unit_tests`, `codepilot`, and `srepilot`.
+- [x] Run filtered `rasn_*.*:codepilot_*.*` unit tests.
+- [x] `git diff --check`.
+
 ## Dependency order
 
 ```text
@@ -3385,6 +3422,7 @@ Phase 1 task model
   -> Phase 76 SREPilot incident-response application
   -> Phase 77 model gateway token/cost budget
   -> Phase 78 unified local runtime output layout
+  -> Phase 79 model cost-budget arithmetic hardening
 ```
 
 Some phases can overlap after Phase 3, but the public message model and generic

@@ -112,19 +112,18 @@ rate_decision rate_limiter::try_acquire(uint64_t now_ms, double cost)
     const double deficit = cost - _tokens;     // > 0 here
     const double tpm = tokens_per_ms();        // > 0 here (requests_per_min != 0)
     const double wait = std::ceil(deficit / tpm);
-    const uint64_t wait_ms = wait <= 0.0 ? 0 : static_cast<uint64_t>(wait);
-
-    if (wait_ms <= _config.max_wait_ms)
+    if (!std::isfinite(wait) || wait > static_cast<double>(_config.max_wait_ms))
     {
-        _tokens -= cost;
-        decision.allowed = true;
-        decision.delay_ms = static_cast<uint32_t>(wait_ms);
+        decision.allowed = false;
+        decision.delay_ms = 0;
         decision.tokens = _tokens;
         return decision;
     }
+    const uint32_t wait_ms = wait <= 0.0 ? 0 : static_cast<uint32_t>(wait);
 
-    decision.allowed = false;
-    decision.delay_ms = 0;
+    _tokens -= cost;
+    decision.allowed = true;
+    decision.delay_ms = wait_ms;
     decision.tokens = _tokens;
     return decision;
 }

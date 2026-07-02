@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace dsn {
 namespace rasn {
@@ -28,6 +29,25 @@ double estimate_prompt_cost_tokens(size_t prompt_chars, const model_cost_config 
     // draws from the budget.
     const double charge = input_tokens * static_cast<double>(completion_percent) / 100.0;
     return charge < 1.0 ? 1.0 : charge;
+}
+
+uint32_t saturating_estimated_token_count(double estimated_tokens)
+{
+    if (estimated_tokens <= 0.0)
+    {
+        return 0;
+    }
+    if (!std::isfinite(estimated_tokens))
+    {
+        return (std::numeric_limits<uint32_t>::max)();
+    }
+    const double rounded = std::ceil(estimated_tokens);
+    const double max_u32 = static_cast<double>((std::numeric_limits<uint32_t>::max)());
+    if (rounded >= max_u32)
+    {
+        return (std::numeric_limits<uint32_t>::max)();
+    }
+    return static_cast<uint32_t>(rounded);
 }
 
 rate_limit_config to_rate_limit_config(const model_cost_config &config)

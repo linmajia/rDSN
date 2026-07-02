@@ -871,6 +871,10 @@ Responsibilities:
 - Because a single request can cost more than one token, an operator must size
   `cost_burst_tokens` at least as large as the largest single-request estimate they
   intend to admit; a prompt whose charge exceeds the burst can never fit.
+- Oversized estimates and projected waits are fail-safe: diagnostic/event token
+  counts saturate at `uint32_t` instead of casting out of range, and the token
+  bucket rejects unrepresentably large waits before converting them to the
+  millisecond API type.
 
 rDSN design:
 
@@ -903,7 +907,9 @@ rDSN design:
   provider summary.
 - `[rasn.model] cost_budget_enabled`, `cost_tokens_per_min`, `cost_burst_tokens`,
   `cost_max_wait_ms`, `cost_chars_per_token`, and `cost_completion_percent` are read
-  once through `dsn_config` with null-safe defaults.
+  once through `dsn_config` with null-safe defaults. The arithmetic hardening
+  lives in the shared `model_cost` / `rate_limiter` helpers, so every gateway that
+  reuses the token bucket inherits the same overflow behavior.
 
 ### 12.6 Tool gateway admission and rate controls
 

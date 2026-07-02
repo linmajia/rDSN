@@ -1264,7 +1264,7 @@ Files & Layer & Responsibility \\
 \texttt{circuit\_breaker} & Resilience & Per-provider model circuit breaker (closed/open/half-open) \\
 \texttt{admission\_gate} & Resilience & Per-provider/per-tool concurrency bulkhead and \texttt{exp\_delay} backpressure \\
 \texttt{rate\_limiter} & Resilience & Per-provider/per-tool token-bucket rate limiter (requests/minute pacing) \\
-\texttt{model\_cost} & Resilience & Deterministic prompt-size token/cost estimator mapped onto the token bucket (tokens/minute budget) \\
+\texttt{model\_cost} & Resilience & Deterministic prompt-size token/cost estimator mapped onto the token bucket (tokens/minute budget, saturated diagnostics for oversized estimates) \\
 \texttt{llm\_provider/model\_agent} & Provider & Simulator and HTTP-compatible model adapters \\
 \texttt{agent\_tools} & Provider API & Generic tool provider interface \\
 \texttt{apps/codepilot/*} & Application & CLI commands, local tools, skills, provider configuration \\
@@ -2075,7 +2075,11 @@ rate token and the token charge). It is disabled by default
 providers, so existing behavior is unchanged. Rejections and pacing are exported as
 \texttt{rasn\_model\_cost\_limited\_total} and
 \texttt{rasn\_model\_cost\_delayed\_total}, and per-provider tokens/minute, burst,
-and available budget are shown by \texttt{rasn.resilience}. A process-wide
+and available budget are shown by \texttt{rasn.resilience}. The implementation also
+hardens the arithmetic boundary exposed by operator configuration: oversized
+estimated token counts saturate before they are stored in diagnostics or events,
+and the shared token bucket rejects unrepresentably large projected waits before
+converting them to the millisecond API type. A process-wide
 request-rate ceiling still layers above the per-provider limiter (see the
 Process-Wide Overload Budget subsection).
 

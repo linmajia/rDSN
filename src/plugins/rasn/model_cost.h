@@ -69,6 +69,11 @@ struct model_cost_config
 // prompt still draws from the budget. Deterministic in its inputs.
 double estimate_prompt_cost_tokens(size_t prompt_chars, const model_cost_config &config);
 
+// Convert a floating-point token estimate into an integer diagnostic/event value.
+// Values are rounded up like the budget decision text, then clamped to uint32_t
+// so malformed-but-valid config cannot trigger undefined behavior in casts.
+uint32_t saturating_estimated_token_count(double estimated_tokens);
+
 // Project the cost tunables onto the generic token-bucket config so a
 // rate_limiter / rate_limiter_registry can meter estimated token charges. The
 // bucket's "requests_per_min" therefore holds tokens/minute and "burst" holds

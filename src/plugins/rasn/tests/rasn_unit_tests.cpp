@@ -30,6 +30,7 @@
 #include <climits>
 #include <condition_variable>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -2716,6 +2717,20 @@ TEST(rasn_rate_limiter, non_positive_cost_is_free_passthrough)
     EXPECT_TRUE(limiter.try_acquire(0, -5.0).allowed); // negative cost => free passthrough
 }
 
+TEST(rasn_rate_limiter, oversized_weighted_wait_rejects_without_overflow)
+{
+    rate_limit_config cfg;
+    cfg.requests_per_min = 1;
+    cfg.burst = 1;
+    cfg.max_wait_ms = (std::numeric_limits<uint32_t>::max)();
+    rate_limiter limiter(cfg);
+
+    EXPECT_TRUE(limiter.try_acquire(0).allowed); // drain the initial token
+    const rate_decision rejected = limiter.try_acquire(0, 1.0e300);
+    EXPECT_FALSE(rejected.allowed);
+    EXPECT_EQ(0u, rejected.delay_ms);
+}
+
 TEST(rasn_model_cost, estimate_scales_with_prompt_and_floors_at_one_token)
 {
     model_cost_config cfg; // defaults: chars_per_token = 4, completion_percent = 150
@@ -2754,6 +2769,21 @@ TEST(rasn_model_cost, to_rate_limit_config_maps_token_budget_onto_the_bucket)
     EXPECT_EQ(12000u, bucket.requests_per_min); // tokens/min carried as the refill rate
     EXPECT_EQ(3000u, bucket.burst);             // burst tokens as the bucket capacity
     EXPECT_EQ(750u, bucket.max_wait_ms);
+}
+
+TEST(rasn_model_cost, token_count_diagnostics_saturate_oversized_estimates)
+{
+    EXPECT_EQ(0u, saturating_estimated_token_count(0.0));
+    EXPECT_EQ(2u, saturating_estimated_token_count(1.1));
+    EXPECT_EQ((std::numeric_limits<uint32_t>::max)(), saturating_estimated_token_count(1.0e300));
+    EXPECT_EQ((std::numeric_limits<uint32_t>::max)(),
+              saturating_estimated_token_count(std::numeric_limits<double>::infinity()));
+
+    model_cost_config cfg;
+    cfg.chars_per_token = 1;
+    cfg.completion_percent = (std::numeric_limits<uint32_t>::max)();
+    const double estimate = estimate_prompt_cost_tokens((std::numeric_limits<uint32_t>::max)(), cfg);
+    EXPECT_EQ((std::numeric_limits<uint32_t>::max)(), saturating_estimated_token_count(estimate));
 }
 
 } // namespace

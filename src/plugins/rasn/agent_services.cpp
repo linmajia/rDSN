@@ -1098,7 +1098,7 @@ rate_decision rasn_llm_agent_service::model_cost_acquire(const std::string &prov
     const rate_decision decision = limiter.try_acquire(::dsn_now_ms(), cost);
     if (!decision.allowed)
     {
-        const uint32_t estimated_tokens = static_cast<uint32_t>(std::ceil(cost));
+        const uint32_t estimated_tokens = saturating_estimated_token_count(cost);
         dwarn("rASN model cost budget rejected request for provider=%s; budget %u tokens/min exceeded "
               "(estimated %u tokens)",
               provider.c_str(),
