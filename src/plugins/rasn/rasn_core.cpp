@@ -44,64 +44,62 @@ size_t event_log_memory_capacity()
     return capacity;
 }
 
-std::string extract_json_string_field(const std::string &json, const std::string &field)
+bool parse_hex4(const std::string &text, std::string::size_type pos, unsigned int *out)
 {
-    const std::string needle = "\"" + field + "\"";
-    const std::string::size_type pos = json.find(needle);
-    if (pos == std::string::npos)
+    if (pos + 4 > text.size())
     {
-        return "";
+        return false;
     }
-
-    const std::string::size_type colon = json.find(':', pos + needle.size());
-    if (colon == std::string::npos)
+    unsigned int value = 0;
+    for (int i = 0; i < 4; ++i)
     {
-        return "";
-    }
-
-    std::string::size_type quote = json.find('"', colon + 1);
-    if (quote == std::string::npos)
-    {
-        return "";
-    }
-
-    std::string result;
-    bool escaping = false;
-    for (++quote; quote < json.size(); ++quote)
-    {
-        const char c = json[quote];
-        if (escaping)
+        const char c = text[pos + static_cast<std::string::size_type>(i)];
+        value <<= 4;
+        if (c >= '0' && c <= '9')
         {
-            switch (c)
-            {
-            case 'n':
-                result.push_back('\n');
-                break;
-            case 'r':
-                result.push_back('\r');
-                break;
-            case 't':
-                result.push_back('\t');
-                break;
-            default:
-                result.push_back(c);
-                break;
-            }
-            escaping = false;
-            continue;
+            value |= static_cast<unsigned int>(c - '0');
         }
-        if (c == '\\')
+        else if (c >= 'a' && c <= 'f')
         {
-            escaping = true;
-            continue;
+            value |= static_cast<unsigned int>(c - 'a' + 10);
         }
-        if (c == '"')
+        else if (c >= 'A' && c <= 'F')
         {
-            break;
+            value |= static_cast<unsigned int>(c - 'A' + 10);
         }
-        result.push_back(c);
+        else
+        {
+            return false;
+        }
     }
-    return result;
+    *out = value;
+    return true;
+}
+
+void append_utf8(std::string *out, unsigned int code)
+{
+    if (code <= 0x7F)
+    {
+        out->push_back(static_cast<char>(code));
+    }
+    else if (code <= 0x7FF)
+    {
+        out->push_back(static_cast<char>(0xC0 | (code >> 6)));
+        out->push_back(static_cast<char>(0x80 | (code & 0x3F)));
+    }
+    else if (code <= 0xFFFF)
+    {
+        out->push_back(static_cast<char>(0xE0 | (code >> 12)));
+        out->push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
+        out->push_back(static_cast<char>(0x80 | (code & 0x3F)));
+    }
+    else
+    {
+        out->push_back(static_cast<char>(0xF0 | (code >> 18)));
+        out->push_back(static_cast<char>(0x80 | ((code >> 12) & 0x3F)));
+        out->push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
+        out->push_back(static_cast<char>(0x80 | (code & 0x3F)));
+    }
 }
 
 std::string event_to_json(const runtime_event &event)
@@ -208,6 +206,104 @@ std::string json_escape(const std::string &value)
         }
     }
     return oss.str();
+}
+
+std::string extract_json_string_field(const std::string &json, const std::string &field)
+{
+    const std::string needle = "\"" + field + "\"";
+    const std::string::size_type pos = json.find(needle);
+    if (pos == std::string::npos)
+    {
+        return "";
+    }
+
+    const std::string::size_type colon = json.find(':', pos + needle.size());
+    if (colon == std::string::npos)
+    {
+        return "";
+    }
+
+    std::string::size_type value_pos = colon + 1;
+    while (value_pos < json.size() && std::isspace(static_cast<unsigned char>(json[value_pos])))
+    {
+        ++value_pos;
+    }
+    // Only extract when the value is genuinely a JSON string. A non-string value
+    // (e.g. "content":null or a number) must not fall through to json.find('"')
+    // and accidentally capture the NEXT field's quoted string.
+    if (value_pos >= json.size() || json[value_pos] != '"')
+    {
+        return "";
+    }
+
+    std::string result;
+    bool escaping = false;
+    for (std::string::size_type quote = value_pos + 1; quote < json.size(); ++quote)
+    {
+        const char c = json[quote];
+        if (escaping)
+        {
+            switch (c)
+            {
+            case 'n':
+                result.push_back('\n');
+                break;
+            case 'r':
+                result.push_back('\r');
+                break;
+            case 't':
+                result.push_back('\t');
+                break;
+            case 'b':
+                result.push_back('\b');
+                break;
+            case 'f':
+                result.push_back('\f');
+                break;
+            case 'u':
+            {
+                unsigned int code = 0;
+                if (parse_hex4(json, quote + 1, &code))
+                {
+                    quote += 4;
+                    // Combine a UTF-16 surrogate pair into a single code point.
+                    if (code >= 0xD800 && code <= 0xDBFF && quote + 2 < json.size() &&
+                        json[quote + 1] == '\\' && json[quote + 2] == 'u')
+                    {
+                        unsigned int low = 0;
+                        if (parse_hex4(json, quote + 3, &low) && low >= 0xDC00 && low <= 0xDFFF)
+                        {
+                            code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+                            quote += 6;
+                        }
+                    }
+                    append_utf8(&result, code);
+                }
+                else
+                {
+                    result.push_back('u');
+                }
+                break;
+            }
+            default:
+                result.push_back(c);
+                break;
+            }
+            escaping = false;
+            continue;
+        }
+        if (c == '\\')
+        {
+            escaping = true;
+            continue;
+        }
+        if (c == '"')
+        {
+            break;
+        }
+        result.push_back(c);
+    }
+    return result;
 }
 
 std::string trim(const std::string &value)

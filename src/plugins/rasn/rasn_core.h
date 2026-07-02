@@ -270,6 +270,11 @@ private:
 std::string now_utc_string();
 std::string make_trace_id();
 std::string json_escape(const std::string &value);
+// Decode a JSON string field's value: handles \n \r \t \b \f and \uXXXX (including
+// UTF-16 surrogate pairs), and returns "" when the field is absent or its value is
+// not a JSON string. Shared by the state journal, session store, and LLM response
+// parsers so the three copies can no longer drift apart.
+std::string extract_json_string_field(const std::string &json, const std::string &field);
 std::string trim(const std::string &value);
 std::string normalize_platform_path(const std::string &path);
 std::vector<std::string> split_words(const std::string &line);

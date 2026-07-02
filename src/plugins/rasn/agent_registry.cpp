@@ -1,5 +1,6 @@
 #include <rasn/agent_registry.h>
 
+#include <dsn/cpp/utils.h>
 #include <dsn/service_api_cpp.h>
 
 #include <algorithm>
@@ -49,17 +50,11 @@ uint64_t registry_lease_sweep_ms()
 
 std::vector<std::string> split_config_csv(const std::string &value)
 {
+    // Reuse rDSN's dsn::utils::split_args instead of a hand-rolled splitter: it
+    // splits on the delimiter, trims each field, and drops empty fields -- exactly
+    // the semantics this comma-separated config list needs.
     std::vector<std::string> result;
-    std::stringstream input(value);
-    std::string item;
-    while (std::getline(input, item, ','))
-    {
-        std::string normalized = trim(item);
-        if (!normalized.empty())
-        {
-            result.push_back(normalized);
-        }
-    }
+    ::dsn::utils::split_args(value.c_str(), result, ',');
     return result;
 }
 
