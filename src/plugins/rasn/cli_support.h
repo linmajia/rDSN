@@ -769,14 +769,10 @@ inline std::string interactive_help_intro(const std::string &plain_text_behavior
 
 inline std::string cli_help_intro(bool interactive_mode, const std::string &plain_text_behavior)
 {
-    if (interactive_mode)
-    {
-        return "  Commands below are shown with '/'. /help and /exit always work.\n"
-               "  Without '/', plain text is " +
-               plain_text_behavior + ".\n\n";
-    }
-    return "  Direct CLI commands are shown without '/'. In interactive mode, prefix commands with '/'.\n"
-           "  Plain text is " +
+    (void)interactive_mode;
+    return "  Commands are shown with '/' and work that way in direct and interactive modes.\n"
+           "  /help and /exit always work.\n"
+           "  Without '/', plain text is " +
            plain_text_behavior + ".\n\n";
 }
 
@@ -785,7 +781,9 @@ inline std::string cli_help_item(bool interactive_mode,
                                  const std::string &description,
                                  size_t width = 32u)
 {
-    const std::string rendered = interactive_mode ? "/" + usage : usage;
+    (void)interactive_mode;
+    const bool usage_is_option = !usage.empty() && usage[0] == '-';
+    const std::string rendered = usage_is_option ? usage : "/" + usage;
     std::ostringstream output;
     output << "  " << rendered;
     if (rendered.size() < width)

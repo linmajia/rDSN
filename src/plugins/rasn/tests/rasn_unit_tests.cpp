@@ -1107,14 +1107,17 @@ TEST(rasn_cli_support, zero_context_budget_does_not_report_truncation)
     std::remove(path.c_str());
 }
 
-TEST(rasn_cli_support, help_items_use_slash_prefix_in_interactive_mode)
+TEST(rasn_cli_support, help_items_render_slash_command_usage)
 {
     const std::string interactive = cli_help_item(true, "ask <prompt>", "send a coding prompt");
     EXPECT_NE(std::string::npos, interactive.find("  /ask <prompt>"));
 
+    const std::string option = cli_help_item(true, "--prompt <prompt>", "run one prompt");
+    EXPECT_NE(std::string::npos, option.find("  --prompt <prompt>"));
+    EXPECT_EQ(std::string::npos, option.find("  /--prompt <prompt>"));
+
     const std::string direct = cli_help_item(false, "ask <prompt>", "send a coding prompt");
-    EXPECT_NE(std::string::npos, direct.find("  ask <prompt>"));
-    EXPECT_EQ(std::string::npos, direct.find("  /ask <prompt>"));
+    EXPECT_NE(std::string::npos, direct.find("  /ask <prompt>"));
 }
 
 TEST(rasn_cli_support, workspace_source_context_includes_index_and_excerpts)

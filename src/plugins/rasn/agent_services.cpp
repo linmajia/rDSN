@@ -862,11 +862,6 @@ void rasn_llm_agent_service::stop()
     agent_runtime::stop();
 }
 
-void rasn_llm_agent_service::set_provider(const std::string &provider_name)
-{
-    _provider = create_provider(provider_name);
-}
-
 model_gateway_response rasn_llm_agent_service::set_model_provider(const model_provider_request &request)
 {
     if (request.schema_version != RASN_AGENT_SCHEMA_VERSION)

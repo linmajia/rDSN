@@ -33,7 +33,6 @@ public:
 
     void start();
     void stop();
-    void set_provider(const std::string &provider_name);
     model_gateway_response set_model_provider(const model_provider_request &request);
     model_gateway_response describe_model_provider() const;
     model_gateway_response model_health() const;

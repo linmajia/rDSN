@@ -590,6 +590,14 @@ int rasn_cli_app_base::run(const std::vector<std::string> &args)
         std::cout << parse_error << "\n";
         return 1;
     }
+    if (compat_options.help || compat_options.version)
+    {
+        int exit_code = 0;
+        if (handle_compat_options(compat_options, &exit_code))
+        {
+            return exit_code;
+        }
+    }
     if (compat_options.workspace_set)
     {
         std::string workspace_error;
@@ -597,14 +605,6 @@ int rasn_cli_app_base::run(const std::vector<std::string> &args)
         {
             std::cout << workspace_error << "\n";
             return 1;
-        }
-    }
-    if (compat_options.help || compat_options.version)
-    {
-        int exit_code = 0;
-        if (handle_compat_options(compat_options, &exit_code))
-        {
-            return exit_code;
         }
     }
 
@@ -638,6 +638,20 @@ int rasn_cli_app_base::run(const std::vector<std::string> &args)
     if (normalized_args[0] == "interactive" || normalized_args[0] == "repl")
     {
         return repl();
+    }
+    if (normalized_args[0] == "/exit" || normalized_args[0] == "/quit")
+    {
+        return 0;
+    }
+    if (normalized_args[0].size() > 1 && normalized_args[0][0] == '/')
+    {
+        const std::string command = normalized_args[0].substr(1);
+        if (cli_argument_is_command(command, app_commands))
+        {
+            std::vector<std::string> slash_args = normalized_args;
+            slash_args[0] = command;
+            return run_command(slash_args);
+        }
     }
     return run_command(normalized_args);
 }
@@ -709,6 +723,11 @@ bool rasn_cli_app_base::handle_compat_options(const rasn_cli_compat_options &opt
     }
 
     const bool quiet_provider = options.prompt_set || options.print || options.stream;
+    if (options.dry_run)
+    {
+        std::cout << compat_dry_run_message() << "\n";
+        return true;
+    }
     if (options.provider_set || options.model_set)
     {
         std::string provider_name = options.provider;
@@ -732,11 +751,6 @@ bool rasn_cli_app_base::handle_compat_options(const rasn_cli_compat_options &opt
         {
             print_compat_provider(response);
         }
-    }
-    if (options.dry_run)
-    {
-        std::cout << compat_dry_run_message() << "\n";
-        return true;
     }
     if ((options.resume_set || options.continue_latest) && handle_compat_resume(options, exit_code))
     {
