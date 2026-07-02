@@ -18,6 +18,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <thread>
 
@@ -174,6 +175,20 @@ public:
 private:
     rasn_service_graph &_services;
 };
+
+} // namespace
+
+void debug_log(const std::string &message)
+{
+#if defined(DEBUG) || defined(_DEBUG)
+    std::cerr << "[codepilot debug] " << message << "\n";
+    std::cerr.flush();
+#else
+    (void)message;
+#endif
+}
+
+namespace {
 
 void append_readiness_error(std::vector<std::string> *errors, const std::string &component, const std::string &detail)
 {
@@ -705,7 +720,6 @@ int codepilot_cli::run(const std::vector<std::string> &args)
         }
     }
 
-    service_graph_lifecycle_scope lifecycle(_services);
     if (startup.matched)
     {
         std::cout << startup.message << "\n";
@@ -792,6 +806,8 @@ int codepilot_cli::run_command(const std::vector<std::string> &args, bool intera
 
     if (args[0] == "tools")
     {
+        debug_log("acquire service graph for tools");
+        service_graph_lifecycle_scope lifecycle(_services);
         std::cout << _services.tools_summary() << "\n";
         return 0;
     }
@@ -860,6 +876,8 @@ int codepilot_cli::run_command(const std::vector<std::string> &args, bool intera
 
     if (args[0] == "topology")
     {
+        debug_log("acquire service graph for topology");
+        service_graph_lifecycle_scope lifecycle(_services);
         std::cout << _services.topology() << "\n";
         return 0;
     }
@@ -970,6 +988,8 @@ int codepilot_cli::run_command(const std::vector<std::string> &args, bool intera
 
     if (args[0] == "workflow")
     {
+        debug_log("acquire service graph for workflow command");
+        service_graph_lifecycle_scope lifecycle(_services);
         if (args.size() < 2)
         {
             std::cout << "usage: workflow [validate|compile|start|resume|query|cancel|nodes] <workflow-file-or-run-id>\n";
@@ -1142,6 +1162,8 @@ int codepilot_cli::run_command(const std::vector<std::string> &args, bool intera
 
 int codepilot_cli::ask(const std::string &prompt, bool planning_mode)
 {
+    debug_log("acquire service graph for ask");
+    service_graph_lifecycle_scope lifecycle(_services);
     agent_task task;
     task.id = make_trace_id();
     task.name = planning_mode ? "codepilot.plan" : "codepilot.ask";
@@ -1171,6 +1193,8 @@ int codepilot_cli::ask(const std::string &prompt, bool planning_mode)
 
 int codepilot_cli::stream(const std::string &prompt)
 {
+    debug_log("acquire service graph for stream");
+    service_graph_lifecycle_scope lifecycle(_services);
     agent_task task;
     task.id = make_trace_id();
     task.name = "codepilot.stream";
@@ -1209,6 +1233,8 @@ int codepilot_cli::stream(const std::string &prompt)
 
 int codepilot_cli::agent(const std::string &prompt)
 {
+    debug_log("acquire service graph for agent");
+    service_graph_lifecycle_scope lifecycle(_services);
     agent_task task;
     task.id = make_trace_id();
     task.name = "codepilot.agent";
@@ -1316,6 +1342,13 @@ int codepilot_cli::run_eval(const std::vector<std::string> &args)
         return 1;
     }
 
+    std::unique_ptr<service_graph_lifecycle_scope> lifecycle;
+    if (!external)
+    {
+        debug_log("acquire service graph for eval");
+        lifecycle.reset(new service_graph_lifecycle_scope(_services));
+    }
+
     std::cout << "target=" << (external ? "external" : "codepilot")
               << " tasks=" << tasks.size() << "\n";
     uint64_t total_latency_ms = 0;
@@ -1390,6 +1423,8 @@ int codepilot_cli::run_eval(const std::vector<std::string> &args)
 
 int codepilot_cli::run_tool(const std::vector<std::string> &args)
 {
+    debug_log("acquire service graph for tool");
+    service_graph_lifecycle_scope lifecycle(_services);
     if (args.empty())
     {
         std::cout << _services.tools_summary() << "\n";
@@ -1493,6 +1528,8 @@ bool codepilot_cli::approve_tool_invocation(const std::string &tool_name,
 
 int codepilot_cli::run_state(const std::vector<std::string> &args)
 {
+    debug_log("acquire service graph for state");
+    service_graph_lifecycle_scope lifecycle(_services);
     if (args.empty())
     {
         std::cout << "usage: state <put|get|query|checkpoint|recover> ...\n";
@@ -1592,6 +1629,8 @@ int codepilot_cli::run_state(const std::vector<std::string> &args)
 
 int codepilot_cli::run_registry(const std::vector<std::string> &args)
 {
+    debug_log("acquire service graph for registry");
+    service_graph_lifecycle_scope lifecycle(_services);
     if (_services.rpc_clients_enabled())
     {
         rasn_registry_client client(_services.registry_address());
@@ -1716,6 +1755,8 @@ int codepilot_cli::run_registry(const std::vector<std::string> &args)
 
 int codepilot_cli::run_agent_control(const std::vector<std::string> &args)
 {
+    debug_log("acquire service graph for agentctl");
+    service_graph_lifecycle_scope lifecycle(_services);
     if (args.size() < 2)
     {
         std::cout << "usage: agentctl <describe|heartbeat|query|cancel> <coordinator|model|tool>\n";
@@ -1821,6 +1862,8 @@ int codepilot_cli::run_agent_control(const std::vector<std::string> &args)
 
 int codepilot_cli::run_observe(const std::vector<std::string> &args)
 {
+    debug_log("acquire service graph for observe");
+    service_graph_lifecycle_scope lifecycle(_services);
     if (args.empty())
     {
         std::cout << "usage: observe <events|failures|timeline|diagnose|replay|metrics|resilience|snapshot> ...\n";
@@ -1970,6 +2013,8 @@ int codepilot_cli::run_skill(const std::vector<std::string> &args)
 
 int codepilot_cli::run_selftest(const std::vector<std::string> &args)
 {
+    debug_log("acquire service graph for selftest");
+    service_graph_lifecycle_scope lifecycle(_services);
     if (args.size() > 1)
     {
         std::cout << "usage: selftest [checkpoint-path]\n";
@@ -2181,6 +2226,8 @@ int codepilot_cli::run_selftest(const std::vector<std::string> &args)
 
 int codepilot_cli::run_workflow(const std::string &path, const std::string &run_id, bool resume)
 {
+    debug_log("acquire service graph for workflow");
+    service_graph_lifecycle_scope lifecycle(_services);
     std::string error;
     workflow_source source;
     if (!load_workflow_source(path, &source, &error))
@@ -2207,6 +2254,8 @@ int codepilot_cli::run_workflow(const std::string &path, const std::string &run_
 
 int codepilot_cli::enable_replay(const std::string &path)
 {
+    debug_log("acquire service graph for replay");
+    service_graph_lifecycle_scope lifecycle(_services);
     replay_load_request request;
     request.path = path;
     const observability_response response = _services.load_replay(request);
@@ -2221,6 +2270,8 @@ int codepilot_cli::enable_replay(const std::string &path)
 
 int codepilot_cli::set_provider(const std::string &provider_name)
 {
+    debug_log("acquire service graph for provider switch");
+    service_graph_lifecycle_scope lifecycle(_services);
     const model_gateway_response response = _services.set_provider(provider_name);
     if (!response.ok)
     {

@@ -16,6 +16,8 @@
 namespace dsn {
 namespace rasn {
 
+void debug_log(const std::string &message);
+
 class codepilot_cli
 {
 public:
