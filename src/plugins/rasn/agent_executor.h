@@ -58,7 +58,6 @@ struct agent_executor_options
 struct agent_executor_request
 {
     agent_task task;
-    std::string trace_id;
     std::string prompt;
     std::string system_prompt;
     std::vector<std::string> context;

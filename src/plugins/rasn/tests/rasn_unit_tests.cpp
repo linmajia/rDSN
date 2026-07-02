@@ -853,7 +853,6 @@ TEST(rasn_agent_executor, executes_tool_then_final_answer)
     agent_executor_request request;
     request.task.id = "executor-task";
     request.task.name = "unit.executor";
-    request.trace_id = "trace-executor";
     request.prompt = "inspect the repo";
     request.system_prompt = "system";
     request.context.push_back("initial context");
@@ -930,7 +929,6 @@ TEST(rasn_agent_executor, stops_at_tool_limit)
 {
     agent_executor_request request;
     request.task.id = "executor-limit";
-    request.trace_id = "trace-limit";
     request.prompt = "loop";
 
     agent_executor_options options;

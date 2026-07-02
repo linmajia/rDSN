@@ -19,7 +19,7 @@ std::string executor_error_message(const agent_response &response)
     {
         return response.output;
     }
-    return "agent model request failed";
+    return "agent request failed";
 }
 
 std::string executor_system_prompt(const agent_executor_request &request, const agent_executor_options &options)

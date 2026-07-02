@@ -25,7 +25,8 @@ set(MY_SRC_SEARCH_MODE "GLOB")
 
 set(MY_PROJ_INC_PATH
     ${GTEST_INCLUDE_DIR}
-    "${CMAKE_CURRENT_SOURCE_DIR}/..")
+    "${CMAKE_CURRENT_SOURCE_DIR}/.."
+    "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 
 # gtest plus the rasn static library. The platform thread library that gtest
 # needs is linked automatically by rDSN (CMAKE_THREAD_LIBS_INIT, carried in
