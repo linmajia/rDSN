@@ -1,8 +1,8 @@
 #pragma once
 
-#include "agent_types.h"
-#include "agent_tools.h"
-#include "llm_provider.h"
+#include <rasn/agent_types.h>
+#include <rasn/agent_tools.h>
+#include <rasn/llm_provider.h>
 
 #include <dsn/cpp/serialization.h>
 

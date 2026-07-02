@@ -25,7 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "rate_limiter.h"
+#include <rasn/rate_limiter.h>
 
 namespace dsn {
 namespace rasn {

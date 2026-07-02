@@ -4,7 +4,7 @@
 // Only thrift-free rDSN headers are used here (the C perf-counter API and the
 // task/node accessor), so this translation unit stays self-contained.
 
-#include "metrics.h"
+#include <rasn/metrics.h>
 
 #include <dsn/c/api_utilities.h>
 #include <dsn/tool-api/task.h>

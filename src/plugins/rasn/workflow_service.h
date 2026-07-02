@@ -1,9 +1,9 @@
 #pragma once
 
-#include "agent_types.h"
-#include "rasn.code.definition.h"
-#include "state_service.h"
-#include "workflow.h"
+#include <rasn/agent_types.h>
+#include <rasn/rasn.code.definition.h>
+#include <rasn/state_service.h>
+#include <rasn/workflow.h>
 
 #include <dsn/cpp/zlocks.h>
 #include <dsn/service_api_cpp.h>

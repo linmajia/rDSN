@@ -7,7 +7,7 @@
 // -- so refill is deterministic under replay and the limiter is unit-testable
 // without a live rDSN node.
 
-#include "rate_limiter.h"
+#include <rasn/rate_limiter.h>
 
 #include <algorithm>
 #include <cmath>

@@ -2,7 +2,7 @@
 // headers, so this translation unit compiles and unit-tests without a live
 // service node. Callers supply monotonic time (ms).
 
-#include "circuit_breaker.h"
+#include <rasn/circuit_breaker.h>
 
 namespace dsn {
 namespace rasn {

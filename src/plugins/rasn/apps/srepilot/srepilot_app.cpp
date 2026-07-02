@@ -31,7 +31,7 @@ std::vector<std::string> srepilot_commands()
 {
     static const std::vector<std::string> commands = {
         "help", "-h", "--help", "interactive", "repl", "diagnose", "runbook",
-        "status", "observe", "selftest", "provider",
+        "status", "observe", "runtime", "selftest", "provider",
     };
     return commands;
 }
@@ -206,6 +206,11 @@ int srepilot_cli::run_command(const std::vector<std::string> &args, bool interac
     {
         return observe(std::vector<std::string>(args.begin() + 1, args.end()));
     }
+    if (args[0] == "runtime")
+    {
+        std::cout << runtime_modules_summary();
+        return 0;
+    }
     if (args[0] == "selftest")
     {
         return selftest();
@@ -238,10 +243,12 @@ int srepilot_cli::diagnose(const std::vector<std::string> &args)
     const llm_response response = _services.complete(request);
     if (!response.ok)
     {
+        (void)record_runtime_choice(request.task.id, "model.response", "srepilot.diagnose", response.error);
         std::cout << "diagnosis failed: " << response.error << "\n";
         return 1;
     }
 
+    (void)record_runtime_choice(request.task.id, "model.response", "srepilot.diagnose", response.text);
     std::cout << response.text << "\n";
     std::string key;
     if (!persist_response("diagnosis", request.task, incident, response.text, &key))
@@ -271,10 +278,12 @@ int srepilot_cli::runbook(const std::vector<std::string> &args)
     const llm_response response = _services.complete(request);
     if (!response.ok)
     {
+        (void)record_runtime_choice(request.task.id, "model.response", "srepilot.runbook", response.error);
         std::cout << "runbook generation failed: " << response.error << "\n";
         return 1;
     }
 
+    (void)record_runtime_choice(request.task.id, "model.response", "srepilot.runbook", response.text);
     std::cout << response.text << "\n";
     std::string key;
     if (!persist_response("runbook", request.task, symptom, response.text, &key))
@@ -339,6 +348,8 @@ int srepilot_cli::status()
     {
         std::cout << "incident records: query failed " << state.error << "\n";
     }
+
+    std::cout << runtime_modules_summary();
     return health.ok && snapshot.ok ? 0 : 1;
 }
 
@@ -483,6 +494,16 @@ int srepilot_cli::selftest()
     const std::string resilience = _services.resilience_report();
     print_check(!resilience.empty(), "resilience report", resilience.empty() ? "" : "available", &ok);
 
+    const std::string runtime_summary = runtime_modules_summary();
+    print_check(runtime_summary.find("agent_control_plane") != std::string::npos &&
+                    runtime_summary.find("agent_message_bus") != std::string::npos &&
+                    runtime_summary.find("task_orchestration_kernel") != std::string::npos &&
+                    runtime_summary.find("determinism_ledger") != std::string::npos &&
+                    runtime_summary.find("sandbox_runtime") != std::string::npos,
+                "general multi-agent runtime modules",
+                "wired into SREPilot CLI",
+                &ok);
+
     if (ok)
     {
         std::cout << "SREPilot self-test passed\n";
@@ -619,6 +640,7 @@ void srepilot_cli::print_help(bool interactive_mode) const
               << cli_help_item(interactive_mode, "observe failures [limit]", "show classified failures")
               << cli_help_item(interactive_mode, "observe metrics [format]", "dump runtime metrics (text|prometheus|json)")
               << cli_help_item(interactive_mode, "observe resilience", "dump overload/model/tool/remote-agent guards")
+              << cli_help_item(interactive_mode, "runtime", "show agent control, message bus, orchestration, replay, and sandbox state")
               << cli_help_item(interactive_mode, "provider [name]", "show or switch model provider")
               << cli_help_item(interactive_mode, "selftest", "run model/state/observability checks")
               << cli_help_item(interactive_mode, "interactive", "start REPL mode");

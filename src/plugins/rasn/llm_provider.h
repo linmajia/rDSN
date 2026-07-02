@@ -1,7 +1,7 @@
 #pragma once
 
-#include "model_agent.h"
-#include "rasn_core.h"
+#include <rasn/model_agent.h>
+#include <rasn/rasn_core.h>
 
 #include <memory>
 #include <cstddef>

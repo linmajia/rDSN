@@ -38,6 +38,7 @@ private:
     void print_compat_provider(const model_gateway_response &response) const override;
     void on_compat_prompt_start(const rasn_cli_compat_options &options) override;
     void on_compat_prompt_finish(const rasn_cli_compat_options &options) override;
+    void on_cli_workspace_changed(const std::string &workspace) override;
     void on_startup_context(const cli_startup_context &startup) override;
     int ask(const std::string &prompt, bool planning_mode);
     int stream(const std::string &prompt);
@@ -63,6 +64,7 @@ private:
                                  const std::vector<std::string> &args,
                                  bool explicit_approval,
                                  std::vector<std::string> *policy_labels) const;
+    void configure_sandbox_profile(const std::string &workspace_root);
     void print_help(bool interactive_mode) const;
 
     std::vector<std::string> _context;

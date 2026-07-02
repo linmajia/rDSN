@@ -1,9 +1,10 @@
-#include "cli_app.h"
+#include <rasn/cli_app.h>
 
-#include "agent_clients.h"
-#include "agent_registry.h"
+#include <rasn/agent_clients.h>
+#include <rasn/agent_registry.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <iostream>
 #include <sstream>
@@ -37,6 +38,30 @@ std::string join_args(const std::vector<std::string> &args, size_t begin)
 bool starts_with(const std::string &value, const std::string &prefix)
 {
     return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
+}
+
+std::string sanitize_agent_id_component(const std::string &value)
+{
+    std::string result;
+    bool previous_separator = true;
+    for (unsigned char c : value)
+    {
+        if (std::isalnum(c))
+        {
+            result.push_back(static_cast<char>(std::tolower(c)));
+            previous_separator = false;
+        }
+        else if (!previous_separator)
+        {
+            result.push_back('.');
+            previous_separator = true;
+        }
+    }
+    while (!result.empty() && result[result.size() - 1] == '.')
+    {
+        result.resize(result.size() - 1);
+    }
+    return result.empty() ? "cli" : result;
 }
 
 bool take_flag_value(const std::vector<std::string> &args,
@@ -575,7 +600,10 @@ bool wait_for_cli_service_dependencies(const rasn_service_graph &services,
     return false;
 }
 
-rasn_cli_app_base::rasn_cli_app_base(rasn_service_graph &services) : _services(services) {}
+rasn_cli_app_base::rasn_cli_app_base(rasn_service_graph &services)
+    : _services(services), _sandbox_profile(default_read_only_sandbox_profile())
+{
+}
 
 rasn_cli_app_base::~rasn_cli_app_base() {}
 
@@ -606,6 +634,7 @@ int rasn_cli_app_base::run(const std::vector<std::string> &args)
             std::cout << workspace_error << "\n";
             return 1;
         }
+        on_cli_workspace_changed(compat_options.workspace);
     }
 
     cli_startup_context startup;
@@ -621,6 +650,7 @@ int rasn_cli_app_base::run(const std::vector<std::string> &args)
     }
 
     rasn_service_graph_lifecycle_scope lifecycle(_services);
+    initialize_runtime_modules();
     int compat_exit_code = 0;
     if (handle_compat_options(compat_options, &compat_exit_code))
     {
@@ -650,14 +680,15 @@ int rasn_cli_app_base::run(const std::vector<std::string> &args)
         {
             std::vector<std::string> slash_args = normalized_args;
             slash_args[0] = command;
-            return run_command(slash_args);
+            return run_tracked_command(slash_args, false);
         }
     }
-    return run_command(normalized_args);
+    return run_tracked_command(normalized_args, false);
 }
 
 int rasn_cli_app_base::repl()
 {
+    initialize_runtime_modules();
     terminal_input_scope terminal_input;
     std::cout << repl_title() << "\n";
     std::cout << provider_summary() << "\n";
@@ -688,7 +719,7 @@ int rasn_cli_app_base::repl()
         }
         if (line[0] == '/')
         {
-            const int rc = run_command(split_words(line.substr(1)), true);
+            const int rc = run_tracked_command(split_words(line.substr(1)), true);
             if (rc != 0)
             {
                 std::cout << "command failed: " << rc << "\n";
@@ -774,7 +805,7 @@ bool rasn_cli_app_base::handle_compat_options(const rasn_cli_compat_options &opt
     if (options.prompt_set)
     {
         on_compat_prompt_start(options);
-        const int rc = run_compat_prompt(options.prompt, options.stream);
+        const int rc = run_tracked_compat_prompt(options);
         on_compat_prompt_finish(options);
         if (exit_code != nullptr)
         {
@@ -862,6 +893,11 @@ void rasn_cli_app_base::on_compat_prompt_finish(const rasn_cli_compat_options &o
     (void)options;
 }
 
+void rasn_cli_app_base::on_cli_workspace_changed(const std::string &workspace)
+{
+    (void)workspace;
+}
+
 void rasn_cli_app_base::on_startup_context(const cli_startup_context &startup)
 {
     (void)startup;
@@ -882,12 +918,282 @@ std::string rasn_cli_app_base::provider_summary() const
     return _services.provider_summary();
 }
 
+std::string rasn_cli_app_base::cli_agent_id() const
+{
+    return "rasn." + sanitize_agent_id_component(repl_prompt()) + ".cli";
+}
+
+std::string rasn_cli_app_base::cli_agent_role() const
+{
+    return "cli";
+}
+
+std::string rasn_cli_app_base::cli_agent_app_name() const
+{
+    return repl_title();
+}
+
+std::vector<agent_capability> rasn_cli_app_base::cli_agent_capabilities() const
+{
+    std::vector<agent_capability> capabilities;
+    agent_capability prompt;
+    prompt.name = "cli.prompt";
+    prompt.input_type = "text";
+    prompt.output_type = "text";
+    prompt.side_effect_class = "model";
+    capabilities.push_back(prompt);
+
+    const std::vector<std::string> app_commands = commands();
+    for (const std::string &command : app_commands)
+    {
+        if (command.empty() || command[0] == '-')
+        {
+            continue;
+        }
+        agent_capability capability;
+        capability.name = "cli.command." + command;
+        capability.input_type = "argv";
+        capability.output_type = "exit_code";
+        capability.side_effect_class = "mixed";
+        capabilities.push_back(capability);
+    }
+    return capabilities;
+}
+
+void rasn_cli_app_base::initialize_runtime_modules()
+{
+    if (_runtime_modules_initialized)
+    {
+        heartbeat_runtime_modules();
+        return;
+    }
+
+    agent_control_record record;
+    record.descriptor.agent_id = cli_agent_id();
+    record.descriptor.role = cli_agent_role();
+    record.descriptor.app_name = cli_agent_app_name();
+    record.descriptor.version = version_string();
+    record.descriptor.health = "healthy";
+    record.descriptor.capabilities = cli_agent_capabilities();
+    record.state = "starting";
+    record.placement = "local";
+    record.restart_policy = "manual";
+
+    std::string error;
+    if (!_agent_control.upsert_agent(record, &error))
+    {
+        warn_runtime_module_failure("agent_control_plane", error);
+    }
+    else
+    {
+        const uint64_t now_ms = ::dsn_now_ms();
+        const std::string owner = cli_agent_id() + ".process";
+        const agent_control_lease lease = _agent_control.acquire_lease(record.descriptor.agent_id, owner, now_ms, 0);
+        if (!lease.ok)
+        {
+            warn_runtime_module_failure("agent_control_plane", lease.error);
+        }
+        if (!_agent_control.heartbeat(record.descriptor.agent_id, now_ms, &error))
+        {
+            warn_runtime_module_failure("agent_control_plane", error);
+        }
+    }
+
+    _runtime_modules_initialized = true;
+}
+
+void rasn_cli_app_base::heartbeat_runtime_modules()
+{
+    _agent_control.expire_leases(::dsn_now_ms());
+    std::string error;
+    if (!_agent_control.heartbeat(cli_agent_id(), ::dsn_now_ms(), &error))
+    {
+        warn_runtime_module_failure("agent_control_plane", error);
+    }
+}
+
+int rasn_cli_app_base::run_tracked_command(const std::vector<std::string> &args, bool interactive_mode)
+{
+    initialize_runtime_modules();
+    const std::string input = join_args(args, 0);
+    const std::string name = args.empty() ? "empty" : args[0];
+    const runtime_execution execution =
+        begin_runtime_execution("command", name, input, cli_agent_id(), "cli.command");
+    const int rc = run_command(args, interactive_mode);
+    finish_runtime_execution(execution, rc, input);
+    return rc;
+}
+
+int rasn_cli_app_base::run_tracked_compat_prompt(const rasn_cli_compat_options &options)
+{
+    initialize_runtime_modules();
+    const runtime_execution execution =
+        begin_runtime_execution("prompt", options.stream ? "stream" : "prompt", options.prompt, cli_agent_id(), "cli.prompt");
+    const int rc = run_compat_prompt(options.prompt, options.stream);
+    finish_runtime_execution(execution, rc, options.prompt);
+    return rc;
+}
+
+rasn_cli_app_base::runtime_execution rasn_cli_app_base::begin_runtime_execution(const std::string &kind,
+                                                                               const std::string &name,
+                                                                               const std::string &input,
+                                                                               const std::string &receiver,
+                                                                               const std::string &message_type)
+{
+    runtime_execution execution;
+    execution.active = true;
+    execution.task_id = make_trace_id();
+
+    orchestration_task task;
+    task.task_id = execution.task_id;
+    task.owner_agent = cli_agent_id();
+    task.input = input;
+    std::string error;
+    if (!_orchestration.add_task(task, &error))
+    {
+        warn_runtime_module_failure("task_orchestration", error);
+    }
+    else if (!_orchestration.start(task.task_id, cli_agent_id(), &error))
+    {
+        warn_runtime_module_failure("task_orchestration", error);
+    }
+
+    agent_message message;
+    message.message_id = execution.task_id + "/message";
+    message.correlation_id = execution.task_id;
+    message.sender = cli_agent_id();
+    message.receiver = receiver.empty() ? cli_agent_id() : receiver;
+    message.type = message_type;
+    message.payload = kind + ":" + name + "\n" + input;
+    message.deadline_ms = ::dsn_now_ms() + 10 * 60 * 1000;
+    agent_message stored;
+    if (!_message_bus.publish(message, &stored, &error))
+    {
+        warn_runtime_module_failure("agent_message_bus", error);
+    }
+    else
+    {
+        execution.message_id = stored.message_id;
+    }
+
+    deterministic_choice choice;
+    if (!_determinism.record(execution.task_id, "route", "rasn.cli", kind + ":" + name, &choice, &error))
+    {
+        warn_runtime_module_failure("determinism_ledger", error);
+    }
+    return execution;
+}
+
+void rasn_cli_app_base::finish_runtime_execution(const runtime_execution &execution,
+                                                 int exit_code,
+                                                 const std::string &detail)
+{
+    if (!execution.active)
+    {
+        return;
+    }
+
+    std::string error;
+    deterministic_choice choice;
+    if (!_determinism.record(
+            execution.task_id, "exit_code", "rasn.cli", std::to_string(exit_code), &choice, &error))
+    {
+        warn_runtime_module_failure("determinism_ledger", error);
+    }
+
+    if (exit_code == 0)
+    {
+        if (!_orchestration.complete(execution.task_id, detail, &error))
+        {
+            warn_runtime_module_failure("task_orchestration", error);
+        }
+        if (!execution.message_id.empty() && !_message_bus.ack(execution.message_id, &error))
+        {
+            warn_runtime_module_failure("agent_message_bus", error);
+        }
+    }
+    else
+    {
+        if (!_orchestration.fail(execution.task_id, detail, false, &error))
+        {
+            warn_runtime_module_failure("task_orchestration", error);
+        }
+        if (!execution.message_id.empty() && !_message_bus.dead_letter(execution.message_id, detail, &error))
+        {
+            warn_runtime_module_failure("agent_message_bus", error);
+        }
+    }
+    heartbeat_runtime_modules();
+}
+
+std::string rasn_cli_app_base::runtime_modules_summary() const
+{
+    std::ostringstream output;
+    const std::vector<agent_control_record> agents = _agent_control.list(false, ::dsn_now_ms());
+    const std::vector<agent_message> messages = _message_bus.snapshot();
+    const std::vector<orchestration_task> tasks = _orchestration.snapshot();
+    const std::vector<deterministic_choice> choices = _determinism.snapshot();
+    output << "rASN runtime modules\n"
+           << "agent_control_plane: agents=" << agents.size() << "\n"
+           << _agent_control.describe(::dsn_now_ms()) << "\n"
+           << "agent_message_bus: messages=" << messages.size() << "\n"
+           << "task_orchestration_kernel: tasks=" << tasks.size()
+           << " ready=" << _orchestration.ready_tasks(::dsn_now_ms()).size()
+           << " blocked=" << _orchestration.blocked_tasks().size() << "\n"
+           << "determinism_ledger: choices=" << choices.size() << "\n"
+           << "sandbox_runtime: profile=" << _sandbox_profile.name
+           << " fs_read=" << (_sandbox_profile.allow_filesystem_read ? "yes" : "no")
+           << " fs_write=" << (_sandbox_profile.allow_filesystem_write ? "yes" : "no")
+           << " network=" << (_sandbox_profile.allow_network ? "yes" : "no")
+           << " process=" << (_sandbox_profile.allow_process_spawn ? "yes" : "no") << "\n";
+    return output.str();
+}
+
+deterministic_replay_result rasn_cli_app_base::record_runtime_choice(const std::string &task_id,
+                                                                    const std::string &key,
+                                                                    const std::string &source,
+                                                                    const std::string &value)
+{
+    deterministic_replay_result result;
+    std::string error;
+    deterministic_choice choice;
+    if (!_determinism.record(task_id, key, source, value, &choice, &error))
+    {
+        result.error = error;
+        return result;
+    }
+    result.ok = true;
+    result.choice = choice;
+    return result;
+}
+
+sandbox_decision rasn_cli_app_base::evaluate_cli_sandbox_request(const sandbox_request &request) const
+{
+    return evaluate_sandbox_request(_sandbox_profile, request);
+}
+
+void rasn_cli_app_base::set_cli_sandbox_profile(const sandbox_profile &profile)
+{
+    _sandbox_profile = profile;
+}
+
+void rasn_cli_app_base::warn_runtime_module_failure(const std::string &module, const std::string &error) const
+{
+    if (!error.empty())
+    {
+        std::cerr << module << " warning: " << error << "\n";
+    }
+}
+
 int rasn_cli_app_base::run_agent_plan(const rasn_cli_agent_plan &plan,
                                       const agent_plan_executor::model_callback &model,
                                       const agent_plan_executor::approval_callback &approve,
                                       const agent_plan_executor::tool_callback &tool)
 {
     _services.runtime().begin_task(plan.task);
+    const runtime_execution plan_execution =
+        begin_runtime_execution("agent-plan", plan.task.name, plan.prompt, "rasn.agent.executor", "agent.plan");
+    (void)record_runtime_choice(plan.task.id, "agent.plan.prompt", "rasn.agent_executor", plan.prompt);
 
     agent_executor_request request;
     request.task = plan.task;
@@ -896,7 +1202,30 @@ int rasn_cli_app_base::run_agent_plan(const rasn_cli_agent_plan &plan,
     request.context = plan.context;
 
     agent_plan_executor executor;
-    const agent_executor_result result = executor.execute(request, plan.executor_options, model, approve, tool);
+    agent_plan_executor::model_callback tracked_model =
+        [this, &model, &plan](const agent_executor_model_request &model_request) {
+            const runtime_execution execution =
+                begin_runtime_execution("model", model_request.request_id, model_request.conversation, "rasn.llm.agent", "model.complete");
+            const agent_response response = model(model_request);
+            const std::string value = response.ok ? response.output : response.error.message;
+            (void)record_runtime_choice(plan.task.id, "model:" + model_request.request_id, "rasn.model", value);
+            finish_runtime_execution(execution, response.ok ? 0 : 1, value);
+            return response;
+        };
+    agent_plan_executor::tool_callback tracked_tool =
+        [this, &tool, &plan](const agent_executor_tool_request &tool_request) {
+            const runtime_execution execution = begin_runtime_execution("tool",
+                                                                        tool_request.request_id,
+                                                                        tool_request.tool.name,
+                                                                        "rasn.tool.agent",
+                                                                        "tool.run");
+            const tool_result result = tool(tool_request);
+            const std::string value = result.ok ? result.output : result.error;
+            (void)record_runtime_choice(plan.task.id, "tool:" + tool_request.request_id, "rasn.tool", value);
+            finish_runtime_execution(execution, result.ok ? 0 : 1, value);
+            return result;
+        };
+    const agent_executor_result result = executor.execute(request, plan.executor_options, tracked_model, approve, tracked_tool);
     const std::string status = result.status.empty() ? (result.ok ? "ok" : "failed") : result.status;
     const std::string error = result.error.empty() ? "agent plan execution failed" : result.error;
     if (status == "approval-denied" && !plan.approval_failure_source.empty())
@@ -905,6 +1234,7 @@ int rasn_cli_app_base::run_agent_plan(const rasn_cli_agent_plan &plan,
             plan.task, plan.approval_failure_category, plan.approval_failure_code, error, false, plan.approval_failure_source);
     }
     _services.runtime().finish_task(plan.task, status);
+    finish_runtime_execution(plan_execution, result.ok ? 0 : 1, result.ok ? result.output : error);
 
     if (result.ok)
     {

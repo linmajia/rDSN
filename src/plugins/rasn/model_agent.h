@@ -1,6 +1,6 @@
 #pragma once
 
-#include "agent_types.h"
+#include <rasn/agent_types.h>
 
 #include <dsn/cpp/serialization.h>
 

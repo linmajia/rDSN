@@ -227,7 +227,7 @@ std::vector<std::string> codepilot_commands()
         "tools",       "schema",   "topology",  "selftest",    "tool",     "state",
         "registry",    "agentctl", "observe",   "skills",      "skill",    "provider",
         "trace",       "context",  "replay",    "workflow",    "plan",     "agent",
-        "eval",        "ask",      "stream",    "simulate",
+        "eval",        "runtime",  "ask",       "stream",      "simulate",
     };
     return commands;
 }
@@ -258,7 +258,42 @@ std::string current_process_directory()
     {
         return normalize_platform_path(cwd);
     }
-    return ".";
+    return normalize_platform_path(".");
+}
+
+bool make_codepilot_tool_sandbox_request(const std::string &tool_name,
+                                         const std::vector<std::string> &args,
+                                         sandbox_request *request)
+{
+    if (request == nullptr)
+    {
+        return false;
+    }
+    if (tool_name == "list")
+    {
+        request->operation = "fs.read";
+        request->path = args.empty() ? "." : args[0];
+        return true;
+    }
+    if ((tool_name == "read" || tool_name == "search") && !args.empty())
+    {
+        request->operation = "fs.read";
+        request->path = args[0];
+        return true;
+    }
+    if ((tool_name == "write" || tool_name == "replace") && !args.empty())
+    {
+        request->operation = "fs.write";
+        request->path = args[0];
+        return true;
+    }
+    if (tool_name == "shell" && !args.empty())
+    {
+        request->operation = "process";
+        request->command = join_args(args, 0);
+        return true;
+    }
+    return false;
 }
 
 bool read_text_file(const std::string &path, std::string *text, std::string *error)
@@ -442,6 +477,7 @@ codepilot_cli::codepilot_cli() : rasn_cli_app_base(global_rasn_services())
 {
     register_default_tool_provider(&create_codepilot_tool_provider);
     _services.set_tool_provider(create_default_tool_provider());
+    configure_sandbox_profile(current_process_directory());
 }
 
 std::vector<std::string> codepilot_cli::commands() const
@@ -467,11 +503,18 @@ std::string codepilot_cli::repl_plain_text_behavior() const
 void codepilot_cli::on_startup_context(const cli_startup_context &startup)
 {
     _workspace_root = startup.workspace_root;
+    configure_sandbox_profile(_workspace_root);
     _context.push_back("workspace: " + startup.workspace_root);
     if (!startup.context_text.empty())
     {
         _context.push_back(startup.context_text);
     }
+}
+
+void codepilot_cli::on_cli_workspace_changed(const std::string &workspace)
+{
+    _workspace_root = normalize_platform_path(workspace);
+    configure_sandbox_profile(_workspace_root);
 }
 
 void codepilot_cli::handle_plain_text(const std::string &line)
@@ -932,6 +975,12 @@ int codepilot_cli::run_command(const std::vector<std::string> &args, bool intera
         return run_eval(args);
     }
 
+    if (args[0] == "runtime")
+    {
+        std::cout << runtime_modules_summary();
+        return 0;
+    }
+
     if (args[0] == "ask")
     {
         if (args.size() < 2)
@@ -983,12 +1032,14 @@ int codepilot_cli::ask(const std::string &prompt, bool planning_mode)
     {
         _services.runtime().finish_task(task, "failed");
         const std::string error = agent_error_message(response);
+        (void)record_runtime_choice(task.id, "model.response", "codepilot.ask", error);
         record_session_event("response", task.name + ".failed", error);
         std::cout << error << "\n";
         return 1;
     }
 
     _services.runtime().finish_task(task, "ok");
+    (void)record_runtime_choice(task.id, "model.response", "codepilot.ask", response.output);
     record_session_event("response", task.name + ".ok", response.output);
     std::cout << response.output << "\n";
     return 0;
@@ -1022,6 +1073,7 @@ int codepilot_cli::stream(const std::string &prompt)
     if (!response.ok)
     {
         _services.runtime().finish_task(task, "failed");
+        (void)record_runtime_choice(task.id, "model.response", "codepilot.stream", response.error);
         record_session_event("response", "codepilot.stream.failed", response.error);
         std::cout << "\n" << response.error << "\n";
         return 1;
@@ -1034,6 +1086,7 @@ int codepilot_cli::stream(const std::string &prompt)
         streamed_text = response.text;
     }
     record_session_event("response", "codepilot.stream.ok", streamed_text);
+    (void)record_runtime_choice(task.id, "model.response", "codepilot.stream", streamed_text);
     std::cout << "\n";
     return 0;
 }
@@ -1238,6 +1291,7 @@ int codepilot_cli::run_tool(const std::vector<std::string> &args)
                                                               policy_labels);
     const tool_result result = make_tool_result_from_agent(_services.invoke(request));
     _services.runtime().finish_task(task, result.ok ? "ok" : "failed");
+    (void)record_runtime_choice(task.id, "tool.result", "codepilot.tool", result.ok ? result.output : result.error);
     record_session_event("tool", result.ok ? "ok" : "failed", result.ok ? result.output : result.error);
     std::cout << (result.ok ? result.output : result.error) << "\n";
     if (!result.ok && !result.output.empty())
@@ -1252,6 +1306,21 @@ bool codepilot_cli::approve_tool_invocation(const std::string &tool_name,
                                             bool explicit_approval,
                                             std::vector<std::string> *policy_labels) const
 {
+    sandbox_request sandbox;
+    if (make_codepilot_tool_sandbox_request(tool_name, args, &sandbox))
+    {
+        const sandbox_decision sandbox_decision = evaluate_cli_sandbox_request(sandbox);
+        if (!sandbox_decision.allowed)
+        {
+            std::cout << "sandbox denied: " << sandbox_decision.reason << "\n";
+            return false;
+        }
+        if (policy_labels != nullptr)
+        {
+            policy_labels->push_back("sandbox:" + sandbox_decision.profile);
+        }
+    }
+
     approval_sandbox_request request;
     request.tool_name = tool_name;
     request.args = args;
@@ -1286,6 +1355,16 @@ bool codepilot_cli::approve_tool_invocation(const std::string &tool_name,
         policy_labels->insert(policy_labels->end(), decision.policy_labels.begin(), decision.policy_labels.end());
     }
     return true;
+}
+
+void codepilot_cli::configure_sandbox_profile(const std::string &workspace_root)
+{
+    sandbox_profile profile =
+        default_workspace_write_sandbox_profile(workspace_root.empty() ? current_process_directory() : workspace_root);
+    profile.name = "codepilot-workspace";
+    profile.allow_process_spawn = true;
+    profile.max_cpu_ms = 300000;
+    set_cli_sandbox_profile(profile);
 }
 
 int codepilot_cli::run_state(const std::vector<std::string> &args)
@@ -1965,6 +2044,15 @@ int codepilot_cli::run_selftest(const std::vector<std::string> &args)
                             " failures=" + std::to_string(observed.failures.size())
                       : observed.error);
 
+    const std::string runtime_summary = runtime_modules_summary();
+    check(runtime_summary.find("agent_control_plane") != std::string::npos &&
+              runtime_summary.find("agent_message_bus") != std::string::npos &&
+              runtime_summary.find("task_orchestration_kernel") != std::string::npos &&
+              runtime_summary.find("determinism_ledger") != std::string::npos &&
+              runtime_summary.find("sandbox_runtime") != std::string::npos,
+          "general multi-agent runtime modules",
+          "wired into CodePilot CLI");
+
     state_query_request snapshot_query;
     snapshot_query.key_prefix = "observability-snapshot/";
     const state_response snapshot_index = _services.query_state(snapshot_query);
@@ -2133,6 +2221,7 @@ void codepilot_cli::print_help(bool interactive_mode) const
               << cli_help_item(interactive_mode, "plan <goal>", "request an implementation plan")
               << cli_help_item(interactive_mode, "eval [suite]", "run CodePilot eval tasks and latency/failure metrics")
               << cli_help_item(interactive_mode, "eval external <template> [suite]", "run an external CLI command template with {prompt}")
+              << cli_help_item(interactive_mode, "runtime", "show agent control, message bus, orchestration, replay, and sandbox state")
               << cli_help_item(interactive_mode, "workflow <file>", "execute a declarative task graph")
               << cli_help_item(interactive_mode, "workflow start <file> [run-id]", "execute a task graph")
               << cli_help_item(interactive_mode, "workflow resume <file> <run-id>", "resume from completed node state")

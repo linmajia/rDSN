@@ -1,8 +1,13 @@
 #pragma once
 
-#include "agent_executor.h"
-#include "agent_services.h"
-#include "cli_support.h"
+#include <rasn/agent_control_plane.h>
+#include <rasn/agent_executor.h>
+#include <rasn/agent_message_bus.h>
+#include <rasn/agent_services.h>
+#include <rasn/cli_support.h>
+#include <rasn/determinism_ledger.h>
+#include <rasn/sandbox_runtime.h>
+#include <rasn/task_orchestration.h>
 
 #include <atomic>
 #include <cstddef>
@@ -108,19 +113,56 @@ protected:
     virtual void on_compat_prompt_start(const rasn_cli_compat_options &options);
     virtual void on_compat_prompt_finish(const rasn_cli_compat_options &options);
     virtual int handle_empty_args();
+    virtual void on_cli_workspace_changed(const std::string &workspace);
     virtual void on_startup_context(const cli_startup_context &startup);
     virtual size_t max_context_bytes() const;
     virtual cli_workspace_context_options workspace_context_options() const;
     virtual std::string provider_summary() const;
+    virtual std::string cli_agent_id() const;
+    virtual std::string cli_agent_role() const;
+    virtual std::string cli_agent_app_name() const;
+    virtual std::vector<agent_capability> cli_agent_capabilities() const;
     int run_agent_plan(const rasn_cli_agent_plan &plan,
                        const agent_plan_executor::model_callback &model,
                        const agent_plan_executor::approval_callback &approve,
                        const agent_plan_executor::tool_callback &tool);
+    std::string runtime_modules_summary() const;
+    deterministic_replay_result record_runtime_choice(const std::string &task_id,
+                                                      const std::string &key,
+                                                      const std::string &source,
+                                                      const std::string &value);
+    sandbox_decision evaluate_cli_sandbox_request(const sandbox_request &request) const;
+    void set_cli_sandbox_profile(const sandbox_profile &profile);
 
     rasn_service_graph &_services;
 
 private:
+    struct runtime_execution
+    {
+        bool active = false;
+        std::string task_id;
+        std::string message_id;
+    };
+
+    void initialize_runtime_modules();
+    void heartbeat_runtime_modules();
+    int run_tracked_command(const std::vector<std::string> &args, bool interactive_mode);
+    int run_tracked_compat_prompt(const rasn_cli_compat_options &options);
+    runtime_execution begin_runtime_execution(const std::string &kind,
+                                              const std::string &name,
+                                              const std::string &input,
+                                              const std::string &receiver,
+                                              const std::string &message_type);
+    void finish_runtime_execution(const runtime_execution &execution, int exit_code, const std::string &detail);
+    void warn_runtime_module_failure(const std::string &module, const std::string &error) const;
+
     std::atomic<bool> _shutdown_requested{false};
+    agent_control_plane _agent_control;
+    agent_message_bus _message_bus;
+    task_orchestration_kernel _orchestration;
+    determinism_ledger _determinism;
+    sandbox_profile _sandbox_profile;
+    bool _runtime_modules_initialized = false;
 };
 
 } // namespace rasn

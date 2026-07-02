@@ -1,29 +1,34 @@
-#include "../agent_types.h"
-#include "../agent_executor.h"
-#include "../agent_messages.h"
-#include "../agent_registry.h"
-#include "../agent_runtime.h"
-#include "../agent_services.h"
-#include "../admission_gate.h"
-#include "../approval_sandbox.h"
-#include "../circuit_breaker.h"
-#include "../cli_support.h"
-#include "../coordinator_service.h"
-#include "../apps/codepilot/local_tools.h"
-#include "../metrics.h"
-#include "../model_cost.h"
-#include "../policy_manager.h"
-#include "../provider_router.h"
-#include "../rate_limiter.h"
-#include "../redaction.h"
-#include "../state_service.h"
-#include "../schema_manifest.h"
-#include "../session_store.h"
-#include "../tool_catalog.h"
-#include "../workflow.h"
-#include "../workflow_service.h"
-#include "../workspace_change.h"
-#include "../workspace_index.h"
+#include <rasn/agent_types.h>
+#include <rasn/agent_control_plane.h>
+#include <rasn/agent_executor.h>
+#include <rasn/agent_messages.h>
+#include <rasn/agent_message_bus.h>
+#include <rasn/agent_registry.h>
+#include <rasn/agent_runtime.h>
+#include <rasn/agent_services.h>
+#include <rasn/admission_gate.h>
+#include <rasn/approval_sandbox.h>
+#include <rasn/circuit_breaker.h>
+#include <rasn/cli_support.h>
+#include <rasn/coordinator_service.h>
+#include <rasn/apps/codepilot/local_tools.h>
+#include <rasn/determinism_ledger.h>
+#include <rasn/metrics.h>
+#include <rasn/model_cost.h>
+#include <rasn/policy_manager.h>
+#include <rasn/provider_router.h>
+#include <rasn/rate_limiter.h>
+#include <rasn/redaction.h>
+#include <rasn/sandbox_runtime.h>
+#include <rasn/state_service.h>
+#include <rasn/schema_manifest.h>
+#include <rasn/session_store.h>
+#include <rasn/task_orchestration.h>
+#include <rasn/tool_catalog.h>
+#include <rasn/workflow.h>
+#include <rasn/workflow_service.h>
+#include <rasn/workspace_change.h>
+#include <rasn/workspace_index.h>
 
 #include <dsn/cpp/utils.h>
 #include <dsn/tool-api/command.h>
@@ -203,6 +208,27 @@ std::string temp_file_path(const std::string &name)
 std::string workspace_temp_file_path(const std::string &name)
 {
     return normalize_platform_path(name);
+}
+
+agent_descriptor make_unit_agent_descriptor(const std::string &agent_id,
+                                            const std::string &role,
+                                            const std::string &capability)
+{
+    agent_descriptor descriptor;
+    descriptor.agent_id = agent_id;
+    descriptor.role = role;
+    descriptor.app_name = "unit";
+    descriptor.health = "healthy";
+    if (!capability.empty())
+    {
+        agent_capability cap;
+        cap.name = capability;
+        cap.input_type = "text";
+        cap.output_type = "text";
+        cap.side_effect_class = "read_only";
+        descriptor.capabilities.push_back(cap);
+    }
+    return descriptor;
 }
 
 void write_text_file(const std::string &path, const std::string &content)
@@ -1222,6 +1248,164 @@ TEST(rasn_core, split_words_and_normalize_platform_paths)
 #else
     EXPECT_EQ("a/b/c", normalize_platform_path("a\\b/c"));
 #endif
+}
+
+TEST(rasn_agent_control_plane, manages_lifecycle_capabilities_and_leases)
+{
+    agent_control_plane plane;
+    agent_control_record record;
+    record.descriptor = make_unit_agent_descriptor("agent-a", "worker", "model.complete");
+    record.state = "starting";
+    record.placement = "node-a";
+    record.restart_policy = "always";
+
+    std::string error;
+    ASSERT_TRUE(plane.upsert_agent(record, &error)) << error;
+
+    agent_control_lease lease = plane.acquire_lease("agent-a", "owner-a", 1000, 100);
+    ASSERT_TRUE(lease.ok) << lease.error;
+    EXPECT_EQ("owner-a", lease.owner);
+    EXPECT_FALSE(plane.acquire_lease("agent-a", "owner-b", 1050, 100).ok);
+    EXPECT_EQ(1u, plane.expire_leases(1200));
+
+    lease = plane.acquire_lease("agent-a", "owner-b", 1200, 100);
+    ASSERT_TRUE(lease.ok) << lease.error;
+    EXPECT_TRUE(plane.heartbeat("agent-a", 1210, &error)) << error;
+
+    std::vector<agent_control_record> capable = plane.query_by_capability("model.complete", true, 1210);
+    ASSERT_EQ(1u, capable.size());
+    EXPECT_EQ("running", capable[0].state);
+    EXPECT_EQ("owner-b", capable[0].owner);
+
+    EXPECT_TRUE(plane.transition("agent-a", "failed", "boom", &error)) << error;
+    EXPECT_TRUE(plane.query_by_capability("model.complete", true, 1220).empty());
+}
+
+TEST(rasn_agent_message_bus, delivers_defers_acks_and_deadletters_messages)
+{
+    agent_message_bus bus;
+    agent_message message;
+    message.message_id = "msg-1";
+    message.sender = "planner";
+    message.receiver = "worker";
+    message.type = "task.request";
+    message.payload = "inspect";
+    message.deadline_ms = 2000;
+
+    std::string error;
+    ASSERT_TRUE(bus.publish(message, nullptr, &error)) << error;
+
+    std::vector<agent_message> pulled = bus.pull("worker", 1, 1000);
+    ASSERT_EQ(1u, pulled.size());
+    EXPECT_EQ("delivered", pulled[0].state);
+    EXPECT_EQ(1u, pulled[0].attempt);
+
+    EXPECT_TRUE(bus.defer("msg-1", 1500, "backpressure", &error)) << error;
+    EXPECT_TRUE(bus.pull("worker", 1, 1400).empty());
+    pulled = bus.pull("worker", 1, 1500);
+    ASSERT_EQ(1u, pulled.size());
+    EXPECT_EQ(2u, pulled[0].attempt);
+    EXPECT_TRUE(bus.ack("msg-1", &error)) << error;
+
+    message.message_id = "msg-2";
+    message.deadline_ms = 1600;
+    ASSERT_TRUE(bus.publish(message, nullptr, &error)) << error;
+    EXPECT_EQ(1u, bus.expire_deadlines(1700));
+    agent_message expired;
+    ASSERT_TRUE(bus.find("msg-2", &expired));
+    EXPECT_EQ("deadline_expired", expired.state);
+
+    message.message_id = "msg-3";
+    message.deadline_ms = 0;
+    ASSERT_TRUE(bus.publish(message, nullptr, &error)) << error;
+    EXPECT_TRUE(bus.dead_letter("msg-3", "failed", &error)) << error;
+    ASSERT_TRUE(bus.find("msg-3", &expired));
+    EXPECT_EQ("dead_letter", expired.state);
+}
+
+TEST(rasn_task_orchestration, schedules_dependencies_and_terminal_transitions)
+{
+    task_orchestration_kernel kernel;
+    orchestration_task inspect;
+    inspect.task_id = "inspect";
+    inspect.input = "list files";
+    orchestration_task summarize;
+    summarize.task_id = "summarize";
+    summarize.depends_on.push_back("inspect");
+
+    std::string error;
+    ASSERT_TRUE(kernel.add_task(inspect, &error)) << error;
+    ASSERT_TRUE(kernel.add_task(summarize, &error)) << error;
+
+    std::vector<orchestration_task> ready = kernel.ready_tasks();
+    ASSERT_EQ(1u, ready.size());
+    EXPECT_EQ("inspect", ready[0].task_id);
+    EXPECT_EQ(1u, kernel.blocked_tasks().size());
+
+    EXPECT_TRUE(kernel.start("inspect", "agent-a", &error)) << error;
+    EXPECT_TRUE(kernel.complete("inspect", "files", &error)) << error;
+    ready = kernel.ready_tasks();
+    ASSERT_EQ(1u, ready.size());
+    EXPECT_EQ("summarize", ready[0].task_id);
+
+    EXPECT_TRUE(kernel.assign("summarize", "agent-b", &error)) << error;
+    EXPECT_TRUE(kernel.start("summarize", "agent-b", &error)) << error;
+    EXPECT_TRUE(kernel.fail("summarize", "retry", true, &error)) << error;
+    orchestration_task loaded;
+    ASSERT_TRUE(kernel.find("summarize", &loaded));
+    EXPECT_EQ("pending", loaded.state);
+}
+
+TEST(rasn_determinism_ledger, records_and_replays_choices)
+{
+    determinism_ledger ledger;
+    deterministic_replay_result first = ledger.choose("task", "model", "unit", []() { return "generated"; });
+    ASSERT_TRUE(first.ok) << first.error;
+    EXPECT_FALSE(first.replayed);
+    EXPECT_EQ("generated", first.choice.value);
+    EXPECT_NE(std::string::npos, ledger.to_jsonl().find("\"key\":\"model\""));
+
+    determinism_ledger replay;
+    replay.set_replay_choices(ledger.snapshot());
+    bool called = false;
+    deterministic_replay_result second = replay.choose("task", "model", "unit", [&called]() {
+        called = true;
+        return "new";
+    });
+    ASSERT_TRUE(second.ok) << second.error;
+    EXPECT_TRUE(second.replayed);
+    EXPECT_FALSE(called);
+    EXPECT_EQ("generated", second.choice.value);
+}
+
+TEST(rasn_sandbox_runtime, evaluates_filesystem_network_and_process_policy)
+{
+    const std::string root = temp_file_path("rasn-sandbox-root");
+    sandbox_profile read_only = default_read_only_sandbox_profile();
+
+    sandbox_request request;
+    request.operation = "fs.read";
+    request.path = ::dsn::utils::filesystem::path_combine(root, "file.txt");
+    EXPECT_TRUE(evaluate_sandbox_request(read_only, request).allowed);
+
+    request.operation = "fs.write";
+    EXPECT_FALSE(evaluate_sandbox_request(read_only, request).allowed);
+
+    sandbox_profile write_profile = default_workspace_write_sandbox_profile(root);
+    EXPECT_TRUE(evaluate_sandbox_request(write_profile, request).allowed);
+    request.path = temp_file_path("rasn-sandbox-outside.txt");
+    EXPECT_FALSE(evaluate_sandbox_request(write_profile, request).allowed);
+
+    sandbox_profile network = read_only;
+    network.name = "network";
+    network.allow_network = true;
+    network.allowed_network_hosts.push_back("api.example.test");
+    request = sandbox_request();
+    request.operation = "network";
+    request.network_host = "api.example.test";
+    EXPECT_TRUE(evaluate_sandbox_request(network, request).allowed);
+    request.network_host = "evil.example.test";
+    EXPECT_FALSE(evaluate_sandbox_request(network, request).allowed);
 }
 
 TEST(rasn_tool_catalog, describes_aliases_and_normalizes_invocations)

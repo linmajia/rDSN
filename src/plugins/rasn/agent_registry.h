@@ -1,7 +1,7 @@
 #pragma once
 
-#include "agent_types.h"
-#include "rasn.code.definition.h"
+#include <rasn/agent_types.h>
+#include <rasn/rasn.code.definition.h>
 
 #include <dsn/service_api_cpp.h>
 #include <dsn/cpp/zlocks.h>

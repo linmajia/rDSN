@@ -7,7 +7,7 @@
 // configured max_backpressure_ms, keeping the curve rDSN-native while making its
 // magnitude tunable.
 
-#include "admission_gate.h"
+#include <rasn/admission_gate.h>
 
 #include <dsn/utility/exp_delay.h>
 

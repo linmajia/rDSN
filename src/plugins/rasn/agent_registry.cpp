@@ -1,4 +1,4 @@
-#include "agent_registry.h"
+#include <rasn/agent_registry.h>
 
 #include <dsn/service_api_cpp.h>
 

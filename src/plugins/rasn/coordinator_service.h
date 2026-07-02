@@ -1,7 +1,7 @@
 #pragma once
 
-#include "agent_registry.h"
-#include "agent_types.h"
+#include <rasn/agent_registry.h>
+#include <rasn/agent_types.h>
 
 #include <dsn/service_api_cpp.h>
 

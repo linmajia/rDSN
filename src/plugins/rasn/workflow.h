@@ -1,7 +1,7 @@
 #pragma once
 
-#include "agent_tools.h"
-#include "llm_provider.h"
+#include <rasn/agent_tools.h>
+#include <rasn/llm_provider.h>
 
 #include <functional>
 #include <istream>

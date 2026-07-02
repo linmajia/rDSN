@@ -1,6 +1,6 @@
 #pragma once
 
-#include "rasn_core.h"
+#include <rasn/rasn_core.h>
 
 #include <dsn/cpp/address.h>
 #include <dsn/cpp/serialization.h>

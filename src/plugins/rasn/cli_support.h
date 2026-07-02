@@ -1,7 +1,7 @@
 #pragma once
 
-#include "rasn_core.h"
-#include "workspace_index.h"
+#include <rasn/rasn_core.h>
+#include <rasn/workspace_index.h>
 
 #include <dsn/cpp/utils.h>
 

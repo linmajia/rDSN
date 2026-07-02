@@ -1,6 +1,6 @@
 #pragma once
 
-#include "rasn.code.definition.h"
+#include <rasn/rasn.code.definition.h>
 
 #include <dsn/cpp/serialization.h>
 #include <dsn/service_api_cpp.h>

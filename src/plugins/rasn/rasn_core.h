@@ -1,6 +1,6 @@
 #pragma once
 
-#include "observability.h"
+#include <rasn/observability.h>
 
 #include <chrono>
 #include <cstddef>
