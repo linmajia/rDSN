@@ -999,6 +999,53 @@ void rasn_cli_app_base::initialize_runtime_modules()
         }
     }
 
+    capability_provider provider;
+    provider.descriptor = record.descriptor;
+    provider.state = "running";
+    provider.placement = "local";
+    provider.labels.push_back("cli");
+    provider.labels.push_back(cli_agent_role());
+    if (!_capability_directory.upsert_provider(provider, &error))
+    {
+        warn_runtime_module_failure("capability_directory", error);
+    }
+
+    resource_quota quota;
+    quota.scope = cli_agent_id();
+    quota.max_tool_calls = 100000;
+    if (!_budget_manager.configure(quota, &error))
+    {
+        warn_runtime_module_failure("resource_budget", error);
+    }
+
+    recovery_policy fallback_policy;
+    fallback_policy.failure_class = "*";
+    fallback_policy.max_attempts = 1;
+    fallback_policy.retryable = false;
+    if (!_recovery.set_policy(fallback_policy, &error))
+    {
+        warn_runtime_module_failure("recovery_supervisor", error);
+    }
+    recovery_policy transient_policy;
+    transient_policy.failure_class = "transient";
+    transient_policy.max_attempts = 3;
+    transient_policy.retry_delay_ms = 100;
+    transient_policy.escalate_after_attempts = 3;
+    transient_policy.retryable = true;
+    if (!_recovery.set_policy(transient_policy, &error))
+    {
+        warn_runtime_module_failure("recovery_supervisor", error);
+    }
+
+    agent_contract command_contract;
+    command_contract.contract_id = "cli.command";
+    command_contract.require_input_non_empty = false;
+    command_contract.require_output_non_empty = false;
+    if (!_contracts.register_contract(command_contract, &error))
+    {
+        warn_runtime_module_failure("contract_verifier", error);
+    }
+
     _runtime_modules_initialized = true;
 }
 
@@ -1043,6 +1090,14 @@ rasn_cli_app_base::runtime_execution rasn_cli_app_base::begin_runtime_execution(
     runtime_execution execution;
     execution.active = true;
     execution.task_id = make_trace_id();
+    execution.budget.scope = cli_agent_id();
+    execution.budget.tool_calls = 1;
+    execution.budget.reason = kind + ":" + name;
+    const resource_budget_decision budget = _budget_manager.reserve(execution.budget);
+    if (!budget.allowed)
+    {
+        warn_runtime_module_failure("resource_budget", budget.reason);
+    }
 
     orchestration_task task;
     task.task_id = execution.task_id;
@@ -1080,6 +1135,23 @@ rasn_cli_app_base::runtime_execution rasn_cli_app_base::begin_runtime_execution(
     if (!_determinism.record(execution.task_id, "route", "rasn.cli", kind + ":" + name, &choice, &error))
     {
         warn_runtime_module_failure("determinism_ledger", error);
+    }
+
+    blackboard_entry input_entry;
+    input_entry.key = "task/" + execution.task_id + "/input";
+    input_entry.kind = kind + ".input";
+    input_entry.owner = cli_agent_id();
+    input_entry.value = input;
+    input_entry.tags.push_back(kind);
+    if (!_blackboard.put(input_entry, nullptr, &error))
+    {
+        warn_runtime_module_failure("blackboard", error);
+    }
+
+    const contract_evaluation input_contract = _contracts.evaluate_input("cli.command", input);
+    if (!input_contract.ok)
+    {
+        warn_runtime_module_failure("contract_verifier", "input contract violation for " + execution.task_id);
     }
     return execution;
 }
@@ -1122,6 +1194,32 @@ void rasn_cli_app_base::finish_runtime_execution(const runtime_execution &execut
         {
             warn_runtime_module_failure("agent_message_bus", error);
         }
+        failure_observation failure;
+        failure.task_id = execution.task_id;
+        failure.component = cli_agent_id();
+        failure.failure_class = "cli";
+        failure.code = "non_zero_exit";
+        failure.message = detail;
+        failure.attempt = 1;
+        failure.retryable = false;
+        (void)_recovery.observe(failure);
+    }
+
+    blackboard_entry output_entry;
+    output_entry.key = "task/" + execution.task_id + "/output";
+    output_entry.kind = "cli.output";
+    output_entry.owner = cli_agent_id();
+    output_entry.value = detail;
+    output_entry.tags.push_back(exit_code == 0 ? "ok" : "failed");
+    if (!_blackboard.put(output_entry, nullptr, &error))
+    {
+        warn_runtime_module_failure("blackboard", error);
+    }
+
+    const contract_evaluation output_contract = _contracts.evaluate_output("cli.command", detail, std::vector<std::string>());
+    if (!output_contract.ok)
+    {
+        warn_runtime_module_failure("contract_verifier", "output contract violation for " + execution.task_id);
     }
     heartbeat_runtime_modules();
 }
@@ -1133,6 +1231,8 @@ std::string rasn_cli_app_base::runtime_modules_summary() const
     const std::vector<agent_message> messages = _message_bus.snapshot();
     const std::vector<orchestration_task> tasks = _orchestration.snapshot();
     const std::vector<deterministic_choice> choices = _determinism.snapshot();
+    const std::vector<blackboard_entry> blackboard = _blackboard.snapshot(false, ::dsn_now_ms());
+    const std::vector<human_interaction_request> human = _human_interactions.snapshot();
     output << "rASN runtime modules\n"
            << "agent_control_plane: agents=" << agents.size() << "\n"
            << _agent_control.describe(::dsn_now_ms()) << "\n"
@@ -1145,8 +1245,62 @@ std::string rasn_cli_app_base::runtime_modules_summary() const
            << " fs_read=" << (_sandbox_profile.allow_filesystem_read ? "yes" : "no")
            << " fs_write=" << (_sandbox_profile.allow_filesystem_write ? "yes" : "no")
            << " network=" << (_sandbox_profile.allow_network ? "yes" : "no")
-           << " process=" << (_sandbox_profile.allow_process_spawn ? "yes" : "no") << "\n";
+           << " process=" << (_sandbox_profile.allow_process_spawn ? "yes" : "no") << "\n"
+           << "capability_directory: " << _capability_directory.describe() << "\n"
+           << "resource_budget: " << _budget_manager.describe() << "\n"
+           << "recovery_supervisor: " << _recovery.describe() << "\n"
+           << "blackboard: entries=" << blackboard.size() << "\n"
+           << "contract_verifier: " << _contracts.describe() << "\n"
+           << "human_interaction: requests=" << human.size()
+           << " pending=" << _human_interactions.pending().size() << "\n";
     return output.str();
+}
+
+bool rasn_cli_app_base::runtime_modules_ready(std::string *detail) const
+{
+    const std::string summary = runtime_modules_summary();
+    static const char *const required_modules[] = {
+        "agent_control_plane",
+        "agent_message_bus",
+        "task_orchestration_kernel",
+        "determinism_ledger",
+        "sandbox_runtime",
+        "capability_directory",
+        "resource_budget",
+        "recovery_supervisor",
+        "blackboard",
+        "contract_verifier",
+        "human_interaction",
+    };
+
+    std::vector<std::string> missing;
+    for (const char *module : required_modules)
+    {
+        if (summary.find(module) == std::string::npos)
+        {
+            missing.push_back(module);
+        }
+    }
+    if (missing.empty())
+    {
+        if (detail != nullptr)
+        {
+            *detail = "all general runtime modules wired";
+        }
+        return true;
+    }
+
+    if (detail != nullptr)
+    {
+        std::ostringstream oss;
+        oss << "missing:";
+        for (const std::string &module : missing)
+        {
+            oss << " " << module;
+        }
+        *detail = oss.str();
+    }
+    return false;
 }
 
 deterministic_replay_result rasn_cli_app_base::record_runtime_choice(const std::string &task_id,

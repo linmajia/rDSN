@@ -494,15 +494,8 @@ int srepilot_cli::selftest()
     const std::string resilience = _services.resilience_report();
     print_check(!resilience.empty(), "resilience report", resilience.empty() ? "" : "available", &ok);
 
-    const std::string runtime_summary = runtime_modules_summary();
-    print_check(runtime_summary.find("agent_control_plane") != std::string::npos &&
-                    runtime_summary.find("agent_message_bus") != std::string::npos &&
-                    runtime_summary.find("task_orchestration_kernel") != std::string::npos &&
-                    runtime_summary.find("determinism_ledger") != std::string::npos &&
-                    runtime_summary.find("sandbox_runtime") != std::string::npos,
-                "general multi-agent runtime modules",
-                "wired into SREPilot CLI",
-                &ok);
+    std::string runtime_detail;
+    print_check(runtime_modules_ready(&runtime_detail), "general multi-agent runtime modules", runtime_detail, &ok);
 
     if (ok)
     {

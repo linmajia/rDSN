@@ -4,8 +4,14 @@
 #include <rasn/agent_executor.h>
 #include <rasn/agent_message_bus.h>
 #include <rasn/agent_services.h>
+#include <rasn/blackboard.h>
+#include <rasn/capability_directory.h>
 #include <rasn/cli_support.h>
+#include <rasn/contract_verifier.h>
 #include <rasn/determinism_ledger.h>
+#include <rasn/human_interaction.h>
+#include <rasn/recovery_supervisor.h>
+#include <rasn/resource_budget.h>
 #include <rasn/sandbox_runtime.h>
 #include <rasn/task_orchestration.h>
 
@@ -127,12 +133,19 @@ protected:
                        const agent_plan_executor::approval_callback &approve,
                        const agent_plan_executor::tool_callback &tool);
     std::string runtime_modules_summary() const;
+    bool runtime_modules_ready(std::string *detail = nullptr) const;
     deterministic_replay_result record_runtime_choice(const std::string &task_id,
                                                       const std::string &key,
                                                       const std::string &source,
                                                       const std::string &value);
     sandbox_decision evaluate_cli_sandbox_request(const sandbox_request &request) const;
     void set_cli_sandbox_profile(const sandbox_profile &profile);
+    capability_directory &runtime_capabilities() { return _capability_directory; }
+    resource_budget_manager &runtime_budgets() { return _budget_manager; }
+    recovery_supervisor &runtime_recovery() { return _recovery; }
+    shared_blackboard &runtime_blackboard() { return _blackboard; }
+    contract_verifier &runtime_contracts() { return _contracts; }
+    human_interaction_queue &runtime_human_interactions() { return _human_interactions; }
 
     rasn_service_graph &_services;
 
@@ -142,6 +155,7 @@ private:
         bool active = false;
         std::string task_id;
         std::string message_id;
+        resource_request budget;
     };
 
     void initialize_runtime_modules();
@@ -161,6 +175,12 @@ private:
     agent_message_bus _message_bus;
     task_orchestration_kernel _orchestration;
     determinism_ledger _determinism;
+    capability_directory _capability_directory;
+    resource_budget_manager _budget_manager;
+    recovery_supervisor _recovery;
+    shared_blackboard _blackboard;
+    contract_verifier _contracts;
+    human_interaction_queue _human_interactions;
     sandbox_profile _sandbox_profile;
     bool _runtime_modules_initialized = false;
 };

@@ -8,17 +8,23 @@
 #include <rasn/agent_services.h>
 #include <rasn/admission_gate.h>
 #include <rasn/approval_sandbox.h>
+#include <rasn/blackboard.h>
+#include <rasn/capability_directory.h>
 #include <rasn/circuit_breaker.h>
 #include <rasn/cli_support.h>
+#include <rasn/contract_verifier.h>
 #include <rasn/coordinator_service.h>
 #include <rasn/apps/codepilot/local_tools.h>
 #include <rasn/determinism_ledger.h>
+#include <rasn/human_interaction.h>
 #include <rasn/metrics.h>
 #include <rasn/model_cost.h>
 #include <rasn/policy_manager.h>
 #include <rasn/provider_router.h>
 #include <rasn/rate_limiter.h>
+#include <rasn/recovery_supervisor.h>
 #include <rasn/redaction.h>
+#include <rasn/resource_budget.h>
 #include <rasn/sandbox_runtime.h>
 #include <rasn/state_service.h>
 #include <rasn/schema_manifest.h>
@@ -1406,6 +1412,184 @@ TEST(rasn_sandbox_runtime, evaluates_filesystem_network_and_process_policy)
     EXPECT_TRUE(evaluate_sandbox_request(network, request).allowed);
     request.network_host = "evil.example.test";
     EXPECT_FALSE(evaluate_sandbox_request(network, request).allowed);
+}
+
+TEST(rasn_capability_directory, ranks_and_filters_capability_providers)
+{
+    capability_directory directory;
+    capability_provider fast;
+    fast.descriptor = make_unit_agent_descriptor("agent-fast", "worker", "model.complete");
+    fast.descriptor.capabilities[0].latency_hint_ms = 50;
+    fast.descriptor.capabilities[0].reliability_hint = 99;
+    fast.descriptor.health = "healthy";
+    fast.labels.push_back("local");
+    fast.load = 10;
+
+    capability_provider slow = fast;
+    slow.descriptor.agent_id = "agent-slow";
+    slow.descriptor.capabilities[0].latency_hint_ms = 500;
+    slow.load = 20;
+
+    std::string error;
+    ASSERT_TRUE(directory.upsert_provider(slow, &error)) << error;
+    ASSERT_TRUE(directory.upsert_provider(fast, &error)) << error;
+
+    capability_query query;
+    query.capability = "model.complete";
+    query.required_labels.push_back("local");
+    capability_match best;
+    ASSERT_TRUE(directory.choose_best(query, &best, &error)) << error;
+    EXPECT_EQ("agent-fast", best.provider.descriptor.agent_id);
+    EXPECT_EQ(2u, directory.query(query).size());
+
+    query.max_load = 15;
+    std::vector<capability_match> filtered = directory.query(query);
+    ASSERT_EQ(1u, filtered.size());
+    EXPECT_EQ("agent-fast", filtered[0].provider.descriptor.agent_id);
+}
+
+TEST(rasn_resource_budget, reserves_and_denies_over_budget_requests)
+{
+    resource_budget_manager budgets;
+    resource_quota quota;
+    quota.scope = "session";
+    quota.max_tokens = 100;
+    quota.max_tool_calls = 2;
+
+    std::string error;
+    ASSERT_TRUE(budgets.configure(quota, &error)) << error;
+
+    resource_request request;
+    request.scope = "session";
+    request.tokens = 40;
+    request.tool_calls = 1;
+    EXPECT_TRUE(budgets.reserve(request).allowed);
+    EXPECT_TRUE(budgets.reserve(request).allowed);
+    resource_budget_decision denied = budgets.reserve(request);
+    EXPECT_FALSE(denied.allowed);
+    EXPECT_NE(std::string::npos, denied.reason.find("token budget"));
+
+    EXPECT_TRUE(budgets.release(request, &error)) << error;
+    resource_usage usage;
+    ASSERT_TRUE(budgets.usage("session", &usage));
+    EXPECT_EQ(40u, usage.tokens);
+    EXPECT_EQ(1u, usage.tool_calls);
+}
+
+TEST(rasn_recovery_supervisor, chooses_retry_escalate_and_abort_actions)
+{
+    recovery_supervisor supervisor;
+    recovery_policy transient;
+    transient.failure_class = "transient";
+    transient.retryable = true;
+    transient.max_attempts = 3;
+    transient.retry_delay_ms = 25;
+    transient.escalate_after_attempts = 3;
+
+    std::string error;
+    ASSERT_TRUE(supervisor.set_policy(transient, &error)) << error;
+
+    failure_observation failure;
+    failure.task_id = "task";
+    failure.component = "model";
+    failure.failure_class = "transient";
+    failure.retryable = true;
+    failure.attempt = 1;
+    recovery_action action = supervisor.observe(failure);
+    EXPECT_EQ("retry", action.action);
+    EXPECT_EQ(25u, action.delay_ms);
+
+    failure.attempt = 3;
+    action = supervisor.observe(failure);
+    EXPECT_EQ("escalate", action.action);
+
+    failure.failure_class = "policy";
+    failure.retryable = false;
+    action = supervisor.observe(failure);
+    EXPECT_EQ("abort", action.action);
+    EXPECT_EQ(3u, supervisor.history().size());
+}
+
+TEST(rasn_blackboard, stores_queries_and_compacts_entries)
+{
+    shared_blackboard board;
+    blackboard_entry entry;
+    entry.key = "task/1/input";
+    entry.kind = "input";
+    entry.owner = "agent";
+    entry.value = "payload";
+    entry.tags.push_back("task");
+    entry.expires_at_ms = 200;
+
+    std::string error;
+    blackboard_entry stored;
+    ASSERT_TRUE(board.put(entry, &stored, &error)) << error;
+    EXPECT_EQ(1u, stored.generation);
+    entry.value = "updated";
+    ASSERT_TRUE(board.put(entry, &stored, &error)) << error;
+    EXPECT_EQ(2u, stored.generation);
+
+    blackboard_query query;
+    query.key_prefix = "task/";
+    query.tags.push_back("task");
+    query.now_ms = 100;
+    ASSERT_EQ(1u, board.query(query).size());
+    EXPECT_EQ(1u, board.compact_expired(250));
+    EXPECT_TRUE(board.snapshot(false, 250).empty());
+}
+
+TEST(rasn_contract_verifier, reports_contract_violations)
+{
+    contract_verifier verifier;
+    agent_contract contract;
+    contract.contract_id = "answer";
+    contract.require_input_non_empty = true;
+    contract.require_output_non_empty = true;
+    contract.required_output_fragments.push_back("Summary");
+    contract.forbidden_output_fragments.push_back("SECRET");
+    contract.required_policy_labels.push_back("sandbox:read-only");
+
+    std::string error;
+    ASSERT_TRUE(verifier.register_contract(contract, &error)) << error;
+    contract_evaluation ok =
+        verifier.evaluate("answer", "input", "Summary: safe", std::vector<std::string>{"sandbox:read-only"});
+    EXPECT_TRUE(ok.ok);
+
+    contract_evaluation bad =
+        verifier.evaluate("answer", "", "SECRET", std::vector<std::string>());
+    EXPECT_FALSE(bad.ok);
+    EXPECT_GE(bad.violations.size(), 4u);
+}
+
+TEST(rasn_human_interaction, tracks_answers_cancellation_and_expiry)
+{
+    human_interaction_queue queue;
+    human_interaction_request request;
+    request.request_id = "approval-1";
+    request.kind = "approval";
+    request.requester = "agent";
+    request.prompt = "Approve?";
+    request.choices.push_back("yes");
+    request.choices.push_back("no");
+    request.deadline_ms = 200;
+
+    human_interaction_result opened = queue.open(request);
+    ASSERT_TRUE(opened.ok) << opened.error;
+    EXPECT_EQ(1u, queue.pending("agent").size());
+
+    human_interaction_result rejected = queue.answer("approval-1", "maybe");
+    EXPECT_FALSE(rejected.ok);
+    human_interaction_result answered = queue.answer("approval-1", "yes");
+    ASSERT_TRUE(answered.ok) << answered.error;
+    EXPECT_EQ("answered", answered.request.state);
+
+    request.request_id = "approval-2";
+    opened = queue.open(request);
+    ASSERT_TRUE(opened.ok) << opened.error;
+    EXPECT_EQ(1u, queue.expire(250));
+    human_interaction_request expired;
+    ASSERT_TRUE(queue.find("approval-2", &expired));
+    EXPECT_EQ("expired", expired.state);
 }
 
 TEST(rasn_tool_catalog, describes_aliases_and_normalizes_invocations)

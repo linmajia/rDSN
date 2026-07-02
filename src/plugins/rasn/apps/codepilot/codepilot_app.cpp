@@ -2044,14 +2044,8 @@ int codepilot_cli::run_selftest(const std::vector<std::string> &args)
                             " failures=" + std::to_string(observed.failures.size())
                       : observed.error);
 
-    const std::string runtime_summary = runtime_modules_summary();
-    check(runtime_summary.find("agent_control_plane") != std::string::npos &&
-              runtime_summary.find("agent_message_bus") != std::string::npos &&
-              runtime_summary.find("task_orchestration_kernel") != std::string::npos &&
-              runtime_summary.find("determinism_ledger") != std::string::npos &&
-              runtime_summary.find("sandbox_runtime") != std::string::npos,
-          "general multi-agent runtime modules",
-          "wired into CodePilot CLI");
+    std::string runtime_detail;
+    check(runtime_modules_ready(&runtime_detail), "general multi-agent runtime modules", runtime_detail);
 
     state_query_request snapshot_query;
     snapshot_query.key_prefix = "observability-snapshot/";
