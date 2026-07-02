@@ -5,6 +5,7 @@
 #include "../agent_runtime.h"
 #include "../agent_services.h"
 #include "../admission_gate.h"
+#include "../approval_sandbox.h"
 #include "../circuit_breaker.h"
 #include "../cli_support.h"
 #include "../coordinator_service.h"
@@ -16,8 +17,10 @@
 #include "../redaction.h"
 #include "../state_service.h"
 #include "../schema_manifest.h"
+#include "../session_store.h"
 #include "../workflow.h"
 #include "../workflow_service.h"
+#include "../workspace_index.h"
 
 #include <dsn/cpp/utils.h>
 #include <dsn/tool-api/command.h>
@@ -1292,6 +1295,67 @@ TEST(rasn_cli_support, workspace_source_context_includes_index_and_excerpts)
     EXPECT_EQ(std::string::npos, context.find("TOKEN=secret"));
     EXPECT_EQ(std::string::npos, context.find("password: secret"));
 
+    workspace_index_result index;
+    EXPECT_TRUE(build_workspace_index(root, options, &index, &error));
+    EXPECT_TRUE(error.empty()) << error;
+    EXPECT_EQ(4u, index.matched_files);
+    ASSERT_EQ(4u, index.files.size());
+    EXPECT_NE(std::string::npos, index.files[0].relative_path.find("README.md"));
+    EXPECT_EQ(0, index.files[0].priority);
+    EXPECT_GT(index.entries_seen, 0u);
+    for (const workspace_file_entry &file : index.files)
+    {
+        EXPECT_EQ(std::string::npos, file.relative_path.find(".env"));
+        EXPECT_EQ(std::string::npos, file.relative_path.find("config.json"));
+        EXPECT_EQ(std::string::npos, file.relative_path.find("secrets"));
+    }
+
+    ::dsn::utils::filesystem::remove_path(root);
+}
+
+TEST(rasn_session_store, persists_loads_and_formats_resume_context)
+{
+    const std::string root = temp_file_path("rasn-session-store-unit");
+    ::dsn::utils::filesystem::remove_path(root);
+
+    rasn_session_store_options options;
+    options.directory = ::dsn::utils::filesystem::path_combine(root, "sessions");
+    rasn_session_store store(options);
+
+    std::string error;
+    rasn_session_summary first;
+    ASSERT_TRUE(store.begin_session("codepilot", "workspace-a", "trace-a.jsonl", "unit-session-a", &first, &error))
+        << error;
+    EXPECT_TRUE(store.append_event(first.session_id, "prompt", "ask", "explain rASN", &error)) << error;
+    EXPECT_TRUE(store.append_event(first.session_id, "response", "ok", "rASN summary", &error)) << error;
+
+    rasn_session_summary second;
+    ASSERT_TRUE(store.begin_session("codepilot", "workspace-b", "trace-b.jsonl", "unit-session-b", &second, &error))
+        << error;
+    EXPECT_TRUE(store.append_event(second.session_id, "prompt", "ask", "continue work", &error)) << error;
+
+    rasn_session_summary loaded;
+    std::vector<rasn_session_event> events;
+    ASSERT_TRUE(store.load_session(first.session_id, &loaded, &events, &error)) << error;
+    EXPECT_EQ("unit-session-a", loaded.session_id);
+    EXPECT_EQ("codepilot", loaded.app_name);
+    EXPECT_EQ("workspace-a", loaded.workspace_root);
+    EXPECT_EQ("trace-a.jsonl", loaded.trace_file);
+    EXPECT_EQ("explain rASN", loaded.last_prompt);
+    ASSERT_EQ(3u, events.size());
+    EXPECT_EQ("session", events[0].kind);
+    EXPECT_EQ("prompt", events[1].kind);
+
+    rasn_session_summary latest;
+    ASSERT_TRUE(store.latest_session(&latest, &error)) << error;
+    EXPECT_EQ("unit-session-b", latest.session_id);
+
+    const std::string context = format_session_resume_context(loaded, events, 2);
+    EXPECT_NE(std::string::npos, context.find("resumed rASN session: unit-session-a"));
+    EXPECT_NE(std::string::npos, context.find("last prompt: explain rASN"));
+    EXPECT_NE(std::string::npos, context.find("prompt.ask"));
+    EXPECT_EQ(std::string::npos, context.find("session.begin"));
+
     ::dsn::utils::filesystem::remove_path(root);
 }
 
@@ -2161,6 +2225,54 @@ TEST(rasn_policy, recognizes_side_effect_human_approval_labels)
     const std::vector<std::string> generic_labels{"human_approved"};
     EXPECT_TRUE(policy_labels_include_human_approval(generic_labels, tool_side_effect::write));
     EXPECT_TRUE(policy_labels_include_human_approval(generic_labels, tool_side_effect::shell));
+}
+
+TEST(rasn_approval_sandbox, classifies_approval_and_sandbox_decisions)
+{
+    approval_sandbox_options options;
+    options.require_write_approval = true;
+    options.require_shell_approval = true;
+    options.write_sandbox_mode = "workspace-write";
+    options.shell_sandbox_mode = "command-allowlist";
+
+    approval_sandbox_request read_request;
+    read_request.tool_name = "read";
+    read_request.args.push_back("src/main.cpp");
+    approval_sandbox_decision read = evaluate_approval_sandbox_request(read_request, options);
+    EXPECT_TRUE(read.approved);
+    EXPECT_FALSE(read.prompt_required);
+    EXPECT_EQ(tool_side_effect::read_only, read.side_effect);
+    EXPECT_EQ("read-only", read.sandbox_mode);
+    EXPECT_TRUE(read.policy_labels.empty());
+
+    approval_sandbox_request write_request;
+    write_request.tool_name = "write";
+    write_request.args.push_back("src/main.cpp");
+    write_request.args.push_back("updated");
+    write_request.actor = "unit";
+    approval_sandbox_decision write = evaluate_approval_sandbox_request(write_request, options);
+    EXPECT_FALSE(write.approved);
+    EXPECT_TRUE(write.prompt_required);
+    EXPECT_EQ(tool_side_effect::write, write.side_effect);
+    EXPECT_EQ("workspace-write", write.sandbox_mode);
+    EXPECT_NE(std::string::npos, write.prompt.find("Approval required for write tool 'write' target 'src/main.cpp'"));
+    EXPECT_NE(std::string::npos, write.review_text.find("content_bytes=7"));
+
+    grant_human_approval(&write);
+    ASSERT_EQ(1u, write.policy_labels.size());
+    EXPECT_TRUE(write.approved);
+    EXPECT_EQ(human_approval_policy_label(tool_side_effect::write), write.policy_labels[0]);
+
+    approval_sandbox_request shell_request;
+    shell_request.tool_name = "shell";
+    shell_request.args.push_back("git status");
+    shell_request.explicit_approval = true;
+    approval_sandbox_decision shell = evaluate_approval_sandbox_request(shell_request, options);
+    EXPECT_TRUE(shell.approved);
+    EXPECT_FALSE(shell.prompt_required);
+    ASSERT_EQ(1u, shell.policy_labels.size());
+    EXPECT_EQ(human_approval_policy_label(tool_side_effect::shell), shell.policy_labels[0]);
+    EXPECT_EQ("command-allowlist", shell.sandbox_mode);
 }
 
 TEST(rasn_policy, replays_recorded_side_effect_tool_results_without_execution)

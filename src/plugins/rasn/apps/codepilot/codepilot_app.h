@@ -2,6 +2,7 @@
 
 #include <rasn/cli_app.h>
 #include <rasn/rasn.code.definition.h>
+#include <rasn/session_store.h>
 #include <rasn/workflow.h>
 #include "skills.h"
 
@@ -32,6 +33,7 @@ private:
     std::string version_string() const override;
     std::string compat_dry_run_message() const override;
     bool handle_compat_resume(const rasn_cli_compat_options &options, int *exit_code) override;
+    std::string compat_resume_continue_message() const override;
     bool supports_compat_safety_options() const override;
     void print_compat_provider(const model_gateway_response &response) const override;
     void on_startup_context(const cli_startup_context &startup) override;
@@ -48,6 +50,10 @@ private:
     int run_selftest(const std::vector<std::string> &args);
     int run_eval(const std::vector<std::string> &args);
     int enable_replay(const std::string &path);
+    bool resume_session_context(const std::string &session_id, std::string *error);
+    bool resume_latest_session_context(std::string *error);
+    bool ensure_session(std::string *error);
+    void record_session_event(const std::string &kind, const std::string &name, const std::string &value);
     int set_provider(const std::string &provider_name);
     bool load_context_file(const std::string &path, std::string *error);
     bool approve_tool_invocation(const std::string &tool_name,
@@ -57,6 +63,9 @@ private:
     void print_help(bool interactive_mode) const;
 
     std::vector<std::string> _context;
+    std::string _session_id;
+    std::string _workspace_root;
+    rasn_session_store _session_store;
 };
 
 class codepilot_app : public ::dsn::service_app

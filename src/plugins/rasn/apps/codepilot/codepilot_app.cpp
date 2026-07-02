@@ -3,11 +3,13 @@
 #include <rasn/agent_clients.h>
 #include <rasn/agent_executor.h>
 #include <rasn/agent_registry.h>
+#include <rasn/approval_sandbox.h>
 #include <rasn/cli_support.h>
 #include <rasn/metrics.h>
 #include <rasn/observability.h>
 #include <rasn/policy_manager.h>
 #include <rasn/schema_manifest.h>
+#include <rasn/session_store.h>
 #include "local_tools.h"
 
 #include <dsn/c/app_model.h>
@@ -218,20 +220,6 @@ bool agent_target_address(const rasn_service_graph &services,
     return false;
 }
 
-bool config_bool_or_default(const std::string &section,
-                            const std::string &key,
-                            bool default_value,
-                            const std::string &description)
-{
-    return ::dsn_config_get_value_bool(section.c_str(), key.c_str(), default_value, description.c_str());
-}
-
-bool policy_config_bool_or_default(const std::string &key, bool default_value, const std::string &description)
-{
-    const bool compat_value = config_bool_or_default("rasn.codepilot.tools", key, default_value, description);
-    return config_bool_or_default("rasn.policy", key, compat_value, description);
-}
-
 std::vector<std::string> codepilot_commands()
 {
     static const std::vector<std::string> commands = {
@@ -242,19 +230,6 @@ std::vector<std::string> codepilot_commands()
         "eval",        "ask",      "stream",    "simulate",
     };
     return commands;
-}
-
-std::string side_effect_approval_config_key(tool_side_effect side_effect)
-{
-    if (side_effect == tool_side_effect::write)
-    {
-        return "require_write_approval";
-    }
-    if (side_effect == tool_side_effect::shell)
-    {
-        return "require_shell_approval";
-    }
-    return "";
 }
 
 bool codepilot_approval_answer_is_yes(const std::string &answer)
@@ -274,6 +249,16 @@ std::string state_record_line(const state_record &record)
         << " sequence=" << record.sequence
         << " value=" << record.value;
     return oss.str();
+}
+
+std::string current_process_directory()
+{
+    std::string cwd;
+    if (::dsn::utils::filesystem::get_current_directory(cwd) && !cwd.empty())
+    {
+        return normalize_platform_path(cwd);
+    }
+    return ".";
 }
 
 bool read_text_file(const std::string &path, std::string *text, std::string *error)
@@ -481,6 +466,7 @@ std::string codepilot_cli::repl_plain_text_behavior() const
 
 void codepilot_cli::on_startup_context(const cli_startup_context &startup)
 {
+    _workspace_root = startup.workspace_root;
     _context.push_back("workspace: " + startup.workspace_root);
     if (!startup.context_text.empty())
     {
@@ -519,13 +505,25 @@ bool codepilot_cli::handle_compat_resume(const rasn_cli_compat_options &options,
     {
         if (options.resume_id.empty())
         {
-            std::cout << "--resume requires a trace file or workflow/run command in this prototype\n";
-            if (exit_code != nullptr)
+            std::string error;
+            if (!resume_latest_session_context(&error))
             {
-                *exit_code = 1;
+                std::cout << error << "\n";
+                if (exit_code != nullptr)
+                {
+                    *exit_code = 1;
+                }
+                return true;
             }
-            return true;
+            return false;
         }
+
+        std::string session_error;
+        if (resume_session_context(options.resume_id, &session_error))
+        {
+            return false;
+        }
+
         const int rc = enable_replay(options.resume_id);
         if (rc != 0)
         {
@@ -538,9 +536,23 @@ bool codepilot_cli::handle_compat_resume(const rasn_cli_compat_options &options,
     }
     if (options.continue_latest)
     {
-        std::cout << compat_resume_continue_message() << "\n";
+        std::string error;
+        if (!resume_latest_session_context(&error))
+        {
+            std::cout << error << "\n";
+            if (exit_code != nullptr)
+            {
+                *exit_code = 1;
+            }
+            return true;
+        }
     }
     return false;
+}
+
+std::string codepilot_cli::compat_resume_continue_message() const
+{
+    return "--resume/--continue load persisted CodePilot session context from rasn/sessions";
 }
 
 bool codepilot_cli::supports_compat_safety_options() const
@@ -934,6 +946,7 @@ int codepilot_cli::ask(const std::string &prompt, bool planning_mode)
     task.id = make_trace_id();
     task.name = planning_mode ? "codepilot.plan" : "codepilot.ask";
     task.input = prompt;
+    record_session_event("prompt", planning_mode ? "plan" : "ask", prompt);
 
     _services.runtime().begin_task(task);
 
@@ -948,11 +961,14 @@ int codepilot_cli::ask(const std::string &prompt, bool planning_mode)
     if (!response.ok)
     {
         _services.runtime().finish_task(task, "failed");
-        std::cout << agent_error_message(response) << "\n";
+        const std::string error = agent_error_message(response);
+        record_session_event("response", task.name + ".failed", error);
+        std::cout << error << "\n";
         return 1;
     }
 
     _services.runtime().finish_task(task, "ok");
+    record_session_event("response", task.name + ".ok", response.output);
     std::cout << response.output << "\n";
     return 0;
 }
@@ -963,6 +979,7 @@ int codepilot_cli::stream(const std::string &prompt)
     task.id = make_trace_id();
     task.name = "codepilot.stream";
     task.input = prompt;
+    record_session_event("prompt", "stream", prompt);
 
     _services.runtime().begin_task(task);
 
@@ -974,14 +991,17 @@ int codepilot_cli::stream(const std::string &prompt)
                                                                _services.runtime().trace_id());
     const agent_completion_request completion = make_completion_request_from_agent(generic);
     size_t chunks = 0;
-    const llm_response response = _services.complete_streaming(completion, [&chunks](const std::string &chunk) {
+    std::string streamed_text;
+    const llm_response response = _services.complete_streaming(completion, [&chunks, &streamed_text](const std::string &chunk) {
         ++chunks;
+        streamed_text += chunk;
         std::cout << chunk;
         std::cout.flush();
     });
     if (!response.ok)
     {
         _services.runtime().finish_task(task, "failed");
+        record_session_event("response", "codepilot.stream.failed", response.error);
         std::cout << "\n" << response.error << "\n";
         return 1;
     }
@@ -990,7 +1010,9 @@ int codepilot_cli::stream(const std::string &prompt)
     if (chunks == 0)
     {
         std::cout << response.text;
+        streamed_text = response.text;
     }
+    record_session_event("response", "codepilot.stream.ok", streamed_text);
     std::cout << "\n";
     return 0;
 }
@@ -1001,6 +1023,7 @@ int codepilot_cli::agent(const std::string &prompt)
     task.id = make_trace_id();
     task.name = "codepilot.agent";
     task.input = prompt;
+    record_session_event("prompt", "agent", prompt);
 
     rasn_cli_agent_plan plan;
     plan.task = task;
@@ -1170,6 +1193,7 @@ int codepilot_cli::run_tool(const std::vector<std::string> &args)
     task.id = make_trace_id();
     task.name = "codepilot.tool";
     task.input = join_args(tool_args, 0);
+    record_session_event("tool", "request", task.input);
     _services.runtime().begin_task(task);
 
     const std::string tool_name = tool_args[0];
@@ -1180,6 +1204,7 @@ int codepilot_cli::run_tool(const std::vector<std::string> &args)
         _services.runtime().record_failure(
             task, "policy", "tool_approval_denied", "tool denied by user approval", false, "codepilot.cli");
         _services.runtime().finish_task(task, "approval-denied");
+        record_session_event("tool", "approval-denied", task.input);
         std::cout << "tool denied by user approval\n";
         return 1;
     }
@@ -1192,6 +1217,7 @@ int codepilot_cli::run_tool(const std::vector<std::string> &args)
                                                               policy_labels);
     const tool_result result = make_tool_result_from_agent(_services.invoke(request));
     _services.runtime().finish_task(task, result.ok ? "ok" : "failed");
+    record_session_event("tool", result.ok ? "ok" : "failed", result.ok ? result.output : result.error);
     std::cout << (result.ok ? result.output : result.error) << "\n";
     if (!result.ok && !result.output.empty())
     {
@@ -1205,45 +1231,38 @@ bool codepilot_cli::approve_tool_invocation(const std::string &tool_name,
                                             bool explicit_approval,
                                             std::vector<std::string> *policy_labels) const
 {
-    const tool_side_effect side_effect = classify_tool_side_effect(tool_name);
-    if (side_effect != tool_side_effect::write && side_effect != tool_side_effect::shell)
-    {
-        return true;
-    }
+    approval_sandbox_request request;
+    request.tool_name = tool_name;
+    request.args = args;
+    request.explicit_approval = explicit_approval;
+    request.actor = "codepilot.cli";
 
-    const std::string config_key = side_effect_approval_config_key(side_effect);
-    const bool require_approval = config_key.empty()
-                                      ? false
-                                      : policy_config_bool_or_default(
-                                            config_key, true, "CodePilot side-effect approval setting");
-    if (explicit_approval)
+    approval_sandbox_decision decision =
+        evaluate_approval_sandbox_request(request, default_approval_sandbox_options());
+    if (decision.approved)
     {
         if (policy_labels != nullptr)
         {
-            policy_labels->push_back(human_approval_policy_label(side_effect));
+            policy_labels->insert(policy_labels->end(), decision.policy_labels.begin(), decision.policy_labels.end());
         }
         return true;
     }
-    if (!require_approval)
+    if (!decision.prompt_required)
     {
-        return true;
+        return false;
     }
 
-    std::cout << "Approval required for " << to_string(side_effect) << " tool '" << tool_name << "'";
-    if (!args.empty())
-    {
-        std::cout << " target '" << args[0] << "'";
-    }
-    std::cout << ". Type 'yes' to continue: ";
+    std::cout << decision.prompt;
     std::string answer;
     if (!std::getline(std::cin, answer) || !codepilot_approval_answer_is_yes(answer))
     {
         return false;
     }
 
+    grant_human_approval(&decision);
     if (policy_labels != nullptr)
     {
-        policy_labels->push_back(human_approval_policy_label(side_effect));
+        policy_labels->insert(policy_labels->end(), decision.policy_labels.begin(), decision.policy_labels.end());
     }
     return true;
 }
@@ -1976,6 +1995,63 @@ int codepilot_cli::enable_replay(const std::string &path)
     return 0;
 }
 
+bool codepilot_cli::resume_session_context(const std::string &session_id, std::string *error)
+{
+    rasn_session_summary summary;
+    std::vector<rasn_session_event> events;
+    if (!_session_store.load_session(session_id, &summary, &events, error))
+    {
+        return false;
+    }
+
+    _session_id = summary.session_id;
+    if (!summary.workspace_root.empty())
+    {
+        _workspace_root = summary.workspace_root;
+    }
+    _context.push_back(format_session_resume_context(summary, events, 12));
+    std::cout << "resumed session " << summary.session_id << "\n";
+    return true;
+}
+
+bool codepilot_cli::resume_latest_session_context(std::string *error)
+{
+    rasn_session_summary summary;
+    if (!_session_store.latest_session(&summary, error))
+    {
+        return false;
+    }
+    return resume_session_context(summary.session_id, error);
+}
+
+bool codepilot_cli::ensure_session(std::string *error)
+{
+    if (!_session_id.empty())
+    {
+        return true;
+    }
+
+    rasn_session_summary summary;
+    const std::string workspace = _workspace_root.empty() ? current_process_directory() : _workspace_root;
+    if (!_session_store.begin_session(
+            "codepilot", workspace, _services.runtime().trace_file(), make_trace_id(), &summary, error))
+    {
+        return false;
+    }
+    _session_id = summary.session_id;
+    _workspace_root = workspace;
+    return true;
+}
+
+void codepilot_cli::record_session_event(const std::string &kind, const std::string &name, const std::string &value)
+{
+    std::string error;
+    if (!ensure_session(&error) || !_session_store.append_event(_session_id, kind, name, value, &error))
+    {
+        std::cerr << "session persistence warning: " << error << "\n";
+    }
+}
+
 int codepilot_cli::set_provider(const std::string &provider_name)
 {
     const model_gateway_response response = _services.set_provider(provider_name);
@@ -2015,8 +2091,8 @@ void codepilot_cli::print_help(bool interactive_mode) const
               << cli_help_item(interactive_mode, "-m, --model <model>", "select a provider model")
               << cli_help_item(interactive_mode, "--provider <name>", "select an LLM provider")
               << cli_help_item(interactive_mode, "--cwd|--workspace|--dir <path>", "run from a workspace directory")
-              << cli_help_item(interactive_mode, "--resume <trace-jsonl>", "load replay choices before running")
-              << cli_help_item(interactive_mode, "--continue", "accept coding-CLI continue flag when no session store is configured")
+              << cli_help_item(interactive_mode, "--resume [session-id|trace-jsonl]", "load session context or replay choices before running")
+              << cli_help_item(interactive_mode, "--continue", "load the latest persisted session context")
               << cli_help_item(interactive_mode, "--approval <policy>", "record an approval policy alias for CLI compatibility")
               << cli_help_item(interactive_mode, "--sandbox <mode>", "record a sandbox alias for CLI compatibility")
               << cli_help_item(interactive_mode, "--yes", "accept approval prompts for compatible commands")
