@@ -22,6 +22,10 @@
 #include <sstream>
 #include <thread>
 
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
+
 namespace dsn {
 namespace rasn {
 
@@ -181,8 +185,16 @@ private:
 void debug_log(const std::string &message)
 {
 #if defined(DEBUG) || defined(_DEBUG)
+#if defined(_WIN32)
     std::cerr << "[codepilot debug] " << message << "\n";
     std::cerr.flush();
+#else
+    const char prefix[] = "[codepilot debug] ";
+    const char newline[] = "\n";
+    (void)::write(STDERR_FILENO, prefix, sizeof(prefix) - 1);
+    (void)::write(STDERR_FILENO, message.data(), message.size());
+    (void)::write(STDERR_FILENO, newline, sizeof(newline) - 1);
+#endif
 #else
     (void)message;
 #endif

@@ -21,6 +21,14 @@
 #include <unistd.h>
 #endif
 
+#if !defined(_WIN32) && (defined(DEBUG) || defined(_DEBUG))
+__attribute__((constructor)) static void codepilot_pre_main_probe()
+{
+    const char message[] = "[codepilot debug] pre-main constructor entered\n";
+    (void)::write(STDERR_FILENO, message, sizeof(message) - 1);
+}
+#endif
+
 namespace {
 
 void register_rasn_apps()
