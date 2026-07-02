@@ -1,6 +1,7 @@
 #include "cli_app.h"
 
 #include "agent_clients.h"
+#include "agent_registry.h"
 
 #include <chrono>
 #include <iostream>
