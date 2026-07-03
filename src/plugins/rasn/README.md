@@ -1139,8 +1139,16 @@ rasn.tool.agent
 rasn.state
 rasn.workflow
 rasn.observability
+rasn.runtime
 rasn.codepilot
 ```
+
+`rasn.runtime` hosts the shared rASN runtime modules (agent
+control plane, message bus, task kernel, determinism ledger, capability
+directory, resource budget, recovery supervisor, blackboard, contract verifier,
+human interaction, and sandbox runtime) behind one service. See
+[Distributed rASN runtime modules](#distributed-rasn-runtime-modules) for how
+to split these modules across processes or nodes.
 
 `rasn.llm.agent`, `rasn.tool.agent`, `rasn.coordinator`, `rasn.workflow`,
 `rasn.observability`, and `rasn.codepilot` all retain the shared
@@ -1214,6 +1222,137 @@ C:\Users\haoxlin\source\repos\rdsn\rb-rasn\bin\codepilot\Debug\codepilot.exe --d
 
 The direct one-shot CLI mode is recommended for local prototyping and provider testing.
 
+### Distributed rASN runtime modules
+
+Apps do not own the rASN runtime modules directly. They call a `rasn_runtime`
+facade, and a provider decides how each call is executed:
+
+- **local** (default): calls resolve in-process, or over an intra-node LPC when a
+  rDSN node is present. State lives in the process-global module store.
+- **distributed**: every call is a typed rDSN RPC to a module service, so module
+  state is owned by the service node and can run on a remote host. Select it with
+  `[rasn.runtime] provider = distributed` (and `strict = true` to fail closed
+  when a module RPC fails instead of degrading).
+- **hybrid**: each module is routed independently, so hot or latency-sensitive
+  modules stay in-process while shared, stateful modules (for example `blackboard`
+  or `resource_budget`) are pushed onto their own service nodes. Select it with
+  `[rasn.runtime] rasn_runtime_provider = hybrid`, then set
+  `[rasn.service] rasn_runtime_default_mode` and per-module `<module>_mode`
+  (`local` or `remote`).
+
+The provider is chosen like an rDSN environment/aspect provider: apps depend only
+on the facade API, and swapping `local`/`distributed`/`hybrid` changes where the
+modules run without any app code change.
+
+In service mode the aggregate `rasn.runtime` app hosts all eleven modules
+behind one endpoint (default port `27107`). Each module also has a standalone
+role so it can be deployed on its own process or node:
+
+| Module | Standalone role | Default port |
+| --- | --- | --- |
+| agent_control_plane | `rasn.runtime.agent_control` | 27110 |
+| agent_message_bus | `rasn.runtime.message_bus` | 27111 |
+| task_orchestration_kernel | `rasn.runtime.task_kernel` | 27112 |
+| determinism_ledger | `rasn.runtime.determinism` | 27113 |
+| capability_directory | `rasn.runtime.capability` | 27114 |
+| resource_budget | `rasn.runtime.budget` | 27115 |
+| recovery_supervisor | `rasn.runtime.recovery` | 27116 |
+| blackboard | `rasn.runtime.blackboard` | 27117 |
+| contract_verifier | `rasn.runtime.contract` | 27118 |
+| human_interaction | `rasn.runtime.human_interaction` | 27119 |
+| sandbox_runtime | `rasn.runtime.sandbox_runtime` | 27120 |
+
+Launch a single module service by passing its name (module name or role) after
+the config; the app-list is normalized to the matching standalone role:
+
+```bat
+codepilot.exe --dsn config.ini resource_budget
+```
+
+Point clients at each module independently with `[rasn.service]` overrides. The
+key prefix is the module name, and any of `uri`, `host`, or `port` may be set:
+
+```ini
+resource_budget_uri = dsn://meta-server:34601/rasn-resource-budget
+blackboard_host = remote-host
+blackboard_port = 27117
+```
+
+Distributed RPCs are resilient to cross-node latency and transient transport
+errors. These `[rasn.service]` knobs apply to the shared endpoint and accept the
+same per-module prefix (for example `resource_budget_timeout_ms`):
+
+```ini
+; 0 falls back to [rasn.rpc] timeout_ms (default 5000).
+rasn_runtime_timeout_ms = 0
+; extra attempts on timeout/network/busy/capacity/try-again errors.
+rasn_runtime_retries = 2
+rasn_runtime_retry_backoff_ms = 50
+rasn_runtime_ping_timeout_ms = 1000
+```
+
+The runtime also owns two higher-level resilience policies for remote calls, so a
+single unhealthy module node cannot stall or corrupt the system:
+
+- **Per-module circuit breaker.** After `rasn_runtime_breaker_failures`
+  consecutive transport failures to a module, its breaker opens and calls
+  short-circuit for `rasn_runtime_breaker_open_ms` before a half-open probe is
+  admitted. This bounds the blast radius of a dead node instead of retrying into it.
+- **Idempotent retries (best-effort).** When `rasn_runtime_idempotency_enabled`
+  is set, the client stamps each remote call with a unique id that is stable across
+  its own retries, and the module service returns the first cached response per id
+  (bounded by `rasn_runtime_dedup_capacity`). This suppresses the common
+  lost-reply retry so a duplicated call is usually not re-applied. It is
+  best-effort, **not** exactly-once: the service-side lookup/apply/store is not a
+  single atomic step, so two concurrent retries of the same id can still both
+  execute, and an id can be evicted once more than `rasn_runtime_dedup_capacity`
+  distinct ids have been seen. Operations that are not naturally idempotent (for
+  example `resource_budget` reservations, `agent_message_bus` publishes without a
+  caller-supplied message id, `determinism_ledger` appends, task lifecycle
+  transitions) should carry a caller-stable id and tolerate a rare double-apply.
+
+```ini
+rasn_runtime_breaker_enabled = true
+rasn_runtime_breaker_failures = 5
+rasn_runtime_breaker_open_ms = 30000
+rasn_runtime_idempotency_enabled = true
+rasn_runtime_dedup_capacity = 8192
+```
+
+Readiness is probed by pinging every module through the facade, so a module
+whose service is down (locally or on a remote node) is reported by name instead
+of being masked by a static summary. In distributed mode the ping uses the
+dedicated `*_ping_timeout_ms` budget and a single attempt so an unreachable
+endpoint surfaces quickly. `rasn_runtime::describe_topology()` renders where
+each module is routed (local vs. remote), its endpoint, standalone role, and both
+its intended consistency model and its `actual=single_writer_in_memory` runtime
+backing, which is useful for verifying a hybrid or multi-node layout.
+
+Each module declares an intended distributed consistency model
+(`rasn_runtime_module_descriptors()`): stateless-coordination modules are
+`sharded` (for example `blackboard` by key, `resource_budget` by scope),
+ownership/ledger modules are `replicated` (for example `agent_control_plane`,
+`determinism_ledger`), and control-surface modules are `singleton` (for example
+`human_interaction`, `sandbox_runtime`). These document the target rDSN-native
+replication strategy; the current in-memory service store realizes each as a
+single-writer singleton per service.
+
+> **Operational warning — one active instance per module.** Because each module
+> service is currently a single in-memory writer, do **not** run more than one
+> active instance of the same module (for example `blackboard@3`) expecting real
+> sharding or replication: you would get several independent, unsynchronized
+> stores (split state). Run exactly one active service per module until real
+> rDSN replication/sharding fronts it. Relatedly, the state-service mirror written
+> in `distributed` mode is an observational checkpoint, **not** a durability or
+> recovery mechanism — a restarted module service starts empty because module
+> state is not yet hydrated from the mirror. In `hybrid` mode, flipping a module
+> from `local` to `remote` is a cold migration: local-routed modules are not
+> mirrored, so the remote service starts without the previously local state.
+
+For the full architecture, provider model, resilience contracts, consistency
+models, and the multi-node roadmap, see
+[docs/DISTRIBUTED_RUNTIME.md](docs/DISTRIBUTED_RUNTIME.md).
+
 ### Current product limitations
 
 The current implementation is a usable prototype platform, but these product
@@ -1224,7 +1363,7 @@ hardening gaps remain:
 | State availability | Checkpoints, append-only journals, conditional writes, workflow leases, optional local replica mirroring, and optional rDSN NFS import. | No quorum-replicated or externally managed HA state backend yet. |
 | Tool isolation | Default-deny side effects, workspace scoping, approvals, command allowlists, timeout/job containment, and a configurable container command wrapper. | No hardened container orchestrator with image, mount, network, and lifecycle policy. |
 | Replay fidelity | Replay for model responses, tool results, workflow scheduling, filesystem snapshots, and an `external.effect` ledger for side-effect intents. | No full virtualization of arbitrary external services, clocks, network state, or process environments. |
-| Deployment validation | Inline mode, typed service-mode RPC, URI/host endpoint configuration, registry heartbeats, and active lease cleanup. | Multi-process and cluster deployment tests are still limited. |
+| Deployment validation | Inline mode, typed service-mode RPC, URI/host endpoint configuration, registry heartbeats, active lease cleanup, and distributed rASN runtime modules with an aggregate service, standalone per-module roles, per-module endpoint overrides, `local`/`distributed`/`hybrid` providers, per-module circuit breaker, idempotent retries, RPC retry/backoff, and health-ping readiness/topology reporting. | Multi-process and cluster deployment tests are still limited; durable per-module persistence, quorum replication/sharding of module state, and cross-node module auth are not yet implemented. |
 | Credentials | `token_ref` handles for environment variables, files, and commands, plus deterministic redaction. | No vault-backed or OS-backed credential provider integration. |
 | SDK packaging | Generated C++/TypeScript/Python contracts and RPC-client source. | Packaged SDKs and concrete TypeScript/Python transports are not shipped. |
 | Evaluation evidence | Unit tests, self-tests, service smokes, schema smokes, report build, and a small eval harness. | Large benchmarks and user studies for debugging effectiveness remain future work. |

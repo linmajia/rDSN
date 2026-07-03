@@ -128,7 +128,7 @@ Validation:
 
 Status: `[x]`
 
-Goal: Create a common runtime abstraction for all rASN agents.
+Goal: Create an rASN runtime abstraction for all rASN agents.
 
 Files:
 
@@ -459,7 +459,7 @@ Work items:
 - [x] Define failure classes as structured runtime event metadata.
 - [x] Record lifecycle, routing, tool, retry, policy, replay, and
   nondeterminism events; provider/state/workflow paths continue to use the
-  common runtime trace hooks where they cross the service graph.
+  rASN runtime trace hooks where they cross the service graph.
 - [x] Add replay lookup by nondeterminism key from JSONL traces.
 - [x] Add retry metadata while keeping retry execution in coordinator/workflow.
 - [x] Add trace query through `rasn.observability` service.

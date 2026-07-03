@@ -12,6 +12,7 @@
 #include <rasn/capability_directory.h>
 #include <rasn/circuit_breaker.h>
 #include <rasn/cli_support.h>
+#include <rasn/runtime_provider.h>
 #include <rasn/contract_verifier.h>
 #include <rasn/coordinator_service.h>
 #include <rasn/apps/codepilot/local_tools.h>
@@ -3759,6 +3760,216 @@ TEST(rasn_model_cost, token_count_diagnostics_saturate_oversized_estimates)
     cfg.completion_percent = (std::numeric_limits<uint32_t>::max)();
     const double estimate = estimate_prompt_cost_tokens((std::numeric_limits<uint32_t>::max)(), cfg);
     EXPECT_EQ((std::numeric_limits<uint32_t>::max)(), saturating_estimated_token_count(estimate));
+}
+
+TEST(rasn_runtime, module_names_cover_all_rasn_runtime_modules)
+{
+    const std::vector<std::string> names = rasn_runtime_module_names();
+    EXPECT_EQ(11u, names.size());
+    const std::vector<std::string> expected = {"agent_control_plane",
+                                               "agent_message_bus",
+                                               "task_orchestration_kernel",
+                                               "determinism_ledger",
+                                               "capability_directory",
+                                               "resource_budget",
+                                               "recovery_supervisor",
+                                               "blackboard",
+                                               "contract_verifier",
+                                               "human_interaction",
+                                               "sandbox_runtime"};
+    for (const std::string &module : expected)
+    {
+        EXPECT_NE(std::find(names.begin(), names.end(), module), names.end()) << module;
+    }
+}
+
+TEST(rasn_runtime, app_role_maps_aliases_to_standalone_roles)
+{
+    EXPECT_EQ("rasn.runtime.budget", rasn_runtime_module_app_role("resource_budget"));
+    EXPECT_EQ("rasn.runtime.budget", rasn_runtime_module_app_role("budget"));
+    EXPECT_EQ("rasn.runtime.budget", rasn_runtime_module_app_role("rasn.runtime.budget"));
+    EXPECT_EQ("rasn.runtime.blackboard", rasn_runtime_module_app_role("blackboard"));
+    EXPECT_EQ("rasn.runtime.task_kernel", rasn_runtime_module_app_role("task_orchestration_kernel"));
+    EXPECT_EQ("rasn.runtime.task_kernel", rasn_runtime_module_app_role("task_orchestration"));
+    EXPECT_EQ("rasn.runtime.agent_control", rasn_runtime_module_app_role("agent_control_plane"));
+    EXPECT_EQ("rasn.runtime", rasn_runtime_module_app_role("modules"));
+    // Case-insensitive and whitespace tolerant.
+    EXPECT_EQ("rasn.runtime.budget", rasn_runtime_module_app_role("  Resource_Budget "));
+    // Unknown roles map to empty so callers can pass them through unchanged.
+    EXPECT_EQ("", rasn_runtime_module_app_role("rasn.codepilot"));
+    EXPECT_EQ("", rasn_runtime_module_app_role("not_a_module"));
+}
+
+TEST(rasn_runtime, normalize_app_list_rewrites_modules_and_preserves_overrides)
+{
+    // Bare module names become standalone roles.
+    EXPECT_EQ("rasn.runtime.budget", normalize_rasn_runtime_app_list("resource_budget"));
+    // Mixed known/unknown tokens: unknown passed through, separators normalized to ';'.
+    EXPECT_EQ("rasn.runtime.budget;rasn.codepilot", normalize_rasn_runtime_app_list("budget, rasn.codepilot"));
+    // '@count' style suffixes are preserved on the rewritten role.
+    EXPECT_EQ("rasn.runtime.blackboard@3", normalize_rasn_runtime_app_list("blackboard@3"));
+    // Multiple modules across ';' and ',' separators.
+    EXPECT_EQ("rasn.runtime.budget;rasn.runtime.blackboard",
+              normalize_rasn_runtime_app_list("resource_budget;blackboard"));
+    // Empty tokens are dropped.
+    EXPECT_EQ("rasn.runtime.budget", normalize_rasn_runtime_app_list(";resource_budget;"));
+}
+
+TEST(rasn_runtime, dispatch_requires_module_and_operation)
+{
+    rasn_runtime_request missing_module;
+    missing_module.operation = "describe";
+    EXPECT_FALSE(dispatch_rasn_runtime_request(missing_module).ok);
+
+    rasn_runtime_request missing_operation;
+    missing_operation.module = "resource_budget";
+    EXPECT_FALSE(dispatch_rasn_runtime_request(missing_operation).ok);
+}
+
+TEST(rasn_runtime, dispatch_pings_and_describes_every_module)
+{
+    for (const std::string &module : rasn_runtime_module_names())
+    {
+        rasn_runtime_request ping;
+        ping.module = module;
+        ping.operation = "ping";
+        const rasn_runtime_response ping_response = dispatch_rasn_runtime_request(ping);
+        EXPECT_TRUE(ping_response.ok) << "ping " << module << ": " << ping_response.error;
+
+        rasn_runtime_request describe;
+        describe.module = module;
+        describe.operation = "describe";
+        const rasn_runtime_response describe_response = dispatch_rasn_runtime_request(describe);
+        EXPECT_TRUE(describe_response.ok) << "describe " << module << ": " << describe_response.error;
+    }
+}
+
+TEST(rasn_runtime, dispatch_rejects_unknown_module_and_operation)
+{
+    rasn_runtime_request unknown_module;
+    unknown_module.module = "not_a_module";
+    unknown_module.operation = "ping";
+    EXPECT_FALSE(dispatch_rasn_runtime_request(unknown_module).ok);
+
+    rasn_runtime_request unknown_operation;
+    unknown_operation.module = "resource_budget";
+    unknown_operation.operation = "not_an_operation";
+    EXPECT_FALSE(dispatch_rasn_runtime_request(unknown_operation).ok);
+}
+
+TEST(rasn_runtime, dispatch_accepts_state_mirror_operations)
+{
+    rasn_runtime_request mirror;
+    mirror.module = "blackboard";
+    mirror.operation = "mirror_state:entry";
+    mirror.key = "runtime-key";
+    mirror.payload = "runtime-value";
+    EXPECT_TRUE(dispatch_rasn_runtime_request(mirror).ok);
+}
+
+TEST(rasn_runtime, module_descriptors_cover_every_module_with_role_and_consistency)
+{
+    const std::vector<rasn_runtime_descriptor> descriptors = rasn_runtime_module_descriptors();
+    const std::vector<std::string> names = rasn_runtime_module_names();
+    EXPECT_EQ(11u, descriptors.size());
+    ASSERT_EQ(names.size(), descriptors.size());
+
+    for (const rasn_runtime_descriptor &descriptor : descriptors)
+    {
+        // Every descriptor names a real module and resolves to its standalone role.
+        EXPECT_NE(std::find(names.begin(), names.end(), descriptor.name), names.end()) << descriptor.name;
+        EXPECT_EQ(rasn_runtime_module_app_role(descriptor.name), descriptor.role) << descriptor.name;
+        EXPECT_FALSE(descriptor.role.empty()) << descriptor.name;
+        EXPECT_TRUE(descriptor.stateful) << descriptor.name;
+        EXPECT_FALSE(descriptor.summary.empty()) << descriptor.name;
+        // Consistency is one of the three intended distribution strategies.
+        EXPECT_TRUE(descriptor.consistency == "replicated" || descriptor.consistency == "sharded" ||
+                    descriptor.consistency == "singleton")
+            << descriptor.name << " -> " << descriptor.consistency;
+    }
+
+    // Descriptors and module names describe exactly the same set (one descriptor per module).
+    for (const std::string &name : names)
+    {
+        const std::ptrdiff_t matches = std::count_if(
+            descriptors.begin(), descriptors.end(), [&name](const rasn_runtime_descriptor &descriptor) {
+                return descriptor.name == name;
+            });
+        EXPECT_EQ(1, static_cast<int>(matches)) << name;
+    }
+}
+
+TEST(rasn_runtime, request_marshalling_round_trips_request_id)
+{
+    rasn_runtime_request request;
+    request.module = "resource_budget";
+    request.operation = "reserve";
+    request.key = "scope-a";
+    request.payload = "amount=5";
+    request.request_id = "idem-1234";
+
+    ::dsn::binary_writer writer;
+    marshall(writer, request, DSF_THRIFT_BINARY);
+    ::dsn::binary_reader reader(writer.get_buffer());
+
+    rasn_runtime_request decoded;
+    unmarshall(reader, decoded, DSF_THRIFT_BINARY);
+
+    EXPECT_EQ(request.schema_version, decoded.schema_version);
+    EXPECT_EQ(request.module, decoded.module);
+    EXPECT_EQ(request.operation, decoded.operation);
+    EXPECT_EQ(request.key, decoded.key);
+    EXPECT_EQ(request.payload, decoded.payload);
+    // The idempotency id survives the wire round-trip so a retry reuses it.
+    EXPECT_EQ(request.request_id, decoded.request_id);
+}
+
+TEST(rasn_runtime, dispatch_dedups_repeated_request_ids)
+{
+    // The first request establishes the cached response for this id.
+    rasn_runtime_request first;
+    first.module = "blackboard";
+    first.operation = "describe";
+    first.key = "dedup-key-first";
+    first.request_id = "dedup-req-alpha";
+    const rasn_runtime_response first_response = dispatch_rasn_runtime_request(first);
+    ASSERT_TRUE(first_response.ok) << first_response.error;
+    EXPECT_EQ("dedup-key-first", first_response.key);
+
+    // A retry carrying the same id but a different key returns the cached response
+    // (echoing the first key), proving the operation was not routed a second time.
+    rasn_runtime_request retry;
+    retry.module = "blackboard";
+    retry.operation = "describe";
+    retry.key = "dedup-key-second";
+    retry.request_id = "dedup-req-alpha";
+    const rasn_runtime_response retry_response = dispatch_rasn_runtime_request(retry);
+    EXPECT_TRUE(retry_response.ok) << retry_response.error;
+    EXPECT_EQ("dedup-key-first", retry_response.key);
+    EXPECT_EQ(first_response.payload, retry_response.payload);
+
+    // A different id for the same module is routed fresh (not deduped).
+    rasn_runtime_request other_id;
+    other_id.module = "blackboard";
+    other_id.operation = "describe";
+    other_id.key = "dedup-key-third";
+    other_id.request_id = "dedup-req-beta";
+    const rasn_runtime_response other_id_response = dispatch_rasn_runtime_request(other_id);
+    EXPECT_TRUE(other_id_response.ok) << other_id_response.error;
+    EXPECT_EQ("dedup-key-third", other_id_response.key);
+
+    // Requests without an id are never deduped even if otherwise identical.
+    rasn_runtime_request no_id_a;
+    no_id_a.module = "blackboard";
+    no_id_a.operation = "describe";
+    no_id_a.key = "no-id-key-a";
+    const rasn_runtime_response no_id_a_response = dispatch_rasn_runtime_request(no_id_a);
+    EXPECT_EQ("no-id-key-a", no_id_a_response.key);
+
+    rasn_runtime_request no_id_b = no_id_a;
+    no_id_b.key = "no-id-key-b";
+    const rasn_runtime_response no_id_b_response = dispatch_rasn_runtime_request(no_id_b);
+    EXPECT_EQ("no-id-key-b", no_id_b_response.key);
 }
 
 } // namespace

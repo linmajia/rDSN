@@ -4,6 +4,11 @@ This document describes the target architecture for Robust Agent System Nucleus
 (rASN) as a generic rDSN-native multi-agent runtime. CodePilot is only one
 application built on top of this runtime.
 
+> **Related design:** the shared module tier — how the eleven rASN runtime modules are
+> hosted and made deployable across one or many nodes via the `local`,
+> `distributed`, and `hybrid` runtime providers — has its own design doc:
+> [DISTRIBUTED_RUNTIME.md](DISTRIBUTED_RUNTIME.md).
+
 ## Design goals
 
 - Model every agent as a distributed service component with explicit lifecycle,

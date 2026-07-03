@@ -7,7 +7,7 @@
 #include <rasn/blackboard.h>
 #include <rasn/capability_directory.h>
 #include <rasn/cli_support.h>
-#include <rasn/common_runtime_provider.h>
+#include <rasn/runtime_provider.h>
 #include <rasn/contract_verifier.h>
 #include <rasn/determinism_ledger.h>
 #include <rasn/human_interaction.h>
@@ -178,7 +178,7 @@ private:
     void warn_runtime_module_failure(const std::string &module, const std::string &error) const;
 
     std::atomic<bool> _shutdown_requested{false};
-    mutable std::unique_ptr<common_runtime> _common_runtime;
+    mutable std::unique_ptr<rasn_runtime> _rasn_runtime;
     bool _runtime_modules_initialized = false;
 };
 
