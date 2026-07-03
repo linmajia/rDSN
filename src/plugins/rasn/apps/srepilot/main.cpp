@@ -1,5 +1,6 @@
 #include "srepilot_app.h"
 #include <rasn/agent_registry.h>
+#include <rasn/common_runtime_provider.h>
 #include <rasn/observability.h>
 #include <rasn/state_service.h>
 #include <rasn/workflow_service.h>
@@ -21,6 +22,7 @@ void register_rasn_apps()
             "register rasn.workflow app failed");
     dassert(::dsn::register_app<::dsn::rasn::rasn_observability_app>("rasn.observability"),
             "register rasn.observability app failed");
+    ::dsn::rasn::register_rasn_common_module_apps();
     dassert(::dsn::register_app<::dsn::rasn::rasn_llm_agent_app>("rasn.llm.agent"),
             "register rasn.llm.agent app failed");
     dassert(::dsn::register_app<::dsn::rasn::rasn_tool_agent_app>("rasn.tool.agent"),
@@ -78,6 +80,7 @@ int main(int argc, char **argv)
     const std::string program = process_args.empty() ? "" : process_args[0];
     const bool dsn_mode = !command_args.empty() && command_args[0] == "--dsn";
     const std::string explicit_dsn_config = (dsn_mode && command_args.size() > 1) ? command_args[1] : "";
+    const std::string explicit_dsn_app_list = (dsn_mode && command_args.size() > 2) ? command_args[2] : "";
 
     if (!dsn_mode)
     {
@@ -91,9 +94,12 @@ int main(int argc, char **argv)
     }
 
     const std::string config_path = explicit_dsn_config.empty() ? find_config_path(program) : explicit_dsn_config;
-    const std::string srepilot_app_list =
+    const std::string default_srepilot_app_list =
         "rasn.registry;rasn.llm.agent;rasn.tool.agent;rasn.state;rasn.coordinator;rasn.workflow;"
-        "rasn.observability;rasn.srepilot";
+        "rasn.observability;rasn.common.modules;rasn.srepilot";
+    const std::string srepilot_app_list =
+        explicit_dsn_app_list.empty() ? default_srepilot_app_list
+                                      : ::dsn::rasn::normalize_common_runtime_app_list(explicit_dsn_app_list);
     ::dsn::rasn::run_dsn_with_cli_args(
         std::vector<std::string>{program, config_path, "-app_list", srepilot_app_list}, true);
     return 0;

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <thread>
@@ -38,6 +39,42 @@ std::string join_args(const std::vector<std::string> &args, size_t begin)
 bool starts_with(const std::string &value, const std::string &prefix)
 {
     return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
+}
+
+std::string to_lower_ascii(std::string value)
+{
+    for (char &c : value)
+    {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return value;
+}
+
+std::string config_string_or_default(const char *section,
+                                     const char *key,
+                                     const char *fallback,
+                                     const char *description)
+{
+    const char *value = ::dsn_config_get_value_string(section, key, fallback, description);
+    return value == nullptr ? fallback : value;
+}
+
+std::string runtime_state_key_component(const std::string &value)
+{
+    std::ostringstream output;
+    for (const unsigned char c : value)
+    {
+        if (std::isalnum(c) || c == '.' || c == '-' || c == '_')
+        {
+            output << static_cast<char>(c);
+        }
+        else
+        {
+            output << '_' << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned int>(c)
+                   << std::dec << std::setfill('0');
+        }
+    }
+    return output.str().empty() ? "_" : output.str();
 }
 
 std::string sanitize_agent_id_component(const std::string &value)
@@ -109,6 +146,15 @@ bool take_optional_flag_value(const std::vector<std::string> &args,
         return true;
     }
     return false;
+}
+
+std::vector<std::string> normalize_slash_command_args(std::vector<std::string> args)
+{
+    if (!args.empty() && args[0] == "?")
+    {
+        args[0] = "help";
+    }
+    return args;
 }
 
 bool parse_compat_args(const std::vector<std::string> &args,
@@ -531,6 +577,20 @@ private:
 #endif
 };
 
+std::string join_strings(const std::vector<std::string> &values, const std::string &delimiter)
+{
+    std::ostringstream output;
+    for (size_t i = 0; i < values.size(); ++i)
+    {
+        if (i != 0)
+        {
+            output << delimiter;
+        }
+        output << values[i];
+    }
+    return output.str();
+}
+
 } // namespace
 
 rasn_service_graph_lifecycle_scope::rasn_service_graph_lifecycle_scope(rasn_service_graph &services)
@@ -601,7 +661,7 @@ bool wait_for_cli_service_dependencies(const rasn_service_graph &services,
 }
 
 rasn_cli_app_base::rasn_cli_app_base(rasn_service_graph &services)
-    : _services(services), _sandbox_profile(default_read_only_sandbox_profile())
+    : _services(services)
 {
 }
 
@@ -675,7 +735,11 @@ int rasn_cli_app_base::run(const std::vector<std::string> &args)
     }
     if (normalized_args[0].size() > 1 && normalized_args[0][0] == '/')
     {
-        const std::string command = normalized_args[0].substr(1);
+        std::string command = normalized_args[0].substr(1);
+        if (command == "?")
+        {
+            command = "help";
+        }
         if (cli_argument_is_command(command, app_commands))
         {
             std::vector<std::string> slash_args = normalized_args;
@@ -719,7 +783,7 @@ int rasn_cli_app_base::repl()
         }
         if (line[0] == '/')
         {
-            const int rc = run_tracked_command(split_words(line.substr(1)), true);
+            const int rc = run_tracked_command(normalize_slash_command_args(split_words(line.substr(1))), true);
             if (rc != 0)
             {
                 std::cout << "command failed: " << rc << "\n";
@@ -967,6 +1031,7 @@ void rasn_cli_app_base::initialize_runtime_modules()
         heartbeat_runtime_modules();
         return;
     }
+    configure_runtime_module_mode();
 
     agent_control_record record;
     record.descriptor.agent_id = cli_agent_id();
@@ -980,22 +1045,31 @@ void rasn_cli_app_base::initialize_runtime_modules()
     record.restart_policy = "manual";
 
     std::string error;
-    if (!_agent_control.upsert_agent(record, &error))
+    if (!_common_runtime->upsert_agent(record, &error))
     {
         warn_runtime_module_failure("agent_control_plane", error);
     }
     else
     {
+        mirror_runtime_module_state_or_warn(
+            "agent_control_plane", "agent", record.descriptor.agent_id, describe_agent_control_record(record));
         const uint64_t now_ms = ::dsn_now_ms();
         const std::string owner = cli_agent_id() + ".process";
-        const agent_control_lease lease = _agent_control.acquire_lease(record.descriptor.agent_id, owner, now_ms, 0);
+        const agent_control_lease lease =
+            _common_runtime->acquire_agent_lease(record.descriptor.agent_id, owner, now_ms, 0);
         if (!lease.ok)
         {
             warn_runtime_module_failure("agent_control_plane", lease.error);
         }
-        if (!_agent_control.heartbeat(record.descriptor.agent_id, now_ms, &error))
+        if (!_common_runtime->heartbeat_agent(record.descriptor.agent_id, now_ms, &error))
         {
             warn_runtime_module_failure("agent_control_plane", error);
+        }
+        agent_control_record updated;
+        if (_common_runtime->find_agent(record.descriptor.agent_id, &updated))
+        {
+            mirror_runtime_module_state_or_warn(
+                "agent_control_plane", "agent", updated.descriptor.agent_id, describe_agent_control_record(updated));
         }
     }
 
@@ -1005,26 +1079,40 @@ void rasn_cli_app_base::initialize_runtime_modules()
     provider.placement = "local";
     provider.labels.push_back("cli");
     provider.labels.push_back(cli_agent_role());
-    if (!_capability_directory.upsert_provider(provider, &error))
+    if (!_common_runtime->upsert_capability_provider(provider, &error))
     {
         warn_runtime_module_failure("capability_directory", error);
+    }
+    else
+    {
+        mirror_runtime_module_state_or_warn(
+            "capability_directory", "provider", provider.descriptor.agent_id, describe_capability_provider_record(provider));
     }
 
     resource_quota quota;
     quota.scope = cli_agent_id();
     quota.max_tool_calls = 100000;
-    if (!_budget_manager.configure(quota, &error))
+    if (!_common_runtime->configure_budget(quota, &error))
     {
         warn_runtime_module_failure("resource_budget", error);
+    }
+    else
+    {
+        mirror_runtime_module_state_or_warn("resource_budget", "quota", quota.scope, describe_resource_quota_record(quota));
     }
 
     recovery_policy fallback_policy;
     fallback_policy.failure_class = "*";
     fallback_policy.max_attempts = 1;
     fallback_policy.retryable = false;
-    if (!_recovery.set_policy(fallback_policy, &error))
+    if (!_common_runtime->set_recovery_policy(fallback_policy, &error))
     {
         warn_runtime_module_failure("recovery_supervisor", error);
+    }
+    else
+    {
+        mirror_runtime_module_state_or_warn(
+            "recovery_supervisor", "policy", fallback_policy.failure_class, describe_recovery_policy_record(fallback_policy));
     }
     recovery_policy transient_policy;
     transient_policy.failure_class = "transient";
@@ -1032,18 +1120,28 @@ void rasn_cli_app_base::initialize_runtime_modules()
     transient_policy.retry_delay_ms = 100;
     transient_policy.escalate_after_attempts = 3;
     transient_policy.retryable = true;
-    if (!_recovery.set_policy(transient_policy, &error))
+    if (!_common_runtime->set_recovery_policy(transient_policy, &error))
     {
         warn_runtime_module_failure("recovery_supervisor", error);
+    }
+    else
+    {
+        mirror_runtime_module_state_or_warn(
+            "recovery_supervisor", "policy", transient_policy.failure_class, describe_recovery_policy_record(transient_policy));
     }
 
     agent_contract command_contract;
     command_contract.contract_id = "cli.command";
     command_contract.require_input_non_empty = false;
     command_contract.require_output_non_empty = false;
-    if (!_contracts.register_contract(command_contract, &error))
+    if (!_common_runtime->register_contract(command_contract, &error))
     {
         warn_runtime_module_failure("contract_verifier", error);
+    }
+    else
+    {
+        mirror_runtime_module_state_or_warn(
+            "contract_verifier", "contract", command_contract.contract_id, describe_contract_record(command_contract));
     }
 
     _runtime_modules_initialized = true;
@@ -1051,11 +1149,25 @@ void rasn_cli_app_base::initialize_runtime_modules()
 
 void rasn_cli_app_base::heartbeat_runtime_modules()
 {
-    _agent_control.expire_leases(::dsn_now_ms());
+    const uint64_t now_ms = ::dsn_now_ms();
+    const size_t expired = _common_runtime->expire_agent_leases(now_ms);
+    if (expired != 0)
+    {
+        mirror_runtime_module_state_or_warn("agent_control_plane", "lease_expiry", cli_agent_id(), "expired=" + std::to_string(expired));
+    }
     std::string error;
-    if (!_agent_control.heartbeat(cli_agent_id(), ::dsn_now_ms(), &error))
+    if (!_common_runtime->heartbeat_agent(cli_agent_id(), now_ms, &error))
     {
         warn_runtime_module_failure("agent_control_plane", error);
+    }
+    else
+    {
+        agent_control_record record;
+        if (_common_runtime->find_agent(cli_agent_id(), &record))
+        {
+            mirror_runtime_module_state_or_warn(
+                "agent_control_plane", "agent", record.descriptor.agent_id, describe_agent_control_record(record));
+        }
     }
 }
 
@@ -1093,7 +1205,7 @@ rasn_cli_app_base::runtime_execution rasn_cli_app_base::begin_runtime_execution(
     execution.budget.scope = cli_agent_id();
     execution.budget.tool_calls = 1;
     execution.budget.reason = kind + ":" + name;
-    const resource_budget_decision budget = _budget_manager.reserve(execution.budget);
+    const resource_budget_decision budget = _common_runtime->reserve_budget(execution.budget);
     if (!budget.allowed)
     {
         warn_runtime_module_failure("resource_budget", budget.reason);
@@ -1102,19 +1214,29 @@ rasn_cli_app_base::runtime_execution rasn_cli_app_base::begin_runtime_execution(
     {
         execution.budget_reserved = true;
     }
+    mirror_runtime_module_state_or_warn("resource_budget", "reservation", execution.task_id, describe_resource_decision_record(budget));
 
     orchestration_task task;
     task.task_id = execution.task_id;
     task.owner_agent = cli_agent_id();
     task.input = input;
     std::string error;
-    if (!_orchestration.add_task(task, &error))
+    if (!_common_runtime->add_task(task, &error))
     {
         warn_runtime_module_failure("task_orchestration", error);
     }
-    else if (!_orchestration.start(task.task_id, cli_agent_id(), &error))
+    else if (!_common_runtime->start_task(task.task_id, cli_agent_id(), &error))
     {
         warn_runtime_module_failure("task_orchestration", error);
+    }
+    else
+    {
+        orchestration_task stored_task;
+        if (_common_runtime->find_task(task.task_id, &stored_task))
+        {
+            mirror_runtime_module_state_or_warn(
+                "task_orchestration_kernel", "task", stored_task.task_id, describe_orchestration_task_record(stored_task));
+        }
     }
 
     agent_message message;
@@ -1126,19 +1248,26 @@ rasn_cli_app_base::runtime_execution rasn_cli_app_base::begin_runtime_execution(
     message.payload = kind + ":" + name + "\n" + input;
     message.deadline_ms = ::dsn_now_ms() + 10 * 60 * 1000;
     agent_message stored;
-    if (!_message_bus.publish(message, &stored, &error))
+    if (!_common_runtime->publish_message(message, &stored, &error))
     {
         warn_runtime_module_failure("agent_message_bus", error);
     }
     else
     {
         execution.message_id = stored.message_id;
+        mirror_runtime_module_state_or_warn(
+            "agent_message_bus", "message", stored.message_id, describe_agent_message_record(stored));
     }
 
     deterministic_choice choice;
-    if (!_determinism.record(execution.task_id, "route", "rasn.cli", kind + ":" + name, &choice, &error))
+    if (!_common_runtime->record_choice(execution.task_id, "route", "rasn.cli", kind + ":" + name, &choice, &error))
     {
         warn_runtime_module_failure("determinism_ledger", error);
+    }
+    else
+    {
+        mirror_runtime_module_state_or_warn(
+            "determinism_ledger", "choice", execution.task_id + "/route", describe_choice_record(choice));
     }
 
     blackboard_entry input_entry;
@@ -1147,12 +1276,20 @@ rasn_cli_app_base::runtime_execution rasn_cli_app_base::begin_runtime_execution(
     input_entry.owner = cli_agent_id();
     input_entry.value = input;
     input_entry.tags.push_back(kind);
-    if (!_blackboard.put(input_entry, nullptr, &error))
+    if (!_common_runtime->put_blackboard(input_entry, nullptr, &error))
     {
         warn_runtime_module_failure("blackboard", error);
     }
+    else
+    {
+        blackboard_entry stored_entry;
+        if (_common_runtime->get_blackboard(input_entry.key, &stored_entry))
+        {
+            mirror_runtime_module_state_or_warn("blackboard", "entry", stored_entry.key, describe_blackboard_record(stored_entry));
+        }
+    }
 
-    const contract_evaluation input_contract = _contracts.evaluate_input("cli.command", input);
+    const contract_evaluation input_contract = _common_runtime->evaluate_input("cli.command", input);
     if (!input_contract.ok)
     {
         warn_runtime_module_failure("contract_verifier", "input contract violation for " + execution.task_id);
@@ -1171,32 +1308,73 @@ void rasn_cli_app_base::finish_runtime_execution(const runtime_execution &execut
 
     std::string error;
     deterministic_choice choice;
-    if (!_determinism.record(
+    if (!_common_runtime->record_choice(
             execution.task_id, "exit_code", "rasn.cli", std::to_string(exit_code), &choice, &error))
     {
         warn_runtime_module_failure("determinism_ledger", error);
     }
+    else
+    {
+        mirror_runtime_module_state_or_warn(
+            "determinism_ledger", "choice", execution.task_id + "/exit_code", describe_choice_record(choice));
+    }
 
     if (exit_code == 0)
     {
-        if (!_orchestration.complete(execution.task_id, detail, &error))
+        if (!_common_runtime->complete_task(execution.task_id, detail, &error))
         {
             warn_runtime_module_failure("task_orchestration", error);
         }
-        if (!execution.message_id.empty() && !_message_bus.ack(execution.message_id, &error))
+        else
+        {
+            orchestration_task task;
+            if (_common_runtime->find_task(execution.task_id, &task))
+            {
+                mirror_runtime_module_state_or_warn(
+                    "task_orchestration_kernel", "task", task.task_id, describe_orchestration_task_record(task));
+            }
+        }
+        if (!execution.message_id.empty() && !_common_runtime->ack_message(execution.message_id, &error))
         {
             warn_runtime_module_failure("agent_message_bus", error);
+        }
+        else if (!execution.message_id.empty())
+        {
+            agent_message message;
+            if (_common_runtime->find_message(execution.message_id, &message))
+            {
+                mirror_runtime_module_state_or_warn(
+                    "agent_message_bus", "message", message.message_id, describe_agent_message_record(message));
+            }
         }
     }
     else
     {
-        if (!_orchestration.fail(execution.task_id, detail, false, &error))
+        if (!_common_runtime->fail_task(execution.task_id, detail, false, &error))
         {
             warn_runtime_module_failure("task_orchestration", error);
         }
-        if (!execution.message_id.empty() && !_message_bus.dead_letter(execution.message_id, detail, &error))
+        else
+        {
+            orchestration_task task;
+            if (_common_runtime->find_task(execution.task_id, &task))
+            {
+                mirror_runtime_module_state_or_warn(
+                    "task_orchestration_kernel", "task", task.task_id, describe_orchestration_task_record(task));
+            }
+        }
+        if (!execution.message_id.empty() && !_common_runtime->dead_letter_message(execution.message_id, detail, &error))
         {
             warn_runtime_module_failure("agent_message_bus", error);
+        }
+        else if (!execution.message_id.empty())
+        {
+            agent_message message;
+            if (_common_runtime->find_message(execution.message_id, &message))
+            {
+                mirror_runtime_module_state_or_warn(
+                    "agent_message_bus", "message", message.message_id, describe_agent_message_record(message));
+            }
         }
         failure_observation failure;
         failure.task_id = execution.task_id;
@@ -1206,7 +1384,9 @@ void rasn_cli_app_base::finish_runtime_execution(const runtime_execution &execut
         failure.message = detail;
         failure.attempt = 1;
         failure.retryable = false;
-        (void)_recovery.observe(failure);
+        (void)_common_runtime->observe_failure(failure);
+        mirror_runtime_module_state_or_warn(
+            "recovery_supervisor", "failure", execution.task_id, describe_failure_observation_record(failure));
     }
 
     blackboard_entry output_entry;
@@ -1215,19 +1395,36 @@ void rasn_cli_app_base::finish_runtime_execution(const runtime_execution &execut
     output_entry.owner = cli_agent_id();
     output_entry.value = detail;
     output_entry.tags.push_back(exit_code == 0 ? "ok" : "failed");
-    if (!_blackboard.put(output_entry, nullptr, &error))
+    if (!_common_runtime->put_blackboard(output_entry, nullptr, &error))
     {
         warn_runtime_module_failure("blackboard", error);
     }
+    else
+    {
+        blackboard_entry stored_entry;
+        if (_common_runtime->get_blackboard(output_entry.key, &stored_entry))
+        {
+            mirror_runtime_module_state_or_warn("blackboard", "entry", stored_entry.key, describe_blackboard_record(stored_entry));
+        }
+    }
 
-    const contract_evaluation output_contract = _contracts.evaluate_output("cli.command", detail, std::vector<std::string>());
+    const contract_evaluation output_contract =
+        _common_runtime->evaluate_output("cli.command", detail, std::vector<std::string>());
     if (!output_contract.ok)
     {
         warn_runtime_module_failure("contract_verifier", "output contract violation for " + execution.task_id);
     }
-    if (execution.budget_reserved && !_budget_manager.release(execution.budget, &error))
+    if (execution.budget_reserved && !_common_runtime->release_budget(execution.budget, &error))
     {
         warn_runtime_module_failure("resource_budget", error);
+    }
+    else if (execution.budget_reserved)
+    {
+        resource_usage usage;
+        if (_common_runtime->budget_usage(execution.budget.scope, &usage))
+        {
+            mirror_runtime_module_state_or_warn("resource_budget", "usage", usage.scope, describe_resource_usage_record(usage));
+        }
     }
     heartbeat_runtime_modules();
 }
@@ -1235,32 +1432,34 @@ void rasn_cli_app_base::finish_runtime_execution(const runtime_execution &execut
 std::string rasn_cli_app_base::runtime_modules_summary() const
 {
     std::ostringstream output;
-    const std::vector<agent_control_record> agents = _agent_control.list(false, ::dsn_now_ms());
-    const std::vector<agent_message> messages = _message_bus.snapshot();
-    const std::vector<orchestration_task> tasks = _orchestration.snapshot();
-    const std::vector<deterministic_choice> choices = _determinism.snapshot();
-    const std::vector<blackboard_entry> blackboard = _blackboard.snapshot(false, ::dsn_now_ms());
-    const std::vector<human_interaction_request> human = _human_interactions.snapshot();
+    const sandbox_profile sandbox = _common_runtime->sandbox();
+    const std::vector<agent_control_record> agents = _common_runtime->list_agents(false, ::dsn_now_ms());
+    const std::vector<agent_message> messages = _common_runtime->message_snapshot();
+    const std::vector<orchestration_task> tasks = _common_runtime->task_snapshot();
+    const std::vector<deterministic_choice> choices = _common_runtime->choice_snapshot();
+    const std::vector<blackboard_entry> blackboard = _common_runtime->blackboard_snapshot(false, ::dsn_now_ms());
+    const std::vector<human_interaction_request> human = _common_runtime->human_snapshot();
     output << "rASN runtime modules\n"
+           << _common_runtime->summary_header() << "\n"
            << "agent_control_plane: agents=" << agents.size() << "\n"
-           << _agent_control.describe(::dsn_now_ms()) << "\n"
+           << _common_runtime->describe_agents(::dsn_now_ms()) << "\n"
            << "agent_message_bus: messages=" << messages.size() << "\n"
            << "task_orchestration_kernel: tasks=" << tasks.size()
-           << " ready=" << _orchestration.ready_tasks(::dsn_now_ms()).size()
-           << " blocked=" << _orchestration.blocked_tasks().size() << "\n"
+           << " ready=" << _common_runtime->ready_tasks(::dsn_now_ms()).size()
+           << " blocked=" << _common_runtime->blocked_tasks().size() << "\n"
            << "determinism_ledger: choices=" << choices.size() << "\n"
-           << "sandbox_runtime: profile=" << _sandbox_profile.name
-           << " fs_read=" << (_sandbox_profile.allow_filesystem_read ? "yes" : "no")
-           << " fs_write=" << (_sandbox_profile.allow_filesystem_write ? "yes" : "no")
-           << " network=" << (_sandbox_profile.allow_network ? "yes" : "no")
-           << " process=" << (_sandbox_profile.allow_process_spawn ? "yes" : "no") << "\n"
-           << "capability_directory: " << _capability_directory.describe() << "\n"
-           << "resource_budget: " << _budget_manager.describe() << "\n"
-           << "recovery_supervisor: " << _recovery.describe() << "\n"
+           << "sandbox_runtime: profile=" << sandbox.name
+           << " fs_read=" << (sandbox.allow_filesystem_read ? "yes" : "no")
+           << " fs_write=" << (sandbox.allow_filesystem_write ? "yes" : "no")
+           << " network=" << (sandbox.allow_network ? "yes" : "no")
+           << " process=" << (sandbox.allow_process_spawn ? "yes" : "no") << "\n"
+           << "capability_directory: " << _common_runtime->describe_capabilities() << "\n"
+           << "resource_budget: " << _common_runtime->describe_budgets() << "\n"
+           << "recovery_supervisor: " << _common_runtime->describe_recovery() << "\n"
            << "blackboard: entries=" << blackboard.size() << "\n"
-           << "contract_verifier: " << _contracts.describe() << "\n"
+           << "contract_verifier: " << _common_runtime->describe_contracts() << "\n"
            << "human_interaction: requests=" << human.size()
-           << " pending=" << _human_interactions.pending().size() << "\n";
+           << " pending=" << _common_runtime->pending_human().size() << "\n";
     return output.str();
 }
 
@@ -1311,6 +1510,46 @@ bool rasn_cli_app_base::runtime_modules_ready(std::string *detail) const
     return false;
 }
 
+void rasn_cli_app_base::configure_runtime_module_mode() const
+{
+    if (_common_runtime == nullptr)
+    {
+        _common_runtime = create_common_runtime(_services, load_common_runtime_config());
+    }
+}
+
+bool rasn_cli_app_base::mirror_runtime_module_state(const std::string &module,
+                                                   const std::string &kind,
+                                                   const std::string &key,
+                                                   const std::string &value,
+                                                   std::string *error)
+{
+    configure_runtime_module_mode();
+    if (_common_runtime == nullptr)
+    {
+        if (error != nullptr)
+        {
+            *error = "common runtime is not configured";
+        }
+        return false;
+    }
+    return _common_runtime->mirror_state(module, kind, key, value, error);
+}
+
+void rasn_cli_app_base::mirror_runtime_module_state_or_warn(const std::string &module,
+                                                           const std::string &kind,
+                                                           const std::string &key,
+                                                           const std::string &value)
+{
+    std::string error;
+    if (!mirror_runtime_module_state(module, kind, key, value, &error))
+    {
+        const bool strict = _common_runtime != nullptr && _common_runtime->strict();
+        const std::string prefix = strict ? "strict distributed runtime provider failed: " : "distributed runtime provider failed: ";
+        warn_runtime_module_failure(module, prefix + error);
+    }
+}
+
 deterministic_replay_result rasn_cli_app_base::record_runtime_choice(const std::string &task_id,
                                                                     const std::string &key,
                                                                     const std::string &source,
@@ -1319,11 +1558,14 @@ deterministic_replay_result rasn_cli_app_base::record_runtime_choice(const std::
     deterministic_replay_result result;
     std::string error;
     deterministic_choice choice;
-    if (!_determinism.record(task_id, key, source, value, &choice, &error))
+    configure_runtime_module_mode();
+    if (!_common_runtime->record_choice(task_id, key, source, value, &choice, &error))
     {
         result.error = error;
         return result;
     }
+    mirror_runtime_module_state_or_warn(
+        "determinism_ledger", "choice", task_id + "/" + key, describe_choice_record(choice));
     result.ok = true;
     result.choice = choice;
     return result;
@@ -1331,12 +1573,14 @@ deterministic_replay_result rasn_cli_app_base::record_runtime_choice(const std::
 
 sandbox_decision rasn_cli_app_base::evaluate_cli_sandbox_request(const sandbox_request &request) const
 {
-    return evaluate_sandbox_request(_sandbox_profile, request);
+    configure_runtime_module_mode();
+    return _common_runtime->evaluate_sandbox(request);
 }
 
 void rasn_cli_app_base::set_cli_sandbox_profile(const sandbox_profile &profile)
 {
-    _sandbox_profile = profile;
+    configure_runtime_module_mode();
+    _common_runtime->set_sandbox_profile(profile);
 }
 
 void rasn_cli_app_base::warn_runtime_module_failure(const std::string &module, const std::string &error) const

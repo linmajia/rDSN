@@ -7,6 +7,7 @@
 #include <rasn/blackboard.h>
 #include <rasn/capability_directory.h>
 #include <rasn/cli_support.h>
+#include <rasn/common_runtime_provider.h>
 #include <rasn/contract_verifier.h>
 #include <rasn/determinism_ledger.h>
 #include <rasn/human_interaction.h>
@@ -17,6 +18,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -140,12 +142,6 @@ protected:
                                                       const std::string &value);
     sandbox_decision evaluate_cli_sandbox_request(const sandbox_request &request) const;
     void set_cli_sandbox_profile(const sandbox_profile &profile);
-    capability_directory &runtime_capabilities() { return _capability_directory; }
-    resource_budget_manager &runtime_budgets() { return _budget_manager; }
-    recovery_supervisor &runtime_recovery() { return _recovery; }
-    shared_blackboard &runtime_blackboard() { return _blackboard; }
-    contract_verifier &runtime_contracts() { return _contracts; }
-    human_interaction_queue &runtime_human_interactions() { return _human_interactions; }
 
     rasn_service_graph &_services;
 
@@ -161,6 +157,7 @@ private:
 
     void initialize_runtime_modules();
     void heartbeat_runtime_modules();
+    void configure_runtime_module_mode() const;
     int run_tracked_command(const std::vector<std::string> &args, bool interactive_mode);
     int run_tracked_compat_prompt(const rasn_cli_compat_options &options);
     runtime_execution begin_runtime_execution(const std::string &kind,
@@ -169,20 +166,19 @@ private:
                                               const std::string &receiver,
                                               const std::string &message_type);
     void finish_runtime_execution(const runtime_execution &execution, int exit_code, const std::string &detail);
+    bool mirror_runtime_module_state(const std::string &module,
+                                     const std::string &kind,
+                                     const std::string &key,
+                                     const std::string &value,
+                                     std::string *error);
+    void mirror_runtime_module_state_or_warn(const std::string &module,
+                                             const std::string &kind,
+                                             const std::string &key,
+                                             const std::string &value);
     void warn_runtime_module_failure(const std::string &module, const std::string &error) const;
 
     std::atomic<bool> _shutdown_requested{false};
-    agent_control_plane _agent_control;
-    agent_message_bus _message_bus;
-    task_orchestration_kernel _orchestration;
-    determinism_ledger _determinism;
-    capability_directory _capability_directory;
-    resource_budget_manager _budget_manager;
-    recovery_supervisor _recovery;
-    shared_blackboard _blackboard;
-    contract_verifier _contracts;
-    human_interaction_queue _human_interactions;
-    sandbox_profile _sandbox_profile;
+    mutable std::unique_ptr<common_runtime> _common_runtime;
     bool _runtime_modules_initialized = false;
 };
 

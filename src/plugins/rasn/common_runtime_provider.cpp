@@ -1,0 +1,3069 @@
+#include <rasn/common_runtime_provider.h>
+
+#include <rasn/agent_services.h>
+#include <rasn/rasn_core.h>
+#include <rasn/state_service.h>
+
+#include <dsn/tool-api/task.h>
+
+#include <algorithm>
+#include <cctype>
+#include <future>
+#include <iomanip>
+#include <limits>
+#include <map>
+#include <sstream>
+#include <utility>
+
+namespace dsn {
+namespace rasn {
+
+namespace {
+
+std::string config_string(const char *key, const char *fallback, const char *description)
+{
+    const char *value = ::dsn_config_get_value_string("rasn.runtime", key, fallback, description);
+    return value == nullptr ? fallback : value;
+}
+
+std::string lower_ascii(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+std::string normalize_common_runtime_provider_name(const std::string &name)
+{
+    const std::string provider = lower_ascii(trim(name.empty() ? "local" : name));
+    if (provider == "embedded" || provider == "in-process" || provider == "inprocess")
+    {
+        return "local";
+    }
+    if (provider == "rdsn" || provider == "rdsn-state" || provider == "remote")
+    {
+        return "distributed";
+    }
+    return provider == "distributed" ? "distributed" : "local";
+}
+
+std::string state_key_component(const std::string &value)
+{
+    std::ostringstream output;
+    for (const unsigned char c : value)
+    {
+        if (std::isalnum(c) || c == '.' || c == '-' || c == '_')
+        {
+            output << static_cast<char>(c);
+        }
+        else
+        {
+            output << '_' << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned int>(c)
+                   << std::dec << std::setfill('0');
+        }
+    }
+    return output.str().empty() ? "_" : output.str();
+}
+
+std::string join_strings(const std::vector<std::string> &values, const std::string &delimiter)
+{
+    std::ostringstream output;
+    for (size_t i = 0; i < values.size(); ++i)
+    {
+        if (i != 0)
+        {
+            output << delimiter;
+        }
+        output << values[i];
+    }
+    return output.str();
+}
+
+std::string describe_sandbox_profile(const sandbox_profile &profile)
+{
+    std::ostringstream output;
+    output << "profile=" << profile.name
+           << "\nallow_filesystem_read=" << (profile.allow_filesystem_read ? "true" : "false")
+           << "\nallow_filesystem_write=" << (profile.allow_filesystem_write ? "true" : "false")
+           << "\nallow_network=" << (profile.allow_network ? "true" : "false")
+           << "\nallow_process_spawn=" << (profile.allow_process_spawn ? "true" : "false")
+           << "\nallowed_roots=" << join_strings(profile.allowed_roots, ",")
+           << "\ndenied_paths=" << join_strings(profile.denied_paths, ",");
+    return output.str();
+}
+
+uint16_t config_service_port(const std::string &key, uint16_t default_port)
+{
+    const uint64_t configured =
+        ::dsn_config_get_value_uint64("rasn.service", key.c_str(), default_port, "rASN common module RPC port");
+    if (configured > (std::numeric_limits<uint16_t>::max)())
+    {
+        dwarn("rasn.service.%s=%llu exceeds uint16_t port range; using default %u",
+              key.c_str(),
+              static_cast<unsigned long long>(configured),
+              static_cast<unsigned int>(default_port));
+        return default_port;
+    }
+    return static_cast<uint16_t>(configured);
+}
+
+std::string config_service_string(const std::string &key, const std::string &fallback, const std::string &description)
+{
+    const char *value = ::dsn_config_get_value_string("rasn.service", key.c_str(), fallback.c_str(), description.c_str());
+    return value == nullptr ? fallback : value;
+}
+
+std::string module_service_key(const std::string &module)
+{
+    return state_key_component(module);
+}
+
+bool has_module(const std::vector<std::string> &modules, const std::string &module)
+{
+    return std::find(modules.begin(), modules.end(), module) != modules.end();
+}
+
+::dsn::rpc_address common_module_address(const std::string &module)
+{
+    const std::string module_key = module_service_key(module);
+    const std::string common_uri = config_service_string("common_modules_uri", "", "rASN common module service URI");
+    const std::string uri = config_service_string(module_key + "_uri", common_uri, "rASN per-module service URI");
+    if (!uri.empty())
+    {
+        return ::dsn::url_host_address(uri.c_str());
+    }
+    const std::string default_host = config_service_string("host", "localhost", "default rASN service RPC host");
+    const std::string common_host = config_service_string("common_modules_host", default_host, "rASN common module service host");
+    std::string host = config_service_string(module_key + "_host", common_host, "rASN per-module service host");
+    if (host.empty())
+    {
+        host = "localhost";
+    }
+    const uint16_t common_port = config_service_port("common_modules_port", 27107);
+    const uint16_t port = config_service_port(module_key + "_port", common_port);
+    ::dsn::rpc_address address;
+    address.assign_ipv4(host.c_str(), port);
+    return address;
+}
+
+::dsn::task_code rpc_code_for_module(const std::string &module)
+{
+    if (module == "agent_control_plane") return RPC_RASN_AGENT_CONTROL;
+    if (module == "agent_message_bus") return RPC_RASN_MESSAGE_BUS;
+    if (module == "task_orchestration_kernel") return RPC_RASN_TASK_ORCHESTRATION;
+    if (module == "determinism_ledger") return RPC_RASN_DETERMINISM_LEDGER;
+    if (module == "capability_directory") return RPC_RASN_CAPABILITY_DIRECTORY;
+    if (module == "resource_budget") return RPC_RASN_RESOURCE_BUDGET;
+    if (module == "recovery_supervisor") return RPC_RASN_RECOVERY_SUPERVISOR;
+    if (module == "blackboard") return RPC_RASN_BLACKBOARD;
+    if (module == "contract_verifier") return RPC_RASN_CONTRACT_VERIFIER;
+    if (module == "human_interaction") return RPC_RASN_HUMAN_INTERACTION;
+    if (module == "sandbox_runtime") return RPC_RASN_SANDBOX_RUNTIME;
+    return RPC_RASN_AGENT_CONTROL;
+}
+
+::dsn::task_code lpc_code_for_module(const std::string &module)
+{
+    if (module == "agent_control_plane") return LPC_RASN_AGENT_CONTROL;
+    if (module == "agent_message_bus") return LPC_RASN_MESSAGE_BUS;
+    if (module == "task_orchestration_kernel") return LPC_RASN_TASK_ORCHESTRATION;
+    if (module == "determinism_ledger") return LPC_RASN_DETERMINISM_LEDGER;
+    if (module == "capability_directory") return LPC_RASN_CAPABILITY_DIRECTORY;
+    if (module == "resource_budget") return LPC_RASN_RESOURCE_BUDGET;
+    if (module == "recovery_supervisor") return LPC_RASN_RECOVERY_SUPERVISOR;
+    if (module == "blackboard") return LPC_RASN_BLACKBOARD;
+    if (module == "contract_verifier") return LPC_RASN_CONTRACT_VERIFIER;
+    if (module == "human_interaction") return LPC_RASN_HUMAN_INTERACTION;
+    if (module == "sandbox_runtime") return LPC_RASN_SANDBOX_RUNTIME;
+    return LPC_RASN_AGENT_CONTROL;
+}
+
+common_module_response make_common_module_response(const common_module_request &request)
+{
+    common_module_response response;
+    response.module = request.module;
+    response.operation = request.operation;
+    response.key = request.key;
+    response.payload = request.payload;
+    return response;
+}
+
+common_module_response make_common_module_error(const common_module_request &request, const std::string &error)
+{
+    common_module_response response = make_common_module_response(request);
+    response.ok = false;
+    response.error = error;
+    return response;
+}
+
+void force_common_module(common_module_request *request, const std::string &module)
+{
+    if (request != nullptr)
+    {
+        request->module = module;
+    }
+}
+
+typedef std::map<std::string, std::vector<std::string>> field_map;
+
+void append_field(std::ostringstream &output, const std::string &key, const std::string &value)
+{
+    output << key << "=" << value.size() << ":" << value << "\n";
+}
+
+std::string encode_fields(const std::vector<std::pair<std::string, std::string>> &fields)
+{
+    std::ostringstream output;
+    for (const std::pair<std::string, std::string> &field : fields)
+    {
+        append_field(output, field.first, field.second);
+    }
+    return output.str();
+}
+
+bool parse_size_text(const std::string &text, size_t *value)
+{
+    if (value == nullptr || text.empty())
+    {
+        return false;
+    }
+    size_t result = 0;
+    for (const char ch : text)
+    {
+        if (ch < '0' || ch > '9')
+        {
+            return false;
+        }
+        const size_t digit = static_cast<size_t>(ch - '0');
+        if (result > ((std::numeric_limits<size_t>::max)() - digit) / 10)
+        {
+            return false;
+        }
+        result = result * 10 + digit;
+    }
+    *value = result;
+    return true;
+}
+
+bool decode_fields(const std::string &payload, field_map *fields, std::string *error)
+{
+    if (fields == nullptr)
+    {
+        if (error != nullptr)
+        {
+            *error = "field map output is null";
+        }
+        return false;
+    }
+    fields->clear();
+    size_t offset = 0;
+    while (offset < payload.size())
+    {
+        const size_t equal = payload.find('=', offset);
+        if (equal == std::string::npos)
+        {
+            if (error != nullptr)
+            {
+                *error = "malformed common module payload: missing '='";
+            }
+            return false;
+        }
+        const size_t colon = payload.find(':', equal + 1);
+        if (colon == std::string::npos)
+        {
+            if (error != nullptr)
+            {
+                *error = "malformed common module payload: missing ':'";
+            }
+            return false;
+        }
+        const std::string key = payload.substr(offset, equal - offset);
+        size_t length = 0;
+        if (!parse_size_text(payload.substr(equal + 1, colon - equal - 1), &length))
+        {
+            if (error != nullptr)
+            {
+                *error = "malformed common module payload: invalid length";
+            }
+            return false;
+        }
+        const size_t value_begin = colon + 1;
+        if (value_begin > payload.size() || length > payload.size() - value_begin)
+        {
+            if (error != nullptr)
+            {
+                *error = "malformed common module payload: truncated value";
+            }
+            return false;
+        }
+        (*fields)[key].push_back(payload.substr(value_begin, length));
+        offset = value_begin + length;
+        if (offset < payload.size())
+        {
+            if (payload[offset] != '\n')
+            {
+                if (error != nullptr)
+                {
+                    *error = "malformed common module payload: missing field terminator";
+                }
+                return false;
+            }
+            ++offset;
+        }
+    }
+    if (error != nullptr)
+    {
+        error->clear();
+    }
+    return true;
+}
+
+std::vector<std::string> field_values(const field_map &fields, const std::string &key)
+{
+    const field_map::const_iterator it = fields.find(key);
+    return it == fields.end() ? std::vector<std::string>() : it->second;
+}
+
+std::string field_string(const field_map &fields, const std::string &key, const std::string &fallback = "")
+{
+    const field_map::const_iterator it = fields.find(key);
+    return it == fields.end() || it->second.empty() ? fallback : it->second.front();
+}
+
+bool field_bool(const field_map &fields, const std::string &key, bool fallback = false)
+{
+    const std::string value = lower_ascii(field_string(fields, key, fallback ? "true" : "false"));
+    return value == "true" || value == "1" || value == "yes";
+}
+
+uint64_t field_uint64(const field_map &fields, const std::string &key, uint64_t fallback = 0)
+{
+    const std::string value = field_string(fields, key, "");
+    if (value.empty())
+    {
+        return fallback;
+    }
+    uint64_t result = 0;
+    for (const char ch : value)
+    {
+        if (ch < '0' || ch > '9')
+        {
+            return fallback;
+        }
+        const uint64_t digit = static_cast<uint64_t>(ch - '0');
+        if (result > ((std::numeric_limits<uint64_t>::max)() - digit) / 10)
+        {
+            return fallback;
+        }
+        result = result * 10 + digit;
+    }
+    return result;
+}
+
+uint32_t field_uint32(const field_map &fields, const std::string &key, uint32_t fallback = 0)
+{
+    const uint64_t value = field_uint64(fields, key, fallback);
+    return value > (std::numeric_limits<uint32_t>::max)() ? fallback : static_cast<uint32_t>(value);
+}
+
+size_t field_size(const field_map &fields, const std::string &key, size_t fallback = 0)
+{
+    const uint64_t value = field_uint64(fields, key, static_cast<uint64_t>(fallback));
+    return value > (std::numeric_limits<size_t>::max)() ? fallback : static_cast<size_t>(value);
+}
+
+bool parse_payload(const std::string &payload, field_map *fields, std::string *error)
+{
+    if (!decode_fields(payload, fields, error))
+    {
+        return false;
+    }
+    return true;
+}
+
+std::string encode_capability_payload(const agent_capability &capability)
+{
+    return encode_fields({{"schema_version", std::to_string(capability.schema_version)},
+                          {"name", capability.name},
+                          {"input_type", capability.input_type},
+                          {"output_type", capability.output_type},
+                          {"side_effect_class", capability.side_effect_class},
+                          {"cost_hint", std::to_string(capability.cost_hint)},
+                          {"latency_hint_ms", std::to_string(capability.latency_hint_ms)},
+                          {"reliability_hint", std::to_string(capability.reliability_hint)}});
+}
+
+bool decode_capability_payload(const std::string &payload, agent_capability *capability, std::string *error)
+{
+    field_map fields;
+    if (!parse_payload(payload, &fields, error))
+    {
+        return false;
+    }
+    capability->schema_version = field_uint32(fields, "schema_version", RASN_AGENT_SCHEMA_VERSION);
+    capability->name = field_string(fields, "name");
+    capability->input_type = field_string(fields, "input_type");
+    capability->output_type = field_string(fields, "output_type");
+    capability->side_effect_class = field_string(fields, "side_effect_class");
+    capability->cost_hint = field_uint32(fields, "cost_hint");
+    capability->latency_hint_ms = field_uint32(fields, "latency_hint_ms");
+    capability->reliability_hint = field_uint32(fields, "reliability_hint");
+    return true;
+}
+
+std::string encode_descriptor_payload(const agent_descriptor &descriptor)
+{
+    std::vector<std::pair<std::string, std::string>> fields;
+    fields.push_back({"schema_version", std::to_string(descriptor.schema_version)});
+    fields.push_back({"agent_id", descriptor.agent_id});
+    fields.push_back({"role", descriptor.role});
+    fields.push_back({"app_name", descriptor.app_name});
+    fields.push_back({"host", descriptor.host});
+    fields.push_back({"port", std::to_string(descriptor.port)});
+    fields.push_back({"endpoint_uri", descriptor.endpoint_uri});
+    fields.push_back({"version", descriptor.version});
+    fields.push_back({"health", descriptor.health});
+    for (const agent_capability &capability : descriptor.capabilities)
+    {
+        fields.push_back({"capability", encode_capability_payload(capability)});
+    }
+    return encode_fields(fields);
+}
+
+bool decode_descriptor_payload(const std::string &payload, agent_descriptor *descriptor, std::string *error)
+{
+    field_map fields;
+    if (!parse_payload(payload, &fields, error))
+    {
+        return false;
+    }
+    descriptor->schema_version = field_uint32(fields, "schema_version", RASN_AGENT_SCHEMA_VERSION);
+    descriptor->agent_id = field_string(fields, "agent_id");
+    descriptor->role = field_string(fields, "role");
+    descriptor->app_name = field_string(fields, "app_name");
+    descriptor->host = field_string(fields, "host");
+    descriptor->port = field_uint32(fields, "port");
+    descriptor->endpoint_uri = field_string(fields, "endpoint_uri");
+    descriptor->version = field_string(fields, "version");
+    descriptor->health = field_string(fields, "health");
+    descriptor->capabilities.clear();
+    const std::vector<std::string> capabilities = field_values(fields, "capability");
+    for (const std::string &encoded : capabilities)
+    {
+        agent_capability capability;
+        if (!decode_capability_payload(encoded, &capability, error))
+        {
+            return false;
+        }
+        descriptor->capabilities.push_back(capability);
+    }
+    return true;
+}
+
+std::string encode_agent_control_payload(const agent_control_record &record)
+{
+    return encode_fields({{"descriptor", encode_descriptor_payload(record.descriptor)},
+                          {"state", record.state},
+                          {"placement", record.placement},
+                          {"owner", record.owner},
+                          {"restart_policy", record.restart_policy},
+                          {"last_error", record.last_error},
+                          {"generation", std::to_string(record.generation)},
+                          {"last_heartbeat_ms", std::to_string(record.last_heartbeat_ms)},
+                          {"lease_expires_ms", std::to_string(record.lease_expires_ms)}});
+}
+
+bool decode_agent_control_payload(const std::string &payload, agent_control_record *record, std::string *error)
+{
+    field_map fields;
+    if (!parse_payload(payload, &fields, error))
+    {
+        return false;
+    }
+    if (!decode_descriptor_payload(field_string(fields, "descriptor"), &record->descriptor, error))
+    {
+        return false;
+    }
+    record->state = field_string(fields, "state", "starting");
+    record->placement = field_string(fields, "placement");
+    record->owner = field_string(fields, "owner");
+    record->restart_policy = field_string(fields, "restart_policy", "never");
+    record->last_error = field_string(fields, "last_error");
+    record->generation = field_uint64(fields, "generation");
+    record->last_heartbeat_ms = field_uint64(fields, "last_heartbeat_ms");
+    record->lease_expires_ms = field_uint64(fields, "lease_expires_ms");
+    return true;
+}
+
+std::string encode_lease_payload(const agent_control_lease &lease)
+{
+    return encode_fields({{"ok", lease.ok ? "true" : "false"},
+                          {"agent_id", lease.agent_id},
+                          {"owner", lease.owner},
+                          {"generation", std::to_string(lease.generation)},
+                          {"expires_ms", std::to_string(lease.expires_ms)},
+                          {"error", lease.error}});
+}
+
+bool decode_lease_payload(const std::string &payload, agent_control_lease *lease, std::string *error)
+{
+    field_map fields;
+    if (!parse_payload(payload, &fields, error))
+    {
+        return false;
+    }
+    lease->ok = field_bool(fields, "ok");
+    lease->agent_id = field_string(fields, "agent_id");
+    lease->owner = field_string(fields, "owner");
+    lease->generation = field_uint64(fields, "generation");
+    lease->expires_ms = field_uint64(fields, "expires_ms");
+    lease->error = field_string(fields, "error");
+    return true;
+}
+
+std::string encode_message_payload(const agent_message &message)
+{
+    return encode_fields({{"message_id", message.message_id},
+                          {"correlation_id", message.correlation_id},
+                          {"sender", message.sender},
+                          {"receiver", message.receiver},
+                          {"type", message.type},
+                          {"payload", message.payload},
+                          {"state", message.state},
+                          {"error", message.error},
+                          {"attempt", std::to_string(message.attempt)},
+                          {"deadline_ms", std::to_string(message.deadline_ms)},
+                          {"available_at_ms", std::to_string(message.available_at_ms)},
+                          {"created_at_ms", std::to_string(message.created_at_ms)},
+                          {"updated_at_ms", std::to_string(message.updated_at_ms)}});
+}
+
+bool decode_message_payload(const std::string &payload, agent_message *message, std::string *error)
+{
+    field_map fields;
+    if (!parse_payload(payload, &fields, error))
+    {
+        return false;
+    }
+    message->message_id = field_string(fields, "message_id");
+    message->correlation_id = field_string(fields, "correlation_id");
+    message->sender = field_string(fields, "sender");
+    message->receiver = field_string(fields, "receiver");
+    message->type = field_string(fields, "type");
+    message->payload = field_string(fields, "payload");
+    message->state = field_string(fields, "state", "queued");
+    message->error = field_string(fields, "error");
+    message->attempt = field_uint32(fields, "attempt");
+    message->deadline_ms = field_uint64(fields, "deadline_ms");
+    message->available_at_ms = field_uint64(fields, "available_at_ms");
+    message->created_at_ms = field_uint64(fields, "created_at_ms");
+    message->updated_at_ms = field_uint64(fields, "updated_at_ms");
+    return true;
+}
+
+std::string encode_task_payload(const orchestration_task &task)
+{
+    std::vector<std::pair<std::string, std::string>> fields;
+    fields.push_back({"task_id", task.task_id});
+    fields.push_back({"parent_task_id", task.parent_task_id});
+    fields.push_back({"owner_agent", task.owner_agent});
+    fields.push_back({"state", task.state});
+    fields.push_back({"input", task.input});
+    fields.push_back({"output", task.output});
+    fields.push_back({"error", task.error});
+    fields.push_back({"compensation", task.compensation});
+    fields.push_back({"deadline_ms", std::to_string(task.deadline_ms)});
+    fields.push_back({"generation", std::to_string(task.generation)});
+    for (const std::string &dependency : task.depends_on)
+    {
+        fields.push_back({"depends_on", dependency});
+    }
+    return encode_fields(fields);
+}
+
+bool decode_task_payload(const std::string &payload, orchestration_task *task, std::string *error)
+{
+    field_map fields;
+    if (!parse_payload(payload, &fields, error))
+    {
+        return false;
+    }
+    task->task_id = field_string(fields, "task_id");
+    task->parent_task_id = field_string(fields, "parent_task_id");
+    task->owner_agent = field_string(fields, "owner_agent");
+    task->state = field_string(fields, "state", "pending");
+    task->input = field_string(fields, "input");
+    task->output = field_string(fields, "output");
+    task->error = field_string(fields, "error");
+    task->compensation = field_string(fields, "compensation");
+    task->deadline_ms = field_uint64(fields, "deadline_ms");
+    task->generation = field_uint64(fields, "generation");
+    task->depends_on = field_values(fields, "depends_on");
+    return true;
+}
+
+std::string encode_choice_payload(const deterministic_choice &choice)
+{
+    return encode_fields({{"sequence", std::to_string(choice.sequence)},
+                          {"task_id", choice.task_id},
+                          {"key", choice.key},
+                          {"source", choice.source},
+                          {"value", choice.value}});
+}
+
+bool decode_choice_payload(const std::string &payload, deterministic_choice *choice, std::string *error)
+{
+    field_map fields;
+    if (!parse_payload(payload, &fields, error))
+    {
+        return false;
+    }
+    choice->sequence = field_uint64(fields, "sequence");
+    choice->task_id = field_string(fields, "task_id");
+    choice->key = field_string(fields, "key");
+    choice->source = field_string(fields, "source");
+    choice->value = field_string(fields, "value");
+    return true;
+}
+
+std::string encode_capability_provider_payload(const capability_provider &provider)
+{
+    std::vector<std::pair<std::string, std::string>> fields;
+    fields.push_back({"descriptor", encode_descriptor_payload(provider.descriptor)});
+    fields.push_back({"state", provider.state});
+    fields.push_back({"placement", provider.placement});
+    fields.push_back({"load", std::to_string(provider.load)});
+    fields.push_back({"last_seen_ms", std::to_string(provider.last_seen_ms)});
+    for (const std::string &label : provider.labels)
+    {
+        fields.push_back({"label", label});
+    }
+    return encode_fields(fields);
+}
+
+bool decode_capability_provider_payload(const std::string &payload, capability_provider *provider, std::string *error)
+{
+    field_map fields;
+    if (!parse_payload(payload, &fields, error))
+    {
+        return false;
+    }
+    if (!decode_descriptor_payload(field_string(fields, "descriptor"), &provider->descriptor, error))
+    {
+        return false;
+    }
+    provider->state = field_string(fields, "state", "running");
+    provider->placement = field_string(fields, "placement");
+    provider->load = field_uint32(fields, "load");
+    provider->last_seen_ms = field_uint64(fields, "last_seen_ms");
+    provider->labels = field_values(fields, "label");
+    return true;
+}
+
+std::string encode_quota_payload(const resource_quota &quota)
+{
+    return encode_fields({{"scope", quota.scope},
+                          {"max_cost_units", std::to_string(quota.max_cost_units)},
+                          {"max_latency_ms", std::to_string(quota.max_latency_ms)},
+                          {"max_tokens", std::to_string(quota.max_tokens)},
+                          {"max_tool_calls", std::to_string(quota.max_tool_calls)}});
+}
+
+bool decode_quota_payload(const std::string &payload, resource_quota *quota, std::string *error)
+{
+    field_map fields;
+    if (!parse_payload(payload, &fields, error))
+    {
+        return false;
+    }
+    quota->scope = field_string(fields, "scope");
+    quota->max_cost_units = field_uint64(fields, "max_cost_units");
+    quota->max_latency_ms = field_uint64(fields, "max_latency_ms");
+    quota->max_tokens = field_uint64(fields, "max_tokens");
+    quota->max_tool_calls = field_uint64(fields, "max_tool_calls");
+    return true;
+}
+
+std::string encode_request_payload(const resource_request &request)
+{
+    return encode_fields({{"scope", request.scope},
+                          {"cost_units", std::to_string(request.cost_units)},
+                          {"latency_ms", std::to_string(request.latency_ms)},
+                          {"tokens", std::to_string(request.tokens)},
+                          {"tool_calls", std::to_string(request.tool_calls)},
+                          {"reason", request.reason}});
+}
+
+bool decode_request_payload(const std::string &payload, resource_request *request, std::string *error)
+{
+    field_map fields;
+    if (!parse_payload(payload, &fields, error))
+    {
+        return false;
+    }
+    request->scope = field_string(fields, "scope");
+    request->cost_units = field_uint64(fields, "cost_units");
+    request->latency_ms = field_uint64(fields, "latency_ms");
+    request->tokens = field_uint64(fields, "tokens");
+    request->tool_calls = field_uint64(fields, "tool_calls");
+    request->reason = field_string(fields, "reason");
+    return true;
+}
+
+std::string encode_usage_payload(const resource_usage &usage)
+{
+    return encode_fields({{"scope", usage.scope},
+                          {"cost_units", std::to_string(usage.cost_units)},
+                          {"latency_ms", std::to_string(usage.latency_ms)},
+                          {"tokens", std::to_string(usage.tokens)},
+                          {"tool_calls", std::to_string(usage.tool_calls)}});
+}
+
+bool decode_usage_payload(const std::string &payload, resource_usage *usage, std::string *error)
+{
+    field_map fields;
+    if (!parse_payload(payload, &fields, error))
+    {
+        return false;
+    }
+    usage->scope = field_string(fields, "scope");
+    usage->cost_units = field_uint64(fields, "cost_units");
+    usage->latency_ms = field_uint64(fields, "latency_ms");
+    usage->tokens = field_uint64(fields, "tokens");
+    usage->tool_calls = field_uint64(fields, "tool_calls");
+    return true;
+}
+
+std::string encode_decision_payload(const resource_budget_decision &decision)
+{
+    return encode_fields({{"allowed", decision.allowed ? "true" : "false"},
+                          {"scope", decision.scope},
+                          {"reason", decision.reason},
+                          {"usage_after", encode_usage_payload(decision.usage_after)},
+                          {"quota", encode_quota_payload(decision.quota)}});
+}
+
+bool decode_decision_payload(const std::string &payload, resource_budget_decision *decision, std::string *error)
+{
+    field_map fields;
+    if (!parse_payload(payload, &fields, error))
+    {
+        return false;
+    }
+    decision->allowed = field_bool(fields, "allowed");
+    decision->scope = field_string(fields, "scope");
+    decision->reason = field_string(fields, "reason");
+    if (!decode_usage_payload(field_string(fields, "usage_after"), &decision->usage_after, error))
+    {
+        return false;
+    }
+    if (!decode_quota_payload(field_string(fields, "quota"), &decision->quota, error))
+    {
+        return false;
+    }
+    return true;
+}
+
+std::string encode_recovery_policy_payload(const recovery_policy &policy)
+{
+    return encode_fields({{"failure_class", policy.failure_class},
+                          {"max_attempts", std::to_string(policy.max_attempts)},
+                          {"retry_delay_ms", std::to_string(policy.retry_delay_ms)},
+                          {"escalate_after_attempts", std::to_string(policy.escalate_after_attempts)},
+                          {"retryable", policy.retryable ? "true" : "false"},
+                          {"compensation", policy.compensation}});
+}
+
+bool decode_recovery_policy_payload(const std::string &payload, recovery_policy *policy, std::string *error)
+{
+    field_map fields;
+    if (!parse_payload(payload, &fields, error))
+    {
+        return false;
+    }
+    policy->failure_class = field_string(fields, "failure_class");
+    policy->max_attempts = field_uint32(fields, "max_attempts", 1);
+    policy->retry_delay_ms = field_uint64(fields, "retry_delay_ms");
+    policy->escalate_after_attempts = field_uint32(fields, "escalate_after_attempts");
+    policy->retryable = field_bool(fields, "retryable");
+    policy->compensation = field_string(fields, "compensation");
+    return true;
+}
+
+std::string encode_failure_payload(const failure_observation &failure)
+{
+    return encode_fields({{"task_id", failure.task_id},
+                          {"component", failure.component},
+                          {"failure_class", failure.failure_class},
+                          {"code", failure.code},
+                          {"message", failure.message},
+                          {"attempt", std::to_string(failure.attempt)},
+                          {"retryable", failure.retryable ? "true" : "false"},
+                          {"time_ms", std::to_string(failure.time_ms)}});
+}
+
+bool decode_failure_payload(const std::string &payload, failure_observation *failure, std::string *error)
+{
+    field_map fields;
+    if (!parse_payload(payload, &fields, error))
+    {
+        return false;
+    }
+    failure->task_id = field_string(fields, "task_id");
+    failure->component = field_string(fields, "component");
+    failure->failure_class = field_string(fields, "failure_class");
+    failure->code = field_string(fields, "code");
+    failure->message = field_string(fields, "message");
+    failure->attempt = field_uint32(fields, "attempt");
+    failure->retryable = field_bool(fields, "retryable");
+    failure->time_ms = field_uint64(fields, "time_ms");
+    return true;
+}
+
+std::string encode_recovery_action_payload(const recovery_action &action)
+{
+    std::vector<std::pair<std::string, std::string>> fields;
+    fields.push_back({"handled", action.handled ? "true" : "false"});
+    fields.push_back({"action", action.action});
+    fields.push_back({"delay_ms", std::to_string(action.delay_ms)});
+    fields.push_back({"reason", action.reason});
+    for (const std::string &label : action.labels)
+    {
+        fields.push_back({"label", label});
+    }
+    return encode_fields(fields);
+}
+
+bool decode_recovery_action_payload(const std::string &payload, recovery_action *action, std::string *error)
+{
+    field_map fields;
+    if (!parse_payload(payload, &fields, error))
+    {
+        return false;
+    }
+    action->handled = field_bool(fields, "handled");
+    action->action = field_string(fields, "action");
+    action->delay_ms = field_uint64(fields, "delay_ms");
+    action->reason = field_string(fields, "reason");
+    action->labels = field_values(fields, "label");
+    return true;
+}
+
+std::string encode_blackboard_payload(const blackboard_entry &entry)
+{
+    std::vector<std::pair<std::string, std::string>> fields;
+    fields.push_back({"key", entry.key});
+    fields.push_back({"kind", entry.kind});
+    fields.push_back({"owner", entry.owner});
+    fields.push_back({"value", entry.value});
+    fields.push_back({"generation", std::to_string(entry.generation)});
+    fields.push_back({"created_at_ms", std::to_string(entry.created_at_ms)});
+    fields.push_back({"updated_at_ms", std::to_string(entry.updated_at_ms)});
+    fields.push_back({"expires_at_ms", std::to_string(entry.expires_at_ms)});
+    for (const std::string &tag : entry.tags)
+    {
+        fields.push_back({"tag", tag});
+    }
+    return encode_fields(fields);
+}
+
+bool decode_blackboard_payload(const std::string &payload, blackboard_entry *entry, std::string *error)
+{
+    field_map fields;
+    if (!parse_payload(payload, &fields, error))
+    {
+        return false;
+    }
+    entry->key = field_string(fields, "key");
+    entry->kind = field_string(fields, "kind");
+    entry->owner = field_string(fields, "owner");
+    entry->value = field_string(fields, "value");
+    entry->generation = field_uint64(fields, "generation");
+    entry->created_at_ms = field_uint64(fields, "created_at_ms");
+    entry->updated_at_ms = field_uint64(fields, "updated_at_ms");
+    entry->expires_at_ms = field_uint64(fields, "expires_at_ms");
+    entry->tags = field_values(fields, "tag");
+    return true;
+}
+
+std::string encode_contract_payload(const agent_contract &contract)
+{
+    std::vector<std::pair<std::string, std::string>> fields;
+    fields.push_back({"contract_id", contract.contract_id});
+    fields.push_back({"require_input_non_empty", contract.require_input_non_empty ? "true" : "false"});
+    fields.push_back({"require_output_non_empty", contract.require_output_non_empty ? "true" : "false"});
+    fields.push_back({"max_output_bytes", std::to_string(contract.max_output_bytes)});
+    for (const std::string &fragment : contract.required_input_fragments) fields.push_back({"required_input", fragment});
+    for (const std::string &fragment : contract.required_output_fragments) fields.push_back({"required_output", fragment});
+    for (const std::string &fragment : contract.forbidden_output_fragments) fields.push_back({"forbidden_output", fragment});
+    for (const std::string &label : contract.required_policy_labels) fields.push_back({"required_label", label});
+    return encode_fields(fields);
+}
+
+bool decode_contract_payload(const std::string &payload, agent_contract *contract, std::string *error)
+{
+    field_map fields;
+    if (!parse_payload(payload, &fields, error))
+    {
+        return false;
+    }
+    contract->contract_id = field_string(fields, "contract_id");
+    contract->require_input_non_empty = field_bool(fields, "require_input_non_empty");
+    contract->require_output_non_empty = field_bool(fields, "require_output_non_empty", true);
+    contract->max_output_bytes = field_size(fields, "max_output_bytes");
+    contract->required_input_fragments = field_values(fields, "required_input");
+    contract->required_output_fragments = field_values(fields, "required_output");
+    contract->forbidden_output_fragments = field_values(fields, "forbidden_output");
+    contract->required_policy_labels = field_values(fields, "required_label");
+    return true;
+}
+
+std::string encode_contract_evaluation_payload(const contract_evaluation &evaluation)
+{
+    std::vector<std::pair<std::string, std::string>> fields;
+    fields.push_back({"ok", evaluation.ok ? "true" : "false"});
+    fields.push_back({"contract_id", evaluation.contract_id});
+    for (const std::string &violation : evaluation.violations) fields.push_back({"violation", violation});
+    for (const std::string &warning : evaluation.warnings) fields.push_back({"warning", warning});
+    return encode_fields(fields);
+}
+
+bool decode_contract_evaluation_payload(const std::string &payload, contract_evaluation *evaluation, std::string *error)
+{
+    field_map fields;
+    if (!parse_payload(payload, &fields, error))
+    {
+        return false;
+    }
+    evaluation->ok = field_bool(fields, "ok", true);
+    evaluation->contract_id = field_string(fields, "contract_id");
+    evaluation->violations = field_values(fields, "violation");
+    evaluation->warnings = field_values(fields, "warning");
+    return true;
+}
+
+std::string encode_human_payload(const human_interaction_request &request)
+{
+    std::vector<std::pair<std::string, std::string>> fields;
+    fields.push_back({"request_id", request.request_id});
+    fields.push_back({"task_id", request.task_id});
+    fields.push_back({"kind", request.kind});
+    fields.push_back({"requester", request.requester});
+    fields.push_back({"prompt", request.prompt});
+    fields.push_back({"state", request.state});
+    fields.push_back({"answer", request.answer});
+    fields.push_back({"created_at_ms", std::to_string(request.created_at_ms)});
+    fields.push_back({"updated_at_ms", std::to_string(request.updated_at_ms)});
+    fields.push_back({"deadline_ms", std::to_string(request.deadline_ms)});
+    for (const std::string &choice : request.choices) fields.push_back({"choice", choice});
+    return encode_fields(fields);
+}
+
+bool decode_human_payload(const std::string &payload, human_interaction_request *request, std::string *error)
+{
+    field_map fields;
+    if (!parse_payload(payload, &fields, error))
+    {
+        return false;
+    }
+    request->request_id = field_string(fields, "request_id");
+    request->task_id = field_string(fields, "task_id");
+    request->kind = field_string(fields, "kind", "approval");
+    request->requester = field_string(fields, "requester");
+    request->prompt = field_string(fields, "prompt");
+    request->state = field_string(fields, "state", "pending");
+    request->answer = field_string(fields, "answer");
+    request->created_at_ms = field_uint64(fields, "created_at_ms");
+    request->updated_at_ms = field_uint64(fields, "updated_at_ms");
+    request->deadline_ms = field_uint64(fields, "deadline_ms");
+    request->choices = field_values(fields, "choice");
+    return true;
+}
+
+std::string encode_sandbox_profile_payload(const sandbox_profile &profile)
+{
+    std::vector<std::pair<std::string, std::string>> fields;
+    fields.push_back({"name", profile.name});
+    fields.push_back({"allow_filesystem_read", profile.allow_filesystem_read ? "true" : "false"});
+    fields.push_back({"allow_filesystem_write", profile.allow_filesystem_write ? "true" : "false"});
+    fields.push_back({"allow_network", profile.allow_network ? "true" : "false"});
+    fields.push_back({"allow_process_spawn", profile.allow_process_spawn ? "true" : "false"});
+    fields.push_back({"max_cpu_ms", std::to_string(profile.max_cpu_ms)});
+    fields.push_back({"max_memory_bytes", std::to_string(profile.max_memory_bytes)});
+    for (const std::string &value : profile.allowed_roots) fields.push_back({"allowed_root", value});
+    for (const std::string &value : profile.denied_paths) fields.push_back({"denied_path", value});
+    for (const std::string &value : profile.allowed_network_hosts) fields.push_back({"allowed_network_host", value});
+    for (const std::string &value : profile.allowed_commands) fields.push_back({"allowed_command", value});
+    return encode_fields(fields);
+}
+
+bool decode_sandbox_profile_payload(const std::string &payload, sandbox_profile *profile, std::string *error)
+{
+    field_map fields;
+    if (!parse_payload(payload, &fields, error))
+    {
+        return false;
+    }
+    profile->name = field_string(fields, "name", "read-only");
+    profile->allow_filesystem_read = field_bool(fields, "allow_filesystem_read", true);
+    profile->allow_filesystem_write = field_bool(fields, "allow_filesystem_write");
+    profile->allow_network = field_bool(fields, "allow_network");
+    profile->allow_process_spawn = field_bool(fields, "allow_process_spawn");
+    profile->max_cpu_ms = field_uint64(fields, "max_cpu_ms");
+    profile->max_memory_bytes = field_uint64(fields, "max_memory_bytes");
+    profile->allowed_roots = field_values(fields, "allowed_root");
+    profile->denied_paths = field_values(fields, "denied_path");
+    profile->allowed_network_hosts = field_values(fields, "allowed_network_host");
+    profile->allowed_commands = field_values(fields, "allowed_command");
+    return true;
+}
+
+std::string encode_sandbox_request_payload(const sandbox_request &request)
+{
+    return encode_fields({{"operation", request.operation},
+                          {"path", request.path},
+                          {"network_host", request.network_host},
+                          {"command", request.command}});
+}
+
+bool decode_sandbox_request_payload(const std::string &payload, sandbox_request *request, std::string *error)
+{
+    field_map fields;
+    if (!parse_payload(payload, &fields, error))
+    {
+        return false;
+    }
+    request->operation = field_string(fields, "operation");
+    request->path = field_string(fields, "path");
+    request->network_host = field_string(fields, "network_host");
+    request->command = field_string(fields, "command");
+    return true;
+}
+
+std::string encode_sandbox_decision_payload(const sandbox_decision &decision)
+{
+    return encode_fields({{"allowed", decision.allowed ? "true" : "false"},
+                          {"profile", decision.profile},
+                          {"reason", decision.reason},
+                          {"max_cpu_ms", std::to_string(decision.max_cpu_ms)},
+                          {"max_memory_bytes", std::to_string(decision.max_memory_bytes)}});
+}
+
+bool decode_sandbox_decision_payload(const std::string &payload, sandbox_decision *decision, std::string *error)
+{
+    field_map fields;
+    if (!parse_payload(payload, &fields, error))
+    {
+        return false;
+    }
+    decision->allowed = field_bool(fields, "allowed");
+    decision->profile = field_string(fields, "profile");
+    decision->reason = field_string(fields, "reason");
+    decision->max_cpu_ms = field_uint64(fields, "max_cpu_ms");
+    decision->max_memory_bytes = field_uint64(fields, "max_memory_bytes");
+    return true;
+}
+
+template <typename T, typename Encoder>
+std::string encode_items(const std::vector<T> &items, Encoder encoder)
+{
+    std::vector<std::pair<std::string, std::string>> fields;
+    for (const T &item : items)
+    {
+        fields.push_back({"item", encoder(item)});
+    }
+    return encode_fields(fields);
+}
+
+template <typename T, typename Decoder>
+bool decode_items(const std::string &payload, std::vector<T> *items, Decoder decoder, std::string *error)
+{
+    field_map fields;
+    if (!parse_payload(payload, &fields, error))
+    {
+        return false;
+    }
+    items->clear();
+    const std::vector<std::string> encoded_items = field_values(fields, "item");
+    for (const std::string &encoded : encoded_items)
+    {
+        T item;
+        if (!decoder(encoded, &item, error))
+        {
+            return false;
+        }
+        items->push_back(item);
+    }
+    return true;
+}
+
+common_module_response success_response(const common_module_request &request, const std::string &payload = "")
+{
+    common_module_response response = make_common_module_response(request);
+    response.payload = payload;
+    return response;
+}
+
+common_module_response bool_response(const common_module_request &request, bool ok, const std::string &error = "")
+{
+    common_module_response response = make_common_module_response(request);
+    response.ok = ok;
+    response.error = ok ? "" : error;
+    return response;
+}
+
+class common_module_service_store
+{
+public:
+    common_module_response dispatch(const common_module_request &request)
+    {
+        if (request.operation.find("mirror_state:") == 0)
+        {
+            return success_response(request);
+        }
+        if (request.module == "agent_control_plane") return dispatch_agent_control(request);
+        if (request.module == "agent_message_bus") return dispatch_message_bus(request);
+        if (request.module == "task_orchestration_kernel") return dispatch_orchestration(request);
+        if (request.module == "determinism_ledger") return dispatch_determinism(request);
+        if (request.module == "capability_directory") return dispatch_capabilities(request);
+        if (request.module == "resource_budget") return dispatch_budget(request);
+        if (request.module == "recovery_supervisor") return dispatch_recovery(request);
+        if (request.module == "blackboard") return dispatch_blackboard(request);
+        if (request.module == "contract_verifier") return dispatch_contracts(request);
+        if (request.module == "human_interaction") return dispatch_human(request);
+        if (request.module == "sandbox_runtime") return dispatch_sandbox(request);
+        return make_common_module_error(request, "unknown common module: " + request.module);
+    }
+
+private:
+    common_module_response dispatch_agent_control(const common_module_request &request)
+    {
+        std::string error;
+        if (request.operation == "upsert_agent")
+        {
+            agent_control_record record;
+            if (!decode_agent_control_payload(request.payload, &record, &error)) return make_common_module_error(request, error);
+            return bool_response(request, _agent_control.upsert_agent(record, &error), error);
+        }
+        if (request.operation == "acquire_lease")
+        {
+            field_map fields;
+            if (!parse_payload(request.payload, &fields, &error)) return make_common_module_error(request, error);
+            const agent_control_lease lease = _agent_control.acquire_lease(
+                request.key, field_string(fields, "owner"), field_uint64(fields, "now_ms"), field_uint64(fields, "lease_ms"));
+            return success_response(request, encode_lease_payload(lease));
+        }
+        if (request.operation == "heartbeat")
+        {
+            return bool_response(request, _agent_control.heartbeat(request.key, field_uint64_payload(request.payload), &error), error);
+        }
+        if (request.operation == "find")
+        {
+            agent_control_record record;
+            if (!_agent_control.find(request.key, &record)) return make_common_module_error(request, "agent not found: " + request.key);
+            return success_response(request, encode_agent_control_payload(record));
+        }
+        if (request.operation == "expire_leases")
+        {
+            const size_t expired = _agent_control.expire_leases(field_uint64_payload(request.payload));
+            return success_response(request, encode_fields({{"count", std::to_string(expired)}}));
+        }
+        if (request.operation == "list")
+        {
+            field_map fields;
+            if (!parse_payload(request.payload, &fields, &error)) return make_common_module_error(request, error);
+            return success_response(request,
+                                    encode_items(_agent_control.list(field_bool(fields, "include_expired"),
+                                                                     field_uint64(fields, "now_ms")),
+                                                 encode_agent_control_payload));
+        }
+        if (request.operation == "describe")
+        {
+            return success_response(request, _agent_control.describe(field_uint64_payload(request.payload)));
+        }
+        return make_common_module_error(request, "unsupported agent_control_plane operation: " + request.operation);
+    }
+
+    uint64_t field_uint64_payload(const std::string &payload) const
+    {
+        field_map fields;
+        std::string error;
+        if (parse_payload(payload, &fields, &error))
+        {
+            return field_uint64(fields, "value");
+        }
+        return 0;
+    }
+
+    common_module_response dispatch_message_bus(const common_module_request &request)
+    {
+        std::string error;
+        if (request.operation == "publish")
+        {
+            agent_message message;
+            if (!decode_message_payload(request.payload, &message, &error)) return make_common_module_error(request, error);
+            agent_message stored;
+            if (!_message_bus.publish(message, &stored, &error)) return make_common_module_error(request, error);
+            return success_response(request, encode_message_payload(stored));
+        }
+        if (request.operation == "ack") return bool_response(request, _message_bus.ack(request.key, &error), error);
+        if (request.operation == "dead_letter") return bool_response(request, _message_bus.dead_letter(request.key, request.payload, &error), error);
+        if (request.operation == "find")
+        {
+            agent_message message;
+            if (!_message_bus.find(request.key, &message)) return make_common_module_error(request, "message not found: " + request.key);
+            return success_response(request, encode_message_payload(message));
+        }
+        if (request.operation == "snapshot") return success_response(request, encode_items(_message_bus.snapshot(), encode_message_payload));
+        if (request.operation == "describe") return success_response(request, "messages=" + std::to_string(_message_bus.snapshot().size()));
+        return make_common_module_error(request, "unsupported agent_message_bus operation: " + request.operation);
+    }
+
+    common_module_response dispatch_orchestration(const common_module_request &request)
+    {
+        std::string error;
+        if (request.operation == "add_task")
+        {
+            orchestration_task task;
+            if (!decode_task_payload(request.payload, &task, &error)) return make_common_module_error(request, error);
+            return bool_response(request, _orchestration.add_task(task, &error), error);
+        }
+        if (request.operation == "start") return bool_response(request, _orchestration.start(request.key, request.payload, &error), error);
+        if (request.operation == "complete") return bool_response(request, _orchestration.complete(request.key, request.payload, &error), error);
+        if (request.operation == "fail")
+        {
+            field_map fields;
+            if (!parse_payload(request.payload, &fields, &error)) return make_common_module_error(request, error);
+            return bool_response(
+                request, _orchestration.fail(request.key, field_string(fields, "error"), field_bool(fields, "retryable"), &error), error);
+        }
+        if (request.operation == "find")
+        {
+            orchestration_task task;
+            if (!_orchestration.find(request.key, &task)) return make_common_module_error(request, "task not found: " + request.key);
+            return success_response(request, encode_task_payload(task));
+        }
+        if (request.operation == "snapshot") return success_response(request, encode_items(_orchestration.snapshot(), encode_task_payload));
+        if (request.operation == "ready_tasks") return success_response(request, encode_items(_orchestration.ready_tasks(field_uint64_payload(request.payload)), encode_task_payload));
+        if (request.operation == "blocked_tasks") return success_response(request, encode_items(_orchestration.blocked_tasks(), encode_task_payload));
+        if (request.operation == "describe") return success_response(request, "tasks=" + std::to_string(_orchestration.snapshot().size()));
+        return make_common_module_error(request, "unsupported task_orchestration_kernel operation: " + request.operation);
+    }
+
+    common_module_response dispatch_determinism(const common_module_request &request)
+    {
+        std::string error;
+        if (request.operation == "record")
+        {
+            field_map fields;
+            if (!parse_payload(request.payload, &fields, &error)) return make_common_module_error(request, error);
+            deterministic_choice choice;
+            if (!_determinism.record(field_string(fields, "task_id"),
+                                     field_string(fields, "key"),
+                                     field_string(fields, "source"),
+                                     field_string(fields, "value"),
+                                     &choice,
+                                     &error))
+            {
+                return make_common_module_error(request, error);
+            }
+            return success_response(request, encode_choice_payload(choice));
+        }
+        if (request.operation == "snapshot") return success_response(request, encode_items(_determinism.snapshot(), encode_choice_payload));
+        if (request.operation == "describe") return success_response(request, "choices=" + std::to_string(_determinism.snapshot().size()));
+        return make_common_module_error(request, "unsupported determinism_ledger operation: " + request.operation);
+    }
+
+    common_module_response dispatch_capabilities(const common_module_request &request)
+    {
+        std::string error;
+        if (request.operation == "upsert_provider")
+        {
+            capability_provider provider;
+            if (!decode_capability_provider_payload(request.payload, &provider, &error)) return make_common_module_error(request, error);
+            return bool_response(request, _capabilities.upsert_provider(provider, &error), error);
+        }
+        if (request.operation == "describe") return success_response(request, _capabilities.describe());
+        return make_common_module_error(request, "unsupported capability_directory operation: " + request.operation);
+    }
+
+    common_module_response dispatch_budget(const common_module_request &request)
+    {
+        std::string error;
+        if (request.operation == "configure")
+        {
+            resource_quota quota;
+            if (!decode_quota_payload(request.payload, &quota, &error)) return make_common_module_error(request, error);
+            return bool_response(request, _budgets.configure(quota, &error), error);
+        }
+        if (request.operation == "reserve")
+        {
+            resource_request resource_request_value;
+            if (!decode_request_payload(request.payload, &resource_request_value, &error)) return make_common_module_error(request, error);
+            return success_response(request, encode_decision_payload(_budgets.reserve(resource_request_value)));
+        }
+        if (request.operation == "release")
+        {
+            resource_request resource_request_value;
+            if (!decode_request_payload(request.payload, &resource_request_value, &error)) return make_common_module_error(request, error);
+            return bool_response(request, _budgets.release(resource_request_value, &error), error);
+        }
+        if (request.operation == "usage")
+        {
+            resource_usage usage;
+            if (!_budgets.usage(request.key, &usage)) return make_common_module_error(request, "budget usage not found: " + request.key);
+            return success_response(request, encode_usage_payload(usage));
+        }
+        if (request.operation == "describe") return success_response(request, _budgets.describe());
+        return make_common_module_error(request, "unsupported resource_budget operation: " + request.operation);
+    }
+
+    common_module_response dispatch_recovery(const common_module_request &request)
+    {
+        std::string error;
+        if (request.operation == "set_policy")
+        {
+            recovery_policy policy;
+            if (!decode_recovery_policy_payload(request.payload, &policy, &error)) return make_common_module_error(request, error);
+            return bool_response(request, _recovery.set_policy(policy, &error), error);
+        }
+        if (request.operation == "observe")
+        {
+            failure_observation failure;
+            if (!decode_failure_payload(request.payload, &failure, &error)) return make_common_module_error(request, error);
+            return success_response(request, encode_recovery_action_payload(_recovery.observe(failure)));
+        }
+        if (request.operation == "describe") return success_response(request, _recovery.describe());
+        return make_common_module_error(request, "unsupported recovery_supervisor operation: " + request.operation);
+    }
+
+    common_module_response dispatch_blackboard(const common_module_request &request)
+    {
+        std::string error;
+        if (request.operation == "put")
+        {
+            blackboard_entry entry;
+            if (!decode_blackboard_payload(request.payload, &entry, &error)) return make_common_module_error(request, error);
+            blackboard_entry stored;
+            if (!_blackboard.put(entry, &stored, &error)) return make_common_module_error(request, error);
+            return success_response(request, encode_blackboard_payload(stored));
+        }
+        if (request.operation == "get")
+        {
+            blackboard_entry entry;
+            if (!_blackboard.get(request.key, &entry)) return make_common_module_error(request, "blackboard entry not found: " + request.key);
+            return success_response(request, encode_blackboard_payload(entry));
+        }
+        if (request.operation == "snapshot")
+        {
+            field_map fields;
+            if (!parse_payload(request.payload, &fields, &error)) return make_common_module_error(request, error);
+            return success_response(
+                request,
+                encode_items(_blackboard.snapshot(field_bool(fields, "include_expired", true), field_uint64(fields, "now_ms")),
+                             encode_blackboard_payload));
+        }
+        if (request.operation == "describe") return success_response(request, _blackboard.describe());
+        return make_common_module_error(request, "unsupported blackboard operation: " + request.operation);
+    }
+
+    common_module_response dispatch_contracts(const common_module_request &request)
+    {
+        std::string error;
+        if (request.operation == "register")
+        {
+            agent_contract contract;
+            if (!decode_contract_payload(request.payload, &contract, &error)) return make_common_module_error(request, error);
+            return bool_response(request, _contracts.register_contract(contract, &error), error);
+        }
+        if (request.operation == "evaluate_input")
+        {
+            field_map fields;
+            if (!parse_payload(request.payload, &fields, &error)) return make_common_module_error(request, error);
+            return success_response(request,
+                                    encode_contract_evaluation_payload(_contracts.evaluate_input(field_string(fields, "contract_id"),
+                                                                                                field_string(fields, "input"))));
+        }
+        if (request.operation == "evaluate_output")
+        {
+            field_map fields;
+            if (!parse_payload(request.payload, &fields, &error)) return make_common_module_error(request, error);
+            return success_response(
+                request,
+                encode_contract_evaluation_payload(_contracts.evaluate_output(field_string(fields, "contract_id"),
+                                                                              field_string(fields, "output"),
+                                                                              field_values(fields, "policy_label"))));
+        }
+        if (request.operation == "describe") return success_response(request, _contracts.describe());
+        return make_common_module_error(request, "unsupported contract_verifier operation: " + request.operation);
+    }
+
+    common_module_response dispatch_human(const common_module_request &request)
+    {
+        if (request.operation == "snapshot") return success_response(request, encode_items(_human.snapshot(), encode_human_payload));
+        if (request.operation == "pending") return success_response(request, encode_items(_human.pending(request.key), encode_human_payload));
+        if (request.operation == "describe") return success_response(request, _human.describe());
+        return make_common_module_error(request, "unsupported human_interaction operation: " + request.operation);
+    }
+
+    common_module_response dispatch_sandbox(const common_module_request &request)
+    {
+        std::string error;
+        if (request.operation == "set_profile")
+        {
+            sandbox_profile profile;
+            if (!decode_sandbox_profile_payload(request.payload, &profile, &error)) return make_common_module_error(request, error);
+            _sandbox_profile = profile;
+            return success_response(request, encode_sandbox_profile_payload(_sandbox_profile));
+        }
+        if (request.operation == "profile") return success_response(request, encode_sandbox_profile_payload(_sandbox_profile));
+        if (request.operation == "evaluate")
+        {
+            sandbox_request sandbox_request_value;
+            if (!decode_sandbox_request_payload(request.payload, &sandbox_request_value, &error)) return make_common_module_error(request, error);
+            return success_response(request, encode_sandbox_decision_payload(evaluate_sandbox_request(_sandbox_profile, sandbox_request_value)));
+        }
+        if (request.operation == "describe") return success_response(request, describe_sandbox_profile(_sandbox_profile));
+        return make_common_module_error(request, "unsupported sandbox_runtime operation: " + request.operation);
+    }
+
+    agent_control_plane _agent_control;
+    agent_message_bus _message_bus;
+    task_orchestration_kernel _orchestration;
+    determinism_ledger _determinism;
+    capability_directory _capabilities;
+    resource_budget_manager _budgets;
+    recovery_supervisor _recovery;
+    shared_blackboard _blackboard;
+    contract_verifier _contracts;
+    human_interaction_queue _human;
+    sandbox_profile _sandbox_profile = default_read_only_sandbox_profile();
+};
+
+common_module_service_store &global_common_module_store()
+{
+    static common_module_service_store store;
+    return store;
+}
+
+common_module_request make_module_request(const std::string &module,
+                                          const std::string &operation,
+                                          const std::string &key = "",
+                                          const std::string &payload = "")
+{
+    common_module_request request;
+    request.module = module;
+    request.operation = operation;
+    request.key = key;
+    request.payload = payload;
+    return request;
+}
+
+std::string scalar_payload(uint64_t value)
+{
+    return encode_fields({{"value", std::to_string(value)}});
+}
+
+void set_response_error(const common_module_response &response, std::string *error)
+{
+    if (error != nullptr)
+    {
+        *error = response.error.empty() ? "common module API request failed" : response.error;
+    }
+}
+
+void clear_error(std::string *error)
+{
+    if (error != nullptr)
+    {
+        error->clear();
+    }
+}
+
+bool response_bool(const common_module_response &response, std::string *error)
+{
+    if (!response.ok)
+    {
+        set_response_error(response, error);
+        return false;
+    }
+    clear_error(error);
+    return true;
+}
+
+contract_evaluation failed_contract_evaluation(const std::string &contract_id, const std::string &error)
+{
+    contract_evaluation evaluation;
+    evaluation.ok = false;
+    evaluation.contract_id = contract_id;
+    evaluation.violations.push_back(error.empty() ? "common module API request failed" : error);
+    return evaluation;
+}
+
+sandbox_decision denied_sandbox_decision(const std::string &reason)
+{
+    sandbox_decision decision;
+    decision.allowed = false;
+    decision.profile = "unavailable";
+    decision.reason = reason.empty() ? "common module API request failed" : reason;
+    return decision;
+}
+
+class local_common_runtime_provider : public common_runtime_provider
+{
+public:
+    explicit local_common_runtime_provider(const common_runtime_config &config)
+        : common_runtime_provider(config)
+    {
+    }
+
+    std::string provider_name() const override { return "local"; }
+    bool distributed() const override { return false; }
+
+protected:
+    common_module_response call_module_api(const common_module_request &request) const override
+    {
+        if (::dsn::task::get_current_node2() == nullptr)
+        {
+            return dispatch_common_module_request(request);
+        }
+        std::shared_ptr<std::promise<common_module_response>> promise(new std::promise<common_module_response>());
+        std::future<common_module_response> future = promise->get_future();
+        ::dsn::task_ptr task = ::dsn::tasking::enqueue(
+            lpc_code_for_module(request.module),
+            nullptr,
+            [request, promise]() { promise->set_value(dispatch_common_module_request(request)); });
+        if (task == nullptr)
+        {
+            return make_common_module_error(request, "failed to enqueue common module LPC request");
+        }
+        return future.get();
+    }
+
+    bool write_state(const std::string &module,
+                     const std::string &kind,
+                     const std::string &key,
+                     const std::string &value,
+                     std::string *error) override
+    {
+        common_module_request request;
+        request.module = module;
+        request.operation = "mirror_state:" + kind;
+        request.key = key;
+        request.payload = value;
+        const common_module_response response = call_module_api(request);
+        if (!response.ok)
+        {
+            if (error != nullptr)
+            {
+                *error = response.error.empty() ? "common module LPC request failed" : response.error;
+            }
+            return false;
+        }
+        if (error != nullptr)
+        {
+            error->clear();
+        }
+        return true;
+    }
+};
+
+class distributed_common_runtime_provider : public common_runtime_provider
+{
+public:
+    distributed_common_runtime_provider(rasn_service_graph &services, const common_runtime_config &config)
+        : common_runtime_provider(config), _services(services)
+    {
+    }
+
+    std::string provider_name() const override { return "distributed"; }
+    bool distributed() const override { return true; }
+
+protected:
+    common_module_response call_module_api(const common_module_request &request) const override
+    {
+        rasn_common_module_client client(common_module_address(request.module));
+        const std::pair<::dsn::error_code, common_module_response> result = client.call_sync(request, std::chrono::milliseconds(1000));
+        if (result.first != ::dsn::ERR_OK)
+        {
+            return make_common_module_error(request, std::string("common module RPC failed: ") + result.first.to_string());
+        }
+        return result.second;
+    }
+
+    bool write_state(const std::string &module,
+                     const std::string &kind,
+                     const std::string &key,
+                     const std::string &value,
+                     std::string *error) override
+    {
+        common_module_request request;
+        request.module = module;
+        request.operation = "mirror_state:" + kind;
+        request.key = key;
+        request.payload = value;
+        const common_module_response module_response = call_module_api(request);
+        if (!module_response.ok)
+        {
+            if (error != nullptr)
+            {
+                *error = module_response.error.empty() ? "common module RPC request failed" : module_response.error;
+            }
+            return false;
+        }
+
+        state_record record;
+        record.key = state_key(module, kind, key);
+        record.kind = "rasn.runtime." + module + "." + kind;
+        record.scope = "rasn.common_runtime";
+        record.value = value;
+        const state_response response = _services.put_state(record);
+        if (!response.ok)
+        {
+            if (error != nullptr)
+            {
+                *error = response.error.empty() ? "failed to write common runtime state" : response.error;
+            }
+            return false;
+        }
+        if (error != nullptr)
+        {
+            error->clear();
+        }
+        return true;
+    }
+
+private:
+    rasn_service_graph &_services;
+};
+
+} // namespace
+
+std::vector<std::string> common_runtime_module_names()
+{
+    return std::vector<std::string>{"agent_control_plane",
+                                    "agent_message_bus",
+                                    "task_orchestration_kernel",
+                                    "determinism_ledger",
+                                    "capability_directory",
+                                    "resource_budget",
+                                    "recovery_supervisor",
+                                    "blackboard",
+                                    "contract_verifier",
+                                    "human_interaction",
+                                    "sandbox_runtime"};
+}
+
+std::string common_runtime_module_app_role(const std::string &module_or_role)
+{
+    const std::string value = lower_ascii(trim(module_or_role));
+    if (value == "rasn.common.agent_control" || value == "agent_control" || value == "agent_control_plane")
+    {
+        return "rasn.common.agent_control";
+    }
+    if (value == "rasn.common.message_bus" || value == "message_bus" || value == "agent_message_bus")
+    {
+        return "rasn.common.message_bus";
+    }
+    if (value == "rasn.common.task_kernel" || value == "task_kernel" || value == "task_orchestration" ||
+        value == "task_orchestration_kernel")
+    {
+        return "rasn.common.task_kernel";
+    }
+    if (value == "rasn.common.determinism" || value == "determinism" || value == "determinism_ledger")
+    {
+        return "rasn.common.determinism";
+    }
+    if (value == "rasn.common.capability" || value == "capability" || value == "capability_directory")
+    {
+        return "rasn.common.capability";
+    }
+    if (value == "rasn.common.budget" || value == "budget" || value == "resource_budget")
+    {
+        return "rasn.common.budget";
+    }
+    if (value == "rasn.common.recovery" || value == "recovery" || value == "recovery_supervisor")
+    {
+        return "rasn.common.recovery";
+    }
+    if (value == "rasn.common.blackboard" || value == "blackboard")
+    {
+        return "rasn.common.blackboard";
+    }
+    if (value == "rasn.common.contract" || value == "contract" || value == "contract_verifier")
+    {
+        return "rasn.common.contract";
+    }
+    if (value == "rasn.common.human_interaction" || value == "human_interaction")
+    {
+        return "rasn.common.human_interaction";
+    }
+    if (value == "rasn.common.sandbox_runtime" || value == "sandbox" || value == "sandbox_runtime")
+    {
+        return "rasn.common.sandbox_runtime";
+    }
+    if (value == "rasn.common.modules" || value == "common_modules" || value == "modules")
+    {
+        return "rasn.common.modules";
+    }
+    return "";
+}
+
+std::string normalize_common_runtime_app_list(const std::string &app_list)
+{
+    std::vector<std::string> normalized;
+    std::string token;
+    for (size_t i = 0; i <= app_list.size(); ++i)
+    {
+        if (i == app_list.size() || app_list[i] == ';' || app_list[i] == ',')
+        {
+            const std::string trimmed = trim(token);
+            if (!trimmed.empty())
+            {
+                const size_t at = trimmed.find('@');
+                const std::string app = at == std::string::npos ? trimmed : trimmed.substr(0, at);
+                const std::string suffix = at == std::string::npos ? "" : trimmed.substr(at);
+                const std::string role = common_runtime_module_app_role(app);
+                normalized.push_back((role.empty() ? app : role) + suffix);
+            }
+            token.clear();
+        }
+        else
+        {
+            token.push_back(app_list[i]);
+        }
+    }
+    return join_strings(normalized, ";");
+}
+
+common_runtime::common_runtime(std::unique_ptr<common_runtime_provider> provider) : _provider(std::move(provider)) {}
+
+common_runtime::~common_runtime() {}
+
+std::string common_runtime::provider_name() const
+{
+    return _provider->provider_name();
+}
+
+bool common_runtime::distributed() const
+{
+    return _provider->distributed();
+}
+
+bool common_runtime::strict() const
+{
+    return _provider->strict();
+}
+
+const std::string &common_runtime::state_prefix() const
+{
+    return _provider->state_prefix();
+}
+
+std::string common_runtime::summary_header() const
+{
+    return _provider->summary_header();
+}
+
+bool common_runtime::upsert_agent(const agent_control_record &record, std::string *error)
+{
+    return _provider->upsert_agent(record, error);
+}
+
+agent_control_lease common_runtime::acquire_agent_lease(const std::string &agent_id,
+                                                        const std::string &owner,
+                                                        uint64_t now_ms,
+                                                        uint64_t lease_ms)
+{
+    return _provider->acquire_agent_lease(agent_id, owner, now_ms, lease_ms);
+}
+
+bool common_runtime::heartbeat_agent(const std::string &agent_id, uint64_t now_ms, std::string *error)
+{
+    return _provider->heartbeat_agent(agent_id, now_ms, error);
+}
+
+bool common_runtime::find_agent(const std::string &agent_id, agent_control_record *record) const
+{
+    return _provider->find_agent(agent_id, record);
+}
+
+size_t common_runtime::expire_agent_leases(uint64_t now_ms)
+{
+    return _provider->expire_agent_leases(now_ms);
+}
+
+std::vector<agent_control_record> common_runtime::list_agents(bool include_expired, uint64_t now_ms) const
+{
+    return _provider->list_agents(include_expired, now_ms);
+}
+
+std::string common_runtime::describe_agents(uint64_t now_ms) const
+{
+    return _provider->describe_agents(now_ms);
+}
+
+bool common_runtime::publish_message(const agent_message &message, agent_message *stored, std::string *error)
+{
+    return _provider->publish_message(message, stored, error);
+}
+
+bool common_runtime::ack_message(const std::string &message_id, std::string *error)
+{
+    return _provider->ack_message(message_id, error);
+}
+
+bool common_runtime::dead_letter_message(const std::string &message_id, const std::string &error_text, std::string *error)
+{
+    return _provider->dead_letter_message(message_id, error_text, error);
+}
+
+bool common_runtime::find_message(const std::string &message_id, agent_message *message) const
+{
+    return _provider->find_message(message_id, message);
+}
+
+std::vector<agent_message> common_runtime::message_snapshot() const
+{
+    return _provider->message_snapshot();
+}
+
+bool common_runtime::add_task(const orchestration_task &task, std::string *error)
+{
+    return _provider->add_task(task, error);
+}
+
+bool common_runtime::start_task(const std::string &task_id, const std::string &owner_agent, std::string *error)
+{
+    return _provider->start_task(task_id, owner_agent, error);
+}
+
+bool common_runtime::complete_task(const std::string &task_id, const std::string &output, std::string *error)
+{
+    return _provider->complete_task(task_id, output, error);
+}
+
+bool common_runtime::fail_task(const std::string &task_id, const std::string &error_text, bool retryable, std::string *error)
+{
+    return _provider->fail_task(task_id, error_text, retryable, error);
+}
+
+bool common_runtime::find_task(const std::string &task_id, orchestration_task *task) const
+{
+    return _provider->find_task(task_id, task);
+}
+
+std::vector<orchestration_task> common_runtime::task_snapshot() const
+{
+    return _provider->task_snapshot();
+}
+
+std::vector<orchestration_task> common_runtime::ready_tasks(uint64_t now_ms) const
+{
+    return _provider->ready_tasks(now_ms);
+}
+
+std::vector<orchestration_task> common_runtime::blocked_tasks() const
+{
+    return _provider->blocked_tasks();
+}
+
+bool common_runtime::record_choice(const std::string &task_id,
+                                   const std::string &key,
+                                   const std::string &source,
+                                   const std::string &value,
+                                   deterministic_choice *choice,
+                                   std::string *error)
+{
+    return _provider->record_choice(task_id, key, source, value, choice, error);
+}
+
+std::vector<deterministic_choice> common_runtime::choice_snapshot() const
+{
+    return _provider->choice_snapshot();
+}
+
+bool common_runtime::upsert_capability_provider(const capability_provider &provider, std::string *error)
+{
+    return _provider->upsert_capability_provider(provider, error);
+}
+
+std::string common_runtime::describe_capabilities() const
+{
+    return _provider->describe_capabilities();
+}
+
+bool common_runtime::configure_budget(const resource_quota &quota, std::string *error)
+{
+    return _provider->configure_budget(quota, error);
+}
+
+resource_budget_decision common_runtime::reserve_budget(const resource_request &request)
+{
+    return _provider->reserve_budget(request);
+}
+
+bool common_runtime::release_budget(const resource_request &request, std::string *error)
+{
+    return _provider->release_budget(request, error);
+}
+
+bool common_runtime::budget_usage(const std::string &scope, resource_usage *usage) const
+{
+    return _provider->budget_usage(scope, usage);
+}
+
+std::string common_runtime::describe_budgets() const
+{
+    return _provider->describe_budgets();
+}
+
+bool common_runtime::set_recovery_policy(const recovery_policy &policy, std::string *error)
+{
+    return _provider->set_recovery_policy(policy, error);
+}
+
+recovery_action common_runtime::observe_failure(const failure_observation &failure)
+{
+    return _provider->observe_failure(failure);
+}
+
+std::string common_runtime::describe_recovery() const
+{
+    return _provider->describe_recovery();
+}
+
+bool common_runtime::put_blackboard(const blackboard_entry &entry, blackboard_entry *stored, std::string *error)
+{
+    return _provider->put_blackboard(entry, stored, error);
+}
+
+bool common_runtime::get_blackboard(const std::string &key, blackboard_entry *entry) const
+{
+    return _provider->get_blackboard(key, entry);
+}
+
+std::vector<blackboard_entry> common_runtime::blackboard_snapshot(bool include_expired, uint64_t now_ms) const
+{
+    return _provider->blackboard_snapshot(include_expired, now_ms);
+}
+
+bool common_runtime::register_contract(const agent_contract &contract, std::string *error)
+{
+    return _provider->register_contract(contract, error);
+}
+
+contract_evaluation common_runtime::evaluate_input(const std::string &contract_id, const std::string &input) const
+{
+    return _provider->evaluate_input(contract_id, input);
+}
+
+contract_evaluation common_runtime::evaluate_output(const std::string &contract_id,
+                                                    const std::string &output,
+                                                    const std::vector<std::string> &policy_labels) const
+{
+    return _provider->evaluate_output(contract_id, output, policy_labels);
+}
+
+std::string common_runtime::describe_contracts() const
+{
+    return _provider->describe_contracts();
+}
+
+std::vector<human_interaction_request> common_runtime::human_snapshot() const
+{
+    return _provider->human_snapshot();
+}
+
+std::vector<human_interaction_request> common_runtime::pending_human() const
+{
+    return _provider->pending_human();
+}
+
+void common_runtime::set_sandbox_profile(const sandbox_profile &profile)
+{
+    _provider->set_sandbox_profile(profile);
+}
+
+sandbox_decision common_runtime::evaluate_sandbox(const sandbox_request &request) const
+{
+    return _provider->evaluate_sandbox(request);
+}
+
+sandbox_profile common_runtime::sandbox() const
+{
+    return _provider->sandbox();
+}
+
+bool common_runtime::mirror_state(const std::string &module,
+                                  const std::string &kind,
+                                  const std::string &key,
+                                  const std::string &value,
+                                  std::string *error)
+{
+    return _provider->mirror_state(module, kind, key, value, error);
+}
+
+common_runtime_provider::common_runtime_provider(common_runtime_config config)
+    : _config(std::move(config))
+{
+    if (_config.state_prefix.empty())
+    {
+        _config.state_prefix = "rasn/runtime/modules";
+    }
+}
+
+std::string common_runtime_provider::summary_header() const
+{
+    std::ostringstream output;
+    output << "runtime_provider: provider=" << provider_name()
+           << " mode=" << (distributed() ? "distributed" : "local")
+           << " module_api=" << (distributed() ? "rpc" : "lpc")
+           << " state_service=" << (distributed() ? "enabled" : "disabled")
+           << " state_prefix=" << _config.state_prefix
+           << " strict=" << (_config.strict ? "yes" : "no");
+    return output.str();
+}
+
+bool common_runtime_provider::mirror_state(const std::string &module,
+                                           const std::string &kind,
+                                           const std::string &key,
+                                           const std::string &value,
+                                           std::string *error)
+{
+    return write_state(module, kind, key, value, error);
+}
+
+std::string common_runtime_provider::state_key(const std::string &module,
+                                               const std::string &kind,
+                                               const std::string &key) const
+{
+    return _config.state_prefix + "/" + state_key_component(module) + "/" +
+           state_key_component(kind) + "/" + state_key_component(key);
+}
+
+void common_runtime_provider::set_sandbox_profile(const sandbox_profile &profile)
+{
+    const common_module_response response =
+        call_module_api(make_module_request("sandbox_runtime", "set_profile", profile.name, encode_sandbox_profile_payload(profile)));
+    if (!response.ok)
+    {
+        dwarn("failed to set sandbox runtime profile through module API: %s", response.error.c_str());
+    }
+}
+
+sandbox_decision common_runtime_provider::evaluate_sandbox(const sandbox_request &request) const
+{
+    const common_module_response response =
+        call_module_api(make_module_request("sandbox_runtime", "evaluate", "", encode_sandbox_request_payload(request)));
+    if (!response.ok)
+    {
+        return denied_sandbox_decision(response.error);
+    }
+    sandbox_decision decision;
+    std::string error;
+    if (!decode_sandbox_decision_payload(response.payload, &decision, &error))
+    {
+        return denied_sandbox_decision(error);
+    }
+    return decision;
+}
+
+sandbox_profile common_runtime_provider::sandbox() const
+{
+    const common_module_response response = call_module_api(make_module_request("sandbox_runtime", "profile"));
+    sandbox_profile profile = default_read_only_sandbox_profile();
+    if (!response.ok)
+    {
+        profile.name = "unavailable";
+        return profile;
+    }
+    std::string error;
+    if (!decode_sandbox_profile_payload(response.payload, &profile, &error))
+    {
+        profile = default_read_only_sandbox_profile();
+        profile.name = "unavailable";
+    }
+    return profile;
+}
+
+bool common_runtime_provider::upsert_agent(const agent_control_record &record, std::string *error)
+{
+    return response_bool(call_module_api(make_module_request("agent_control_plane",
+                                                             "upsert_agent",
+                                                             record.descriptor.agent_id,
+                                                             encode_agent_control_payload(record))),
+                         error);
+}
+
+agent_control_lease common_runtime_provider::acquire_agent_lease(const std::string &agent_id,
+                                                                 const std::string &owner,
+                                                                 uint64_t now_ms,
+                                                                 uint64_t lease_ms)
+{
+    const common_module_response response = call_module_api(make_module_request(
+        "agent_control_plane",
+        "acquire_lease",
+        agent_id,
+        encode_fields({{"owner", owner}, {"now_ms", std::to_string(now_ms)}, {"lease_ms", std::to_string(lease_ms)}})));
+    agent_control_lease lease;
+    lease.agent_id = agent_id;
+    lease.owner = owner;
+    if (!response.ok)
+    {
+        lease.error = response.error;
+        return lease;
+    }
+    std::string error;
+    if (!decode_lease_payload(response.payload, &lease, &error))
+    {
+        lease.ok = false;
+        lease.error = error;
+    }
+    return lease;
+}
+
+bool common_runtime_provider::heartbeat_agent(const std::string &agent_id, uint64_t now_ms, std::string *error)
+{
+    return response_bool(
+        call_module_api(make_module_request("agent_control_plane", "heartbeat", agent_id, scalar_payload(now_ms))), error);
+}
+
+bool common_runtime_provider::find_agent(const std::string &agent_id, agent_control_record *record) const
+{
+    const common_module_response response = call_module_api(make_module_request("agent_control_plane", "find", agent_id));
+    if (!response.ok)
+    {
+        return false;
+    }
+    std::string error;
+    return decode_agent_control_payload(response.payload, record, &error);
+}
+
+size_t common_runtime_provider::expire_agent_leases(uint64_t now_ms)
+{
+    const common_module_response response =
+        call_module_api(make_module_request("agent_control_plane", "expire_leases", "*", scalar_payload(now_ms)));
+    if (!response.ok)
+    {
+        return 0;
+    }
+    field_map fields;
+    std::string error;
+    return decode_fields(response.payload, &fields, &error) ? field_size(fields, "count") : 0;
+}
+
+std::vector<agent_control_record> common_runtime_provider::list_agents(bool include_expired, uint64_t now_ms) const
+{
+    const common_module_response response = call_module_api(make_module_request(
+        "agent_control_plane",
+        "list",
+        "",
+        encode_fields({{"include_expired", include_expired ? "true" : "false"}, {"now_ms", std::to_string(now_ms)}})));
+    std::vector<agent_control_record> records;
+    std::string error;
+    if (response.ok)
+    {
+        (void)decode_items(response.payload, &records, decode_agent_control_payload, &error);
+    }
+    return records;
+}
+
+std::string common_runtime_provider::describe_agents(uint64_t now_ms) const
+{
+    const common_module_response response =
+        call_module_api(make_module_request("agent_control_plane", "describe", "", scalar_payload(now_ms)));
+    return response.ok ? response.payload : response.error;
+}
+
+bool common_runtime_provider::publish_message(const agent_message &message, agent_message *stored, std::string *error)
+{
+    const common_module_response response =
+        call_module_api(make_module_request("agent_message_bus", "publish", message.message_id, encode_message_payload(message)));
+    if (!response.ok)
+    {
+        set_response_error(response, error);
+        return false;
+    }
+    if (stored != nullptr)
+    {
+        std::string decode_error;
+        if (!decode_message_payload(response.payload, stored, &decode_error))
+        {
+            if (error != nullptr)
+            {
+                *error = decode_error;
+            }
+            return false;
+        }
+    }
+    clear_error(error);
+    return true;
+}
+
+bool common_runtime_provider::ack_message(const std::string &message_id, std::string *error)
+{
+    return response_bool(call_module_api(make_module_request("agent_message_bus", "ack", message_id)), error);
+}
+
+bool common_runtime_provider::dead_letter_message(const std::string &message_id,
+                                                  const std::string &error_text,
+                                                  std::string *error)
+{
+    return response_bool(
+        call_module_api(make_module_request("agent_message_bus", "dead_letter", message_id, error_text)), error);
+}
+
+bool common_runtime_provider::find_message(const std::string &message_id, agent_message *message) const
+{
+    const common_module_response response = call_module_api(make_module_request("agent_message_bus", "find", message_id));
+    if (!response.ok)
+    {
+        return false;
+    }
+    std::string error;
+    return decode_message_payload(response.payload, message, &error);
+}
+
+std::vector<agent_message> common_runtime_provider::message_snapshot() const
+{
+    const common_module_response response = call_module_api(make_module_request("agent_message_bus", "snapshot"));
+    std::vector<agent_message> messages;
+    std::string error;
+    if (response.ok)
+    {
+        (void)decode_items(response.payload, &messages, decode_message_payload, &error);
+    }
+    return messages;
+}
+
+bool common_runtime_provider::add_task(const orchestration_task &task, std::string *error)
+{
+    return response_bool(
+        call_module_api(make_module_request("task_orchestration_kernel", "add_task", task.task_id, encode_task_payload(task))),
+        error);
+}
+
+bool common_runtime_provider::start_task(const std::string &task_id, const std::string &owner_agent, std::string *error)
+{
+    return response_bool(call_module_api(make_module_request("task_orchestration_kernel", "start", task_id, owner_agent)),
+                         error);
+}
+
+bool common_runtime_provider::complete_task(const std::string &task_id, const std::string &output, std::string *error)
+{
+    return response_bool(call_module_api(make_module_request("task_orchestration_kernel", "complete", task_id, output)),
+                         error);
+}
+
+bool common_runtime_provider::fail_task(const std::string &task_id,
+                                        const std::string &error_text,
+                                        bool retryable,
+                                        std::string *error)
+{
+    return response_bool(call_module_api(make_module_request(
+                             "task_orchestration_kernel",
+                             "fail",
+                             task_id,
+                             encode_fields({{"error", error_text}, {"retryable", retryable ? "true" : "false"}}))),
+                         error);
+}
+
+bool common_runtime_provider::find_task(const std::string &task_id, orchestration_task *task) const
+{
+    const common_module_response response = call_module_api(make_module_request("task_orchestration_kernel", "find", task_id));
+    if (!response.ok)
+    {
+        return false;
+    }
+    std::string error;
+    return decode_task_payload(response.payload, task, &error);
+}
+
+std::vector<orchestration_task> common_runtime_provider::task_snapshot() const
+{
+    const common_module_response response = call_module_api(make_module_request("task_orchestration_kernel", "snapshot"));
+    std::vector<orchestration_task> tasks;
+    std::string error;
+    if (response.ok)
+    {
+        (void)decode_items(response.payload, &tasks, decode_task_payload, &error);
+    }
+    return tasks;
+}
+
+std::vector<orchestration_task> common_runtime_provider::ready_tasks(uint64_t now_ms) const
+{
+    const common_module_response response =
+        call_module_api(make_module_request("task_orchestration_kernel", "ready_tasks", "", scalar_payload(now_ms)));
+    std::vector<orchestration_task> tasks;
+    std::string error;
+    if (response.ok)
+    {
+        (void)decode_items(response.payload, &tasks, decode_task_payload, &error);
+    }
+    return tasks;
+}
+
+std::vector<orchestration_task> common_runtime_provider::blocked_tasks() const
+{
+    const common_module_response response = call_module_api(make_module_request("task_orchestration_kernel", "blocked_tasks"));
+    std::vector<orchestration_task> tasks;
+    std::string error;
+    if (response.ok)
+    {
+        (void)decode_items(response.payload, &tasks, decode_task_payload, &error);
+    }
+    return tasks;
+}
+
+bool common_runtime_provider::record_choice(const std::string &task_id,
+                                            const std::string &key,
+                                            const std::string &source,
+                                            const std::string &value,
+                                            deterministic_choice *choice,
+                                            std::string *error)
+{
+    const common_module_response response = call_module_api(make_module_request(
+        "determinism_ledger",
+        "record",
+        task_id + "/" + key,
+        encode_fields({{"task_id", task_id}, {"key", key}, {"source", source}, {"value", value}})));
+    if (!response.ok)
+    {
+        set_response_error(response, error);
+        return false;
+    }
+    if (choice != nullptr)
+    {
+        std::string decode_error;
+        if (!decode_choice_payload(response.payload, choice, &decode_error))
+        {
+            if (error != nullptr)
+            {
+                *error = decode_error;
+            }
+            return false;
+        }
+    }
+    clear_error(error);
+    return true;
+}
+
+std::vector<deterministic_choice> common_runtime_provider::choice_snapshot() const
+{
+    const common_module_response response = call_module_api(make_module_request("determinism_ledger", "snapshot"));
+    std::vector<deterministic_choice> choices;
+    std::string error;
+    if (response.ok)
+    {
+        (void)decode_items(response.payload, &choices, decode_choice_payload, &error);
+    }
+    return choices;
+}
+
+bool common_runtime_provider::upsert_capability_provider(const capability_provider &provider, std::string *error)
+{
+    return response_bool(call_module_api(make_module_request("capability_directory",
+                                                             "upsert_provider",
+                                                             provider.descriptor.agent_id,
+                                                             encode_capability_provider_payload(provider))),
+                         error);
+}
+
+std::string common_runtime_provider::describe_capabilities() const
+{
+    const common_module_response response = call_module_api(make_module_request("capability_directory", "describe"));
+    return response.ok ? response.payload : response.error;
+}
+
+bool common_runtime_provider::configure_budget(const resource_quota &quota, std::string *error)
+{
+    return response_bool(call_module_api(make_module_request("resource_budget", "configure", quota.scope, encode_quota_payload(quota))),
+                         error);
+}
+
+resource_budget_decision common_runtime_provider::reserve_budget(const resource_request &request_value)
+{
+    const common_module_response response =
+        call_module_api(make_module_request("resource_budget", "reserve", request_value.scope, encode_request_payload(request_value)));
+    resource_budget_decision decision;
+    decision.allowed = false;
+    decision.scope = request_value.scope;
+    if (!response.ok)
+    {
+        decision.reason = response.error;
+        return decision;
+    }
+    std::string error;
+    if (!decode_decision_payload(response.payload, &decision, &error))
+    {
+        decision.allowed = false;
+        decision.reason = error;
+    }
+    return decision;
+}
+
+bool common_runtime_provider::release_budget(const resource_request &request_value, std::string *error)
+{
+    return response_bool(
+        call_module_api(make_module_request("resource_budget", "release", request_value.scope, encode_request_payload(request_value))),
+        error);
+}
+
+bool common_runtime_provider::budget_usage(const std::string &scope, resource_usage *usage) const
+{
+    const common_module_response response = call_module_api(make_module_request("resource_budget", "usage", scope));
+    if (!response.ok)
+    {
+        return false;
+    }
+    std::string error;
+    return decode_usage_payload(response.payload, usage, &error);
+}
+
+std::string common_runtime_provider::describe_budgets() const
+{
+    const common_module_response response = call_module_api(make_module_request("resource_budget", "describe"));
+    return response.ok ? response.payload : response.error;
+}
+
+bool common_runtime_provider::set_recovery_policy(const recovery_policy &policy, std::string *error)
+{
+    return response_bool(call_module_api(make_module_request("recovery_supervisor",
+                                                             "set_policy",
+                                                             policy.failure_class,
+                                                             encode_recovery_policy_payload(policy))),
+                         error);
+}
+
+recovery_action common_runtime_provider::observe_failure(const failure_observation &failure)
+{
+    const common_module_response response =
+        call_module_api(make_module_request("recovery_supervisor", "observe", failure.task_id, encode_failure_payload(failure)));
+    recovery_action action;
+    if (!response.ok)
+    {
+        action.reason = response.error;
+        return action;
+    }
+    std::string error;
+    if (!decode_recovery_action_payload(response.payload, &action, &error))
+    {
+        action.reason = error;
+    }
+    return action;
+}
+
+std::string common_runtime_provider::describe_recovery() const
+{
+    const common_module_response response = call_module_api(make_module_request("recovery_supervisor", "describe"));
+    return response.ok ? response.payload : response.error;
+}
+
+bool common_runtime_provider::put_blackboard(const blackboard_entry &entry, blackboard_entry *stored, std::string *error)
+{
+    const common_module_response response =
+        call_module_api(make_module_request("blackboard", "put", entry.key, encode_blackboard_payload(entry)));
+    if (!response.ok)
+    {
+        set_response_error(response, error);
+        return false;
+    }
+    if (stored != nullptr)
+    {
+        std::string decode_error;
+        if (!decode_blackboard_payload(response.payload, stored, &decode_error))
+        {
+            if (error != nullptr)
+            {
+                *error = decode_error;
+            }
+            return false;
+        }
+    }
+    clear_error(error);
+    return true;
+}
+
+bool common_runtime_provider::get_blackboard(const std::string &key, blackboard_entry *entry) const
+{
+    const common_module_response response = call_module_api(make_module_request("blackboard", "get", key));
+    if (!response.ok)
+    {
+        return false;
+    }
+    std::string error;
+    return decode_blackboard_payload(response.payload, entry, &error);
+}
+
+std::vector<blackboard_entry> common_runtime_provider::blackboard_snapshot(bool include_expired, uint64_t now_ms) const
+{
+    const common_module_response response = call_module_api(make_module_request(
+        "blackboard",
+        "snapshot",
+        "",
+        encode_fields({{"include_expired", include_expired ? "true" : "false"}, {"now_ms", std::to_string(now_ms)}})));
+    std::vector<blackboard_entry> entries;
+    std::string error;
+    if (response.ok)
+    {
+        (void)decode_items(response.payload, &entries, decode_blackboard_payload, &error);
+    }
+    return entries;
+}
+
+bool common_runtime_provider::register_contract(const agent_contract &contract, std::string *error)
+{
+    return response_bool(
+        call_module_api(make_module_request("contract_verifier", "register", contract.contract_id, encode_contract_payload(contract))),
+        error);
+}
+
+contract_evaluation common_runtime_provider::evaluate_input(const std::string &contract_id, const std::string &input) const
+{
+    const common_module_response response = call_module_api(make_module_request(
+        "contract_verifier", "evaluate_input", contract_id, encode_fields({{"contract_id", contract_id}, {"input", input}})));
+    if (!response.ok)
+    {
+        return failed_contract_evaluation(contract_id, response.error);
+    }
+    contract_evaluation evaluation;
+    std::string error;
+    return decode_contract_evaluation_payload(response.payload, &evaluation, &error)
+               ? evaluation
+               : failed_contract_evaluation(contract_id, error);
+}
+
+contract_evaluation common_runtime_provider::evaluate_output(const std::string &contract_id,
+                                                             const std::string &output,
+                                                             const std::vector<std::string> &policy_labels) const
+{
+    std::vector<std::pair<std::string, std::string>> fields;
+    fields.push_back({"contract_id", contract_id});
+    fields.push_back({"output", output});
+    for (const std::string &label : policy_labels)
+    {
+        fields.push_back({"policy_label", label});
+    }
+    const common_module_response response =
+        call_module_api(make_module_request("contract_verifier", "evaluate_output", contract_id, encode_fields(fields)));
+    if (!response.ok)
+    {
+        return failed_contract_evaluation(contract_id, response.error);
+    }
+    contract_evaluation evaluation;
+    std::string error;
+    return decode_contract_evaluation_payload(response.payload, &evaluation, &error)
+               ? evaluation
+               : failed_contract_evaluation(contract_id, error);
+}
+
+std::string common_runtime_provider::describe_contracts() const
+{
+    const common_module_response response = call_module_api(make_module_request("contract_verifier", "describe"));
+    return response.ok ? response.payload : response.error;
+}
+
+std::vector<human_interaction_request> common_runtime_provider::human_snapshot() const
+{
+    const common_module_response response = call_module_api(make_module_request("human_interaction", "snapshot"));
+    std::vector<human_interaction_request> requests;
+    std::string error;
+    if (response.ok)
+    {
+        (void)decode_items(response.payload, &requests, decode_human_payload, &error);
+    }
+    return requests;
+}
+
+std::vector<human_interaction_request> common_runtime_provider::pending_human() const
+{
+    const common_module_response response = call_module_api(make_module_request("human_interaction", "pending"));
+    std::vector<human_interaction_request> requests;
+    std::string error;
+    if (response.ok)
+    {
+        (void)decode_items(response.payload, &requests, decode_human_payload, &error);
+    }
+    return requests;
+}
+
+common_runtime_config load_common_runtime_config()
+{
+    common_runtime_config config;
+    const std::string provider =
+        config_string("common_modules_provider", "", "rASN common module provider: local or distributed");
+    const std::string legacy_mode =
+        config_string("common_modules_mode", "local", "legacy rASN common module mode: embedded or distributed");
+    config.provider = normalize_common_runtime_provider_name(provider.empty() ? legacy_mode : provider);
+    config.state_prefix = trim(config_string(
+        "common_modules_state_prefix", "rasn/runtime/modules", "State key prefix for distributed rASN common modules"));
+    if (config.state_prefix.empty())
+    {
+        config.state_prefix = "rasn/runtime/modules";
+    }
+    config.strict = ::dsn_config_get_value_bool("rasn.runtime",
+                                                "common_modules_strict",
+                                                false,
+                                                "Treat distributed common module provider failures as strict warnings");
+    return config;
+}
+
+std::unique_ptr<common_runtime> create_common_runtime(rasn_service_graph &services, const common_runtime_config &config)
+{
+    std::unique_ptr<common_runtime_provider> provider;
+    if (normalize_common_runtime_provider_name(config.provider) == "distributed")
+    {
+        provider.reset(new distributed_common_runtime_provider(services, config));
+    }
+    else
+    {
+        provider.reset(new local_common_runtime_provider(config));
+    }
+    return std::unique_ptr<common_runtime>(new common_runtime(std::move(provider)));
+}
+
+common_module_response dispatch_common_module_request(const common_module_request &request)
+{
+    if (request.module.empty())
+    {
+        return make_common_module_error(request, "common module request missing module");
+    }
+    if (request.operation.empty())
+    {
+        return make_common_module_error(request, "common module request missing operation");
+    }
+    return global_common_module_store().dispatch(request);
+}
+
+rasn_common_module_rpc_service::rasn_common_module_rpc_service(std::vector<std::string> modules)
+    : ::dsn::serverlet<rasn_common_module_rpc_service>("rasn.common.modules"),
+      _modules(modules.empty() ? common_runtime_module_names() : std::move(modules))
+{
+}
+
+void rasn_common_module_rpc_service::open_service()
+{
+    dinfo("opening rasn.common.modules serverlet with module API(s): %s", join_strings(_modules, ",").c_str());
+    for (const std::string &module : _modules)
+    {
+        if (!register_module_handler(module))
+        {
+            dwarn("failed to register common module API handler for '%s'", module.c_str());
+        }
+    }
+}
+
+void rasn_common_module_rpc_service::close_service()
+{
+    dinfo("closing rasn.common.modules serverlet with %d module API(s)", static_cast<int>(_modules.size()));
+    for (const std::string &module : _modules)
+    {
+        unregister_module_handler(module);
+    }
+}
+
+bool rasn_common_module_rpc_service::register_module_handler(const std::string &module)
+{
+    bool registered = false;
+    if (module == "agent_control_plane")
+    {
+        registered = this->register_async_rpc_handler(
+            RPC_RASN_AGENT_CONTROL, "agent_control", &rasn_common_module_rpc_service::on_agent_control);
+    }
+    else if (module == "agent_message_bus")
+    {
+        registered = this->register_async_rpc_handler(
+            RPC_RASN_MESSAGE_BUS, "message_bus", &rasn_common_module_rpc_service::on_message_bus);
+    }
+    else if (module == "task_orchestration_kernel")
+    {
+        registered = this->register_async_rpc_handler(
+            RPC_RASN_TASK_ORCHESTRATION, "task_orchestration", &rasn_common_module_rpc_service::on_task_orchestration);
+    }
+    else if (module == "determinism_ledger")
+    {
+        registered = this->register_async_rpc_handler(
+            RPC_RASN_DETERMINISM_LEDGER, "determinism_ledger", &rasn_common_module_rpc_service::on_determinism_ledger);
+    }
+    else if (module == "capability_directory")
+    {
+        registered = this->register_async_rpc_handler(
+            RPC_RASN_CAPABILITY_DIRECTORY, "capability_directory", &rasn_common_module_rpc_service::on_capability_directory);
+    }
+    else if (module == "resource_budget")
+    {
+        registered = this->register_async_rpc_handler(
+            RPC_RASN_RESOURCE_BUDGET, "resource_budget", &rasn_common_module_rpc_service::on_resource_budget);
+    }
+    else if (module == "recovery_supervisor")
+    {
+        registered = this->register_async_rpc_handler(
+            RPC_RASN_RECOVERY_SUPERVISOR, "recovery_supervisor", &rasn_common_module_rpc_service::on_recovery_supervisor);
+    }
+    else if (module == "blackboard")
+    {
+        registered =
+            this->register_async_rpc_handler(RPC_RASN_BLACKBOARD, "blackboard", &rasn_common_module_rpc_service::on_blackboard);
+    }
+    else if (module == "contract_verifier")
+    {
+        registered = this->register_async_rpc_handler(
+            RPC_RASN_CONTRACT_VERIFIER, "contract_verifier", &rasn_common_module_rpc_service::on_contract_verifier);
+    }
+    else if (module == "human_interaction")
+    {
+        registered = this->register_async_rpc_handler(
+            RPC_RASN_HUMAN_INTERACTION, "human_interaction", &rasn_common_module_rpc_service::on_human_interaction);
+    }
+    else if (module == "sandbox_runtime")
+    {
+        registered = this->register_async_rpc_handler(
+            RPC_RASN_SANDBOX_RUNTIME, "sandbox_runtime", &rasn_common_module_rpc_service::on_sandbox_runtime);
+    }
+    else
+    {
+        dwarn("unknown common module API '%s' is not registered", module.c_str());
+        return false;
+    }
+    return registered;
+}
+
+void rasn_common_module_rpc_service::unregister_module_handler(const std::string &module)
+{
+    if (!has_module(common_runtime_module_names(), module))
+    {
+        return;
+    }
+    this->unregister_rpc_handler(rpc_code_for_module(module));
+}
+
+void rasn_common_module_rpc_service::on_agent_control(const common_module_request &request,
+                                                      ::dsn::rpc_replier<common_module_response> &reply)
+{
+    common_module_request copy = request;
+    force_common_module(&copy, "agent_control_plane");
+    reply(dispatch_common_module_request(copy));
+}
+
+void rasn_common_module_rpc_service::on_message_bus(const common_module_request &request,
+                                                    ::dsn::rpc_replier<common_module_response> &reply)
+{
+    common_module_request copy = request;
+    force_common_module(&copy, "agent_message_bus");
+    reply(dispatch_common_module_request(copy));
+}
+
+void rasn_common_module_rpc_service::on_task_orchestration(const common_module_request &request,
+                                                           ::dsn::rpc_replier<common_module_response> &reply)
+{
+    common_module_request copy = request;
+    force_common_module(&copy, "task_orchestration_kernel");
+    reply(dispatch_common_module_request(copy));
+}
+
+void rasn_common_module_rpc_service::on_determinism_ledger(const common_module_request &request,
+                                                           ::dsn::rpc_replier<common_module_response> &reply)
+{
+    common_module_request copy = request;
+    force_common_module(&copy, "determinism_ledger");
+    reply(dispatch_common_module_request(copy));
+}
+
+void rasn_common_module_rpc_service::on_capability_directory(const common_module_request &request,
+                                                             ::dsn::rpc_replier<common_module_response> &reply)
+{
+    common_module_request copy = request;
+    force_common_module(&copy, "capability_directory");
+    reply(dispatch_common_module_request(copy));
+}
+
+void rasn_common_module_rpc_service::on_resource_budget(const common_module_request &request,
+                                                        ::dsn::rpc_replier<common_module_response> &reply)
+{
+    common_module_request copy = request;
+    force_common_module(&copy, "resource_budget");
+    reply(dispatch_common_module_request(copy));
+}
+
+void rasn_common_module_rpc_service::on_recovery_supervisor(const common_module_request &request,
+                                                            ::dsn::rpc_replier<common_module_response> &reply)
+{
+    common_module_request copy = request;
+    force_common_module(&copy, "recovery_supervisor");
+    reply(dispatch_common_module_request(copy));
+}
+
+void rasn_common_module_rpc_service::on_blackboard(const common_module_request &request,
+                                                   ::dsn::rpc_replier<common_module_response> &reply)
+{
+    common_module_request copy = request;
+    force_common_module(&copy, "blackboard");
+    reply(dispatch_common_module_request(copy));
+}
+
+void rasn_common_module_rpc_service::on_contract_verifier(const common_module_request &request,
+                                                          ::dsn::rpc_replier<common_module_response> &reply)
+{
+    common_module_request copy = request;
+    force_common_module(&copy, "contract_verifier");
+    reply(dispatch_common_module_request(copy));
+}
+
+void rasn_common_module_rpc_service::on_human_interaction(const common_module_request &request,
+                                                          ::dsn::rpc_replier<common_module_response> &reply)
+{
+    common_module_request copy = request;
+    force_common_module(&copy, "human_interaction");
+    reply(dispatch_common_module_request(copy));
+}
+
+void rasn_common_module_rpc_service::on_sandbox_runtime(const common_module_request &request,
+                                                        ::dsn::rpc_replier<common_module_response> &reply)
+{
+    common_module_request copy = request;
+    force_common_module(&copy, "sandbox_runtime");
+    reply(dispatch_common_module_request(copy));
+}
+
+std::pair<::dsn::error_code, common_module_response>
+rasn_common_module_client::call_sync(const common_module_request &request,
+                                     std::chrono::milliseconds timeout,
+                                     int thread_hash,
+                                     uint64_t partition_hash)
+{
+    return ::dsn::rpc::wait_and_unwrap<common_module_response>(::dsn::rpc::call(
+        _server, rpc_code_for_module(request.module), request, nullptr, empty_callback, timeout, thread_hash, partition_hash));
+}
+
+::dsn::error_code rasn_common_module_app::start(int argc, char **argv)
+{
+    global_rasn_services().acquire();
+    _rpc.open_service();
+    return ::dsn::ERR_OK;
+}
+
+rasn_common_module_app::rasn_common_module_app(::dsn_gpid gpid)
+    : ::dsn::service_app(gpid), _rpc(common_runtime_module_names())
+{
+}
+
+rasn_common_module_app::rasn_common_module_app(::dsn_gpid gpid, std::vector<std::string> modules)
+    : ::dsn::service_app(gpid), _rpc(std::move(modules))
+{
+}
+
+void register_rasn_common_module_apps()
+{
+    dassert(::dsn::register_app<rasn_common_module_app>("rasn.common.modules"),
+            "register rasn.common.modules app failed");
+    dassert(::dsn::register_app<rasn_agent_control_module_app>("rasn.common.agent_control"),
+            "register rasn.common.agent_control app failed");
+    dassert(::dsn::register_app<rasn_message_bus_module_app>("rasn.common.message_bus"),
+            "register rasn.common.message_bus app failed");
+    dassert(::dsn::register_app<rasn_task_orchestration_module_app>("rasn.common.task_kernel"),
+            "register rasn.common.task_kernel app failed");
+    dassert(::dsn::register_app<rasn_determinism_ledger_module_app>("rasn.common.determinism"),
+            "register rasn.common.determinism app failed");
+    dassert(::dsn::register_app<rasn_capability_directory_module_app>("rasn.common.capability"),
+            "register rasn.common.capability app failed");
+    dassert(::dsn::register_app<rasn_resource_budget_module_app>("rasn.common.budget"),
+            "register rasn.common.budget app failed");
+    dassert(::dsn::register_app<rasn_recovery_supervisor_module_app>("rasn.common.recovery"),
+            "register rasn.common.recovery app failed");
+    dassert(::dsn::register_app<rasn_blackboard_module_app>("rasn.common.blackboard"),
+            "register rasn.common.blackboard app failed");
+    dassert(::dsn::register_app<rasn_contract_verifier_module_app>("rasn.common.contract"),
+            "register rasn.common.contract app failed");
+    dassert(::dsn::register_app<rasn_human_interaction_module_app>("rasn.common.human_interaction"),
+            "register rasn.common.human_interaction app failed");
+    dassert(::dsn::register_app<rasn_sandbox_runtime_module_app>("rasn.common.sandbox_runtime"),
+            "register rasn.common.sandbox_runtime app failed");
+}
+
+::dsn::error_code rasn_common_module_app::stop(bool cleanup)
+{
+    _rpc.close_service();
+    global_rasn_services().release();
+    return ::dsn::ERR_OK;
+}
+
+std::string describe_agent_control_record(const agent_control_record &record)
+{
+    std::ostringstream output;
+    output << "agent_id=" << record.descriptor.agent_id
+           << "\nrole=" << record.descriptor.role
+           << "\napp=" << record.descriptor.app_name
+           << "\nstate=" << record.state
+           << "\nplacement=" << record.placement
+           << "\nowner=" << record.owner
+           << "\nrestart_policy=" << record.restart_policy
+           << "\nlast_error=" << record.last_error
+           << "\ngeneration=" << record.generation
+           << "\nlast_heartbeat_ms=" << record.last_heartbeat_ms
+           << "\nlease_expires_ms=" << record.lease_expires_ms
+           << "\ncapabilities=";
+    for (size_t i = 0; i < record.descriptor.capabilities.size(); ++i)
+    {
+        if (i != 0)
+        {
+            output << ",";
+        }
+        output << record.descriptor.capabilities[i].name;
+    }
+    return output.str();
+}
+
+std::string describe_capability_provider_record(const capability_provider &provider)
+{
+    std::ostringstream output;
+    output << "provider_id=" << provider.descriptor.agent_id
+           << "\nstate=" << provider.state
+           << "\nplacement=" << provider.placement
+           << "\nlabels=" << join_strings(provider.labels, ",")
+           << "\nload=" << provider.load
+           << "\nlast_seen_ms=" << provider.last_seen_ms;
+    return output.str();
+}
+
+std::string describe_resource_quota_record(const resource_quota &quota)
+{
+    std::ostringstream output;
+    output << "scope=" << quota.scope
+           << "\nmax_cost_units=" << quota.max_cost_units
+           << "\nmax_latency_ms=" << quota.max_latency_ms
+           << "\nmax_tokens=" << quota.max_tokens
+           << "\nmax_tool_calls=" << quota.max_tool_calls;
+    return output.str();
+}
+
+std::string describe_resource_decision_record(const resource_budget_decision &decision)
+{
+    std::ostringstream output;
+    output << "allowed=" << (decision.allowed ? "true" : "false")
+           << "\nscope=" << decision.scope
+           << "\nreason=" << decision.reason
+           << "\ncost_units=" << decision.usage_after.cost_units
+           << "\nlatency_ms=" << decision.usage_after.latency_ms
+           << "\ntokens=" << decision.usage_after.tokens
+           << "\ntool_calls=" << decision.usage_after.tool_calls;
+    return output.str();
+}
+
+std::string describe_resource_usage_record(const resource_usage &usage)
+{
+    std::ostringstream output;
+    output << "scope=" << usage.scope
+           << "\ncost_units=" << usage.cost_units
+           << "\nlatency_ms=" << usage.latency_ms
+           << "\ntokens=" << usage.tokens
+           << "\ntool_calls=" << usage.tool_calls;
+    return output.str();
+}
+
+std::string describe_recovery_policy_record(const recovery_policy &policy)
+{
+    std::ostringstream output;
+    output << "failure_class=" << policy.failure_class
+           << "\nmax_attempts=" << policy.max_attempts
+           << "\nretry_delay_ms=" << policy.retry_delay_ms
+           << "\nescalate_after_attempts=" << policy.escalate_after_attempts
+           << "\nretryable=" << (policy.retryable ? "true" : "false")
+           << "\ncompensation=" << policy.compensation;
+    return output.str();
+}
+
+std::string describe_failure_observation_record(const failure_observation &failure)
+{
+    std::ostringstream output;
+    output << "task_id=" << failure.task_id
+           << "\ncomponent=" << failure.component
+           << "\nfailure_class=" << failure.failure_class
+           << "\ncode=" << failure.code
+           << "\nmessage=" << failure.message
+           << "\nattempt=" << failure.attempt
+           << "\nretryable=" << (failure.retryable ? "true" : "false")
+           << "\ntime_ms=" << failure.time_ms;
+    return output.str();
+}
+
+std::string describe_contract_record(const agent_contract &contract)
+{
+    std::ostringstream output;
+    output << "contract_id=" << contract.contract_id
+           << "\nrequire_input_non_empty=" << (contract.require_input_non_empty ? "true" : "false")
+           << "\nrequire_output_non_empty=" << (contract.require_output_non_empty ? "true" : "false")
+           << "\nmax_output_bytes=" << contract.max_output_bytes
+           << "\nrequired_input_fragments=" << join_strings(contract.required_input_fragments, ",")
+           << "\nrequired_output_fragments=" << join_strings(contract.required_output_fragments, ",")
+           << "\nforbidden_output_fragments=" << join_strings(contract.forbidden_output_fragments, ",")
+           << "\nrequired_policy_labels=" << join_strings(contract.required_policy_labels, ",");
+    return output.str();
+}
+
+std::string describe_orchestration_task_record(const orchestration_task &task)
+{
+    std::ostringstream output;
+    output << "task_id=" << task.task_id
+           << "\nparent_task_id=" << task.parent_task_id
+           << "\nowner_agent=" << task.owner_agent
+           << "\nstate=" << task.state
+           << "\ninput=" << task.input
+           << "\noutput=" << task.output
+           << "\nerror=" << task.error
+           << "\ndepends_on=" << join_strings(task.depends_on, ",")
+           << "\ncompensation=" << task.compensation
+           << "\ndeadline_ms=" << task.deadline_ms
+           << "\ngeneration=" << task.generation;
+    return output.str();
+}
+
+std::string describe_agent_message_record(const agent_message &message)
+{
+    std::ostringstream output;
+    output << "message_id=" << message.message_id
+           << "\ncorrelation_id=" << message.correlation_id
+           << "\nsender=" << message.sender
+           << "\nreceiver=" << message.receiver
+           << "\ntype=" << message.type
+           << "\npayload=" << message.payload
+           << "\nstate=" << message.state
+           << "\nerror=" << message.error
+           << "\nattempt=" << message.attempt
+           << "\ndeadline_ms=" << message.deadline_ms
+           << "\navailable_at_ms=" << message.available_at_ms
+           << "\ncreated_at_ms=" << message.created_at_ms
+           << "\nupdated_at_ms=" << message.updated_at_ms;
+    return output.str();
+}
+
+std::string describe_choice_record(const deterministic_choice &choice)
+{
+    std::ostringstream output;
+    output << "sequence=" << choice.sequence
+           << "\ntask_id=" << choice.task_id
+           << "\nkey=" << choice.key
+           << "\nsource=" << choice.source
+           << "\nvalue=" << choice.value;
+    return output.str();
+}
+
+std::string describe_blackboard_record(const blackboard_entry &entry)
+{
+    std::ostringstream output;
+    output << "key=" << entry.key
+           << "\nkind=" << entry.kind
+           << "\nowner=" << entry.owner
+           << "\nvalue=" << entry.value
+           << "\ntags=" << join_strings(entry.tags, ",")
+           << "\ngeneration=" << entry.generation
+           << "\ncreated_at_ms=" << entry.created_at_ms
+           << "\nupdated_at_ms=" << entry.updated_at_ms
+           << "\nexpires_at_ms=" << entry.expires_at_ms;
+    return output.str();
+}
+
+} // namespace rasn
+} // namespace dsn
