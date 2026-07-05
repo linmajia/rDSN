@@ -6,6 +6,7 @@
 #include <rasn/blackboard.h>
 #include <rasn/capability_directory.h>
 #include <rasn/contract_verifier.h>
+#include <rasn/coordination_service.h>
 #include <rasn/determinism_ledger.h>
 #include <rasn/human_interaction.h>
 #include <rasn/recovery_supervisor.h>
@@ -423,6 +424,11 @@ rasn_runtime_config load_rasn_runtime_config();
 std::unique_ptr<rasn_runtime> create_rasn_runtime(rasn_service_graph &services, const rasn_runtime_config &config);
 rasn_runtime_response dispatch_rasn_runtime_request(const rasn_runtime_request &request);
 std::vector<std::string> rasn_runtime_module_names();
+// Ownership resources a runtime service must acquire before serving the given
+// modules: one resource per module, or one per hosted shard when the module is
+// sharded. Used by the default-off single-writer ownership gate; exported so it
+// can be unit-tested independently of a live app host.
+std::vector<std::string> rasn_runtime_module_ownership_resources(const std::vector<std::string> &modules);
 std::vector<rasn_runtime_descriptor> rasn_runtime_module_descriptors();
 std::string rasn_runtime_module_app_role(const std::string &module_or_role);
 std::string normalize_rasn_runtime_app_list(const std::string &app_list);
@@ -488,6 +494,8 @@ protected:
 
 private:
     ::dsn::error_code hydrate_modules_from_state();
+    ::dsn::error_code acquire_module_ownership();
+    void release_module_ownership();
     void register_modules_with_registry();
     void heartbeat_modules_to_registry();
     void unregister_modules_from_registry();
@@ -497,6 +505,12 @@ private:
     rasn_runtime_rpc_service _rpc;
     std::vector<agent_descriptor> _registry_descriptors;
     ::dsn::task_ptr _registry_heartbeat_timer;
+    // Default-off single-writer ownership gate (see acquire_module_ownership).
+    // Null unless the gate is enabled; holds ownership of _owned_resources
+    // (acquired as _owner_id) until stop() releases them.
+    std::unique_ptr<rasn_coordination_service> _coordination;
+    std::vector<std::string> _owned_resources;
+    std::string _owner_id;
 };
 
 class rasn_agent_control_module_app : public rasn_runtime_app

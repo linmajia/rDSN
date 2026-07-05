@@ -4546,6 +4546,27 @@ TEST(rasn_runtime, dispatch_dedups_repeated_request_signatures)
     EXPECT_EQ("no-id-key-b", no_id_b_response.key);
 }
 
+TEST(rasn_runtime, ownership_resources_expand_modules_and_shards)
+{
+    // No hosted shards are configured in the unit-test host, so each module maps
+    // to exactly one module-level ownership resource, in the given order.
+    const std::vector<std::string> resources =
+        rasn_runtime_module_ownership_resources({"determinism_ledger", "blackboard"});
+    ASSERT_EQ(2u, resources.size());
+    EXPECT_EQ("rasn.runtime.determinism_ledger", resources[0]);
+    EXPECT_EQ("rasn.runtime.blackboard", resources[1]);
+
+    // Every resource is namespaced under the runtime module capability prefix so
+    // it never collides with unrelated coordination locks.
+    for (const std::string &resource : resources)
+    {
+        EXPECT_EQ(0u, resource.find("rasn.runtime."));
+    }
+
+    // No modules means nothing to own (the gate opens handlers immediately).
+    EXPECT_TRUE(rasn_runtime_module_ownership_resources({}).empty());
+}
+
 } // namespace
 } // namespace rasn
 } // namespace dsn

@@ -413,10 +413,16 @@ than reinventing consensus in rASN.
 > explicit. Use `<module>_shard_count` and per-shard endpoints only to partition
 > sharded modules by key; replicated modules still need exactly one active writer
 > until a real replicated backend fronts them. That single-writer constraint is now
-> *enforceable* rather than operator-discipline-only: the coordination module
-> (§13.7) elects exactly one owner per shard via rDSN `distributed_lock_service`, so
-> a module can acquire ownership before serving writes even before quorum
-> replication lands.
+> *enforced at startup*, not operator-discipline-only: when
+> `rasn_runtime_ownership_gate_enabled = true`, each standalone module service
+> acquires ownership of every module (or hosted shard) it serves through the
+> coordination module (§13.7) — reusing rDSN `distributed_lock_service` — **before**
+> opening its RPC API, and fails closed if another node already owns that
+> module/shard. The gate is wired into `rasn_runtime_app::start()` (between state
+> hydration and `open_service`) and defaults **off**: the `inproc` backend only
+> coordinates within one process, so real cross-process single-writer enforcement
+> needs `provider = simple|zookeeper`. This lands the ownership half of finding 1.1
+> even before quorum replication of the state itself.
 
 ## 9. Discovery and security
 
@@ -517,6 +523,42 @@ blackboard_shard_count = 2
 blackboard_hosted_shards = 0
 ```
 
+Single-writer ownership across two nodes (active/standby for one shard). Deploy the
+**same** stanza on two nodes that both host `blackboard` shard 0. With a cross-process
+coordination backend, exactly one node acquires ownership and opens its RPC API; the
+other **fails closed** at startup (`refusing to open module APIs`) and can be left
+running as a warm standby that wins ownership once the primary's lease lapses:
+
+```ini
+[rasn.service]
+rasn_runtime_registry_registration_enabled = true
+blackboard_shard_count = 2
+blackboard_hosted_shards = 0
+; Acquire single-writer ownership of the hosted shard before serving writes.
+rasn_runtime_ownership_gate_enabled = true
+
+[rasn.coordination]
+; inproc coordinates only within one process; use zookeeper for real cross-node
+; single-writer. Requires a --build_plugins build + THREAD_POOL_META_SERVER (see §13.7).
+provider = zookeeper
+lock_namespace = /rasn/locks
+acquire_timeout_ms = 5000
+
+[zookeeper]
+hosts_list = zk-1:2181,zk-2:2181,zk-3:2181
+```
+
+> **Multi-process test procedure (needs a `--build_plugins` build + a ZooKeeper
+> ensemble; not runnable in a single-node local build).** (1) Start ZooKeeper. (2)
+> Launch two module services with the stanza above on different ports/hosts, both
+> `blackboard_hosted_shards = 0`. (3) Assert exactly one logs a successful start and
+> serves `put_blackboard` for a shard-0 key, while the other logs `failed to acquire
+> ownership of rasn.runtime.blackboard.shard.0 ... refusing to open module APIs`. (4)
+> Stop the owner; within one lease interval the standby acquires ownership and begins
+> serving. With `provider = inproc` this test degenerates to a single process (the
+> `inproc` backend does not coordinate across processes), so it must run against
+> `simple` (one process) or `zookeeper` (many processes).
+
 State mirror durability watermarks:
 
 ```ini
@@ -559,14 +601,23 @@ codepilot.exe --dsn config.rasn.ini "rasn.state;resource_budget"
 - **Distributed coordination — DELIVERED (§13.7):** a coordination module reusing
   rDSN `distributed_lock_service` (leader election / single-writer ownership) and
   `meta_state_service` (cluster-shared state), with `inproc`/`simple`/`zookeeper`
-  backends. Remaining: wire runtime modules to acquire ownership before serving
-  writes, and move breaker/dedup/quota counters onto the shared store (finding 1.5).
+  backends. Ownership wiring is now landed: `rasn_runtime_app::start()` acquires
+  ownership of each hosted module/shard before opening its RPC API when
+  `rasn_runtime_ownership_gate_enabled = true` (default off; fail-closed on
+  contention). Remaining: move breaker/dedup/quota counters onto the shared store
+  (finding 1.5), and validate cross-process single-writer on a `simple`/`zookeeper`
+  backend under multi-node.
 - Multi-process integration tests for the distributed/hybrid RPC paths.
 - Generated typed RPC schemas per module (replace the generic envelope payload).
 - State-mirror compaction/watermarks promotion is partially complete: watermarks
   are written and verified, and operators can run a watermark-verified checkpoint
   compaction command; explicit watermark pruning and local-to-remote migration
-  tooling remain.
+  tooling remain. **Prerequisite for pruning:** the state store keeps one record
+  per key in an in-memory `std::map` and exposes no delete — reclaiming keys that
+  are already folded below a verified watermark needs a new `RPC_RASN_STATE_DELETE`
+  op (store erase + journal tombstone + service-graph/client/provider routing).
+  Migration can reuse the existing `query_state`/`put_state` ops to replay a local
+  mirror onto a remote state service.
 - Real replicated storage and shard durability via rDSN-native replication/partitioning.
 - Deployment examples/tests for multi-node and URI-backed module clusters.
 - End-to-end trace propagation across core/module RPC envelopes — **DONE** (§13.4).
@@ -611,7 +662,7 @@ bespoke mechanism, the audit names the rDSN facility that should back it.
 
 | # | Sev | Finding | Status |
 | --- | --- | --- | --- |
-| 1.1 | P0 | **Stateful modules are single-writer in-memory, not quorum-replicated.** The 11 runtime modules and the state service realize `replicated`/`sharded` intent (§8) as single-writer singletons mirrored to `rasn.state`; running >1 active writer per shard is split-brain, not HA. | **MITIGATED (code)** — the new coordination module (§13.7) reuses rDSN `distributed_lock_service` to elect **exactly one** active owner per shard (single-writer enforcement / leader election). Quorum **replication** of the state itself still DOCUMENTED → §13.5 (`replicated_service_app_type_1`) |
+| 1.1 | P0 | **Stateful modules are single-writer in-memory, not quorum-replicated.** The 11 runtime modules and the state service realize `replicated`/`sharded` intent (§8) as single-writer singletons mirrored to `rasn.state`; running >1 active writer per shard is split-brain, not HA. | **MITIGATED (code)** — the coordination module (§13.7) reuses rDSN `distributed_lock_service`, and `rasn_runtime_app::start()` now **acquires ownership of each hosted module/shard before opening its RPC API** (`rasn_runtime_ownership_gate_enabled`, default off, fail-closed on contention), enforcing exactly one active owner per shard. Quorum **replication** of the state itself still DOCUMENTED → §13.5 (`replicated_service_app_type_1`); cross-process enforcement needs `simple`/`zookeeper` + multi-node validation |
 | 1.2 | P0 | **Core services had no RPC resilience.** `rasn.state` / `rasn.workflow` / `rasn.observability` clients made one-shot RPCs — no breaker, no retry — while the module path was fully hardened. A single transient blip failed the call. | **RESOLVED (code)** — §7.1, `rpc_resilience.h`, wrapped in `agent_services.cpp` |
 | 1.3 | P0 | **Registry discovery is an in-memory SPOF on the request path.** Routing resolves live endpoints through a single `rasn.registry`; if that lookup blips the request fails, and the registry itself is not replicated. | **MITIGATED (code)** — the routing-critical discovery query in `coordinator_service.cpp` now goes through `resilient_rpc_call` (breaker + idempotent retry). Registry **HA** still DOCUMENTED → §13.5 (meta-server / ZooKeeper) |
 | 1.4 | P1 | **RPC envelopes carry no end-to-end trace id.** `agent_request`/`response` carry `trace_id`, but the runtime-module envelope (`make_module_request`) didn't propagate it, so a call couldn't be followed across nodes in logs. | **RESOLVED (code)** — §13.4; `trace_id` added to the runtime-module envelope (EOF-safe), stamped from an ambient scope on egress, restored/echoed on ingress |
@@ -843,9 +894,21 @@ delete) against the facade. The `inproc` path and config defaults always run; th
 rDSN lock + meta-state providers, including a concurrent-`put_state` case that races
 eight writers on one fresh key and asserts they all succeed (last-writer-wins).
 
-**What remains.** The module delivers the *facility*; consuming it inside the runtime
-modules is the follow-up: (a) have each `replicated`/`sharded` module acquire
-ownership before serving writes (turns §8's operator-discipline single-writer into an
-*enforced* one), and (b) move breaker/dedup/admission/rate counters onto the shared
-state store for cluster-global protection (finding 1.5 wiring). Quorum **replication**
-of the state itself remains the §13.5 `replicated_service_app_type_1` item.
+**Wired into the runtime (as-built).** Consuming the facility inside the module
+services is now landed for the ownership half: `rasn_runtime_app::start()` calls
+`acquire_module_ownership()` between state hydration and `open_service()`. When
+`rasn_runtime_ownership_gate_enabled = true`, it builds a coordination service from
+`[rasn.coordination]`, then acquires ownership of each module (or hosted shard) the
+service serves — resources named `rasn.runtime.<module>[.shard.<n>]`, owner id = the
+node's primary address — and **fails closed** (refuses to open the RPC API, releasing
+anything it took) if a resource is already owned. `stop()` releases all held
+ownership. The resource derivation is unit-tested
+(`rasn_runtime_module_ownership_resources`). Default off, so single-node/local runs
+and the `inproc` backend are unaffected; turning §8's operator-discipline
+single-writer into an *enforced* one requires `provider = simple|zookeeper`.
+
+**What remains.** (a) Move breaker/dedup/admission/rate counters onto the shared
+state store for cluster-global protection (finding 1.5 wiring). (b) Validate
+cross-process single-writer on a `simple`/`zookeeper` backend under multi-node (the
+`inproc` backend only coordinates within one process). Quorum **replication** of the
+state itself remains the §13.5 `replicated_service_app_type_1` item.

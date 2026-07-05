@@ -470,6 +470,15 @@ bool rasn_runtime_state_hydration_enabled()
         "rasn_runtime_state_hydration_enabled", true, "Hydrate rASN runtime module services from mirrored state");
 }
 
+bool rasn_runtime_ownership_gate_enabled()
+{
+    return config_service_bool(
+        "rasn_runtime_ownership_gate_enabled",
+        false,
+        "Acquire single-writer ownership of hosted runtime module shards (via [rasn.coordination]) "
+        "before opening RPC handlers; fail closed on contention");
+}
+
 std::chrono::milliseconds rasn_runtime_state_hydration_timeout()
 {
     const uint64_t timeout_ms = config_service_uint64(
@@ -3439,6 +3448,27 @@ std::vector<std::string> rasn_runtime_module_names()
                                     "sandbox_runtime"};
 }
 
+std::vector<std::string> rasn_runtime_module_ownership_resources(const std::vector<std::string> &modules)
+{
+    std::vector<std::string> resources;
+    for (const std::string &module : modules)
+    {
+        const std::vector<uint32_t> shards = rasn_runtime_hosted_shards(module);
+        if (shards.empty())
+        {
+            resources.push_back(rasn_runtime_module_capability(module));
+        }
+        else
+        {
+            for (const uint32_t shard : shards)
+            {
+                resources.push_back(rasn_runtime_module_shard_capability(module, shard));
+            }
+        }
+    }
+    return resources;
+}
+
 std::vector<rasn_runtime_descriptor> rasn_runtime_module_descriptors()
 {
     std::vector<rasn_runtime_descriptor> descriptors;
@@ -5139,6 +5169,11 @@ agent_descriptor make_rasn_runtime_module_descriptor(const std::string &module,
     {
         return hydration_error;
     }
+    const ::dsn::error_code ownership_error = acquire_module_ownership();
+    if (ownership_error != ::dsn::ERR_OK)
+    {
+        return ownership_error;
+    }
     _rpc.open_service();
     register_modules_with_registry();
     start_registry_heartbeat_timer();
@@ -5204,6 +5239,80 @@ rasn_runtime_app::rasn_runtime_app(::dsn_gpid gpid, std::vector<std::string> mod
               join_strings(_rpc.modules(), ",").c_str());
     }
     return ::dsn::ERR_OK;
+}
+
+::dsn::error_code rasn_runtime_app::acquire_module_ownership()
+{
+    if (!rasn_runtime_ownership_gate_enabled())
+    {
+        return ::dsn::ERR_OK;
+    }
+
+    const ::dsn::rpc_address endpoint = primary_address();
+    if (endpoint.is_invalid())
+    {
+        derror("rASN runtime app %s cannot acquire module ownership: primary address is invalid; "
+               "refusing to open module APIs",
+               name().c_str());
+        return ::dsn::ERR_UNKNOWN;
+    }
+    _owner_id = endpoint.to_std_string();
+
+    _coordination = create_rasn_coordination_service(load_rasn_coordination_config());
+    const ::dsn::error_code start_err = _coordination->start();
+    if (start_err != ::dsn::ERR_OK)
+    {
+        derror("rASN runtime app %s failed to start coordination backend: %s; refusing to open module APIs",
+               name().c_str(),
+               start_err.to_string());
+        _coordination.reset();
+        return start_err;
+    }
+
+    // Acquire single-writer ownership of every hosted module (or each hosted
+    // shard for sharded modules) before opening RPC handlers, so at most one
+    // runtime service serves writes for a given module/shard. Fail closed on
+    // contention: a node that loses the race releases what it took and does not
+    // open handlers for a resource another node owns.
+    const std::vector<std::string> resources = rasn_runtime_module_ownership_resources(_rpc.modules());
+    for (const std::string &resource : resources)
+    {
+        const ::dsn::error_code acquired = _coordination->acquire_ownership(resource, _owner_id);
+        if (acquired != ::dsn::ERR_OK)
+        {
+            derror("rASN runtime app %s failed to acquire ownership of %s: %s; refusing to open module APIs",
+                   name().c_str(),
+                   resource.c_str(),
+                   acquired.to_string());
+            release_module_ownership();
+            return acquired;
+        }
+        _owned_resources.push_back(resource);
+    }
+
+    if (!_owned_resources.empty())
+    {
+        dinfo("rASN runtime app %s acquired single-writer ownership of %llu module resource(s) via %s coordination",
+              name().c_str(),
+              static_cast<unsigned long long>(_owned_resources.size()),
+              _coordination->provider_name());
+    }
+    return ::dsn::ERR_OK;
+}
+
+void rasn_runtime_app::release_module_ownership()
+{
+    if (!_coordination)
+    {
+        return;
+    }
+    for (const std::string &resource : _owned_resources)
+    {
+        (void)_coordination->release_ownership(resource, _owner_id);
+    }
+    _owned_resources.clear();
+    _coordination->stop();
+    _coordination.reset();
 }
 
 void rasn_runtime_app::register_modules_with_registry()
@@ -5434,6 +5543,7 @@ void register_rasn_runtime_apps()
     cancel_registry_heartbeat_timer();
     unregister_modules_from_registry();
     _rpc.close_service();
+    release_module_ownership();
     global_rasn_services().release();
     return ::dsn::ERR_OK;
 }
