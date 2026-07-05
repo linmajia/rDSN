@@ -2,6 +2,7 @@
 
 #include <rasn/rasn_core.h>
 
+#include <algorithm>
 #include <sstream>
 
 namespace dsn {
@@ -77,6 +78,35 @@ deterministic_replay_result determinism_ledger::choose(const std::string &task_i
     result.replayed = false;
     result.choice = choice;
     return result;
+}
+
+bool determinism_ledger::hydrate_choice(const deterministic_choice &choice, std::string *error)
+{
+    if (choice.key.empty())
+    {
+        if (error != nullptr)
+        {
+            *error = "deterministic choice key cannot be empty";
+        }
+        return false;
+    }
+
+    ::dsn::service::zauto_lock guard(_lock);
+    const std::string key = replay_key(choice.task_id, choice.key);
+    for (deterministic_choice &existing : _choices)
+    {
+        if (replay_key(existing.task_id, existing.key) == key)
+        {
+            existing = choice;
+            _replay[key] = choice;
+            _next_sequence = (std::max)(_next_sequence, choice.sequence + 1);
+            return true;
+        }
+    }
+    _choices.push_back(choice);
+    _replay[key] = choice;
+    _next_sequence = (std::max)(_next_sequence, choice.sequence + 1);
+    return true;
 }
 
 void determinism_ledger::set_replay_choices(const std::vector<deterministic_choice> &choices)

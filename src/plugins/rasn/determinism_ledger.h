@@ -42,6 +42,7 @@ public:
                                        const std::string &key,
                                        const std::string &source,
                                        const std::function<std::string()> &generator);
+    bool hydrate_choice(const deterministic_choice &choice, std::string *error);
     void set_replay_choices(const std::vector<deterministic_choice> &choices);
     std::vector<deterministic_choice> snapshot() const;
     std::string to_jsonl() const;

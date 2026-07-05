@@ -55,6 +55,30 @@ bool agent_control_plane::upsert_agent(const agent_control_record &record, std::
     return true;
 }
 
+bool agent_control_plane::hydrate_agent(const agent_control_record &record, std::string *error)
+{
+    if (record.descriptor.agent_id.empty())
+    {
+        if (error != nullptr)
+        {
+            *error = "agent control record missing agent id";
+        }
+        return false;
+    }
+    if (record.descriptor.role.empty())
+    {
+        if (error != nullptr)
+        {
+            *error = "agent control record missing role";
+        }
+        return false;
+    }
+
+    ::dsn::service::zauto_lock guard(_lock);
+    _agents[record.descriptor.agent_id] = record;
+    return true;
+}
+
 bool agent_control_plane::transition(const std::string &agent_id,
                                      const std::string &state,
                                      const std::string &last_error,

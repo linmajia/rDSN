@@ -816,6 +816,47 @@ TEST(rasn_registry, tracks_heartbeat_leases_and_endpoint_refresh)
     EXPECT_EQ("unit.static", live_agents[0].agent_id);
 }
 
+TEST(rasn_registry, shard_capabilities_select_exact_partition_owners)
+{
+    agent_registry registry;
+    agent_descriptor shard0;
+    shard0.agent_id = "rasn.runtime.blackboard@node-a";
+    shard0.role = "rasn.runtime.blackboard";
+    shard0.app_name = "rasn.runtime.blackboard";
+    shard0.host = "127.0.0.1";
+    shard0.port = 27117;
+    shard0.health = "healthy";
+    shard0.capabilities.push_back(
+        make_capability("rasn.runtime.blackboard", "rasn_runtime_request", "rasn_runtime_response", "stateful"));
+    shard0.capabilities.push_back(
+        make_capability("rasn.runtime.blackboard.shard.0", "rasn_runtime_request", "rasn_runtime_response", "stateful"));
+
+    agent_descriptor shard1 = shard0;
+    shard1.agent_id = "rasn.runtime.blackboard@node-b";
+    shard1.host = "127.0.0.2";
+    shard1.port = 27127;
+    shard1.capabilities.pop_back();
+    shard1.capabilities.push_back(
+        make_capability("rasn.runtime.blackboard.shard.1", "rasn_runtime_request", "rasn_runtime_response", "stateful"));
+
+    std::string error;
+    ASSERT_TRUE(registry.register_agent(shard0, &error, true)) << error;
+    ASSERT_TRUE(registry.register_agent(shard1, &error, true)) << error;
+
+    EXPECT_EQ(2u, registry.query_by_capability("rasn.runtime.blackboard", true).size());
+    const std::vector<agent_descriptor> shard0_owners =
+        registry.query_by_capability("rasn.runtime.blackboard.shard.0", true);
+    ASSERT_EQ(1u, shard0_owners.size());
+    EXPECT_EQ("rasn.runtime.blackboard@node-a", shard0_owners[0].agent_id);
+    EXPECT_EQ(27117u, shard0_owners[0].port);
+
+    const std::vector<agent_descriptor> shard1_owners =
+        registry.query_by_capability("rasn.runtime.blackboard.shard.1", true);
+    ASSERT_EQ(1u, shard1_owners.size());
+    EXPECT_EQ("rasn.runtime.blackboard@node-b", shard1_owners[0].agent_id);
+    EXPECT_EQ(27127u, shard1_owners[0].port);
+}
+
 TEST(rasn_coordinator, retries_retryable_model_invocations_with_trace)
 {
     agent_request request;
@@ -1493,6 +1534,94 @@ TEST(rasn_resource_budget, reserves_and_denies_over_budget_requests)
     ASSERT_TRUE(budgets.usage("session", &usage));
     EXPECT_EQ(40u, usage.tokens);
     EXPECT_EQ(1u, usage.tool_calls);
+}
+
+TEST(rasn_runtime_hydration, hydrate_methods_preserve_generated_state)
+{
+    std::string error;
+
+    agent_control_plane control;
+    agent_control_record agent;
+    agent.descriptor.agent_id = "agent/hydrated";
+    agent.descriptor.role = "cli";
+    agent.state = "running";
+    agent.generation = 7;
+    agent.last_heartbeat_ms = 1234;
+    ASSERT_TRUE(control.hydrate_agent(agent, &error)) << error;
+    agent_control_record found_agent;
+    ASSERT_TRUE(control.find("agent/hydrated", &found_agent));
+    EXPECT_EQ(7u, found_agent.generation);
+    EXPECT_EQ(1234u, found_agent.last_heartbeat_ms);
+
+    task_orchestration_kernel tasks;
+    orchestration_task task;
+    task.task_id = "task/hydrated";
+    task.state = "completed";
+    task.output = "done";
+    task.generation = 9;
+    ASSERT_TRUE(tasks.hydrate_task(task, &error)) << error;
+    orchestration_task found_task;
+    ASSERT_TRUE(tasks.find("task/hydrated", &found_task));
+    EXPECT_EQ("completed", found_task.state);
+    EXPECT_EQ(9u, found_task.generation);
+
+    resource_budget_manager budgets;
+    resource_usage usage;
+    usage.scope = "session/hydrated";
+    usage.tokens = 42;
+    usage.tool_calls = 3;
+    ASSERT_TRUE(budgets.hydrate_usage(usage, &error)) << error;
+    resource_usage found_usage;
+    ASSERT_TRUE(budgets.usage("session/hydrated", &found_usage));
+    EXPECT_EQ(42u, found_usage.tokens);
+    EXPECT_EQ(3u, found_usage.tool_calls);
+
+    shared_blackboard board;
+    blackboard_entry entry;
+    entry.key = "entry/hydrated";
+    entry.value = "payload";
+    entry.generation = 11;
+    entry.created_at_ms = 100;
+    entry.updated_at_ms = 200;
+    ASSERT_TRUE(board.hydrate_entry(entry, &error)) << error;
+    blackboard_entry found_entry;
+    ASSERT_TRUE(board.get("entry/hydrated", &found_entry));
+    EXPECT_EQ(11u, found_entry.generation);
+    EXPECT_EQ(200u, found_entry.updated_at_ms);
+
+    determinism_ledger ledger;
+    deterministic_choice choice;
+    choice.sequence = 13;
+    choice.task_id = "task";
+    choice.key = "choice";
+    choice.value = "selected";
+    ASSERT_TRUE(ledger.hydrate_choice(choice, &error)) << error;
+    ASSERT_EQ(1u, ledger.snapshot().size());
+    EXPECT_EQ(13u, ledger.snapshot()[0].sequence);
+
+    recovery_supervisor recovery;
+    failure_observation failure;
+    failure.task_id = "task/hydrated";
+    failure.component = "cli";
+    failure.failure_class = "transient";
+    failure.code = "timeout";
+    failure.attempt = 1;
+    failure.time_ms = 123;
+    ASSERT_TRUE(recovery.hydrate_failure(failure, &error)) << error;
+    failure.message = "updated";
+    ASSERT_TRUE(recovery.hydrate_failure(failure, &error)) << error;
+    ASSERT_EQ(1u, recovery.history().size());
+    EXPECT_EQ("updated", recovery.history()[0].message);
+
+    human_interaction_queue humans;
+    human_interaction_request human;
+    human.request_id = "human/hydrated";
+    human.prompt = "approve?";
+    human.state = "answered";
+    human.answer = "yes";
+    ASSERT_TRUE(humans.hydrate_request(human, &error)) << error;
+    ASSERT_EQ(1u, humans.snapshot().size());
+    EXPECT_EQ("answered", humans.snapshot()[0].state);
 }
 
 TEST(rasn_recovery_supervisor, chooses_retry_escalate_and_abort_actions)
@@ -2930,6 +3059,11 @@ TEST(rasn_metrics_registry, snapshot_exposes_core_and_latency_series)
     EXPECT_NE(nullptr, snapshot.find("rasn_overload_admission_delayed_total"));
     EXPECT_NE(nullptr, snapshot.find("rasn_overload_rate_limited_total"));
     EXPECT_NE(nullptr, snapshot.find("rasn_overload_rate_delayed_total"));
+    EXPECT_NE(nullptr, snapshot.find("rasn_runtime_dedup_hit_total"));
+    EXPECT_NE(nullptr, snapshot.find("rasn_runtime_dedup_miss_total"));
+    EXPECT_NE(nullptr, snapshot.find("rasn_runtime_dedup_wait_total"));
+    EXPECT_NE(nullptr, snapshot.find("rasn_runtime_dedup_evicted_total"));
+    EXPECT_NE(nullptr, snapshot.find("rasn_runtime_dedup_expired_total"));
 
     // Latency series are present and flagged as latency samples.
     const metric_sample *task_latency = snapshot.find("rasn_task_latency_ms");
@@ -2965,6 +3099,7 @@ TEST(rasn_metrics_registry, runtime_events_increment_cumulative_counters)
     const uint64_t overload_rate_before = registry.snapshot().counter("rasn_overload_rate_limited_total");
     const uint64_t overload_rate_delayed_before =
         registry.snapshot().counter("rasn_overload_rate_delayed_total");
+    const uint64_t runtime_dedup_hit_before = registry.snapshot().counter("rasn_runtime_dedup_hit_total");
 
     nucleus_runtime runtime;
     agent_task task;
@@ -2980,6 +3115,7 @@ TEST(rasn_metrics_registry, runtime_events_increment_cumulative_counters)
     runtime.record_overload_admission_delayed(task, 2, 50);
     runtime.record_overload_rate_limited(task, 60);
     runtime.record_overload_rate_delayed(task, 40);
+    registry.on_event("runtime.dedup.hit", "");
     runtime.finish_task(task, "ok");
 
     const uint64_t begin_after = registry.snapshot().counter("rasn_tasks_begin_total");
@@ -3000,6 +3136,7 @@ TEST(rasn_metrics_registry, runtime_events_increment_cumulative_counters)
     EXPECT_EQ(overload_rate_before + 1, registry.snapshot().counter("rasn_overload_rate_limited_total"));
     EXPECT_EQ(overload_rate_delayed_before + 1,
               registry.snapshot().counter("rasn_overload_rate_delayed_total"));
+    EXPECT_EQ(runtime_dedup_hit_before + 1, registry.snapshot().counter("rasn_runtime_dedup_hit_total"));
 
     // Observing a latency value must never crash, even though percentiles are
     // computed asynchronously by rDSN counter timers.
@@ -3793,6 +3930,9 @@ TEST(rasn_runtime, app_role_maps_aliases_to_standalone_roles)
     EXPECT_EQ("rasn.runtime.task_kernel", rasn_runtime_module_app_role("task_orchestration"));
     EXPECT_EQ("rasn.runtime.agent_control", rasn_runtime_module_app_role("agent_control_plane"));
     EXPECT_EQ("rasn.runtime", rasn_runtime_module_app_role("modules"));
+    // Backward-compatible aliases from the pre-rename common runtime surface.
+    EXPECT_EQ("rasn.runtime.budget", rasn_runtime_module_app_role("rasn.common.budget"));
+    EXPECT_EQ("rasn.runtime", rasn_runtime_module_app_role("rasn.common.modules"));
     // Case-insensitive and whitespace tolerant.
     EXPECT_EQ("rasn.runtime.budget", rasn_runtime_module_app_role("  Resource_Budget "));
     // Unknown roles map to empty so callers can pass them through unchanged.
@@ -3811,6 +3951,9 @@ TEST(rasn_runtime, normalize_app_list_rewrites_modules_and_preserves_overrides)
     // Multiple modules across ';' and ',' separators.
     EXPECT_EQ("rasn.runtime.budget;rasn.runtime.blackboard",
               normalize_rasn_runtime_app_list("resource_budget;blackboard"));
+    // Old common-runtime roles normalize to the new runtime roles.
+    EXPECT_EQ("rasn.runtime.budget;rasn.runtime",
+              normalize_rasn_runtime_app_list("rasn.common.budget, rasn.common.modules"));
     // Empty tokens are dropped.
     EXPECT_EQ("rasn.runtime.budget", normalize_rasn_runtime_app_list(";resource_budget;"));
 }
@@ -3867,6 +4010,85 @@ TEST(rasn_runtime, dispatch_accepts_state_mirror_operations)
     EXPECT_TRUE(dispatch_rasn_runtime_request(mirror).ok);
 }
 
+TEST(rasn_runtime, compacts_state_mirror_after_watermark_verification)
+{
+    const std::string prefix = "unit/runtime-compact-ok";
+    const std::string checkpoint_path = temp_file_path("rasn-runtime-compact-ok.chkpt");
+    std::remove(checkpoint_path.c_str());
+    std::remove((checkpoint_path + ".tmp").c_str());
+    std::remove((checkpoint_path + ".bak").c_str());
+
+    state_record mirror;
+    mirror.key = prefix + "/blackboard/entry/unit-key";
+    mirror.kind = "rasn.runtime.blackboard.entry";
+    mirror.scope = "rasn.runtime";
+    mirror.value = "value=5:hello\n";
+    const state_response stored = global_state_store().put(mirror);
+    ASSERT_TRUE(stored.ok) << stored.error;
+
+    const auto field = [](const std::string &key, const std::string &value) {
+        return key + "=" + std::to_string(value.size()) + ":" + value + "\n";
+    };
+    state_record watermark;
+    watermark.key = prefix + "/blackboard/_meta/watermark";
+    watermark.kind = "rasn.runtime.blackboard.watermark";
+    watermark.scope = "rasn.runtime";
+    watermark.value = field("schema_version", std::to_string(RASN_AGENT_SCHEMA_VERSION)) +
+                      field("module", "blackboard") +
+                      field("state_prefix", prefix) +
+                      field("last_record_sequence", std::to_string(stored.record.sequence)) +
+                      field("last_state_sequence", std::to_string(stored.last_sequence)) +
+                      field("updated_at_ms", "1");
+    ASSERT_TRUE(global_state_store().put(watermark).ok);
+
+    rasn_service_graph services;
+    const rasn_runtime_state_compaction_report report =
+        compact_rasn_runtime_state_mirror(services, checkpoint_path, prefix);
+    ASSERT_TRUE(report.ok) << report.error;
+    EXPECT_EQ(prefix, report.state_prefix);
+    EXPECT_EQ(1u, report.runtime_records);
+    EXPECT_EQ(1u, report.watermark_records);
+    EXPECT_GE(report.checkpointed_records, report.runtime_records + report.watermark_records);
+    EXPECT_GE(report.last_sequence, stored.record.sequence);
+
+    std::remove(checkpoint_path.c_str());
+    std::remove((checkpoint_path + ".tmp").c_str());
+    std::remove((checkpoint_path + ".bak").c_str());
+}
+
+TEST(rasn_runtime, compact_state_mirror_rejects_torn_watermark)
+{
+    const std::string prefix = "unit/runtime-compact-torn";
+    state_record mirror;
+    mirror.key = prefix + "/blackboard/entry/unit-key";
+    mirror.kind = "rasn.runtime.blackboard.entry";
+    mirror.scope = "rasn.runtime";
+    mirror.value = "value=5:hello\n";
+    const state_response stored = global_state_store().put(mirror);
+    ASSERT_TRUE(stored.ok) << stored.error;
+
+    const auto field = [](const std::string &key, const std::string &value) {
+        return key + "=" + std::to_string(value.size()) + ":" + value + "\n";
+    };
+    state_record watermark;
+    watermark.key = prefix + "/blackboard/_meta/watermark";
+    watermark.kind = "rasn.runtime.blackboard.watermark";
+    watermark.scope = "rasn.runtime";
+    watermark.value = field("schema_version", std::to_string(RASN_AGENT_SCHEMA_VERSION)) +
+                      field("module", "blackboard") +
+                      field("state_prefix", prefix) +
+                      field("last_record_sequence", std::to_string(stored.record.sequence + 100)) +
+                      field("last_state_sequence", std::to_string(stored.record.sequence + 100)) +
+                      field("updated_at_ms", "1");
+    ASSERT_TRUE(global_state_store().put(watermark).ok);
+
+    rasn_service_graph services;
+    const rasn_runtime_state_compaction_report report =
+        compact_rasn_runtime_state_mirror(services, "", prefix);
+    EXPECT_FALSE(report.ok);
+    EXPECT_NE(std::string::npos, report.error.find("behind watermark"));
+}
+
 TEST(rasn_runtime, module_descriptors_cover_every_module_with_role_and_consistency)
 {
     const std::vector<rasn_runtime_descriptor> descriptors = rasn_runtime_module_descriptors();
@@ -3899,7 +4121,7 @@ TEST(rasn_runtime, module_descriptors_cover_every_module_with_role_and_consisten
     }
 }
 
-TEST(rasn_runtime, request_marshalling_round_trips_request_id)
+TEST(rasn_runtime, request_marshalling_round_trips_request_metadata)
 {
     rasn_runtime_request request;
     request.module = "resource_budget";
@@ -3907,6 +4129,8 @@ TEST(rasn_runtime, request_marshalling_round_trips_request_id)
     request.key = "scope-a";
     request.payload = "amount=5";
     request.request_id = "idem-1234";
+    request.route_partition = 7;
+    request.auth_token = "shared-runtime-token";
 
     ::dsn::binary_writer writer;
     marshall(writer, request, DSF_THRIFT_BINARY);
@@ -3922,41 +4146,105 @@ TEST(rasn_runtime, request_marshalling_round_trips_request_id)
     EXPECT_EQ(request.payload, decoded.payload);
     // The idempotency id survives the wire round-trip so a retry reuses it.
     EXPECT_EQ(request.request_id, decoded.request_id);
+    EXPECT_EQ(request.route_partition, decoded.route_partition);
+    EXPECT_EQ(request.auth_token, decoded.auth_token);
+
+    ::dsn::binary_writer legacy_writer;
+    legacy_writer.write(request.schema_version);
+    legacy_writer.write(request.module);
+    legacy_writer.write(request.operation);
+    legacy_writer.write(request.key);
+    legacy_writer.write(request.payload);
+    ::dsn::binary_reader legacy_reader(legacy_writer.get_buffer());
+
+    rasn_runtime_request legacy_decoded;
+    unmarshall(legacy_reader, legacy_decoded, DSF_THRIFT_BINARY);
+    EXPECT_EQ(request.module, legacy_decoded.module);
+    EXPECT_TRUE(legacy_decoded.request_id.empty());
+    EXPECT_EQ((std::numeric_limits<uint32_t>::max)(), legacy_decoded.route_partition);
+    EXPECT_TRUE(legacy_decoded.auth_token.empty());
 }
 
-TEST(rasn_runtime, dispatch_dedups_repeated_request_ids)
+TEST(rasn_runtime, dispatch_dedups_repeated_request_signatures)
 {
-    // The first request establishes the cached response for this id.
+    const auto encode_field = [](const std::string &key, const std::string &value) {
+        return key + "=" + std::to_string(value.size()) + ":" + value + "\n";
+    };
+    const auto count_substring = [](const std::string &text, const std::string &needle) {
+        size_t count = 0;
+        size_t offset = 0;
+        while ((offset = text.find(needle, offset)) != std::string::npos)
+        {
+            ++count;
+            offset += needle.size();
+        }
+        return count;
+    };
+    const std::string task_id = "dedup-task-mutating";
+    const std::string payload = encode_field("task_id", task_id) + encode_field("key", "route") +
+                                encode_field("source", "test") + encode_field("value", "first");
+
+    // The first mutating request installs an in-flight placeholder, applies once,
+    // and stores the response for the same logical retry signature.
     rasn_runtime_request first;
-    first.module = "blackboard";
-    first.operation = "describe";
-    first.key = "dedup-key-first";
+    first.module = "determinism_ledger";
+    first.operation = "record";
+    first.key = task_id + "/route";
+    first.payload = payload;
     first.request_id = "dedup-req-alpha";
     const rasn_runtime_response first_response = dispatch_rasn_runtime_request(first);
     ASSERT_TRUE(first_response.ok) << first_response.error;
-    EXPECT_EQ("dedup-key-first", first_response.key);
+    EXPECT_EQ(first.key, first_response.key);
 
-    // A retry carrying the same id but a different key returns the cached response
-    // (echoing the first key), proving the operation was not routed a second time.
+    const rasn_runtime_response duplicate_response = dispatch_rasn_runtime_request(first);
+    ASSERT_TRUE(duplicate_response.ok) << duplicate_response.error;
+    EXPECT_EQ(first_response.payload, duplicate_response.payload);
+
+    rasn_runtime_request snapshot;
+    snapshot.module = "determinism_ledger";
+    snapshot.operation = "snapshot";
+    const rasn_runtime_response snapshot_response = dispatch_rasn_runtime_request(snapshot);
+    ASSERT_TRUE(snapshot_response.ok) << snapshot_response.error;
+    EXPECT_EQ(1u, count_substring(snapshot_response.payload, task_id));
+
+    // A retry carrying the same id but a different key/payload is a distinct
+    // signature, avoiding stale responses after an accidental id collision.
     rasn_runtime_request retry;
-    retry.module = "blackboard";
-    retry.operation = "describe";
-    retry.key = "dedup-key-second";
+    retry.module = "determinism_ledger";
+    retry.operation = "record";
+    retry.key = task_id + "/other";
+    retry.payload = encode_field("task_id", task_id) + encode_field("key", "other") +
+                    encode_field("source", "test") + encode_field("value", "second");
     retry.request_id = "dedup-req-alpha";
     const rasn_runtime_response retry_response = dispatch_rasn_runtime_request(retry);
     EXPECT_TRUE(retry_response.ok) << retry_response.error;
-    EXPECT_EQ("dedup-key-first", retry_response.key);
-    EXPECT_EQ(first_response.payload, retry_response.payload);
+    EXPECT_EQ(retry.key, retry_response.key);
 
     // A different id for the same module is routed fresh (not deduped).
     rasn_runtime_request other_id;
-    other_id.module = "blackboard";
-    other_id.operation = "describe";
-    other_id.key = "dedup-key-third";
+    other_id.module = "determinism_ledger";
+    other_id.operation = "record";
+    other_id.key = task_id + "/third";
+    other_id.payload = encode_field("task_id", task_id) + encode_field("key", "third") +
+                       encode_field("source", "test") + encode_field("value", "third");
     other_id.request_id = "dedup-req-beta";
     const rasn_runtime_response other_id_response = dispatch_rasn_runtime_request(other_id);
     EXPECT_TRUE(other_id_response.ok) << other_id_response.error;
-    EXPECT_EQ("dedup-key-third", other_id_response.key);
+    EXPECT_EQ(other_id.key, other_id_response.key);
+
+    // Read-only operations bypass the mutating-operation dedup cache even with ids.
+    rasn_runtime_request read_a;
+    read_a.module = "blackboard";
+    read_a.operation = "describe";
+    read_a.key = "read-key-a";
+    read_a.request_id = "dedup-read-id";
+    const rasn_runtime_response read_a_response = dispatch_rasn_runtime_request(read_a);
+    EXPECT_EQ("read-key-a", read_a_response.key);
+
+    rasn_runtime_request read_b = read_a;
+    read_b.key = "read-key-b";
+    const rasn_runtime_response read_b_response = dispatch_rasn_runtime_request(read_b);
+    EXPECT_EQ("read-key-b", read_b_response.key);
 
     // Requests without an id are never deduped even if otherwise identical.
     rasn_runtime_request no_id_a;

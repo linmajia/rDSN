@@ -45,6 +45,30 @@ human_interaction_result human_interaction_queue::open(human_interaction_request
     return result;
 }
 
+bool human_interaction_queue::hydrate_request(const human_interaction_request &request, std::string *error)
+{
+    if (request.request_id.empty())
+    {
+        if (error != nullptr)
+        {
+            *error = "human interaction request missing id";
+        }
+        return false;
+    }
+    if (request.prompt.empty())
+    {
+        if (error != nullptr)
+        {
+            *error = "human interaction request missing prompt";
+        }
+        return false;
+    }
+
+    ::dsn::service::zauto_lock guard(_lock);
+    _requests[request.request_id] = request;
+    return true;
+}
+
 human_interaction_result human_interaction_queue::answer(const std::string &request_id, const std::string &answer)
 {
     human_interaction_result result;

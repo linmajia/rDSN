@@ -35,6 +35,22 @@ bool shared_blackboard::put(blackboard_entry entry, blackboard_entry *stored, st
     return true;
 }
 
+bool shared_blackboard::hydrate_entry(const blackboard_entry &entry, std::string *error)
+{
+    if (entry.key.empty())
+    {
+        if (error != nullptr)
+        {
+            *error = "blackboard entry missing key";
+        }
+        return false;
+    }
+
+    ::dsn::service::zauto_lock guard(_lock);
+    _entries[entry.key] = entry;
+    return true;
+}
+
 bool shared_blackboard::get(const std::string &key, blackboard_entry *entry, uint64_t now_ms) const
 {
     ::dsn::service::zauto_lock guard(_lock);

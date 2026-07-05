@@ -29,6 +29,7 @@ class task_orchestration_kernel
 {
 public:
     bool add_task(const orchestration_task &task, std::string *error);
+    bool hydrate_task(const orchestration_task &task, std::string *error);
     bool assign(const std::string &task_id, const std::string &owner_agent, std::string *error);
     bool start(const std::string &task_id, const std::string &owner_agent, std::string *error);
     bool complete(const std::string &task_id, const std::string &output, std::string *error);

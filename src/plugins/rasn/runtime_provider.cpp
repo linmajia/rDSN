@@ -2,6 +2,7 @@
 
 #include <rasn/agent_services.h>
 #include <rasn/circuit_breaker.h>
+#include <rasn/metrics.h>
 #include <rasn/rasn_core.h>
 #include <rasn/state_service.h>
 
@@ -11,14 +12,17 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <condition_variable>
 #include <deque>
 #include <future>
 #include <iomanip>
 #include <limits>
 #include <map>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <thread>
+#include <tuple>
 #include <utility>
 
 namespace dsn {
@@ -124,9 +128,32 @@ std::string config_service_string(const std::string &key, const std::string &fal
     return value == nullptr ? fallback : value;
 }
 
+uint64_t config_service_uint64(const std::string &key, uint64_t fallback, const std::string &description)
+{
+    return ::dsn_config_get_value_uint64("rasn.service", key.c_str(), fallback, description.c_str());
+}
+
+bool config_service_bool(const std::string &key, bool fallback, const std::string &description)
+{
+    return ::dsn_config_get_value_bool("rasn.service", key.c_str(), fallback, description.c_str());
+}
+
 std::string module_service_key(const std::string &module)
 {
     return state_key_component(module);
+}
+
+std::string rasn_runtime_state_key(const std::string &state_prefix,
+                                   const std::string &module,
+                                   const std::string &kind,
+                                   const std::string &key)
+{
+    return state_prefix + "/" + module + "/" + kind + "/" + state_key_component(key);
+}
+
+std::string rasn_runtime_state_prefix(const std::string &state_prefix)
+{
+    return state_prefix + "/";
 }
 
 bool has_module(const std::vector<std::string> &modules, const std::string &module)
@@ -134,27 +161,598 @@ bool has_module(const std::vector<std::string> &modules, const std::string &modu
     return std::find(modules.begin(), modules.end(), module) != modules.end();
 }
 
-::dsn::rpc_address rasn_runtime_address(const std::string &module)
+struct runtime_endpoint
 {
+    ::dsn::rpc_address address;
+    std::string source;
+    uint32_t partition_index = 0;
+    uint32_t partition_count = 1;
+};
+
+bool rasn_runtime_module_is_sharded(const std::string &module)
+{
+    return module == "agent_message_bus" || module == "resource_budget" || module == "blackboard";
+}
+
+uint64_t fnv1a64(const std::string &value)
+{
+    uint64_t hash = 14695981039346656037ULL;
+    for (const unsigned char c : value)
+    {
+        hash ^= static_cast<uint64_t>(c);
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+uint32_t rasn_runtime_partition_count(const std::string &module)
+{
+    if (!rasn_runtime_module_is_sharded(module))
+    {
+        return 1;
+    }
+    const std::string key = module_service_key(module) + "_shard_count";
+    const uint64_t configured =
+        config_service_uint64(key, 1, "rASN sharded runtime module partition count");
+    if (configured == 0)
+    {
+        return 1;
+    }
+    if (configured > (std::numeric_limits<uint32_t>::max)())
+    {
+        dwarn("rasn.service.%s=%llu exceeds uint32_t range; using maximum partition count",
+              key.c_str(),
+              static_cast<unsigned long long>(configured));
+        return (std::numeric_limits<uint32_t>::max)();
+    }
+    return static_cast<uint32_t>(configured);
+}
+
+bool parse_uint32_token(const std::string &value, uint32_t *result)
+{
+    if (value.empty())
+    {
+        return false;
+    }
+    uint64_t parsed = 0;
+    for (const char c : value)
+    {
+        if (c < '0' || c > '9')
+        {
+            return false;
+        }
+        parsed = parsed * 10 + static_cast<uint64_t>(c - '0');
+        if (parsed > (std::numeric_limits<uint32_t>::max)())
+        {
+            return false;
+        }
+    }
+    if (result != nullptr)
+    {
+        *result = static_cast<uint32_t>(parsed);
+    }
+    return true;
+}
+
+void add_hosted_shard_token(const std::string &module,
+                            const std::string &token,
+                            uint32_t partition_count,
+                            std::set<uint32_t> *hosted)
+{
+    const std::string normalized = lower_ascii(trim(token));
+    if (normalized.empty() || hosted == nullptr)
+    {
+        return;
+    }
+    if (normalized == "all" || normalized == "*")
+    {
+        for (uint32_t i = 0; i < partition_count; ++i)
+        {
+            hosted->insert(i);
+        }
+        return;
+    }
+
+    uint32_t shard = 0;
+    if (!parse_uint32_token(normalized, &shard) || shard >= partition_count)
+    {
+        dwarn("ignoring invalid hosted shard '%s' for rASN runtime module %s partition_count=%u",
+              token.c_str(),
+              module.c_str(),
+              partition_count);
+        return;
+    }
+    hosted->insert(shard);
+}
+
+std::vector<uint32_t> rasn_runtime_hosted_shards(const std::string &module)
+{
+    const uint32_t partition_count = rasn_runtime_partition_count(module);
+    if (!rasn_runtime_module_is_sharded(module) || partition_count <= 1)
+    {
+        return std::vector<uint32_t>();
+    }
+
     const std::string module_key = module_service_key(module);
-    const std::string common_uri = config_service_string("rasn_runtime_uri", "", "rASN runtime module service URI");
-    const std::string uri = config_service_string(module_key + "_uri", common_uri, "rASN per-module service URI");
+    std::string configured = trim(config_service_string(module_key + "_hosted_shards",
+                                                        "",
+                                                        "Comma-separated rASN runtime shard indexes hosted by this service"));
+    if (configured.empty())
+    {
+        configured = trim(config_service_string(module_key + "_shard_index",
+                                                "",
+                                                "Single rASN runtime shard index hosted by this service"));
+    }
+    if (configured.empty())
+    {
+        return std::vector<uint32_t>();
+    }
+
+    std::set<uint32_t> hosted;
+    std::string token;
+    for (size_t i = 0; i <= configured.size(); ++i)
+    {
+        const bool separator = i == configured.size() || configured[i] == ',' || configured[i] == ';' ||
+                               std::isspace(static_cast<unsigned char>(configured[i]));
+        if (separator)
+        {
+            add_hosted_shard_token(module, token, partition_count, &hosted);
+            token.clear();
+        }
+        else
+        {
+            token.push_back(configured[i]);
+        }
+    }
+    return std::vector<uint32_t>(hosted.begin(), hosted.end());
+}
+
+uint32_t rasn_runtime_partition_for_key(const std::string &module, const std::string &key)
+{
+    const uint32_t count = rasn_runtime_partition_count(module);
+    if (count <= 1 || key.empty())
+    {
+        return 0;
+    }
+    return static_cast<uint32_t>(fnv1a64(key) % count);
+}
+
+uint32_t rasn_runtime_partition_for_request(const rasn_runtime_request &request)
+{
+    const uint32_t count = rasn_runtime_partition_count(request.module);
+    if (count <= 1)
+    {
+        return 0;
+    }
+    if (request.route_partition != (std::numeric_limits<uint32_t>::max)())
+    {
+        return request.route_partition % count;
+    }
+    return rasn_runtime_partition_for_key(request.module, request.key);
+}
+
+::dsn::rpc_address rasn_service_address(const std::string &service_name, uint16_t default_port)
+{
+    const std::string uri = config_service_string(service_name + "_uri", "", "rASN service URI");
     if (!uri.empty())
     {
         return ::dsn::url_host_address(uri.c_str());
     }
     const std::string default_host = config_service_string("host", "localhost", "default rASN service RPC host");
-    const std::string common_host = config_service_string("rasn_runtime_host", default_host, "rASN runtime module service host");
-    std::string host = config_service_string(module_key + "_host", common_host, "rASN per-module service host");
+    std::string host = config_service_string(service_name + "_host", default_host, "rASN service RPC host");
+    if (host.empty())
+    {
+        host = "localhost";
+    }
+    ::dsn::rpc_address address;
+    address.assign_ipv4(host.c_str(), config_service_port(service_name + "_port", default_port));
+    return address;
+}
+
+std::string rasn_runtime_module_capability(const std::string &module)
+{
+    return "rasn.runtime." + module;
+}
+
+std::string rasn_runtime_module_shard_capability(const std::string &module, uint32_t partition_index)
+{
+    return rasn_runtime_module_capability(module) + ".shard." + std::to_string(partition_index);
+}
+
+bool parse_rasn_runtime_record_kind(const std::string &record_kind, std::string *module, std::string *kind)
+{
+    const std::string prefix = "rasn.runtime.";
+    if (record_kind.find(prefix) != 0)
+    {
+        return false;
+    }
+    const std::string rest = record_kind.substr(prefix.size());
+    const size_t dot = rest.find('.');
+    if (dot == std::string::npos || dot == 0 || dot + 1 >= rest.size())
+    {
+        return false;
+    }
+    if (module != nullptr)
+    {
+        *module = rest.substr(0, dot);
+    }
+    if (kind != nullptr)
+    {
+        *kind = rest.substr(dot + 1);
+    }
+    return true;
+}
+
+bool runtime_hydration_supported(const std::string &module, const std::string &kind)
+{
+    return (module == "agent_control_plane" && kind == "agent") ||
+           (module == "agent_message_bus" && kind == "message") ||
+           (module == "task_orchestration_kernel" && kind == "task") ||
+           (module == "determinism_ledger" && kind == "choice") ||
+           (module == "capability_directory" && kind == "provider") ||
+           (module == "resource_budget" && (kind == "quota" || kind == "usage")) ||
+           (module == "recovery_supervisor" && (kind == "policy" || kind == "failure")) ||
+           (module == "blackboard" && kind == "entry") ||
+           (module == "contract_verifier" && kind == "contract") ||
+           (module == "human_interaction" && kind == "request") ||
+           (module == "sandbox_runtime" && kind == "profile");
+}
+
+bool runtime_operation_is_mutating(const std::string &operation)
+{
+    if (operation.empty() || operation == "ping" || operation == "describe" || operation == "find" ||
+        operation == "list" || operation == "snapshot" || operation == "ready_tasks" ||
+        operation == "blocked_tasks" || operation == "usage" || operation == "get" ||
+        operation == "profile" || operation == "evaluate" || operation == "evaluate_input" ||
+        operation == "evaluate_output" || operation == "pending")
+    {
+        return false;
+    }
+    return true;
+}
+
+bool rasn_runtime_registry_discovery_enabled()
+{
+    return config_service_bool(
+        "rasn_runtime_registry_discovery_enabled", true, "Discover rASN runtime module endpoints through rasn.registry");
+}
+
+bool rasn_runtime_registry_registration_enabled()
+{
+    return config_service_bool(
+        "rasn_runtime_registry_registration_enabled", true, "Register rASN runtime module services with rasn.registry");
+}
+
+std::chrono::milliseconds rasn_runtime_registry_timeout()
+{
+    const uint64_t timeout_ms = ::dsn_config_get_value_uint64(
+        "rasn.registry", "registration_timeout_ms", 1000, "rASN registry register/query/heartbeat RPC timeout");
+    return std::chrono::milliseconds(timeout_ms);
+}
+
+uint64_t rasn_runtime_registry_heartbeat_ms()
+{
+    return ::dsn_config_get_value_uint64(
+        "rasn.registry", "heartbeat_ms", 2000, "rASN runtime registry heartbeat interval in milliseconds");
+}
+
+bool rasn_runtime_state_hydration_enabled()
+{
+    return config_service_bool(
+        "rasn_runtime_state_hydration_enabled", true, "Hydrate rASN runtime module services from mirrored state");
+}
+
+std::chrono::milliseconds rasn_runtime_state_hydration_timeout()
+{
+    const uint64_t timeout_ms = config_service_uint64(
+        "rasn_runtime_state_hydration_timeout_ms", 500, "rASN runtime state hydration query timeout in milliseconds");
+    return std::chrono::milliseconds(timeout_ms);
+}
+
+bool rasn_runtime_state_watermark_enabled()
+{
+    return config_service_bool(
+        "rasn_runtime_state_watermark_enabled", true, "Write runtime state mirror watermarks after mirrored mutations");
+}
+
+bool rasn_runtime_state_watermark_verify_enabled()
+{
+    return config_service_bool(
+        "rasn_runtime_state_watermark_verify_enabled", true, "Verify runtime state mirror watermarks during hydration");
+}
+
+bool rasn_runtime_rpc_auth_enabled()
+{
+    return config_service_bool(
+        "rasn_runtime_auth_enabled", false, "Require a shared token on distributed rASN runtime module RPCs");
+}
+
+std::string rasn_runtime_rpc_auth_token()
+{
+    return config_service_string(
+        "rasn_runtime_auth_token", "", "Shared token for distributed rASN runtime module RPC authentication");
+}
+
+bool constant_time_equal(const std::string &lhs, const std::string &rhs)
+{
+    const size_t max_size = (std::max)(lhs.size(), rhs.size());
+    size_t diff = lhs.size() ^ rhs.size();
+    for (size_t i = 0; i < max_size; ++i)
+    {
+        const unsigned char lhs_byte = i < lhs.size() ? static_cast<unsigned char>(lhs[i]) : 0;
+        const unsigned char rhs_byte = i < rhs.size() ? static_cast<unsigned char>(rhs[i]) : 0;
+        diff |= static_cast<size_t>(lhs_byte ^ rhs_byte);
+    }
+    return diff == 0;
+}
+
+bool prepare_rasn_runtime_rpc_request(rasn_runtime_request *request, std::string *error)
+{
+    if (request == nullptr)
+    {
+        if (error != nullptr)
+        {
+            *error = "runtime module RPC request is null";
+        }
+        return false;
+    }
+    if (!rasn_runtime_rpc_auth_enabled())
+    {
+        request->auth_token.clear();
+        return true;
+    }
+    const std::string token = rasn_runtime_rpc_auth_token();
+    if (token.empty())
+    {
+        if (error != nullptr)
+        {
+            *error = "runtime module RPC auth enabled but rasn_runtime_auth_token is empty";
+        }
+        return false;
+    }
+    request->auth_token = token;
+    if (error != nullptr)
+    {
+        error->clear();
+    }
+    return true;
+}
+
+bool authenticate_rasn_runtime_rpc_request(const rasn_runtime_request &request, std::string *error)
+{
+    if (!rasn_runtime_rpc_auth_enabled())
+    {
+        return true;
+    }
+    const std::string expected = rasn_runtime_rpc_auth_token();
+    if (expected.empty())
+    {
+        if (error != nullptr)
+        {
+            *error = "runtime module RPC auth enabled but rasn_runtime_auth_token is empty on service";
+        }
+        return false;
+    }
+    if (request.auth_token.empty() || !constant_time_equal(request.auth_token, expected))
+    {
+        if (error != nullptr)
+        {
+            *error = "runtime module RPC auth failed";
+        }
+        return false;
+    }
+    if (error != nullptr)
+    {
+        error->clear();
+    }
+    return true;
+}
+
+runtime_endpoint static_rasn_runtime_endpoint(const std::string &module, uint32_t partition_index = 0)
+{
+    const std::string module_key = module_service_key(module);
+    const uint32_t partition_count = rasn_runtime_partition_count(module);
+    const bool sharded = partition_count > 1;
+    const std::string shard_key = module_key + "_shard_" + std::to_string(partition_index);
+    const std::string common_uri = config_service_string("rasn_runtime_uri", "", "rASN runtime module service URI");
+    const std::string module_uri = config_service_string(module_key + "_uri", common_uri, "rASN per-module service URI");
+    const std::string uri =
+        sharded ? config_service_string(shard_key + "_uri", module_uri, "rASN per-shard module service URI")
+                : module_uri;
+    if (!uri.empty())
+    {
+        runtime_endpoint endpoint;
+        endpoint.address = ::dsn::url_host_address(uri.c_str());
+        endpoint.source = sharded ? "static:shard" : "static";
+        endpoint.partition_index = partition_index;
+        endpoint.partition_count = partition_count;
+        return endpoint;
+    }
+    const std::string default_host = config_service_string("host", "localhost", "default rASN service RPC host");
+    const std::string common_host =
+        config_service_string("rasn_runtime_host", default_host, "rASN runtime module service host");
+    const std::string module_host = config_service_string(module_key + "_host", common_host, "rASN per-module service host");
+    std::string host =
+        sharded ? config_service_string(shard_key + "_host", module_host, "rASN per-shard module service host")
+                : module_host;
     if (host.empty())
     {
         host = "localhost";
     }
     const uint16_t common_port = config_service_port("rasn_runtime_port", 27107);
-    const uint16_t port = config_service_port(module_key + "_port", common_port);
+    const uint16_t module_port = config_service_port(module_key + "_port", common_port);
+    const uint16_t port = sharded ? config_service_port(shard_key + "_port", module_port) : module_port;
     ::dsn::rpc_address address;
     address.assign_ipv4(host.c_str(), port);
-    return address;
+    runtime_endpoint endpoint;
+    endpoint.address = address;
+    endpoint.source = sharded ? "static:shard" : "static";
+    endpoint.partition_index = partition_index;
+    endpoint.partition_count = partition_count;
+    return endpoint;
+}
+
+bool endpoint_from_descriptor(const agent_descriptor &descriptor, ::dsn::rpc_address *address)
+{
+    if (address == nullptr)
+    {
+        return false;
+    }
+    if (!descriptor.endpoint_uri.empty())
+    {
+        *address = ::dsn::url_host_address(descriptor.endpoint_uri.c_str());
+        return !address->is_invalid();
+    }
+    if (!descriptor.host.empty() && descriptor.port > 0 &&
+        descriptor.port <= (std::numeric_limits<uint16_t>::max)())
+    {
+        address->assign_ipv4(descriptor.host.c_str(), static_cast<uint16_t>(descriptor.port));
+        return !address->is_invalid();
+    }
+    return false;
+}
+
+bool choose_registry_endpoint(const std::string &module,
+                              std::vector<agent_descriptor> agents,
+                              uint32_t partition_index,
+                              const std::string &source,
+                              runtime_endpoint *endpoint)
+{
+    if (endpoint == nullptr || agents.empty())
+    {
+        return false;
+    }
+    const std::string preferred_role = rasn_runtime_module_app_role(module);
+    const auto choose = [&preferred_role](const agent_descriptor &lhs, const agent_descriptor &rhs) {
+        const bool lhs_preferred = lhs.role == preferred_role || lhs.app_name == preferred_role;
+        const bool rhs_preferred = rhs.role == preferred_role || rhs.app_name == preferred_role;
+        if (lhs_preferred != rhs_preferred)
+        {
+            return lhs_preferred;
+        }
+        return lhs.agent_id < rhs.agent_id;
+    };
+    std::sort(agents.begin(), agents.end(), choose);
+
+    for (size_t offset = 0; offset < agents.size(); ++offset)
+    {
+        const size_t index = (static_cast<size_t>(partition_index) + offset) % agents.size();
+        ::dsn::rpc_address address;
+        if (endpoint_from_descriptor(agents[index], &address))
+        {
+            endpoint->address = address;
+            endpoint->source = source;
+            endpoint->partition_index = partition_index;
+            endpoint->partition_count = rasn_runtime_partition_count(module);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool lookup_rasn_runtime_endpoint_capability(const std::string &module,
+                                             uint32_t partition_index,
+                                             const std::string &capability,
+                                             const std::string &source,
+                                             runtime_endpoint *endpoint)
+{
+    if (endpoint == nullptr || !rasn_runtime_registry_discovery_enabled())
+    {
+        return false;
+    }
+
+    std::vector<agent_descriptor> local_agents = global_agent_registry().query_by_capability(capability, true);
+    if (choose_registry_endpoint(module, local_agents, partition_index, source, endpoint))
+    {
+        return true;
+    }
+
+    registry_query_request request;
+    request.capability = capability;
+    request.healthy_only = true;
+
+    rasn_registry_client registry(rasn_service_address("registry", 27100));
+    ::dsn::error_code err;
+    registry_query_response response;
+    std::tie(err, response) = registry.query_sync(request, rasn_runtime_registry_timeout());
+    if (err != ::dsn::ERR_OK || !response.ok || response.agents.empty())
+    {
+        return false;
+    }
+
+    return choose_registry_endpoint(module, response.agents, partition_index, source, endpoint);
+}
+
+bool lookup_rasn_runtime_endpoint_in_registry(const std::string &module, uint32_t partition_index, runtime_endpoint *endpoint)
+{
+    const uint32_t partition_count = rasn_runtime_partition_count(module);
+    if (partition_count > 1 &&
+        lookup_rasn_runtime_endpoint_capability(module,
+                                                partition_index,
+                                                rasn_runtime_module_shard_capability(module, partition_index),
+                                                "registry:shard",
+                                                endpoint))
+    {
+        return true;
+    }
+    return lookup_rasn_runtime_endpoint_capability(
+        module, partition_index, rasn_runtime_module_capability(module), "registry", endpoint);
+}
+
+runtime_endpoint resolve_rasn_runtime_partition_endpoint(const std::string &module, uint32_t partition_index)
+{
+    runtime_endpoint endpoint;
+    if (lookup_rasn_runtime_endpoint_in_registry(module, partition_index, &endpoint))
+    {
+        return endpoint;
+    }
+    return static_rasn_runtime_endpoint(module, partition_index);
+}
+
+runtime_endpoint resolve_rasn_runtime_endpoint(const std::string &module, const std::string &key = "")
+{
+    return resolve_rasn_runtime_partition_endpoint(module, rasn_runtime_partition_for_key(module, key));
+}
+
+runtime_endpoint resolve_rasn_runtime_endpoint(const rasn_runtime_request &request)
+{
+    return resolve_rasn_runtime_partition_endpoint(request.module, rasn_runtime_partition_for_request(request));
+}
+
+::dsn::rpc_address rasn_runtime_address(const std::string &module)
+{
+    return resolve_rasn_runtime_endpoint(module).address;
+}
+
+std::string runtime_endpoint_label(const runtime_endpoint &endpoint)
+{
+    std::ostringstream output;
+    output << endpoint.source << ":" << endpoint.address.to_string();
+    if (endpoint.partition_count > 1)
+    {
+        output << "#shard=" << endpoint.partition_index << "/" << endpoint.partition_count;
+    }
+    return output.str();
+}
+
+std::string rasn_runtime_module_endpoint_summary(const std::string &module)
+{
+    const uint32_t partition_count = rasn_runtime_partition_count(module);
+    if (partition_count <= 1)
+    {
+        return runtime_endpoint_label(resolve_rasn_runtime_endpoint(module));
+    }
+
+    std::ostringstream output;
+    for (uint32_t i = 0; i < partition_count; ++i)
+    {
+        if (i != 0)
+        {
+            output << ",";
+        }
+        output << "shard" << i << "=" << runtime_endpoint_label(resolve_rasn_runtime_partition_endpoint(module, i));
+    }
+    return output.str();
 }
 
 ::dsn::task_code rpc_code_for_module(const std::string &module)
@@ -187,11 +785,6 @@ bool has_module(const std::vector<std::string> &modules, const std::string &modu
     if (module == "human_interaction") return LPC_RASN_HUMAN_INTERACTION;
     if (module == "sandbox_runtime") return LPC_RASN_SANDBOX_RUNTIME;
     return LPC_RASN_AGENT_CONTROL;
-}
-
-uint64_t config_service_uint64(const std::string &key, uint64_t fallback, const std::string &description)
-{
-    return ::dsn_config_get_value_uint64("rasn.service", key.c_str(), fallback, description.c_str());
 }
 
 // Resolve a numeric [rasn.service] knob with a per-module override: the shared
@@ -444,6 +1037,225 @@ bool parse_payload(const std::string &payload, field_map *fields, std::string *e
     if (!decode_fields(payload, fields, error))
     {
         return false;
+    }
+    return true;
+}
+
+struct runtime_state_watermark
+{
+    std::string module;
+    std::string state_prefix;
+    uint64_t last_record_sequence = 0;
+    uint64_t last_state_sequence = 0;
+    uint64_t updated_at_ms = 0;
+};
+
+std::string rasn_runtime_watermark_key(const std::string &state_prefix, const std::string &module)
+{
+    return state_prefix + "/" + module + "/_meta/watermark";
+}
+
+std::string encode_runtime_state_watermark_payload(const runtime_state_watermark &watermark)
+{
+    return encode_fields({{"schema_version", std::to_string(RASN_AGENT_SCHEMA_VERSION)},
+                          {"module", watermark.module},
+                          {"state_prefix", watermark.state_prefix},
+                          {"last_record_sequence", std::to_string(watermark.last_record_sequence)},
+                          {"last_state_sequence", std::to_string(watermark.last_state_sequence)},
+                          {"updated_at_ms", std::to_string(watermark.updated_at_ms)}});
+}
+
+bool decode_runtime_state_watermark_payload(const std::string &payload,
+                                            runtime_state_watermark *watermark,
+                                            std::string *error)
+{
+    if (watermark == nullptr)
+    {
+        if (error != nullptr)
+        {
+            *error = "runtime state watermark output is null";
+        }
+        return false;
+    }
+    field_map fields;
+    if (!parse_payload(payload, &fields, error))
+    {
+        return false;
+    }
+    watermark->module = field_string(fields, "module");
+    watermark->state_prefix = field_string(fields, "state_prefix");
+    watermark->last_record_sequence = field_uint64(fields, "last_record_sequence");
+    watermark->last_state_sequence = field_uint64(fields, "last_state_sequence");
+    watermark->updated_at_ms = field_uint64(fields, "updated_at_ms");
+    if (watermark->module.empty() || watermark->last_record_sequence == 0)
+    {
+        if (error != nullptr)
+        {
+            *error = "runtime state watermark missing module or last record sequence";
+        }
+        return false;
+    }
+    if (watermark->last_state_sequence != 0 && watermark->last_state_sequence < watermark->last_record_sequence)
+    {
+        if (error != nullptr)
+        {
+            *error = "runtime state watermark state sequence is older than record sequence";
+        }
+        return false;
+    }
+    if (error != nullptr)
+    {
+        error->clear();
+    }
+    return true;
+}
+
+state_record make_runtime_state_record(const std::string &state_prefix,
+                                       const std::string &module,
+                                       const std::string &kind,
+                                       const std::string &key,
+                                       const std::string &value)
+{
+    state_record record;
+    record.key = rasn_runtime_state_key(state_prefix, module, kind, key);
+    record.kind = "rasn.runtime." + module + "." + kind;
+    record.scope = "rasn.runtime";
+    record.value = value;
+    return record;
+}
+
+bool put_runtime_state_mirror(rasn_service_graph &services,
+                              const std::string &state_prefix,
+                              const std::string &module,
+                              const std::string &kind,
+                              const std::string &key,
+                              const std::string &value,
+                              std::string *error)
+{
+    const state_response response = services.put_state(make_runtime_state_record(state_prefix, module, kind, key, value));
+    if (!response.ok)
+    {
+        if (error != nullptr)
+        {
+            *error = response.error.empty() ? "failed to write rASN runtime state" : response.error;
+        }
+        return false;
+    }
+    if (!rasn_runtime_state_watermark_enabled())
+    {
+        if (error != nullptr)
+        {
+            error->clear();
+        }
+        return true;
+    }
+
+    runtime_state_watermark watermark;
+    watermark.module = module;
+    watermark.state_prefix = state_prefix;
+    watermark.last_record_sequence = response.record.sequence;
+    watermark.last_state_sequence = response.last_sequence;
+    watermark.updated_at_ms = ::dsn_now_ms();
+
+    state_record watermark_record;
+    watermark_record.key = rasn_runtime_watermark_key(state_prefix, module);
+    watermark_record.kind = "rasn.runtime." + module + ".watermark";
+    watermark_record.scope = "rasn.runtime";
+    watermark_record.value = encode_runtime_state_watermark_payload(watermark);
+    const state_response watermark_response = services.put_state(watermark_record);
+    if (!watermark_response.ok)
+    {
+        if (error != nullptr)
+        {
+            *error = watermark_response.error.empty() ? "failed to write rASN runtime state watermark"
+                                                     : watermark_response.error;
+        }
+        return false;
+    }
+    if (error != nullptr)
+    {
+        error->clear();
+    }
+    return true;
+}
+
+bool verify_runtime_state_watermarks(const std::vector<state_record> &records,
+                                     const std::vector<std::string> &hosted_modules,
+                                     const std::string &state_prefix,
+                                     std::string *error)
+{
+    std::map<std::string, uint64_t> max_record_sequence;
+    std::map<std::string, runtime_state_watermark> watermarks;
+    for (const state_record &record : records)
+    {
+        std::string module;
+        std::string kind;
+        if (!parse_rasn_runtime_record_kind(record.kind, &module, &kind) || !has_module(hosted_modules, module))
+        {
+            continue;
+        }
+        if (kind == "watermark")
+        {
+            runtime_state_watermark watermark;
+            std::string decode_error;
+            if (!decode_runtime_state_watermark_payload(record.value, &watermark, &decode_error))
+            {
+                if (error != nullptr)
+                {
+                    *error = "invalid runtime state watermark for " + module + ": " + decode_error;
+                }
+                return false;
+            }
+            if (watermark.module != module)
+            {
+                if (error != nullptr)
+                {
+                    *error = "runtime state watermark module mismatch: key module " + module + " payload module " +
+                             watermark.module;
+                }
+                return false;
+            }
+            if (!watermark.state_prefix.empty() && watermark.state_prefix != state_prefix)
+            {
+                if (error != nullptr)
+                {
+                    *error = "runtime state watermark prefix mismatch for " + module;
+                }
+                return false;
+            }
+            const std::map<std::string, runtime_state_watermark>::const_iterator existing = watermarks.find(module);
+            if (existing == watermarks.end() ||
+                watermark.last_record_sequence > existing->second.last_record_sequence)
+            {
+                watermarks[module] = watermark;
+            }
+            continue;
+        }
+        if (!runtime_hydration_supported(module, kind))
+        {
+            continue;
+        }
+        uint64_t &max_sequence = max_record_sequence[module];
+        max_sequence = (std::max)(max_sequence, record.sequence);
+    }
+
+    for (const std::map<std::string, runtime_state_watermark>::value_type &entry : watermarks)
+    {
+        const uint64_t max_sequence = max_record_sequence[entry.first];
+        if (max_sequence < entry.second.last_record_sequence)
+        {
+            if (error != nullptr)
+            {
+                *error = "runtime state mirror for " + entry.first + " is behind watermark " +
+                         std::to_string(entry.second.last_record_sequence) + " (max record sequence " +
+                         std::to_string(max_sequence) + ")";
+            }
+            return false;
+        }
+    }
+    if (error != nullptr)
+    {
+        error->clear();
     }
     return true;
 }
@@ -1196,24 +2008,85 @@ public:
             }
             return success_response(request, encode_fields({{"module", request.module}, {"status", "ok"}}));
         }
-        // Idempotency: when a request carries an id, return the cached response for a
-        // repeat instead of re-applying the operation. This makes a client-side retry
-        // after a lost reply safe (a duplicated write is not applied twice). The
-        // lookup/route/store sequence is deliberately not atomic across the module
-        // mutation, so this is best-effort dedup for the lost-reply retry case rather
-        // than a strict exactly-once guarantee.
-        if (!request.request_id.empty())
+        // Idempotency: mutating requests with an id install an in-flight placeholder
+        // before applying the module operation. A duplicate with the same
+        // module/operation/key/payload/id waits for that first response, then returns
+        // it instead of applying the mutation twice. Read-only operations bypass this
+        // cache so observation calls are never retained solely because a client sent
+        // a request id.
+        if (idempotency_dedup_enabled(request))
         {
             rasn_runtime_response cached;
-            if (lookup_dedup(request, &cached))
+            if (!begin_dedup(request, &cached))
             {
                 return cached;
             }
             const rasn_runtime_response response = route_module_request(request);
-            store_dedup(request, response);
+            finish_dedup(request, response);
             return response;
         }
         return route_module_request(request);
+    }
+
+    bool hydrate_from_state(const std::vector<state_record> &records,
+                            const std::vector<std::string> &hosted_modules,
+                            size_t *applied,
+                            std::string *error)
+    {
+        if (applied != nullptr)
+        {
+            *applied = 0;
+        }
+        if (error != nullptr)
+        {
+            error->clear();
+        }
+
+        std::vector<state_record> sorted = records;
+        std::sort(sorted.begin(), sorted.end(), [](const state_record &left, const state_record &right) {
+            if (left.sequence != right.sequence)
+            {
+                return left.sequence < right.sequence;
+            }
+            return left.key < right.key;
+        });
+
+        bool ok = true;
+        for (const state_record &record : sorted)
+        {
+            std::string module;
+            std::string kind;
+            if (!parse_rasn_runtime_record_kind(record.kind, &module, &kind) || !has_module(hosted_modules, module))
+            {
+                continue;
+            }
+            if (!runtime_hydration_supported(module, kind))
+            {
+                continue;
+            }
+
+            const rasn_runtime_response response = hydrate_record(module, kind, record);
+            if (response.ok)
+            {
+                if (applied != nullptr)
+                {
+                    ++(*applied);
+                }
+            }
+            else
+            {
+                ok = false;
+                if (error != nullptr && error->empty())
+                {
+                    *error = response.error.empty() ? "runtime hydration record failed" : response.error;
+                }
+                dwarn("failed to hydrate runtime module %s record %s: %s",
+                      module.c_str(),
+                      record.key.c_str(),
+                      response.error.c_str());
+            }
+        }
+        return ok;
     }
 
 private:
@@ -1233,6 +2106,79 @@ private:
         return make_rasn_runtime_error(request, "unknown runtime module: " + request.module);
     }
 
+    rasn_runtime_response hydrate_record(const std::string &module, const std::string &kind, const state_record &record)
+    {
+        rasn_runtime_request request;
+        request.module = module;
+        request.key = record.key;
+        request.payload = record.value;
+        if (module == "agent_control_plane" && kind == "agent")
+        {
+            request.operation = "hydrate_agent";
+        }
+        else if (module == "agent_message_bus" && kind == "message")
+        {
+            request.operation = "hydrate_message";
+        }
+        else if (module == "task_orchestration_kernel" && kind == "task")
+        {
+            request.operation = "hydrate_task";
+        }
+        else if (module == "determinism_ledger" && kind == "choice")
+        {
+            request.operation = "hydrate_choice";
+        }
+        else if (module == "capability_directory" && kind == "provider")
+        {
+            request.operation = "upsert_provider";
+        }
+        else if (module == "resource_budget" && kind == "quota")
+        {
+            request.operation = "configure";
+        }
+        else if (module == "resource_budget" && kind == "usage")
+        {
+            request.operation = "hydrate_usage";
+        }
+        else if (module == "recovery_supervisor" && kind == "policy")
+        {
+            request.operation = "set_policy";
+        }
+        else if (module == "recovery_supervisor" && kind == "failure")
+        {
+            request.operation = "hydrate_failure";
+        }
+        else if (module == "blackboard" && kind == "entry")
+        {
+            request.operation = "hydrate_entry";
+        }
+        else if (module == "contract_verifier" && kind == "contract")
+        {
+            request.operation = "register";
+        }
+        else if (module == "human_interaction" && kind == "request")
+        {
+            request.operation = "hydrate_request";
+        }
+        else if (module == "sandbox_runtime" && kind == "profile")
+        {
+            request.operation = "set_profile";
+        }
+        else
+        {
+            return make_rasn_runtime_error(request, "unsupported runtime mirror kind: " + module + "/" + kind);
+        }
+        return route_module_request(request);
+    }
+
+    struct dedup_entry
+    {
+        bool in_flight = false;
+        rasn_runtime_response response;
+        uint64_t expires_at_ms = 0;
+        uint32_t waiters = 0;
+    };
+
     static size_t dedup_capacity()
     {
         const uint64_t configured = ::dsn_config_get_value_uint64(
@@ -1240,59 +2186,194 @@ private:
             "rasn_runtime_dedup_capacity",
             8192,
             "rASN runtime module idempotency cache capacity (0 disables dedup)");
+        if (configured > (std::numeric_limits<size_t>::max)())
+        {
+            dwarn("rasn.service.rasn_runtime_dedup_capacity=%llu exceeds size_t range; using maximum capacity",
+                  static_cast<unsigned long long>(configured));
+            return (std::numeric_limits<size_t>::max)();
+        }
         return static_cast<size_t>(configured);
+    }
+
+    static uint64_t dedup_ttl_ms()
+    {
+        return ::dsn_config_get_value_uint64("rasn.service",
+                                             "rasn_runtime_dedup_ttl_ms",
+                                             300000,
+                                             "rASN runtime module idempotency cache TTL in milliseconds (0 disables TTL expiry)");
+    }
+
+    static bool idempotency_dedup_enabled(const rasn_runtime_request &request)
+    {
+        return !request.request_id.empty() && runtime_operation_is_mutating(request.operation) && dedup_capacity() != 0;
     }
 
     static std::string dedup_key(const rasn_runtime_request &request)
     {
-        return request.module + "\x1f" + request.request_id;
+        return request.module + "\x1f" + request.operation + "\x1f" + request.key + "\x1f" + request.payload + "\x1f" +
+               request.request_id + "\x1f" + std::to_string(request.route_partition);
     }
 
-    bool lookup_dedup(const rasn_runtime_request &request, rasn_runtime_response *out)
+    void record_dedup_metric(const std::string &event) const
     {
-        if (dedup_capacity() == 0)
-        {
-            return false;
-        }
-        const std::string key = dedup_key(request);
-        ::dsn::service::zauto_lock guard(_dedup_lock);
-        const std::map<std::string, rasn_runtime_response>::const_iterator it = _dedup_index.find(key);
-        if (it == _dedup_index.end())
-        {
-            return false;
-        }
-        if (out != nullptr)
-        {
-            *out = it->second;
-        }
-        return true;
+        metrics_registry::instance().on_event("runtime.dedup." + event, "");
     }
 
-    void store_dedup(const rasn_runtime_request &request, const rasn_runtime_response &response)
+    void rebuild_dedup_order_locked()
+    {
+        std::deque<std::string> kept;
+        for (const std::string &key : _dedup_order)
+        {
+            if (_dedup_index.find(key) != _dedup_index.end())
+            {
+                kept.push_back(key);
+            }
+        }
+        _dedup_order.swap(kept);
+    }
+
+    void prune_expired_dedup_locked(uint64_t now_ms)
+    {
+        const uint64_t ttl_ms = dedup_ttl_ms();
+        if (ttl_ms == 0)
+        {
+            return;
+        }
+        bool pruned = false;
+        for (std::map<std::string, dedup_entry>::iterator it = _dedup_index.begin(); it != _dedup_index.end();)
+        {
+            if (!it->second.in_flight && it->second.waiters == 0 && it->second.expires_at_ms != 0 &&
+                it->second.expires_at_ms <= now_ms)
+            {
+                it = _dedup_index.erase(it);
+                pruned = true;
+                record_dedup_metric("expired");
+            }
+            else
+            {
+                ++it;
+            }
+        }
+        if (pruned)
+        {
+            rebuild_dedup_order_locked();
+            _dedup_cv.notify_all();
+        }
+    }
+
+    void enforce_dedup_capacity_locked()
     {
         const size_t capacity = dedup_capacity();
         if (capacity == 0)
         {
+            _dedup_index.clear();
+            _dedup_order.clear();
             return;
         }
-        const std::string key = dedup_key(request);
-        ::dsn::service::zauto_lock guard(_dedup_lock);
-        if (_dedup_index.find(key) != _dedup_index.end())
+
+        size_t scanned = 0;
+        const size_t initial_size = _dedup_order.size();
+        while (_dedup_index.size() > capacity && !_dedup_order.empty() && scanned < initial_size)
         {
-            return; // keep the first recorded result for this id
-        }
-        _dedup_index[key] = response;
-        _dedup_order.push_back(key);
-        while (_dedup_order.size() > capacity)
-        {
-            _dedup_index.erase(_dedup_order.front());
+            const std::string key = _dedup_order.front();
             _dedup_order.pop_front();
+            ++scanned;
+
+            std::map<std::string, dedup_entry>::iterator it = _dedup_index.find(key);
+            if (it == _dedup_index.end())
+            {
+                continue;
+            }
+            if (it->second.in_flight || it->second.waiters != 0)
+            {
+                _dedup_order.push_back(key);
+                continue;
+            }
+            _dedup_index.erase(it);
+            record_dedup_metric("evicted");
         }
+    }
+
+    bool begin_dedup(const rasn_runtime_request &request, rasn_runtime_response *cached)
+    {
+        const std::string key = dedup_key(request);
+        std::unique_lock<std::mutex> guard(_dedup_lock);
+        while (true)
+        {
+            const uint64_t now_ms = ::dsn_now_ms();
+            prune_expired_dedup_locked(now_ms);
+            std::map<std::string, dedup_entry>::iterator it = _dedup_index.find(key);
+            if (it == _dedup_index.end())
+            {
+                dedup_entry entry;
+                entry.in_flight = true;
+                _dedup_index[key] = entry;
+                _dedup_order.push_back(key);
+                record_dedup_metric("miss");
+                enforce_dedup_capacity_locked();
+                return true;
+            }
+
+            if (!it->second.in_flight)
+            {
+                if (cached != nullptr)
+                {
+                    *cached = it->second.response;
+                }
+                record_dedup_metric("hit");
+                return false;
+            }
+
+            ++it->second.waiters;
+            record_dedup_metric("wait");
+            _dedup_cv.wait(guard, [&]() {
+                const std::map<std::string, dedup_entry>::const_iterator current = _dedup_index.find(key);
+                return current == _dedup_index.end() || !current->second.in_flight;
+            });
+            it = _dedup_index.find(key);
+            if (it != _dedup_index.end() && !it->second.in_flight)
+            {
+                if (cached != nullptr)
+                {
+                    *cached = it->second.response;
+                }
+                if (it->second.waiters != 0)
+                {
+                    --it->second.waiters;
+                }
+                record_dedup_metric("hit");
+                return false;
+            }
+        }
+    }
+
+    void finish_dedup(const rasn_runtime_request &request, const rasn_runtime_response &response)
+    {
+        const std::string key = dedup_key(request);
+        const uint64_t now_ms = ::dsn_now_ms();
+        const uint64_t ttl_ms = dedup_ttl_ms();
+        std::lock_guard<std::mutex> guard(_dedup_lock);
+        dedup_entry &entry = _dedup_index[key];
+        entry.in_flight = false;
+        entry.response = response;
+        entry.expires_at_ms =
+            ttl_ms == 0 ? 0
+                        : (now_ms > (std::numeric_limits<uint64_t>::max)() - ttl_ms
+                               ? (std::numeric_limits<uint64_t>::max)()
+                               : now_ms + ttl_ms);
+        enforce_dedup_capacity_locked();
+        _dedup_cv.notify_all();
     }
 
     rasn_runtime_response dispatch_agent_control(const rasn_runtime_request &request)
     {
         std::string error;
+        if (request.operation == "hydrate_agent")
+        {
+            agent_control_record record;
+            if (!decode_agent_control_payload(request.payload, &record, &error)) return make_rasn_runtime_error(request, error);
+            return bool_response(request, _agent_control.hydrate_agent(record, &error), error);
+        }
         if (request.operation == "upsert_agent")
         {
             agent_control_record record;
@@ -1352,6 +2433,12 @@ private:
     rasn_runtime_response dispatch_message_bus(const rasn_runtime_request &request)
     {
         std::string error;
+        if (request.operation == "hydrate_message")
+        {
+            agent_message message;
+            if (!decode_message_payload(request.payload, &message, &error)) return make_rasn_runtime_error(request, error);
+            return bool_response(request, _message_bus.hydrate_message(message, &error), error);
+        }
         if (request.operation == "publish")
         {
             agent_message message;
@@ -1376,6 +2463,12 @@ private:
     rasn_runtime_response dispatch_orchestration(const rasn_runtime_request &request)
     {
         std::string error;
+        if (request.operation == "hydrate_task")
+        {
+            orchestration_task task;
+            if (!decode_task_payload(request.payload, &task, &error)) return make_rasn_runtime_error(request, error);
+            return bool_response(request, _orchestration.hydrate_task(task, &error), error);
+        }
         if (request.operation == "add_task")
         {
             orchestration_task task;
@@ -1407,6 +2500,12 @@ private:
     rasn_runtime_response dispatch_determinism(const rasn_runtime_request &request)
     {
         std::string error;
+        if (request.operation == "hydrate_choice")
+        {
+            deterministic_choice choice;
+            if (!decode_choice_payload(request.payload, &choice, &error)) return make_rasn_runtime_error(request, error);
+            return bool_response(request, _determinism.hydrate_choice(choice, &error), error);
+        }
         if (request.operation == "record")
         {
             field_map fields;
@@ -1444,6 +2543,12 @@ private:
     rasn_runtime_response dispatch_budget(const rasn_runtime_request &request)
     {
         std::string error;
+        if (request.operation == "hydrate_usage")
+        {
+            resource_usage usage;
+            if (!decode_usage_payload(request.payload, &usage, &error)) return make_rasn_runtime_error(request, error);
+            return bool_response(request, _budgets.hydrate_usage(usage, &error), error);
+        }
         if (request.operation == "configure")
         {
             resource_quota quota;
@@ -1475,6 +2580,12 @@ private:
     rasn_runtime_response dispatch_recovery(const rasn_runtime_request &request)
     {
         std::string error;
+        if (request.operation == "hydrate_failure")
+        {
+            failure_observation failure;
+            if (!decode_failure_payload(request.payload, &failure, &error)) return make_rasn_runtime_error(request, error);
+            return bool_response(request, _recovery.hydrate_failure(failure, &error), error);
+        }
         if (request.operation == "set_policy")
         {
             recovery_policy policy;
@@ -1494,6 +2605,12 @@ private:
     rasn_runtime_response dispatch_blackboard(const rasn_runtime_request &request)
     {
         std::string error;
+        if (request.operation == "hydrate_entry")
+        {
+            blackboard_entry entry;
+            if (!decode_blackboard_payload(request.payload, &entry, &error)) return make_rasn_runtime_error(request, error);
+            return bool_response(request, _blackboard.hydrate_entry(entry, &error), error);
+        }
         if (request.operation == "put")
         {
             blackboard_entry entry;
@@ -1554,6 +2671,13 @@ private:
 
     rasn_runtime_response dispatch_human(const rasn_runtime_request &request)
     {
+        std::string error;
+        if (request.operation == "hydrate_request")
+        {
+            human_interaction_request human_request;
+            if (!decode_human_payload(request.payload, &human_request, &error)) return make_rasn_runtime_error(request, error);
+            return bool_response(request, _human.hydrate_request(human_request, &error), error);
+        }
         if (request.operation == "snapshot") return success_response(request, encode_items(_human.snapshot(), encode_human_payload));
         if (request.operation == "pending") return success_response(request, encode_items(_human.pending(request.key), encode_human_payload));
         if (request.operation == "describe") return success_response(request, _human.describe());
@@ -1595,11 +2719,13 @@ private:
     sandbox_profile _sandbox_profile = default_read_only_sandbox_profile();
     mutable ::dsn::service::zlock _sandbox_lock;
 
-    // Bounded idempotency cache: maps module+request_id to the first response, with
-    // a FIFO eviction order so the cache stays within rasn_runtime_dedup_capacity.
-    std::map<std::string, rasn_runtime_response> _dedup_index;
+    // Bounded idempotency cache: maps a request signature plus request_id to the
+    // first response, with a FIFO eviction order so the cache stays within
+    // rasn_runtime_dedup_capacity.
+    std::map<std::string, dedup_entry> _dedup_index;
     std::deque<std::string> _dedup_order;
-    mutable ::dsn::service::zlock _dedup_lock;
+    mutable std::mutex _dedup_lock;
+    std::condition_variable _dedup_cv;
 };
 
 rasn_runtime_service_store &global_rasn_runtime_store()
@@ -1680,10 +2806,11 @@ sandbox_decision denied_sandbox_decision(const std::string &reason)
 
 std::string generate_rasn_runtime_request_id()
 {
+    static const std::string process_prefix = make_trace_id();
     static std::atomic<uint64_t> counter(0);
     const uint64_t seq = counter.fetch_add(1, std::memory_order_relaxed);
     std::ostringstream output;
-    output << std::hex << ::dsn_now_ns() << "-" << seq;
+    output << process_prefix << "-" << std::hex << ::dsn_now_ns() << "-" << seq;
     return output.str();
 }
 
@@ -1705,10 +2832,14 @@ breaker_config read_rasn_runtime_breaker_config()
 {
     breaker_config cfg;
     cfg.enabled = rasn_runtime_breaker_enabled();
-    cfg.failure_threshold = static_cast<uint32_t>(config_service_uint64(
+    const uint64_t failure_threshold = config_service_uint64(
         "rasn_runtime_breaker_failures",
         5,
-        "consecutive runtime module RPC failures before the circuit breaker opens"));
+        "consecutive runtime module RPC failures before the circuit breaker opens");
+    cfg.failure_threshold =
+        failure_threshold > (std::numeric_limits<uint32_t>::max)()
+            ? (std::numeric_limits<uint32_t>::max)()
+            : static_cast<uint32_t>(failure_threshold);
     cfg.open_ms = config_service_uint64(
         "rasn_runtime_breaker_open_ms",
         30000,
@@ -1750,23 +2881,30 @@ rasn_runtime_response invoke_local_module(const rasn_runtime_request &request)
     return future.get();
 }
 
-// Remote invocation with the runtime-owned resilience policy: a per-module circuit
-// breaker fast-fails while a module endpoint is unhealthy, an idempotency id makes
-// retries safe against lost replies, and transient transport errors are retried
-// with linear backoff before the call is surfaced as an error to the facade.
+// Remote invocation with the runtime-owned resilience policy: a per-endpoint
+// circuit breaker fast-fails while a module endpoint is unhealthy, an idempotency
+// id makes retries safe against lost replies, and transient transport errors are
+// retried with linear backoff before the call is surfaced as an error to the
+// facade.
 rasn_runtime_response invoke_remote_module(const rasn_runtime_request &request)
 {
     const std::string &module = request.module;
+    const runtime_endpoint resolved_endpoint = resolve_rasn_runtime_endpoint(request);
+    const ::dsn::rpc_address address = resolved_endpoint.address;
+    const std::string endpoint = std::string(address.to_string());
+    const std::string breaker_key =
+        module + "#" + std::to_string(resolved_endpoint.partition_index) + "@" + endpoint;
     const bool breaker_enabled = rasn_runtime_breaker_enabled();
     if (breaker_enabled)
     {
         ensure_rasn_runtime_breaker_config();
-        circuit_breaker &breaker = global_rasn_runtime_breakers().get(module);
+        circuit_breaker &breaker = global_rasn_runtime_breakers().get(breaker_key);
         const breaker_decision decision = breaker.allow(::dsn_now_ms());
         if (!decision.allowed)
         {
-            dwarn("runtime module '%s' circuit breaker %s; short-circuiting RPC",
+            dwarn("runtime module '%s' endpoint '%s' circuit breaker %s; short-circuiting RPC",
                   module.c_str(),
+                  endpoint.c_str(),
                   to_string(decision.state));
             return make_rasn_runtime_error(
                 request, std::string("runtime module circuit breaker ") + to_string(decision.state));
@@ -1778,8 +2916,12 @@ rasn_runtime_response invoke_remote_module(const rasn_runtime_request &request)
     {
         sending.request_id = generate_rasn_runtime_request_id();
     }
+    std::string auth_error;
+    if (!prepare_rasn_runtime_rpc_request(&sending, &auth_error))
+    {
+        return make_rasn_runtime_error(request, auth_error);
+    }
 
-    const ::dsn::rpc_address address = rasn_runtime_address(module);
     const std::chrono::milliseconds timeout = rasn_runtime_rpc_timeout(module);
     const uint32_t max_attempts = rasn_runtime_rpc_max_attempts(module);
     const uint64_t backoff_ms = rasn_runtime_rpc_backoff_ms(module);
@@ -1792,7 +2934,7 @@ rasn_runtime_response invoke_remote_module(const rasn_runtime_request &request)
         {
             if (breaker_enabled)
             {
-                global_rasn_runtime_breakers().get(module).report(true, ::dsn_now_ms());
+                global_rasn_runtime_breakers().get(breaker_key).report(true, ::dsn_now_ms());
             }
             return result.second;
         }
@@ -1813,11 +2955,12 @@ rasn_runtime_response invoke_remote_module(const rasn_runtime_request &request)
     }
     if (breaker_enabled)
     {
-        circuit_breaker &breaker = global_rasn_runtime_breakers().get(module);
+        circuit_breaker &breaker = global_rasn_runtime_breakers().get(breaker_key);
         if (breaker.report(false, ::dsn_now_ms()))
         {
-            dwarn("runtime module '%s' circuit breaker opened after %u consecutive failures",
+            dwarn("runtime module '%s' endpoint '%s' circuit breaker opened after %u consecutive failures",
                   module.c_str(),
+                  endpoint.c_str(),
                   static_cast<unsigned int>(breaker.consecutive_failures()));
         }
     }
@@ -1829,39 +2972,80 @@ rasn_runtime_response invoke_remote_module(const rasn_runtime_request &request)
 // readiness sweep stays fast when an endpoint is down.
 bool ping_remote_module(const std::string &module, std::string *error)
 {
-    const bool breaker_enabled = rasn_runtime_breaker_enabled();
-    if (breaker_enabled)
+    const uint32_t partition_count = rasn_runtime_partition_count(module);
+    bool all_ok = true;
+    std::string first_error;
+    for (uint32_t partition_index = 0; partition_index < partition_count; ++partition_index)
     {
-        ensure_rasn_runtime_breaker_config();
-        if (global_rasn_runtime_breakers().get(module).is_open(::dsn_now_ms()))
-        {
-            if (error != nullptr)
-            {
-                *error = "runtime module circuit breaker open";
-            }
-            return false;
-        }
-    }
-    rasn_runtime_client client(rasn_runtime_address(module));
-    const std::pair<::dsn::error_code, rasn_runtime_response> result =
-        client.call_sync(make_module_request(module, "ping"), rasn_runtime_ping_timeout(module));
-    if (result.first != ::dsn::ERR_OK)
-    {
+        const runtime_endpoint resolved_endpoint = resolve_rasn_runtime_partition_endpoint(module, partition_index);
+        const ::dsn::rpc_address address = resolved_endpoint.address;
+        const std::string endpoint = std::string(address.to_string());
+        const std::string breaker_key =
+            module + "#" + std::to_string(resolved_endpoint.partition_index) + "@" + endpoint;
+        const bool breaker_enabled = rasn_runtime_breaker_enabled();
         if (breaker_enabled)
         {
-            global_rasn_runtime_breakers().get(module).report(false, ::dsn_now_ms());
+            ensure_rasn_runtime_breaker_config();
+            if (global_rasn_runtime_breakers().get(breaker_key).is_open(::dsn_now_ms()))
+            {
+                all_ok = false;
+                if (first_error.empty())
+                {
+                    first_error = "runtime module circuit breaker open";
+                }
+                continue;
+            }
         }
-        if (error != nullptr)
+        rasn_runtime_request ping = make_module_request(module, "ping");
+        std::string auth_error;
+        if (!prepare_rasn_runtime_rpc_request(&ping, &auth_error))
         {
-            *error = std::string("runtime module ping RPC failed: ") + result.first.to_string();
+            all_ok = false;
+            if (first_error.empty())
+            {
+                first_error = auth_error;
+            }
+            continue;
         }
-        return false;
+        rasn_runtime_client client(address);
+        const std::pair<::dsn::error_code, rasn_runtime_response> result =
+            client.call_sync(ping, rasn_runtime_ping_timeout(module));
+        if (result.first != ::dsn::ERR_OK)
+        {
+            if (breaker_enabled)
+            {
+                global_rasn_runtime_breakers().get(breaker_key).report(false, ::dsn_now_ms());
+            }
+            all_ok = false;
+            if (first_error.empty())
+            {
+                first_error = std::string("runtime module ping RPC failed: ") + result.first.to_string();
+            }
+            continue;
+        }
+        if (breaker_enabled)
+        {
+            global_rasn_runtime_breakers().get(breaker_key).report(true, ::dsn_now_ms());
+        }
+        std::string response_error;
+        if (!response_bool(result.second, &response_error))
+        {
+            all_ok = false;
+            if (first_error.empty())
+            {
+                first_error = response_error;
+            }
+        }
     }
-    if (breaker_enabled)
+    if (!all_ok && error != nullptr)
     {
-        global_rasn_runtime_breakers().get(module).report(true, ::dsn_now_ms());
+        *error = first_error.empty() ? "runtime module ping failed" : first_error;
     }
-    return response_bool(result.second, error);
+    if (all_ok && error != nullptr)
+    {
+        error->clear();
+    }
+    return all_ok;
 }
 
 class rasn_local_runtime_provider : public rasn_runtime_provider
@@ -1933,7 +3117,7 @@ protected:
 
     std::string module_endpoint(const std::string &module) const override
     {
-        return std::string(rasn_runtime_address(module).to_string());
+        return rasn_runtime_module_endpoint_summary(module);
     }
 
     bool write_state(const std::string &module,
@@ -1957,17 +3141,12 @@ protected:
             return false;
         }
 
-        state_record record;
-        record.key = state_key(module, kind, key);
-        record.kind = "rasn.runtime." + module + "." + kind;
-        record.scope = "rasn.runtime";
-        record.value = value;
-        const state_response response = _services.put_state(record);
-        if (!response.ok)
+        std::string state_error;
+        if (!put_runtime_state_mirror(_services, state_prefix(), module, kind, key, value, &state_error))
         {
             if (error != nullptr)
             {
-                *error = response.error.empty() ? "failed to write rASN runtime state" : response.error;
+                *error = state_error;
             }
             return false;
         }
@@ -2022,8 +3201,12 @@ protected:
 
     std::string module_endpoint(const std::string &module) const override
     {
-        return module_is_remote(module) ? std::string(rasn_runtime_address(module).to_string())
-                                        : std::string("in-process");
+        if (!module_is_remote(module))
+        {
+            return "in-process";
+        }
+        const runtime_endpoint endpoint = resolve_rasn_runtime_endpoint(module);
+        return rasn_runtime_module_endpoint_summary(module);
     }
 
     bool write_state(const std::string &module,
@@ -2060,17 +3243,12 @@ protected:
             return true;
         }
 
-        state_record record;
-        record.key = state_key(module, kind, key);
-        record.kind = "rasn.runtime." + module + "." + kind;
-        record.scope = "rasn.runtime";
-        record.value = value;
-        const state_response response = _services.put_state(record);
-        if (!response.ok)
+        std::string state_error;
+        if (!put_runtime_state_mirror(_services, state_prefix(), module, kind, key, value, &state_error))
         {
             if (error != nullptr)
             {
-                *error = response.error.empty() ? "failed to write rASN runtime state" : response.error;
+                *error = state_error;
             }
             return false;
         }
@@ -2141,52 +3319,60 @@ std::vector<rasn_runtime_descriptor> rasn_runtime_module_descriptors()
 std::string rasn_runtime_module_app_role(const std::string &module_or_role)
 {
     const std::string value = lower_ascii(trim(module_or_role));
-    if (value == "rasn.runtime.agent_control" || value == "agent_control" || value == "agent_control_plane")
+    if (value == "rasn.runtime.agent_control" || value == "rasn.common.agent_control" || value == "agent_control" ||
+        value == "agent_control_plane")
     {
         return "rasn.runtime.agent_control";
     }
-    if (value == "rasn.runtime.message_bus" || value == "message_bus" || value == "agent_message_bus")
+    if (value == "rasn.runtime.message_bus" || value == "rasn.common.message_bus" || value == "message_bus" ||
+        value == "agent_message_bus")
     {
         return "rasn.runtime.message_bus";
     }
-    if (value == "rasn.runtime.task_kernel" || value == "task_kernel" || value == "task_orchestration" ||
-        value == "task_orchestration_kernel")
+    if (value == "rasn.runtime.task_kernel" || value == "rasn.common.task_kernel" || value == "task_kernel" ||
+        value == "task_orchestration" || value == "task_orchestration_kernel")
     {
         return "rasn.runtime.task_kernel";
     }
-    if (value == "rasn.runtime.determinism" || value == "determinism" || value == "determinism_ledger")
+    if (value == "rasn.runtime.determinism" || value == "rasn.common.determinism" || value == "determinism" ||
+        value == "determinism_ledger")
     {
         return "rasn.runtime.determinism";
     }
-    if (value == "rasn.runtime.capability" || value == "capability" || value == "capability_directory")
+    if (value == "rasn.runtime.capability" || value == "rasn.common.capability" || value == "capability" ||
+        value == "capability_directory")
     {
         return "rasn.runtime.capability";
     }
-    if (value == "rasn.runtime.budget" || value == "budget" || value == "resource_budget")
+    if (value == "rasn.runtime.budget" || value == "rasn.common.budget" || value == "budget" || value == "resource_budget")
     {
         return "rasn.runtime.budget";
     }
-    if (value == "rasn.runtime.recovery" || value == "recovery" || value == "recovery_supervisor")
+    if (value == "rasn.runtime.recovery" || value == "rasn.common.recovery" || value == "recovery" ||
+        value == "recovery_supervisor")
     {
         return "rasn.runtime.recovery";
     }
-    if (value == "rasn.runtime.blackboard" || value == "blackboard")
+    if (value == "rasn.runtime.blackboard" || value == "rasn.common.blackboard" || value == "blackboard")
     {
         return "rasn.runtime.blackboard";
     }
-    if (value == "rasn.runtime.contract" || value == "contract" || value == "contract_verifier")
+    if (value == "rasn.runtime.contract" || value == "rasn.common.contract" || value == "contract" ||
+        value == "contract_verifier")
     {
         return "rasn.runtime.contract";
     }
-    if (value == "rasn.runtime.human_interaction" || value == "human_interaction")
+    if (value == "rasn.runtime.human_interaction" || value == "rasn.common.human_interaction" ||
+        value == "human_interaction")
     {
         return "rasn.runtime.human_interaction";
     }
-    if (value == "rasn.runtime.sandbox_runtime" || value == "sandbox" || value == "sandbox_runtime")
+    if (value == "rasn.runtime.sandbox_runtime" || value == "rasn.common.sandbox_runtime" || value == "sandbox" ||
+        value == "sandbox_runtime")
     {
         return "rasn.runtime.sandbox_runtime";
     }
-    if (value == "rasn.runtime" || value == "modules")
+    if (value == "rasn.runtime" || value == "rasn.common.modules" || value == "modules")
     {
         return "rasn.runtime";
     }
@@ -2218,6 +3404,67 @@ std::string normalize_rasn_runtime_app_list(const std::string &app_list)
         }
     }
     return join_strings(normalized, ";");
+}
+
+rasn_runtime_state_compaction_report compact_rasn_runtime_state_mirror(rasn_service_graph &services,
+                                                                       const std::string &checkpoint_path,
+                                                                       const std::string &state_prefix)
+{
+    rasn_runtime_state_compaction_report report;
+    report.state_prefix = state_prefix.empty() ? load_rasn_runtime_config().state_prefix : state_prefix;
+    report.checkpoint_path = checkpoint_path;
+
+    state_query_request query;
+    query.key_prefix = rasn_runtime_state_prefix(report.state_prefix);
+    const state_response queried = services.query_state(query);
+    if (!queried.ok)
+    {
+        report.ok = false;
+        report.error = queried.error.empty() ? "failed to query rASN runtime state mirror" : queried.error;
+        return report;
+    }
+
+    report.queried_records = queried.records.size();
+    const std::vector<std::string> modules = rasn_runtime_module_names();
+    for (const state_record &record : queried.records)
+    {
+        std::string module;
+        std::string kind;
+        if (!parse_rasn_runtime_record_kind(record.kind, &module, &kind) || !has_module(modules, module))
+        {
+            continue;
+        }
+        if (kind == "watermark")
+        {
+            ++report.watermark_records;
+        }
+        else
+        {
+            ++report.runtime_records;
+        }
+    }
+
+    std::string watermark_error;
+    if (!verify_runtime_state_watermarks(queried.records, modules, report.state_prefix, &watermark_error))
+    {
+        report.ok = false;
+        report.error = watermark_error.empty() ? "runtime state watermark verification failed" : watermark_error;
+        return report;
+    }
+
+    state_checkpoint_request checkpoint;
+    checkpoint.path = checkpoint_path;
+    const state_response checkpointed = services.checkpoint_state(checkpoint);
+    if (!checkpointed.ok)
+    {
+        report.ok = false;
+        report.error = checkpointed.error.empty() ? "failed to checkpoint rASN state mirror" : checkpointed.error;
+        return report;
+    }
+
+    report.checkpointed_records = checkpointed.records.size();
+    report.last_sequence = checkpointed.last_sequence;
+    return report;
 }
 
 rasn_runtime::rasn_runtime(std::unique_ptr<rasn_runtime_provider> provider) : _provider(std::move(provider)) {}
@@ -2588,17 +3835,59 @@ bool rasn_runtime_provider::mirror_state(const std::string &module,
     return write_state(module, kind, key, value, error);
 }
 
+void rasn_runtime_provider::mirror_state_after_success(const std::string &module,
+                                                       const std::string &kind,
+                                                       const std::string &key,
+                                                       const std::string &value)
+{
+    std::string error;
+    if (!write_state(module, kind, key, value, &error))
+    {
+        dwarn("%s runtime module state mirror failed for %s/%s/%s: %s",
+              strict() ? "strict" : "distributed",
+              module.c_str(),
+              kind.c_str(),
+              key.c_str(),
+              error.c_str());
+    }
+}
+
 bool rasn_runtime_provider::ping_module(const std::string &module, std::string *error) const
 {
     return response_bool(call_module_api(make_module_request(module, "ping")), error);
+}
+
+std::vector<rasn_runtime_response>
+rasn_runtime_provider::call_module_api_shards(const rasn_runtime_request &request) const
+{
+    const uint32_t partition_count = rasn_runtime_partition_count(request.module);
+    if (!module_routed_remote(request.module) || partition_count <= 1)
+    {
+        return std::vector<rasn_runtime_response>{call_module_api(request)};
+    }
+
+    std::vector<rasn_runtime_response> responses;
+    responses.reserve(partition_count);
+    std::set<std::string> queried_endpoints;
+    for (uint32_t i = 0; i < partition_count; ++i)
+    {
+        const runtime_endpoint endpoint = resolve_rasn_runtime_partition_endpoint(request.module, i);
+        if (!queried_endpoints.insert(std::string(endpoint.address.to_string())).second)
+        {
+            continue;
+        }
+        rasn_runtime_request shard_request = request;
+        shard_request.route_partition = i;
+        responses.push_back(call_module_api(shard_request));
+    }
+    return responses;
 }
 
 std::string rasn_runtime_provider::state_key(const std::string &module,
                                                const std::string &kind,
                                                const std::string &key) const
 {
-    return _config.state_prefix + "/" + state_key_component(module) + "/" +
-           state_key_component(kind) + "/" + state_key_component(key);
+    return rasn_runtime_state_key(_config.state_prefix, module, kind, key);
 }
 
 void rasn_runtime_provider::set_sandbox_profile(const sandbox_profile &profile)
@@ -2608,7 +3897,9 @@ void rasn_runtime_provider::set_sandbox_profile(const sandbox_profile &profile)
     if (!response.ok)
     {
         dwarn("failed to set sandbox runtime profile through module API: %s", response.error.c_str());
+        return;
     }
+    mirror_state_after_success("sandbox_runtime", "profile", profile.name, encode_sandbox_profile_payload(profile));
 }
 
 sandbox_decision rasn_runtime_provider::evaluate_sandbox(const sandbox_request &request) const
@@ -2648,11 +3939,20 @@ sandbox_profile rasn_runtime_provider::sandbox() const
 
 bool rasn_runtime_provider::upsert_agent(const agent_control_record &record, std::string *error)
 {
-    return response_bool(call_module_api(make_module_request("agent_control_plane",
-                                                             "upsert_agent",
-                                                             record.descriptor.agent_id,
-                                                             encode_agent_control_payload(record))),
-                         error);
+    const rasn_runtime_response response = call_module_api(make_module_request("agent_control_plane",
+                                                                               "upsert_agent",
+                                                                               record.descriptor.agent_id,
+                                                                               encode_agent_control_payload(record)));
+    if (!response_bool(response, error))
+    {
+        return false;
+    }
+    agent_control_record stored;
+    if (find_agent(record.descriptor.agent_id, &stored))
+    {
+        mirror_state_after_success("agent_control_plane", "agent", stored.descriptor.agent_id, encode_agent_control_payload(stored));
+    }
+    return true;
 }
 
 agent_control_lease rasn_runtime_provider::acquire_agent_lease(const std::string &agent_id,
@@ -2679,13 +3979,31 @@ agent_control_lease rasn_runtime_provider::acquire_agent_lease(const std::string
         lease.ok = false;
         lease.error = error;
     }
+    if (lease.ok)
+    {
+        agent_control_record stored;
+        if (find_agent(agent_id, &stored))
+        {
+            mirror_state_after_success("agent_control_plane", "agent", stored.descriptor.agent_id, encode_agent_control_payload(stored));
+        }
+    }
     return lease;
 }
 
 bool rasn_runtime_provider::heartbeat_agent(const std::string &agent_id, uint64_t now_ms, std::string *error)
 {
-    return response_bool(
-        call_module_api(make_module_request("agent_control_plane", "heartbeat", agent_id, scalar_payload(now_ms))), error);
+    const rasn_runtime_response response =
+        call_module_api(make_module_request("agent_control_plane", "heartbeat", agent_id, scalar_payload(now_ms)));
+    if (!response_bool(response, error))
+    {
+        return false;
+    }
+    agent_control_record stored;
+    if (find_agent(agent_id, &stored))
+    {
+        mirror_state_after_success("agent_control_plane", "agent", stored.descriptor.agent_id, encode_agent_control_payload(stored));
+    }
+    return true;
 }
 
 bool rasn_runtime_provider::find_agent(const std::string &agent_id, agent_control_record *record) const
@@ -2709,7 +4027,16 @@ size_t rasn_runtime_provider::expire_agent_leases(uint64_t now_ms)
     }
     field_map fields;
     std::string error;
-    return decode_fields(response.payload, &fields, &error) ? field_size(fields, "count") : 0;
+    const size_t expired = decode_fields(response.payload, &fields, &error) ? field_size(fields, "count") : 0;
+    if (expired > 0)
+    {
+        const std::vector<agent_control_record> records = list_agents(false, now_ms);
+        for (const agent_control_record &record : records)
+        {
+            mirror_state_after_success("agent_control_plane", "agent", record.descriptor.agent_id, encode_agent_control_payload(record));
+        }
+    }
+    return expired;
 }
 
 std::vector<agent_control_record> rasn_runtime_provider::list_agents(bool include_expired, uint64_t now_ms) const
@@ -2744,33 +4071,56 @@ bool rasn_runtime_provider::publish_message(const agent_message &message, agent_
         set_response_error(response, error);
         return false;
     }
+    agent_message stored_message;
+    std::string decode_error;
+    if (!decode_message_payload(response.payload, &stored_message, &decode_error))
+    {
+        if (error != nullptr)
+        {
+            *error = decode_error;
+        }
+        return false;
+    }
     if (stored != nullptr)
     {
-        std::string decode_error;
-        if (!decode_message_payload(response.payload, stored, &decode_error))
-        {
-            if (error != nullptr)
-            {
-                *error = decode_error;
-            }
-            return false;
-        }
+        *stored = stored_message;
     }
+    mirror_state_after_success("agent_message_bus", "message", stored_message.message_id, encode_message_payload(stored_message));
     clear_error(error);
     return true;
 }
 
 bool rasn_runtime_provider::ack_message(const std::string &message_id, std::string *error)
 {
-    return response_bool(call_module_api(make_module_request("agent_message_bus", "ack", message_id)), error);
+    const rasn_runtime_response response = call_module_api(make_module_request("agent_message_bus", "ack", message_id));
+    if (!response_bool(response, error))
+    {
+        return false;
+    }
+    agent_message stored;
+    if (find_message(message_id, &stored))
+    {
+        mirror_state_after_success("agent_message_bus", "message", stored.message_id, encode_message_payload(stored));
+    }
+    return true;
 }
 
 bool rasn_runtime_provider::dead_letter_message(const std::string &message_id,
                                                   const std::string &error_text,
                                                   std::string *error)
 {
-    return response_bool(
-        call_module_api(make_module_request("agent_message_bus", "dead_letter", message_id, error_text)), error);
+    const rasn_runtime_response response =
+        call_module_api(make_module_request("agent_message_bus", "dead_letter", message_id, error_text));
+    if (!response_bool(response, error))
+    {
+        return false;
+    }
+    agent_message stored;
+    if (find_message(message_id, &stored))
+    {
+        mirror_state_after_success("agent_message_bus", "message", stored.message_id, encode_message_payload(stored));
+    }
+    return true;
 }
 
 bool rasn_runtime_provider::find_message(const std::string &message_id, agent_message *message) const
@@ -2786,33 +4136,66 @@ bool rasn_runtime_provider::find_message(const std::string &message_id, agent_me
 
 std::vector<agent_message> rasn_runtime_provider::message_snapshot() const
 {
-    const rasn_runtime_response response = call_module_api(make_module_request("agent_message_bus", "snapshot"));
     std::vector<agent_message> messages;
-    std::string error;
-    if (response.ok)
+    for (const rasn_runtime_response &response :
+         call_module_api_shards(make_module_request("agent_message_bus", "snapshot")))
     {
-        (void)decode_items(response.payload, &messages, decode_message_payload, &error);
+        std::vector<agent_message> shard_messages;
+        std::string error;
+        if (response.ok && decode_items(response.payload, &shard_messages, decode_message_payload, &error))
+        {
+            messages.insert(messages.end(), shard_messages.begin(), shard_messages.end());
+        }
     }
     return messages;
 }
 
 bool rasn_runtime_provider::add_task(const orchestration_task &task, std::string *error)
 {
-    return response_bool(
-        call_module_api(make_module_request("task_orchestration_kernel", "add_task", task.task_id, encode_task_payload(task))),
-        error);
+    const rasn_runtime_response response =
+        call_module_api(make_module_request("task_orchestration_kernel", "add_task", task.task_id, encode_task_payload(task)));
+    if (!response_bool(response, error))
+    {
+        return false;
+    }
+    orchestration_task stored;
+    if (find_task(task.task_id, &stored))
+    {
+        mirror_state_after_success("task_orchestration_kernel", "task", stored.task_id, encode_task_payload(stored));
+    }
+    return true;
 }
 
 bool rasn_runtime_provider::start_task(const std::string &task_id, const std::string &owner_agent, std::string *error)
 {
-    return response_bool(call_module_api(make_module_request("task_orchestration_kernel", "start", task_id, owner_agent)),
-                         error);
+    const rasn_runtime_response response =
+        call_module_api(make_module_request("task_orchestration_kernel", "start", task_id, owner_agent));
+    if (!response_bool(response, error))
+    {
+        return false;
+    }
+    orchestration_task stored;
+    if (find_task(task_id, &stored))
+    {
+        mirror_state_after_success("task_orchestration_kernel", "task", stored.task_id, encode_task_payload(stored));
+    }
+    return true;
 }
 
 bool rasn_runtime_provider::complete_task(const std::string &task_id, const std::string &output, std::string *error)
 {
-    return response_bool(call_module_api(make_module_request("task_orchestration_kernel", "complete", task_id, output)),
-                         error);
+    const rasn_runtime_response response =
+        call_module_api(make_module_request("task_orchestration_kernel", "complete", task_id, output));
+    if (!response_bool(response, error))
+    {
+        return false;
+    }
+    orchestration_task stored;
+    if (find_task(task_id, &stored))
+    {
+        mirror_state_after_success("task_orchestration_kernel", "task", stored.task_id, encode_task_payload(stored));
+    }
+    return true;
 }
 
 bool rasn_runtime_provider::fail_task(const std::string &task_id,
@@ -2820,12 +4203,21 @@ bool rasn_runtime_provider::fail_task(const std::string &task_id,
                                         bool retryable,
                                         std::string *error)
 {
-    return response_bool(call_module_api(make_module_request(
-                             "task_orchestration_kernel",
-                             "fail",
-                             task_id,
-                             encode_fields({{"error", error_text}, {"retryable", retryable ? "true" : "false"}}))),
-                         error);
+    const rasn_runtime_response response = call_module_api(make_module_request(
+        "task_orchestration_kernel",
+        "fail",
+        task_id,
+        encode_fields({{"error", error_text}, {"retryable", retryable ? "true" : "false"}})));
+    if (!response_bool(response, error))
+    {
+        return false;
+    }
+    orchestration_task stored;
+    if (find_task(task_id, &stored))
+    {
+        mirror_state_after_success("task_orchestration_kernel", "task", stored.task_id, encode_task_payload(stored));
+    }
+    return true;
 }
 
 bool rasn_runtime_provider::find_task(const std::string &task_id, orchestration_task *task) const
@@ -2893,18 +4285,21 @@ bool rasn_runtime_provider::record_choice(const std::string &task_id,
         set_response_error(response, error);
         return false;
     }
+    deterministic_choice stored_choice;
+    std::string decode_error;
+    if (!decode_choice_payload(response.payload, &stored_choice, &decode_error))
+    {
+        if (error != nullptr)
+        {
+            *error = decode_error;
+        }
+        return false;
+    }
     if (choice != nullptr)
     {
-        std::string decode_error;
-        if (!decode_choice_payload(response.payload, choice, &decode_error))
-        {
-            if (error != nullptr)
-            {
-                *error = decode_error;
-            }
-            return false;
-        }
+        *choice = stored_choice;
     }
+    mirror_state_after_success("determinism_ledger", "choice", stored_choice.task_id + "/" + stored_choice.key, encode_choice_payload(stored_choice));
     clear_error(error);
     return true;
 }
@@ -2923,11 +4318,21 @@ std::vector<deterministic_choice> rasn_runtime_provider::choice_snapshot() const
 
 bool rasn_runtime_provider::upsert_capability_provider(const capability_provider &provider, std::string *error)
 {
-    return response_bool(call_module_api(make_module_request("capability_directory",
-                                                             "upsert_provider",
-                                                             provider.descriptor.agent_id,
-                                                             encode_capability_provider_payload(provider))),
-                         error);
+    capability_provider stored = provider;
+    if (stored.last_seen_ms == 0)
+    {
+        stored.last_seen_ms = ::dsn_now_ms();
+    }
+    const rasn_runtime_response response = call_module_api(make_module_request("capability_directory",
+                                                                               "upsert_provider",
+                                                                               stored.descriptor.agent_id,
+                                                                               encode_capability_provider_payload(stored)));
+    if (!response_bool(response, error))
+    {
+        return false;
+    }
+    mirror_state_after_success("capability_directory", "provider", stored.descriptor.agent_id, encode_capability_provider_payload(stored));
+    return true;
 }
 
 std::string rasn_runtime_provider::describe_capabilities() const
@@ -2938,8 +4343,19 @@ std::string rasn_runtime_provider::describe_capabilities() const
 
 bool rasn_runtime_provider::configure_budget(const resource_quota &quota, std::string *error)
 {
-    return response_bool(call_module_api(make_module_request("resource_budget", "configure", quota.scope, encode_quota_payload(quota))),
-                         error);
+    const rasn_runtime_response response =
+        call_module_api(make_module_request("resource_budget", "configure", quota.scope, encode_quota_payload(quota)));
+    if (!response_bool(response, error))
+    {
+        return false;
+    }
+    mirror_state_after_success("resource_budget", "quota", quota.scope, encode_quota_payload(quota));
+    resource_usage usage;
+    if (budget_usage(quota.scope, &usage))
+    {
+        mirror_state_after_success("resource_budget", "usage", usage.scope, encode_usage_payload(usage));
+    }
+    return true;
 }
 
 resource_budget_decision rasn_runtime_provider::reserve_budget(const resource_request &request_value)
@@ -2960,14 +4376,27 @@ resource_budget_decision rasn_runtime_provider::reserve_budget(const resource_re
         decision.allowed = false;
         decision.reason = error;
     }
+    if (decision.allowed)
+    {
+        mirror_state_after_success("resource_budget", "usage", decision.usage_after.scope, encode_usage_payload(decision.usage_after));
+    }
     return decision;
 }
 
 bool rasn_runtime_provider::release_budget(const resource_request &request_value, std::string *error)
 {
-    return response_bool(
-        call_module_api(make_module_request("resource_budget", "release", request_value.scope, encode_request_payload(request_value))),
-        error);
+    const rasn_runtime_response response =
+        call_module_api(make_module_request("resource_budget", "release", request_value.scope, encode_request_payload(request_value)));
+    if (!response_bool(response, error))
+    {
+        return false;
+    }
+    resource_usage usage;
+    if (budget_usage(request_value.scope, &usage))
+    {
+        mirror_state_after_success("resource_budget", "usage", usage.scope, encode_usage_payload(usage));
+    }
+    return true;
 }
 
 bool rasn_runtime_provider::budget_usage(const std::string &scope, resource_usage *usage) const
@@ -2983,23 +4412,47 @@ bool rasn_runtime_provider::budget_usage(const std::string &scope, resource_usag
 
 std::string rasn_runtime_provider::describe_budgets() const
 {
-    const rasn_runtime_response response = call_module_api(make_module_request("resource_budget", "describe"));
-    return response.ok ? response.payload : response.error;
+    const std::vector<rasn_runtime_response> responses =
+        call_module_api_shards(make_module_request("resource_budget", "describe"));
+    if (responses.size() <= 1)
+    {
+        return responses.empty() ? "" : (responses[0].ok ? responses[0].payload : responses[0].error);
+    }
+    std::ostringstream output;
+    for (size_t i = 0; i < responses.size(); ++i)
+    {
+        if (i != 0)
+        {
+            output << "\n";
+        }
+        output << "shard" << i << ": " << (responses[i].ok ? responses[i].payload : responses[i].error);
+    }
+    return output.str();
 }
 
 bool rasn_runtime_provider::set_recovery_policy(const recovery_policy &policy, std::string *error)
 {
-    return response_bool(call_module_api(make_module_request("recovery_supervisor",
-                                                             "set_policy",
-                                                             policy.failure_class,
-                                                             encode_recovery_policy_payload(policy))),
-                         error);
+    const rasn_runtime_response response = call_module_api(make_module_request("recovery_supervisor",
+                                                                               "set_policy",
+                                                                               policy.failure_class,
+                                                                               encode_recovery_policy_payload(policy)));
+    if (!response_bool(response, error))
+    {
+        return false;
+    }
+    mirror_state_after_success("recovery_supervisor", "policy", policy.failure_class, encode_recovery_policy_payload(policy));
+    return true;
 }
 
 recovery_action rasn_runtime_provider::observe_failure(const failure_observation &failure)
 {
+    failure_observation stored_failure = failure;
+    if (stored_failure.time_ms == 0)
+    {
+        stored_failure.time_ms = ::dsn_now_ms();
+    }
     const rasn_runtime_response response =
-        call_module_api(make_module_request("recovery_supervisor", "observe", failure.task_id, encode_failure_payload(failure)));
+        call_module_api(make_module_request("recovery_supervisor", "observe", stored_failure.task_id, encode_failure_payload(stored_failure)));
     recovery_action action;
     if (!response.ok)
     {
@@ -3010,6 +4463,14 @@ recovery_action rasn_runtime_provider::observe_failure(const failure_observation
     if (!decode_recovery_action_payload(response.payload, &action, &error))
     {
         action.reason = error;
+    }
+    else
+    {
+        const std::string key = stored_failure.task_id + "/" + stored_failure.component + "/" +
+                                stored_failure.failure_class + "/" + stored_failure.code + "/" +
+                                std::to_string(stored_failure.attempt) + "/" +
+                                std::to_string(stored_failure.time_ms);
+        mirror_state_after_success("recovery_supervisor", "failure", key, encode_failure_payload(stored_failure));
     }
     return action;
 }
@@ -3029,18 +4490,21 @@ bool rasn_runtime_provider::put_blackboard(const blackboard_entry &entry, blackb
         set_response_error(response, error);
         return false;
     }
+    blackboard_entry stored_entry;
+    std::string decode_error;
+    if (!decode_blackboard_payload(response.payload, &stored_entry, &decode_error))
+    {
+        if (error != nullptr)
+        {
+            *error = decode_error;
+        }
+        return false;
+    }
     if (stored != nullptr)
     {
-        std::string decode_error;
-        if (!decode_blackboard_payload(response.payload, stored, &decode_error))
-        {
-            if (error != nullptr)
-            {
-                *error = decode_error;
-            }
-            return false;
-        }
+        *stored = stored_entry;
     }
+    mirror_state_after_success("blackboard", "entry", stored_entry.key, encode_blackboard_payload(stored_entry));
     clear_error(error);
     return true;
 }
@@ -3058,25 +4522,34 @@ bool rasn_runtime_provider::get_blackboard(const std::string &key, blackboard_en
 
 std::vector<blackboard_entry> rasn_runtime_provider::blackboard_snapshot(bool include_expired, uint64_t now_ms) const
 {
-    const rasn_runtime_response response = call_module_api(make_module_request(
+    std::vector<blackboard_entry> entries;
+    const rasn_runtime_request request = make_module_request(
         "blackboard",
         "snapshot",
         "",
-        encode_fields({{"include_expired", include_expired ? "true" : "false"}, {"now_ms", std::to_string(now_ms)}})));
-    std::vector<blackboard_entry> entries;
-    std::string error;
-    if (response.ok)
+        encode_fields({{"include_expired", include_expired ? "true" : "false"}, {"now_ms", std::to_string(now_ms)}}));
+    for (const rasn_runtime_response &response : call_module_api_shards(request))
     {
-        (void)decode_items(response.payload, &entries, decode_blackboard_payload, &error);
+        std::vector<blackboard_entry> shard_entries;
+        std::string error;
+        if (response.ok && decode_items(response.payload, &shard_entries, decode_blackboard_payload, &error))
+        {
+            entries.insert(entries.end(), shard_entries.begin(), shard_entries.end());
+        }
     }
     return entries;
 }
 
 bool rasn_runtime_provider::register_contract(const agent_contract &contract, std::string *error)
 {
-    return response_bool(
-        call_module_api(make_module_request("contract_verifier", "register", contract.contract_id, encode_contract_payload(contract))),
-        error);
+    const rasn_runtime_response response =
+        call_module_api(make_module_request("contract_verifier", "register", contract.contract_id, encode_contract_payload(contract)));
+    if (!response_bool(response, error))
+    {
+        return false;
+    }
+    mirror_state_after_success("contract_verifier", "contract", contract.contract_id, encode_contract_payload(contract));
+    return true;
 }
 
 contract_evaluation rasn_runtime_provider::evaluate_input(const std::string &contract_id, const std::string &input) const
@@ -3303,92 +4776,88 @@ void rasn_runtime_rpc_service::unregister_module_handler(const std::string &modu
     this->unregister_rpc_handler(rpc_code_for_module(module));
 }
 
+void rasn_runtime_rpc_service::reply_module_request(const std::string &module,
+                                                   const rasn_runtime_request &request,
+                                                   ::dsn::rpc_replier<rasn_runtime_response> &reply)
+{
+    rasn_runtime_request copy = request;
+    force_module(&copy, module);
+    std::string auth_error;
+    if (!authenticate_rasn_runtime_rpc_request(copy, &auth_error))
+    {
+        metrics_registry::instance().on_event("runtime.auth.rejected", module);
+        dwarn("runtime module RPC auth rejected for module '%s'", module.c_str());
+        reply(make_rasn_runtime_error(copy, auth_error));
+        return;
+    }
+    copy.auth_token.clear();
+    reply(dispatch_rasn_runtime_request(copy));
+}
+
 void rasn_runtime_rpc_service::on_agent_control(const rasn_runtime_request &request,
                                                       ::dsn::rpc_replier<rasn_runtime_response> &reply)
 {
-    rasn_runtime_request copy = request;
-    force_module(&copy, "agent_control_plane");
-    reply(dispatch_rasn_runtime_request(copy));
+    reply_module_request("agent_control_plane", request, reply);
 }
 
 void rasn_runtime_rpc_service::on_message_bus(const rasn_runtime_request &request,
                                                     ::dsn::rpc_replier<rasn_runtime_response> &reply)
 {
-    rasn_runtime_request copy = request;
-    force_module(&copy, "agent_message_bus");
-    reply(dispatch_rasn_runtime_request(copy));
+    reply_module_request("agent_message_bus", request, reply);
 }
 
 void rasn_runtime_rpc_service::on_task_orchestration(const rasn_runtime_request &request,
                                                            ::dsn::rpc_replier<rasn_runtime_response> &reply)
 {
-    rasn_runtime_request copy = request;
-    force_module(&copy, "task_orchestration_kernel");
-    reply(dispatch_rasn_runtime_request(copy));
+    reply_module_request("task_orchestration_kernel", request, reply);
 }
 
 void rasn_runtime_rpc_service::on_determinism_ledger(const rasn_runtime_request &request,
                                                            ::dsn::rpc_replier<rasn_runtime_response> &reply)
 {
-    rasn_runtime_request copy = request;
-    force_module(&copy, "determinism_ledger");
-    reply(dispatch_rasn_runtime_request(copy));
+    reply_module_request("determinism_ledger", request, reply);
 }
 
 void rasn_runtime_rpc_service::on_capability_directory(const rasn_runtime_request &request,
                                                              ::dsn::rpc_replier<rasn_runtime_response> &reply)
 {
-    rasn_runtime_request copy = request;
-    force_module(&copy, "capability_directory");
-    reply(dispatch_rasn_runtime_request(copy));
+    reply_module_request("capability_directory", request, reply);
 }
 
 void rasn_runtime_rpc_service::on_resource_budget(const rasn_runtime_request &request,
                                                         ::dsn::rpc_replier<rasn_runtime_response> &reply)
 {
-    rasn_runtime_request copy = request;
-    force_module(&copy, "resource_budget");
-    reply(dispatch_rasn_runtime_request(copy));
+    reply_module_request("resource_budget", request, reply);
 }
 
 void rasn_runtime_rpc_service::on_recovery_supervisor(const rasn_runtime_request &request,
                                                             ::dsn::rpc_replier<rasn_runtime_response> &reply)
 {
-    rasn_runtime_request copy = request;
-    force_module(&copy, "recovery_supervisor");
-    reply(dispatch_rasn_runtime_request(copy));
+    reply_module_request("recovery_supervisor", request, reply);
 }
 
 void rasn_runtime_rpc_service::on_blackboard(const rasn_runtime_request &request,
                                                    ::dsn::rpc_replier<rasn_runtime_response> &reply)
 {
-    rasn_runtime_request copy = request;
-    force_module(&copy, "blackboard");
-    reply(dispatch_rasn_runtime_request(copy));
+    reply_module_request("blackboard", request, reply);
 }
 
 void rasn_runtime_rpc_service::on_contract_verifier(const rasn_runtime_request &request,
                                                           ::dsn::rpc_replier<rasn_runtime_response> &reply)
 {
-    rasn_runtime_request copy = request;
-    force_module(&copy, "contract_verifier");
-    reply(dispatch_rasn_runtime_request(copy));
+    reply_module_request("contract_verifier", request, reply);
 }
 
 void rasn_runtime_rpc_service::on_human_interaction(const rasn_runtime_request &request,
                                                           ::dsn::rpc_replier<rasn_runtime_response> &reply)
 {
-    rasn_runtime_request copy = request;
-    force_module(&copy, "human_interaction");
-    reply(dispatch_rasn_runtime_request(copy));
+    reply_module_request("human_interaction", request, reply);
 }
 
 void rasn_runtime_rpc_service::on_sandbox_runtime(const rasn_runtime_request &request,
                                                         ::dsn::rpc_replier<rasn_runtime_response> &reply)
 {
-    rasn_runtime_request copy = request;
-    force_module(&copy, "sandbox_runtime");
-    reply(dispatch_rasn_runtime_request(copy));
+    reply_module_request("sandbox_runtime", request, reply);
 }
 
 std::pair<::dsn::error_code, rasn_runtime_response>
@@ -3401,10 +4870,55 @@ rasn_runtime_client::call_sync(const rasn_runtime_request &request,
         _server, rpc_code_for_module(request.module), request, nullptr, empty_callback, timeout, thread_hash, partition_hash));
 }
 
+namespace {
+
+agent_capability make_rasn_runtime_capability(const std::string &name)
+{
+    agent_capability capability;
+    capability.name = name;
+    capability.input_type = "rasn_runtime_request";
+    capability.output_type = "rasn_runtime_response";
+    capability.side_effect_class = "stateful";
+    return capability;
+}
+
+agent_descriptor make_rasn_runtime_module_descriptor(const std::string &module,
+                                                    const ::dsn::rpc_address &endpoint,
+                                                    const std::string &app_name)
+{
+    const std::string endpoint_uri = endpoint.to_std_string();
+    const std::string base_capability = rasn_runtime_module_capability(module);
+
+    agent_descriptor descriptor;
+    descriptor.agent_id = base_capability + "@" + endpoint_uri;
+    descriptor.role = rasn_runtime_module_app_role(module);
+    descriptor.app_name = app_name.empty() ? "rasn.runtime" : app_name;
+    descriptor.port = endpoint.type() == HOST_TYPE_IPV4 ? endpoint.port() : 0;
+    descriptor.endpoint_uri = endpoint_uri;
+    descriptor.version = "prototype";
+    descriptor.health = "healthy";
+    descriptor.capabilities.push_back(make_rasn_runtime_capability(base_capability));
+    const std::vector<uint32_t> hosted_shards = rasn_runtime_hosted_shards(module);
+    for (const uint32_t shard : hosted_shards)
+    {
+        descriptor.capabilities.push_back(make_rasn_runtime_capability(rasn_runtime_module_shard_capability(module, shard)));
+    }
+    return descriptor;
+}
+
+} // namespace
+
 ::dsn::error_code rasn_runtime_app::start(int argc, char **argv)
 {
     global_rasn_services().acquire();
+    const ::dsn::error_code hydration_error = hydrate_modules_from_state();
+    if (hydration_error != ::dsn::ERR_OK)
+    {
+        return hydration_error;
+    }
     _rpc.open_service();
+    register_modules_with_registry();
+    start_registry_heartbeat_timer();
     return ::dsn::ERR_OK;
 }
 
@@ -3416,6 +4930,224 @@ rasn_runtime_app::rasn_runtime_app(::dsn_gpid gpid)
 rasn_runtime_app::rasn_runtime_app(::dsn_gpid gpid, std::vector<std::string> modules)
     : ::dsn::service_app(gpid), _rpc(std::move(modules))
 {
+}
+
+::dsn::error_code rasn_runtime_app::hydrate_modules_from_state()
+{
+    if (!rasn_runtime_state_hydration_enabled())
+    {
+        return ::dsn::ERR_OK;
+    }
+
+    const rasn_runtime_config config = load_rasn_runtime_config();
+    state_query_request request;
+    request.key_prefix = rasn_runtime_state_prefix(config.state_prefix);
+
+    rasn_state_client state(rasn_service_address("state", 27104));
+    ::dsn::error_code err;
+    state_response response;
+    std::tie(err, response) = state.query_sync(request, rasn_runtime_state_hydration_timeout());
+    if (err != ::dsn::ERR_OK)
+    {
+        dwarn("runtime state hydration RPC query failed (%s); refusing to open module APIs", err.to_string());
+        return err;
+    }
+    if (!response.ok)
+    {
+        dwarn("runtime state hydration query failed: %s", response.error.c_str());
+        return ::dsn::ERR_UNKNOWN;
+    }
+    if (rasn_runtime_state_watermark_verify_enabled())
+    {
+        std::string watermark_error;
+        if (!verify_runtime_state_watermarks(response.records, _rpc.modules(), config.state_prefix, &watermark_error))
+        {
+            dwarn("runtime state hydration watermark verification failed: %s", watermark_error.c_str());
+            return ::dsn::ERR_UNKNOWN;
+        }
+    }
+
+    size_t applied = 0;
+    std::string error;
+    if (!global_rasn_runtime_store().hydrate_from_state(response.records, _rpc.modules(), &applied, &error))
+    {
+        dwarn("runtime state hydration replay failed: %s", error.c_str());
+        return ::dsn::ERR_UNKNOWN;
+    }
+    if (applied > 0)
+    {
+        dinfo("hydrated %llu rASN runtime module record(s) for %s",
+              static_cast<unsigned long long>(applied),
+              join_strings(_rpc.modules(), ",").c_str());
+    }
+    return ::dsn::ERR_OK;
+}
+
+void rasn_runtime_app::register_modules_with_registry()
+{
+    if (!rasn_runtime_registry_registration_enabled())
+    {
+        return;
+    }
+
+    const ::dsn::rpc_address endpoint = primary_address();
+    if (endpoint.is_invalid())
+    {
+        dwarn("rASN runtime app %s cannot register modules: primary address is invalid", name().c_str());
+        return;
+    }
+
+    _registry_descriptors.clear();
+    rasn_registry_client registry(rasn_service_address("registry", 27100));
+    const std::chrono::milliseconds timeout = rasn_runtime_registry_timeout();
+    bool registry_rpc_available = true;
+    for (const std::string &module : _rpc.modules())
+    {
+        agent_descriptor descriptor = make_rasn_runtime_module_descriptor(module, endpoint, name());
+        std::string error;
+        if (!global_agent_registry().register_agent(descriptor, &error, true))
+        {
+            dwarn("failed to register runtime module %s in local registry: %s", module.c_str(), error.c_str());
+            continue;
+        }
+        _registry_descriptors.push_back(descriptor);
+
+        if (!registry_rpc_available)
+        {
+            continue;
+        }
+        ::dsn::error_code err;
+        agent_response response;
+        std::tie(err, response) = registry.register_sync(descriptor, timeout);
+        if (err != ::dsn::ERR_OK)
+        {
+            dwarn("failed to register runtime module %s through registry RPC: %s",
+                  module.c_str(),
+                  err.to_string());
+            registry_rpc_available = false;
+        }
+        else if (!response.ok)
+        {
+            dwarn("registry rejected runtime module %s: %s", module.c_str(), response.error.message.c_str());
+        }
+    }
+}
+
+void rasn_runtime_app::heartbeat_modules_to_registry()
+{
+    if (_registry_descriptors.empty() || !rasn_runtime_registry_registration_enabled())
+    {
+        return;
+    }
+
+    rasn_registry_client registry(rasn_service_address("registry", 27100));
+    const std::chrono::milliseconds timeout = rasn_runtime_registry_timeout();
+    bool registry_rpc_available = true;
+    for (const agent_descriptor &descriptor : _registry_descriptors)
+    {
+        std::string error;
+        if (!global_agent_registry().heartbeat(descriptor, &error))
+        {
+            (void)global_agent_registry().register_agent(descriptor, &error, true);
+        }
+
+        if (!registry_rpc_available)
+        {
+            continue;
+        }
+        ::dsn::error_code err;
+        agent_response response;
+        std::tie(err, response) = registry.heartbeat_sync(descriptor, timeout);
+        if (err != ::dsn::ERR_OK)
+        {
+            dwarn("failed to heartbeat runtime module %s through registry RPC: %s",
+                  descriptor.agent_id.c_str(),
+                  err.to_string());
+            registry_rpc_available = false;
+        }
+        else if (!response.ok)
+        {
+            std::tie(err, response) = registry.register_sync(descriptor, timeout);
+            if (err != ::dsn::ERR_OK)
+            {
+                dwarn("failed to re-register runtime module %s after heartbeat rejection: %s",
+                      descriptor.agent_id.c_str(),
+                      err.to_string());
+            }
+            else if (!response.ok)
+            {
+                dwarn("registry rejected runtime module %s after heartbeat rejection: %s",
+                      descriptor.agent_id.c_str(),
+                      response.error.message.c_str());
+            }
+        }
+    }
+}
+
+void rasn_runtime_app::unregister_modules_from_registry()
+{
+    if (_registry_descriptors.empty())
+    {
+        return;
+    }
+
+    rasn_registry_client registry(rasn_service_address("registry", 27100));
+    const std::chrono::milliseconds timeout = rasn_runtime_registry_timeout();
+    bool registry_rpc_available = true;
+    for (const agent_descriptor &descriptor : _registry_descriptors)
+    {
+        global_agent_registry().unregister_agent(descriptor.agent_id);
+        if (registry_rpc_available && rasn_runtime_registry_registration_enabled())
+        {
+            ::dsn::error_code err;
+            agent_response response;
+            std::tie(err, response) = registry.unregister_sync(descriptor.agent_id, timeout);
+            if (err != ::dsn::ERR_OK)
+            {
+                dwarn("failed to unregister runtime module %s through registry RPC: %s",
+                      descriptor.agent_id.c_str(),
+                      err.to_string());
+                registry_rpc_available = false;
+            }
+        }
+    }
+    _registry_descriptors.clear();
+}
+
+void rasn_runtime_app::start_registry_heartbeat_timer()
+{
+    if (_registry_descriptors.empty() || _registry_heartbeat_timer != nullptr)
+    {
+        return;
+    }
+
+    const uint64_t interval_ms = rasn_runtime_registry_heartbeat_ms();
+    if (interval_ms == 0)
+    {
+        return;
+    }
+
+    const std::chrono::milliseconds interval(interval_ms);
+    _registry_heartbeat_timer = ::dsn::tasking::enqueue_timer(
+        LPC_RASN_REGISTRY_HEARTBEAT_TIMER,
+        nullptr,
+        [this]() { heartbeat_modules_to_registry(); },
+        interval,
+        0,
+        interval);
+    if (_registry_heartbeat_timer == nullptr)
+    {
+        dwarn("failed to start rASN runtime registry heartbeat timer");
+    }
+}
+
+void rasn_runtime_app::cancel_registry_heartbeat_timer()
+{
+    if (_registry_heartbeat_timer != nullptr)
+    {
+        _registry_heartbeat_timer->cancel(true);
+        _registry_heartbeat_timer = nullptr;
+    }
 }
 
 void register_rasn_runtime_apps()
@@ -3444,10 +5176,40 @@ void register_rasn_runtime_apps()
             "register rasn.runtime.human_interaction app failed");
     dassert(::dsn::register_app<rasn_sandbox_runtime_module_app>("rasn.runtime.sandbox_runtime"),
             "register rasn.runtime.sandbox_runtime app failed");
+
+    // Backward-compatible app type aliases for configs/scripts created before the
+    // common-runtime rename. The public app-list normalizer rewrites these to the
+    // rasn.runtime.* roles, but raw rDSN app lists may still reference them.
+    dassert(::dsn::register_app<rasn_runtime_app>("rasn.common.modules"),
+            "register rasn.common.modules app alias failed");
+    dassert(::dsn::register_app<rasn_agent_control_module_app>("rasn.common.agent_control"),
+            "register rasn.common.agent_control app alias failed");
+    dassert(::dsn::register_app<rasn_message_bus_module_app>("rasn.common.message_bus"),
+            "register rasn.common.message_bus app alias failed");
+    dassert(::dsn::register_app<rasn_task_orchestration_module_app>("rasn.common.task_kernel"),
+            "register rasn.common.task_kernel app alias failed");
+    dassert(::dsn::register_app<rasn_determinism_ledger_module_app>("rasn.common.determinism"),
+            "register rasn.common.determinism app alias failed");
+    dassert(::dsn::register_app<rasn_capability_directory_module_app>("rasn.common.capability"),
+            "register rasn.common.capability app alias failed");
+    dassert(::dsn::register_app<rasn_resource_budget_module_app>("rasn.common.budget"),
+            "register rasn.common.budget app alias failed");
+    dassert(::dsn::register_app<rasn_recovery_supervisor_module_app>("rasn.common.recovery"),
+            "register rasn.common.recovery app alias failed");
+    dassert(::dsn::register_app<rasn_blackboard_module_app>("rasn.common.blackboard"),
+            "register rasn.common.blackboard app alias failed");
+    dassert(::dsn::register_app<rasn_contract_verifier_module_app>("rasn.common.contract"),
+            "register rasn.common.contract app alias failed");
+    dassert(::dsn::register_app<rasn_human_interaction_module_app>("rasn.common.human_interaction"),
+            "register rasn.common.human_interaction app alias failed");
+    dassert(::dsn::register_app<rasn_sandbox_runtime_module_app>("rasn.common.sandbox_runtime"),
+            "register rasn.common.sandbox_runtime app alias failed");
 }
 
 ::dsn::error_code rasn_runtime_app::stop(bool cleanup)
 {
+    cancel_registry_heartbeat_timer();
+    unregister_modules_from_registry();
     _rpc.close_service();
     global_rasn_services().release();
     return ::dsn::ERR_OK;

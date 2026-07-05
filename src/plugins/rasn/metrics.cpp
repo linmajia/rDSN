@@ -132,6 +132,12 @@ enum core_counter
     CC_OVERLOAD_ADMISSION_DELAYED,
     CC_OVERLOAD_RATE_LIMITED,
     CC_OVERLOAD_RATE_DELAYED,
+    CC_RUNTIME_DEDUP_HIT,
+    CC_RUNTIME_DEDUP_MISS,
+    CC_RUNTIME_DEDUP_WAIT,
+    CC_RUNTIME_DEDUP_EVICTED,
+    CC_RUNTIME_DEDUP_EXPIRED,
+    CC_RUNTIME_AUTH_REJECTED,
     CC_COUNT
 };
 
@@ -221,6 +227,24 @@ const counter_def k_core_counters[CC_COUNT] = {
     {"rasn_overload_rate_delayed_total",
      "overload.rate.delayed",
      "operations delayed (paced) by the process-wide overload rate limiter"},
+    {"rasn_runtime_dedup_hit_total",
+     "runtime.dedup.hit",
+     "runtime module idempotency cache hits"},
+    {"rasn_runtime_dedup_miss_total",
+     "runtime.dedup.miss",
+     "runtime module idempotency cache misses that installed an in-flight placeholder"},
+    {"rasn_runtime_dedup_wait_total",
+     "runtime.dedup.wait",
+     "runtime module idempotency duplicate requests that waited for an in-flight response"},
+    {"rasn_runtime_dedup_evicted_total",
+     "runtime.dedup.evicted",
+     "runtime module idempotency cache entries evicted by capacity"},
+    {"rasn_runtime_dedup_expired_total",
+     "runtime.dedup.expired",
+     "runtime module idempotency cache entries expired by TTL"},
+    {"rasn_runtime_auth_rejected_total",
+     "runtime.auth.rejected",
+     "runtime module RPC requests rejected by service-to-service auth"},
 };
 
 enum latency_counter
@@ -281,6 +305,12 @@ const std::unordered_map<std::string, int> &kind_to_core_counter()
         {"overload.admission.delayed", CC_OVERLOAD_ADMISSION_DELAYED},
         {"overload.rate.limited", CC_OVERLOAD_RATE_LIMITED},
         {"overload.rate.delayed", CC_OVERLOAD_RATE_DELAYED},
+        {"runtime.dedup.hit", CC_RUNTIME_DEDUP_HIT},
+        {"runtime.dedup.miss", CC_RUNTIME_DEDUP_MISS},
+        {"runtime.dedup.wait", CC_RUNTIME_DEDUP_WAIT},
+        {"runtime.dedup.evicted", CC_RUNTIME_DEDUP_EVICTED},
+        {"runtime.dedup.expired", CC_RUNTIME_DEDUP_EXPIRED},
+        {"runtime.auth.rejected", CC_RUNTIME_AUTH_REJECTED},
     };
     return m;
 }

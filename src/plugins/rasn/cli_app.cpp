@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
-#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <thread>
@@ -57,24 +56,6 @@ std::string config_string_or_default(const char *section,
 {
     const char *value = ::dsn_config_get_value_string(section, key, fallback, description);
     return value == nullptr ? fallback : value;
-}
-
-std::string runtime_state_key_component(const std::string &value)
-{
-    std::ostringstream output;
-    for (const unsigned char c : value)
-    {
-        if (std::isalnum(c) || c == '.' || c == '-' || c == '_')
-        {
-            output << static_cast<char>(c);
-        }
-        else
-        {
-            output << '_' << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned int>(c)
-                   << std::dec << std::setfill('0');
-        }
-    }
-    return output.str().empty() ? "_" : output.str();
 }
 
 std::string sanitize_agent_id_component(const std::string &value)
@@ -1051,8 +1032,6 @@ void rasn_cli_app_base::initialize_runtime_modules()
     }
     else
     {
-        mirror_runtime_module_state_or_warn(
-            "agent_control_plane", "agent", record.descriptor.agent_id, describe_agent_control_record(record));
         const uint64_t now_ms = ::dsn_now_ms();
         const std::string owner = cli_agent_id() + ".process";
         const agent_control_lease lease =
@@ -1064,12 +1043,6 @@ void rasn_cli_app_base::initialize_runtime_modules()
         if (!_rasn_runtime->heartbeat_agent(record.descriptor.agent_id, now_ms, &error))
         {
             warn_runtime_module_failure("agent_control_plane", error);
-        }
-        agent_control_record updated;
-        if (_rasn_runtime->find_agent(record.descriptor.agent_id, &updated))
-        {
-            mirror_runtime_module_state_or_warn(
-                "agent_control_plane", "agent", updated.descriptor.agent_id, describe_agent_control_record(updated));
         }
     }
 
@@ -1083,11 +1056,6 @@ void rasn_cli_app_base::initialize_runtime_modules()
     {
         warn_runtime_module_failure("capability_directory", error);
     }
-    else
-    {
-        mirror_runtime_module_state_or_warn(
-            "capability_directory", "provider", provider.descriptor.agent_id, describe_capability_provider_record(provider));
-    }
 
     resource_quota quota;
     quota.scope = cli_agent_id();
@@ -1095,10 +1063,6 @@ void rasn_cli_app_base::initialize_runtime_modules()
     if (!_rasn_runtime->configure_budget(quota, &error))
     {
         warn_runtime_module_failure("resource_budget", error);
-    }
-    else
-    {
-        mirror_runtime_module_state_or_warn("resource_budget", "quota", quota.scope, describe_resource_quota_record(quota));
     }
 
     recovery_policy fallback_policy;
@@ -1108,11 +1072,6 @@ void rasn_cli_app_base::initialize_runtime_modules()
     if (!_rasn_runtime->set_recovery_policy(fallback_policy, &error))
     {
         warn_runtime_module_failure("recovery_supervisor", error);
-    }
-    else
-    {
-        mirror_runtime_module_state_or_warn(
-            "recovery_supervisor", "policy", fallback_policy.failure_class, describe_recovery_policy_record(fallback_policy));
     }
     recovery_policy transient_policy;
     transient_policy.failure_class = "transient";
@@ -1124,11 +1083,6 @@ void rasn_cli_app_base::initialize_runtime_modules()
     {
         warn_runtime_module_failure("recovery_supervisor", error);
     }
-    else
-    {
-        mirror_runtime_module_state_or_warn(
-            "recovery_supervisor", "policy", transient_policy.failure_class, describe_recovery_policy_record(transient_policy));
-    }
 
     agent_contract command_contract;
     command_contract.contract_id = "cli.command";
@@ -1137,11 +1091,6 @@ void rasn_cli_app_base::initialize_runtime_modules()
     if (!_rasn_runtime->register_contract(command_contract, &error))
     {
         warn_runtime_module_failure("contract_verifier", error);
-    }
-    else
-    {
-        mirror_runtime_module_state_or_warn(
-            "contract_verifier", "contract", command_contract.contract_id, describe_contract_record(command_contract));
     }
 
     _runtime_modules_initialized = true;
@@ -1153,21 +1102,12 @@ void rasn_cli_app_base::heartbeat_runtime_modules()
     const size_t expired = _rasn_runtime->expire_agent_leases(now_ms);
     if (expired != 0)
     {
-        mirror_runtime_module_state_or_warn("agent_control_plane", "lease_expiry", cli_agent_id(), "expired=" + std::to_string(expired));
+        dinfo("expired %llu rASN runtime agent lease(s)", static_cast<unsigned long long>(expired));
     }
     std::string error;
     if (!_rasn_runtime->heartbeat_agent(cli_agent_id(), now_ms, &error))
     {
         warn_runtime_module_failure("agent_control_plane", error);
-    }
-    else
-    {
-        agent_control_record record;
-        if (_rasn_runtime->find_agent(cli_agent_id(), &record))
-        {
-            mirror_runtime_module_state_or_warn(
-                "agent_control_plane", "agent", record.descriptor.agent_id, describe_agent_control_record(record));
-        }
     }
 }
 
@@ -1214,7 +1154,6 @@ rasn_cli_app_base::runtime_execution rasn_cli_app_base::begin_runtime_execution(
     {
         execution.budget_reserved = true;
     }
-    mirror_runtime_module_state_or_warn("resource_budget", "reservation", execution.task_id, describe_resource_decision_record(budget));
 
     orchestration_task task;
     task.task_id = execution.task_id;
@@ -1228,15 +1167,6 @@ rasn_cli_app_base::runtime_execution rasn_cli_app_base::begin_runtime_execution(
     else if (!_rasn_runtime->start_task(task.task_id, cli_agent_id(), &error))
     {
         warn_runtime_module_failure("task_orchestration", error);
-    }
-    else
-    {
-        orchestration_task stored_task;
-        if (_rasn_runtime->find_task(task.task_id, &stored_task))
-        {
-            mirror_runtime_module_state_or_warn(
-                "task_orchestration_kernel", "task", stored_task.task_id, describe_orchestration_task_record(stored_task));
-        }
     }
 
     agent_message message;
@@ -1255,19 +1185,12 @@ rasn_cli_app_base::runtime_execution rasn_cli_app_base::begin_runtime_execution(
     else
     {
         execution.message_id = stored.message_id;
-        mirror_runtime_module_state_or_warn(
-            "agent_message_bus", "message", stored.message_id, describe_agent_message_record(stored));
     }
 
     deterministic_choice choice;
     if (!_rasn_runtime->record_choice(execution.task_id, "route", "rasn.cli", kind + ":" + name, &choice, &error))
     {
         warn_runtime_module_failure("determinism_ledger", error);
-    }
-    else
-    {
-        mirror_runtime_module_state_or_warn(
-            "determinism_ledger", "choice", execution.task_id + "/route", describe_choice_record(choice));
     }
 
     blackboard_entry input_entry;
@@ -1279,14 +1202,6 @@ rasn_cli_app_base::runtime_execution rasn_cli_app_base::begin_runtime_execution(
     if (!_rasn_runtime->put_blackboard(input_entry, nullptr, &error))
     {
         warn_runtime_module_failure("blackboard", error);
-    }
-    else
-    {
-        blackboard_entry stored_entry;
-        if (_rasn_runtime->get_blackboard(input_entry.key, &stored_entry))
-        {
-            mirror_runtime_module_state_or_warn("blackboard", "entry", stored_entry.key, describe_blackboard_record(stored_entry));
-        }
     }
 
     const contract_evaluation input_contract = _rasn_runtime->evaluate_input("cli.command", input);
@@ -1313,11 +1228,6 @@ void rasn_cli_app_base::finish_runtime_execution(const runtime_execution &execut
     {
         warn_runtime_module_failure("determinism_ledger", error);
     }
-    else
-    {
-        mirror_runtime_module_state_or_warn(
-            "determinism_ledger", "choice", execution.task_id + "/exit_code", describe_choice_record(choice));
-    }
 
     if (exit_code == 0)
     {
@@ -1325,27 +1235,9 @@ void rasn_cli_app_base::finish_runtime_execution(const runtime_execution &execut
         {
             warn_runtime_module_failure("task_orchestration", error);
         }
-        else
-        {
-            orchestration_task task;
-            if (_rasn_runtime->find_task(execution.task_id, &task))
-            {
-                mirror_runtime_module_state_or_warn(
-                    "task_orchestration_kernel", "task", task.task_id, describe_orchestration_task_record(task));
-            }
-        }
         if (!execution.message_id.empty() && !_rasn_runtime->ack_message(execution.message_id, &error))
         {
             warn_runtime_module_failure("agent_message_bus", error);
-        }
-        else if (!execution.message_id.empty())
-        {
-            agent_message message;
-            if (_rasn_runtime->find_message(execution.message_id, &message))
-            {
-                mirror_runtime_module_state_or_warn(
-                    "agent_message_bus", "message", message.message_id, describe_agent_message_record(message));
-            }
         }
     }
     else
@@ -1354,27 +1246,9 @@ void rasn_cli_app_base::finish_runtime_execution(const runtime_execution &execut
         {
             warn_runtime_module_failure("task_orchestration", error);
         }
-        else
-        {
-            orchestration_task task;
-            if (_rasn_runtime->find_task(execution.task_id, &task))
-            {
-                mirror_runtime_module_state_or_warn(
-                    "task_orchestration_kernel", "task", task.task_id, describe_orchestration_task_record(task));
-            }
-        }
         if (!execution.message_id.empty() && !_rasn_runtime->dead_letter_message(execution.message_id, detail, &error))
         {
             warn_runtime_module_failure("agent_message_bus", error);
-        }
-        else if (!execution.message_id.empty())
-        {
-            agent_message message;
-            if (_rasn_runtime->find_message(execution.message_id, &message))
-            {
-                mirror_runtime_module_state_or_warn(
-                    "agent_message_bus", "message", message.message_id, describe_agent_message_record(message));
-            }
         }
         failure_observation failure;
         failure.task_id = execution.task_id;
@@ -1385,8 +1259,6 @@ void rasn_cli_app_base::finish_runtime_execution(const runtime_execution &execut
         failure.attempt = 1;
         failure.retryable = false;
         (void)_rasn_runtime->observe_failure(failure);
-        mirror_runtime_module_state_or_warn(
-            "recovery_supervisor", "failure", execution.task_id, describe_failure_observation_record(failure));
     }
 
     blackboard_entry output_entry;
@@ -1399,14 +1271,6 @@ void rasn_cli_app_base::finish_runtime_execution(const runtime_execution &execut
     {
         warn_runtime_module_failure("blackboard", error);
     }
-    else
-    {
-        blackboard_entry stored_entry;
-        if (_rasn_runtime->get_blackboard(output_entry.key, &stored_entry))
-        {
-            mirror_runtime_module_state_or_warn("blackboard", "entry", stored_entry.key, describe_blackboard_record(stored_entry));
-        }
-    }
 
     const contract_evaluation output_contract =
         _rasn_runtime->evaluate_output("cli.command", detail, std::vector<std::string>());
@@ -1417,14 +1281,6 @@ void rasn_cli_app_base::finish_runtime_execution(const runtime_execution &execut
     if (execution.budget_reserved && !_rasn_runtime->release_budget(execution.budget, &error))
     {
         warn_runtime_module_failure("resource_budget", error);
-    }
-    else if (execution.budget_reserved)
-    {
-        resource_usage usage;
-        if (_rasn_runtime->budget_usage(execution.budget.scope, &usage))
-        {
-            mirror_runtime_module_state_or_warn("resource_budget", "usage", usage.scope, describe_resource_usage_record(usage));
-        }
     }
     heartbeat_runtime_modules();
 }
@@ -1523,38 +1379,6 @@ void rasn_cli_app_base::configure_runtime_module_mode() const
     }
 }
 
-bool rasn_cli_app_base::mirror_runtime_module_state(const std::string &module,
-                                                   const std::string &kind,
-                                                   const std::string &key,
-                                                   const std::string &value,
-                                                   std::string *error)
-{
-    configure_runtime_module_mode();
-    if (_rasn_runtime == nullptr)
-    {
-        if (error != nullptr)
-        {
-            *error = "rASN runtime is not configured";
-        }
-        return false;
-    }
-    return _rasn_runtime->mirror_state(module, kind, key, value, error);
-}
-
-void rasn_cli_app_base::mirror_runtime_module_state_or_warn(const std::string &module,
-                                                           const std::string &kind,
-                                                           const std::string &key,
-                                                           const std::string &value)
-{
-    std::string error;
-    if (!mirror_runtime_module_state(module, kind, key, value, &error))
-    {
-        const bool strict = _rasn_runtime != nullptr && _rasn_runtime->strict();
-        const std::string prefix = strict ? "strict distributed runtime provider failed: " : "distributed runtime provider failed: ";
-        warn_runtime_module_failure(module, prefix + error);
-    }
-}
-
 deterministic_replay_result rasn_cli_app_base::record_runtime_choice(const std::string &task_id,
                                                                     const std::string &key,
                                                                     const std::string &source,
@@ -1569,8 +1393,6 @@ deterministic_replay_result rasn_cli_app_base::record_runtime_choice(const std::
         result.error = error;
         return result;
     }
-    mirror_runtime_module_state_or_warn(
-        "determinism_ledger", "choice", task_id + "/" + key, describe_choice_record(choice));
     result.ok = true;
     result.choice = choice;
     return result;

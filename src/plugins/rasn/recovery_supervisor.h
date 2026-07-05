@@ -45,6 +45,7 @@ class recovery_supervisor
 {
 public:
     bool set_policy(const recovery_policy &policy, std::string *error);
+    bool hydrate_failure(const failure_observation &failure, std::string *error);
     recovery_action decide(const failure_observation &failure) const;
     recovery_action observe(const failure_observation &failure);
     bool clear_history(const std::string &task_id, std::string *error);

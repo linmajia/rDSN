@@ -36,6 +36,7 @@ class human_interaction_queue
 {
 public:
     human_interaction_result open(human_interaction_request request);
+    bool hydrate_request(const human_interaction_request &request, std::string *error);
     human_interaction_result answer(const std::string &request_id, const std::string &answer);
     human_interaction_result cancel(const std::string &request_id, const std::string &reason);
     size_t expire(uint64_t now_ms);

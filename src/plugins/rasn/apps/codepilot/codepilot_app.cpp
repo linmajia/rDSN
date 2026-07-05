@@ -1371,7 +1371,7 @@ int codepilot_cli::run_state(const std::vector<std::string> &args)
 {
     if (args.empty())
     {
-        std::cout << "usage: state <put|get|query|checkpoint|recover> ...\n";
+        std::cout << "usage: state <put|get|query|checkpoint|recover|compact> ...\n";
         return 1;
     }
 
@@ -1451,6 +1451,53 @@ int codepilot_cli::run_state(const std::vector<std::string> &args)
             std::cout << "recovered records=" << response.records.size()
                       << " last_sequence=" << response.last_sequence << "\n";
         }
+    }
+    else if (args[0] == "compact")
+    {
+        std::string checkpoint_path;
+        std::string state_prefix;
+        for (size_t i = 1; i < args.size(); ++i)
+        {
+            const std::string &arg = args[i];
+            const std::string prefix_flag = "--prefix=";
+            if (arg == "--prefix")
+            {
+                if (i + 1 >= args.size())
+                {
+                    std::cout << "usage: state compact [--prefix <state-prefix>] [checkpoint-path]\n";
+                    return 1;
+                }
+                state_prefix = args[++i];
+            }
+            else if (arg.compare(0, prefix_flag.size(), prefix_flag) == 0)
+            {
+                state_prefix = arg.substr(prefix_flag.size());
+            }
+            else if (checkpoint_path.empty())
+            {
+                checkpoint_path = arg;
+            }
+            else
+            {
+                std::cout << "usage: state compact [--prefix <state-prefix>] [checkpoint-path]\n";
+                return 1;
+            }
+        }
+
+        const rasn_runtime_state_compaction_report report =
+            compact_rasn_runtime_state_mirror(_services, checkpoint_path, state_prefix);
+        if (!report.ok)
+        {
+            std::cout << report.error << "\n";
+            return 1;
+        }
+        std::cout << "compacted runtime state mirror prefix=" << report.state_prefix
+                  << " records=" << report.runtime_records
+                  << " watermarks=" << report.watermark_records
+                  << " queried=" << report.queried_records
+                  << " checkpoint_records=" << report.checkpointed_records
+                  << " last_sequence=" << report.last_sequence << "\n";
+        return 0;
     }
     else
     {

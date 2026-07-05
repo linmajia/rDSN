@@ -32,6 +32,22 @@ bool task_orchestration_kernel::add_task(const orchestration_task &task, std::st
     return true;
 }
 
+bool task_orchestration_kernel::hydrate_task(const orchestration_task &task, std::string *error)
+{
+    if (task.task_id.empty())
+    {
+        if (error != nullptr)
+        {
+            *error = "orchestration task missing id";
+        }
+        return false;
+    }
+
+    ::dsn::service::zauto_lock guard(_lock);
+    _tasks[task.task_id] = task;
+    return true;
+}
+
 bool task_orchestration_kernel::assign(const std::string &task_id, const std::string &owner_agent, std::string *error)
 {
     if (owner_agent.empty())

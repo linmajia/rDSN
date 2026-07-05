@@ -70,6 +70,38 @@ bool agent_message_bus::publish(agent_message message, agent_message *stored, st
     return true;
 }
 
+bool agent_message_bus::hydrate_message(const agent_message &message, std::string *error)
+{
+    if (message.message_id.empty())
+    {
+        if (error != nullptr)
+        {
+            *error = "agent message missing id";
+        }
+        return false;
+    }
+    if (message.receiver.empty())
+    {
+        if (error != nullptr)
+        {
+            *error = "agent message missing receiver";
+        }
+        return false;
+    }
+    if (message.type.empty())
+    {
+        if (error != nullptr)
+        {
+            *error = "agent message missing type";
+        }
+        return false;
+    }
+
+    ::dsn::service::zauto_lock guard(_lock);
+    _messages[message.message_id] = message;
+    return true;
+}
+
 std::vector<agent_message> agent_message_bus::pull(const std::string &receiver, size_t max_messages, uint64_t now_ms)
 {
     ::dsn::service::zauto_lock guard(_lock);

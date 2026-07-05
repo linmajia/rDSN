@@ -1001,7 +1001,7 @@ context <file>           attach a source file to future prompts
 tools                    list local tools
 tool <name> <args>       run a local tool directly
 selftest [checkpoint]    run model/tool/state/workflow/observability checks
-state <cmd> [args]       use rASN state/checkpoint service
+state <cmd> [args]       use rASN state/checkpoint service (`compact` verifies runtime watermarks)
 observe events [kind]    query structured runtime events
 observe timeline [trace] show ordered trace events
 schema [text|json|idl|cpp|clients-cpp|ts|clients-ts|py|clients-py] print/export schemas and generated RPC clients
@@ -1231,8 +1231,9 @@ facade, and a provider decides how each call is executed:
   rDSN node is present. State lives in the process-global module store.
 - **distributed**: every call is a typed rDSN RPC to a module service, so module
   state is owned by the service node and can run on a remote host. Select it with
-  `[rasn.runtime] provider = distributed` (and `strict = true` to fail closed
-  when a module RPC fails instead of degrading).
+  `[rasn.runtime] rasn_runtime_provider = distributed` (and
+  `rasn_runtime_strict = true` to label module RPC failures as strict provider
+  failures).
 - **hybrid**: each module is routed independently, so hot or latency-sensitive
   modules stay in-process while shared, stateful modules (for example `blackboard`
   or `resource_budget`) are pushed onto their own service nodes. Select it with
@@ -1262,12 +1263,23 @@ role so it can be deployed on its own process or node:
 | human_interaction | `rasn.runtime.human_interaction` | 27119 |
 | sandbox_runtime | `rasn.runtime.sandbox_runtime` | 27120 |
 
-Launch a single module service by passing its name (module name or role) after
-the config; the app-list is normalized to the matching standalone role:
+Launch a single module service with a state authority available for hydration by
+passing the state service plus module name (module name or role) after the config;
+the app-list is normalized to the matching standalone role:
 
 ```bat
-codepilot.exe --dsn config.ini resource_budget
+codepilot.exe --dsn config.ini "rasn.state;resource_budget"
 ```
+
+When `rasn_runtime_registry_registration_enabled` is true, each runtime module
+service publishes a lease-tracked capability such as
+`rasn.runtime.resource_budget` to `rasn.registry`. Sharded services can also
+publish explicit partition capabilities such as
+`rasn.runtime.blackboard.shard.0` by setting `<module>_hosted_shards` or
+`<module>_shard_index` on the service process. Distributed and hybrid clients
+resolve those registry descriptors first when
+`rasn_runtime_registry_discovery_enabled` is true, then fall back to static
+endpoint config if discovery is empty or unavailable.
 
 Point clients at each module independently with `[rasn.service]` overrides. The
 key prefix is the module name, and any of `uri`, `host`, or `port` may be set:
@@ -1277,6 +1289,34 @@ resource_budget_uri = dsn://meta-server:34601/rasn-resource-budget
 blackboard_host = remote-host
 blackboard_port = 27117
 ```
+
+Sharded modules (`agent_message_bus`, `resource_budget`, and `blackboard`) also
+support deterministic key-based partition routing. Set `<module>_shard_count`,
+then optionally override each shard with
+`<module>_shard_<n>_uri` or `<module>_shard_<n>_{host,port}`. Writes and keyed
+reads route by the module's natural key (`message_id`, budget `scope`, or
+blackboard `key`); snapshot-style reads fan out to each distinct shard endpoint
+and merge typed results.
+
+```ini
+blackboard_shard_count = 2
+blackboard_shard_0_host = blackboard-a
+blackboard_shard_0_port = 27117
+blackboard_shard_1_host = blackboard-b
+blackboard_shard_1_port = 27127
+```
+
+For registry-routed sharded deployments, set the same shard count on clients and
+configure each standalone module service with the shard labels it owns:
+
+```ini
+blackboard_shard_count = 2
+blackboard_hosted_shards = 0
+```
+
+The service advertises both `rasn.runtime.blackboard` and
+`rasn.runtime.blackboard.shard.0`; clients query the shard-specific capability
+first and use the module-level descriptor only as a fallback.
 
 Distributed RPCs are resilient to cross-node latency and transient transport
 errors. These `[rasn.service]` knobs apply to the shared endpoint and accept the
@@ -1294,22 +1334,28 @@ rasn_runtime_ping_timeout_ms = 1000
 The runtime also owns two higher-level resilience policies for remote calls, so a
 single unhealthy module node cannot stall or corrupt the system:
 
-- **Per-module circuit breaker.** After `rasn_runtime_breaker_failures`
-  consecutive transport failures to a module, its breaker opens and calls
+- **Per-endpoint circuit breaker.** After `rasn_runtime_breaker_failures`
+  consecutive transport failures to a resolved module/shard endpoint, its breaker opens and calls
   short-circuit for `rasn_runtime_breaker_open_ms` before a half-open probe is
   admitted. This bounds the blast radius of a dead node instead of retrying into it.
-- **Idempotent retries (best-effort).** When `rasn_runtime_idempotency_enabled`
-  is set, the client stamps each remote call with a unique id that is stable across
-  its own retries, and the module service returns the first cached response per id
-  (bounded by `rasn_runtime_dedup_capacity`). This suppresses the common
-  lost-reply retry so a duplicated call is usually not re-applied. It is
-  best-effort, **not** exactly-once: the service-side lookup/apply/store is not a
-  single atomic step, so two concurrent retries of the same id can still both
-  execute, and an id can be evicted once more than `rasn_runtime_dedup_capacity`
-  distinct ids have been seen. Operations that are not naturally idempotent (for
-  example `resource_budget` reservations, `agent_message_bus` publishes without a
-  caller-supplied message id, `determinism_ledger` appends, task lifecycle
-  transitions) should carry a caller-stable id and tolerate a rare double-apply.
+- **Idempotent retries.** When `rasn_runtime_idempotency_enabled` is set, the
+  client stamps each remote call with a unique id that is stable across its own
+  retries. Module services dedup mutating operations by full request signature
+  plus id: a concurrent duplicate waits on the in-flight placeholder and receives
+  the first response instead of applying twice. Read-only operations bypass the
+  cache, and the completed-response window is bounded by
+  `rasn_runtime_dedup_capacity` plus `rasn_runtime_dedup_ttl_ms`. Hit/miss/wait/
+  eviction/expiry counters are exposed as rASN metrics. This suppresses
+  lost-reply double-apply within one service process; it is not cross-process
+  exactly-once.
+- **Optional service-to-service auth.** When `rasn_runtime_auth_enabled` is true,
+  distributed/hybrid clients stamp a shared token onto runtime module RPC
+  envelopes and runtime services reject missing or invalid tokens before
+  dispatching to module handlers. Rejections increment
+  `rasn_runtime_auth_rejected_total`. Keep it disabled for trusted local
+  experiments; for multi-node deployments, provide the same
+  `rasn_runtime_auth_token` to every client and module service through
+  deployment-specific config, not the checked-in sample config.
 
 ```ini
 rasn_runtime_breaker_enabled = true
@@ -1317,37 +1363,47 @@ rasn_runtime_breaker_failures = 5
 rasn_runtime_breaker_open_ms = 30000
 rasn_runtime_idempotency_enabled = true
 rasn_runtime_dedup_capacity = 8192
+rasn_runtime_dedup_ttl_ms = 300000
+rasn_runtime_auth_enabled = false
+rasn_runtime_auth_token =
 ```
 
 Readiness is probed by pinging every module through the facade, so a module
 whose service is down (locally or on a remote node) is reported by name instead
 of being masked by a static summary. In distributed mode the ping uses the
 dedicated `*_ping_timeout_ms` budget and a single attempt so an unreachable
-endpoint surfaces quickly. `rasn_runtime::describe_topology()` renders where
-each module is routed (local vs. remote), its endpoint, standalone role, and both
-its intended consistency model and its `actual=single_writer_in_memory` runtime
+endpoint surfaces quickly; sharded modules probe every configured shard.
+`rasn_runtime::describe_topology()` renders where each module is routed (local
+vs. remote), whether the endpoint came from `registry:` or `static:` config,
+per-shard endpoint labels when applicable, its standalone role, and both its
+intended consistency model and its `actual=single_writer_in_memory` runtime
 backing, which is useful for verifying a hybrid or multi-node layout.
 
 Each module declares an intended distributed consistency model
-(`rasn_runtime_module_descriptors()`): stateless-coordination modules are
-`sharded` (for example `blackboard` by key, `resource_budget` by scope),
-ownership/ledger modules are `replicated` (for example `agent_control_plane`,
-`determinism_ledger`), and control-surface modules are `singleton` (for example
-`human_interaction`, `sandbox_runtime`). These document the target rDSN-native
-replication strategy; the current in-memory service store realizes each as a
-single-writer singleton per service.
+(`rasn_runtime_module_descriptors()`): `sharded` modules (`blackboard` by key,
+`resource_budget` by scope, `agent_message_bus` by message id) now have
+deterministic partition routing, ownership/ledger modules are `replicated` (for
+example `agent_control_plane`, `determinism_ledger`), and control-surface modules
+are `singleton` (for example `human_interaction`, `sandbox_runtime`). These
+document the target rDSN-native replication strategy; the current in-memory
+service store realizes each shard/replica as a single-writer service store.
 
-> **Operational warning — one active instance per module.** Because each module
-> service is currently a single in-memory writer, do **not** run more than one
-> active instance of the same module (for example `blackboard@3`) expecting real
-> sharding or replication: you would get several independent, unsynchronized
-> stores (split state). Run exactly one active service per module until real
-> rDSN replication/sharding fronts it. Relatedly, the state-service mirror written
-> in `distributed` mode is an observational checkpoint, **not** a durability or
-> recovery mechanism — a restarted module service starts empty because module
-> state is not yet hydrated from the mirror. In `hybrid` mode, flipping a module
-> from `local` to `remote` is a cold migration: local-routed modules are not
-> mirrored, so the remote service starts without the previously local state.
+> **Operational warning — one active writer per shard.** Key-based sharding is a
+> placement/routing layer, not replication. Do **not** run multiple active
+> instances for the same shard expecting high availability: you would get split
+> state. Replicated modules still need one active writer until real rDSN
+> replication fronts them. The state-service mirror written in `distributed` mode
+> is replayed by module services on startup. Each mirrored mutation also writes a
+> per-module watermark by default; hydration verifies those watermarks before
+> replay so a torn or incomplete mirror fails closed instead of serving partial
+> state. `codepilot state compact [--prefix <state-prefix>] [checkpoint-path]`
+> lets operators verify existing watermarks and fold the shared state service into
+> a compact checkpoint/journal baseline. When hydration is enabled, a module
+> service refuses to open its RPC API if the configured state service cannot be
+> queried; disable hydration only for intentionally cold local experiments. In `hybrid` mode,
+> flipping a module from `local` to `remote` is still a cold migration:
+> local-routed modules are not mirrored, so the remote service starts without the
+> previously local state unless the operator explicitly migrates it.
 
 For the full architecture, provider model, resilience contracts, consistency
 models, and the multi-node roadmap, see
@@ -1363,7 +1419,7 @@ hardening gaps remain:
 | State availability | Checkpoints, append-only journals, conditional writes, workflow leases, optional local replica mirroring, and optional rDSN NFS import. | No quorum-replicated or externally managed HA state backend yet. |
 | Tool isolation | Default-deny side effects, workspace scoping, approvals, command allowlists, timeout/job containment, and a configurable container command wrapper. | No hardened container orchestrator with image, mount, network, and lifecycle policy. |
 | Replay fidelity | Replay for model responses, tool results, workflow scheduling, filesystem snapshots, and an `external.effect` ledger for side-effect intents. | No full virtualization of arbitrary external services, clocks, network state, or process environments. |
-| Deployment validation | Inline mode, typed service-mode RPC, URI/host endpoint configuration, registry heartbeats, active lease cleanup, and distributed rASN runtime modules with an aggregate service, standalone per-module roles, per-module endpoint overrides, `local`/`distributed`/`hybrid` providers, per-module circuit breaker, idempotent retries, RPC retry/backoff, and health-ping readiness/topology reporting. | Multi-process and cluster deployment tests are still limited; durable per-module persistence, quorum replication/sharding of module state, and cross-node module auth are not yet implemented. |
+| Deployment validation | Inline mode, typed service-mode RPC, URI/host endpoint configuration, registry heartbeats, active lease cleanup, and distributed rASN runtime modules with an aggregate service, standalone per-module roles, per-module/shard endpoint overrides, `local`/`distributed`/`hybrid` providers, per-module circuit breaker, idempotent retries, RPC retry/backoff, optional shared-token runtime RPC auth, state-mirror hydration with verified watermarks, watermark-verified checkpoint compaction, and health-ping readiness/topology reporting. | Multi-process and cluster deployment tests are still limited; quorum replication/sharding of module state, explicit watermark pruning, and local-to-remote migration tooling are not yet implemented. |
 | Credentials | `token_ref` handles for environment variables, files, and commands, plus deterministic redaction. | No vault-backed or OS-backed credential provider integration. |
 | SDK packaging | Generated C++/TypeScript/Python contracts and RPC-client source. | Packaged SDKs and concrete TypeScript/Python transports are not shipped. |
 | Evaluation evidence | Unit tests, self-tests, service smokes, schema smokes, report build, and a small eval harness. | Large benchmarks and user studies for debugging effectiveness remain future work. |

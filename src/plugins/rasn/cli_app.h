@@ -166,15 +166,6 @@ private:
                                               const std::string &receiver,
                                               const std::string &message_type);
     void finish_runtime_execution(const runtime_execution &execution, int exit_code, const std::string &detail);
-    bool mirror_runtime_module_state(const std::string &module,
-                                     const std::string &kind,
-                                     const std::string &key,
-                                     const std::string &value,
-                                     std::string *error);
-    void mirror_runtime_module_state_or_warn(const std::string &module,
-                                             const std::string &kind,
-                                             const std::string &key,
-                                             const std::string &value);
     void warn_runtime_module_failure(const std::string &module, const std::string &error) const;
 
     std::atomic<bool> _shutdown_requested{false};

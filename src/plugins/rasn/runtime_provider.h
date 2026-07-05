@@ -2,6 +2,7 @@
 
 #include <rasn/agent_control_plane.h>
 #include <rasn/agent_message_bus.h>
+#include <rasn/agent_registry.h>
 #include <rasn/blackboard.h>
 #include <rasn/capability_directory.h>
 #include <rasn/contract_verifier.h>
@@ -15,6 +16,7 @@
 #include <dsn/service_api_cpp.h>
 
 #include <chrono>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -36,6 +38,13 @@ struct rasn_runtime_request
     // response for a repeated id instead of re-applying the operation, so a
     // client-side retry after a lost reply does not double-apply a write.
     std::string request_id;
+    // Optional client-side routing hint used by distributed providers for
+    // shard fan-out reads. Runtime module handlers ignore this value.
+    uint32_t route_partition = (std::numeric_limits<uint32_t>::max)();
+    // Optional shared-token credential for cross-node runtime module RPC. Local
+    // and LPC paths leave this empty; RPC services verify it only when auth is
+    // enabled in [rasn.service].
+    std::string auth_token;
 };
 
 struct rasn_runtime_response
@@ -57,6 +66,8 @@ inline void marshall(::dsn::binary_writer &writer, const rasn_runtime_request &v
     writer.write(value.key);
     writer.write(value.payload);
     writer.write(value.request_id);
+    writer.write(value.route_partition);
+    writer.write(value.auth_token);
 }
 
 inline void unmarshall(::dsn::binary_reader &reader, rasn_runtime_request &value, ::dsn_msg_serialize_format fmt)
@@ -66,7 +77,30 @@ inline void unmarshall(::dsn::binary_reader &reader, rasn_runtime_request &value
     reader.read(value.operation);
     reader.read(value.key);
     reader.read(value.payload);
-    reader.read(value.request_id);
+    if (!reader.is_eof())
+    {
+        reader.read(value.request_id);
+    }
+    else
+    {
+        value.request_id.clear();
+    }
+    if (!reader.is_eof())
+    {
+        reader.read(value.route_partition);
+    }
+    else
+    {
+        value.route_partition = (std::numeric_limits<uint32_t>::max)();
+    }
+    if (!reader.is_eof())
+    {
+        reader.read(value.auth_token);
+    }
+    else
+    {
+        value.auth_token.clear();
+    }
 }
 
 inline void marshall(::dsn::binary_writer &writer, const rasn_runtime_response &value, ::dsn_msg_serialize_format fmt)
@@ -96,6 +130,19 @@ struct rasn_runtime_config
     std::string provider = "local";
     std::string state_prefix = "rasn/runtime";
     bool strict = false;
+};
+
+struct rasn_runtime_state_compaction_report
+{
+    bool ok = true;
+    std::string error;
+    std::string state_prefix;
+    std::string checkpoint_path;
+    size_t queried_records = 0;
+    size_t runtime_records = 0;
+    size_t watermark_records = 0;
+    size_t checkpointed_records = 0;
+    uint64_t last_sequence = 0;
 };
 
 // Static description of a rASN runtime module: its app-facing API name, the
@@ -302,6 +349,11 @@ protected:
         (void)module;
         return "in-process";
     }
+    std::vector<rasn_runtime_response> call_module_api_shards(const rasn_runtime_request &request) const;
+    void mirror_state_after_success(const std::string &module,
+                                    const std::string &kind,
+                                    const std::string &key,
+                                    const std::string &value);
     std::string state_key(const std::string &module, const std::string &kind, const std::string &key) const;
 
 private:
@@ -315,6 +367,9 @@ std::vector<std::string> rasn_runtime_module_names();
 std::vector<rasn_runtime_descriptor> rasn_runtime_module_descriptors();
 std::string rasn_runtime_module_app_role(const std::string &module_or_role);
 std::string normalize_rasn_runtime_app_list(const std::string &app_list);
+rasn_runtime_state_compaction_report compact_rasn_runtime_state_mirror(rasn_service_graph &services,
+                                                                       const std::string &checkpoint_path = "",
+                                                                       const std::string &state_prefix = "");
 void register_rasn_runtime_apps();
 
 class rasn_runtime_rpc_service : public ::dsn::serverlet<rasn_runtime_rpc_service>
@@ -323,6 +378,7 @@ public:
     explicit rasn_runtime_rpc_service(std::vector<std::string> modules = std::vector<std::string>());
     void open_service();
     void close_service();
+    const std::vector<std::string> &modules() const { return _modules; }
 
 protected:
     void on_agent_control(const rasn_runtime_request &request, ::dsn::rpc_replier<rasn_runtime_response> &reply);
@@ -340,6 +396,9 @@ protected:
 private:
     bool register_module_handler(const std::string &module);
     void unregister_module_handler(const std::string &module);
+    void reply_module_request(const std::string &module,
+                              const rasn_runtime_request &request,
+                              ::dsn::rpc_replier<rasn_runtime_response> &reply);
 
     std::vector<std::string> _modules;
 };
@@ -369,7 +428,16 @@ protected:
     rasn_runtime_app(::dsn_gpid gpid, std::vector<std::string> modules);
 
 private:
+    ::dsn::error_code hydrate_modules_from_state();
+    void register_modules_with_registry();
+    void heartbeat_modules_to_registry();
+    void unregister_modules_from_registry();
+    void start_registry_heartbeat_timer();
+    void cancel_registry_heartbeat_timer();
+
     rasn_runtime_rpc_service _rpc;
+    std::vector<agent_descriptor> _registry_descriptors;
+    ::dsn::task_ptr _registry_heartbeat_timer;
 };
 
 class rasn_agent_control_module_app : public rasn_runtime_app

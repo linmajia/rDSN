@@ -39,6 +39,7 @@ class agent_control_plane
 {
 public:
     bool upsert_agent(const agent_control_record &record, std::string *error);
+    bool hydrate_agent(const agent_control_record &record, std::string *error);
     bool transition(const std::string &agent_id,
                     const std::string &state,
                     const std::string &last_error,

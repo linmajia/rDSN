@@ -26,6 +26,28 @@ bool resource_budget_manager::configure(const resource_quota &quota, std::string
     return true;
 }
 
+bool resource_budget_manager::hydrate_usage(const resource_usage &usage, std::string *error)
+{
+    if (usage.scope.empty())
+    {
+        if (error != nullptr)
+        {
+            *error = "resource usage missing scope";
+        }
+        return false;
+    }
+
+    ::dsn::service::zauto_lock guard(_lock);
+    _usage[usage.scope] = usage;
+    if (_quotas.find(usage.scope) == _quotas.end())
+    {
+        resource_quota quota;
+        quota.scope = usage.scope;
+        _quotas[usage.scope] = quota;
+    }
+    return true;
+}
+
 resource_budget_decision resource_budget_manager::reserve(const resource_request &request)
 {
     resource_budget_decision decision;

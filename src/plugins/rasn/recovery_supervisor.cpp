@@ -22,6 +22,32 @@ bool recovery_supervisor::set_policy(const recovery_policy &policy, std::string 
     return true;
 }
 
+bool recovery_supervisor::hydrate_failure(const failure_observation &failure, std::string *error)
+{
+    if (failure.task_id.empty())
+    {
+        if (error != nullptr)
+        {
+            *error = "failure observation missing task id";
+        }
+        return false;
+    }
+
+    ::dsn::service::zauto_lock guard(_lock);
+    for (failure_observation &existing : _history)
+    {
+        if (existing.task_id == failure.task_id && existing.component == failure.component &&
+            existing.failure_class == failure.failure_class && existing.code == failure.code &&
+            existing.attempt == failure.attempt && existing.time_ms == failure.time_ms)
+        {
+            existing = failure;
+            return true;
+        }
+    }
+    _history.push_back(failure);
+    return true;
+}
+
 recovery_action recovery_supervisor::decide(const failure_observation &failure) const
 {
     const recovery_policy policy = policy_for(failure.failure_class);

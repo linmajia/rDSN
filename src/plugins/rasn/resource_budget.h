@@ -51,6 +51,7 @@ class resource_budget_manager
 {
 public:
     bool configure(const resource_quota &quota, std::string *error);
+    bool hydrate_usage(const resource_usage &usage, std::string *error);
     resource_budget_decision reserve(const resource_request &request);
     bool release(const resource_request &request, std::string *error);
     bool usage(const std::string &scope, resource_usage *usage) const;

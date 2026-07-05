@@ -39,6 +39,7 @@ class shared_blackboard
 {
 public:
     bool put(blackboard_entry entry, blackboard_entry *stored, std::string *error);
+    bool hydrate_entry(const blackboard_entry &entry, std::string *error);
     bool get(const std::string &key, blackboard_entry *entry, uint64_t now_ms = 0) const;
     bool erase(const std::string &key, std::string *error);
     std::vector<blackboard_entry> query(const blackboard_query &query) const;
