@@ -26,10 +26,13 @@ set(MY_PROJ_LIBS rasn)
 
 set(MY_PROJ_LIB_PATH "")
 
-# config.ini is this app's own thin config; config.rasn.ini is the single shared
-# rASN runtime config (src/plugins/rasn/config.rasn.ini) used by every app.
+# Binplace only this app's own thin config.ini. The shared rASN runtime config
+# (src/plugins/rasn/config.rasn.ini) is a RUNTIME artifact, not an app artifact:
+# a pure local app runs on built-in defaults from this self-contained config.ini.
+# When an operator drops config.rasn.ini next to the binary to host the runtime
+# (e.g. `<app> --dsn` all-in-one, or a dedicated runtime node), `--dsn` auto-loads
+# it and it `@include`s this config.ini to co-host the app gateway.
 set(MY_BINPLACES
-    "${CMAKE_CURRENT_SOURCE_DIR}/config.ini"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../config.rasn.ini")
+    "${CMAKE_CURRENT_SOURCE_DIR}/config.ini")
 
 dsn_add_executable()

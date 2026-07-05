@@ -78,14 +78,17 @@ std::string find_config_path(const std::string &program)
     return find_config_file(program, "config.ini");
 }
 
-// For `--dsn` (runtime host / all-in-one): prefer the full runtime config so the
-// service apps launch; fall back to the thin app config if it is not present.
+// In `--dsn` service mode, prefer the shared runtime config.rasn.ini when it is
+// deployed next to the binary: it launches the full service fleet and, via a
+// trailing `@include config.ini`, co-hosts this binary's own app gateway. When
+// the runtime config is absent, fall back to the thin config.ini so `--dsn` still
+// starts on built-in default configuration values.
 std::string find_runtime_config_path(const std::string &program)
 {
-    const std::string runtime = find_config_file(program, "config.rasn.ini");
-    if (::dsn::utils::filesystem::file_exists(runtime))
+    const std::string runtime_config = find_config_file(program, "config.rasn.ini");
+    if (::dsn::utils::filesystem::file_exists(runtime_config))
     {
-        return runtime;
+        return runtime_config;
     }
     return find_config_path(program);
 }
@@ -183,6 +186,11 @@ int main(int argc, char **argv)
         return cli.run(command_args);
     }
 
+    // In `--dsn` service mode, prefer the shared runtime config.rasn.ini deployed
+    // next to the binary (it launches the full service fleet and, via its trailing
+    // `@include config.ini`, co-hosts this binary's own gateway). When that runtime
+    // config is absent, fall back to the thin config.ini so `--dsn` still starts on
+    // built-in default configuration values. An explicit `--dsn <path>` wins.
     const std::string config_path = explicit_dsn_config.empty() ? find_runtime_config_path(program) : explicit_dsn_config;
     const std::string default_codepilot_app_list =
         "rasn.registry;rasn.llm.agent;rasn.tool.agent;rasn.state;rasn.coordinator;rasn.workflow;"

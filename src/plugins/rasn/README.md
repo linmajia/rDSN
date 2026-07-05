@@ -92,7 +92,7 @@ resolved by `dsn.dist.uri.resolver`; otherwise it falls back to `<name>_host` an
 
 Standalone one-shot CLI mode still initializes the rDSN runtime with the plugin `config.ini`, but starts no rDSN service apps. It lazily starts the shared graph for the duration of the command and uses the same service implementations inline for fast local commands, while service mode starts the full rDSN app graph and routes through RPC.
 
-Configuration is split into two files composed with rDSN's optional `@include?`, but an **app never carries service config** — the composition runs *runtime → app*, not app → runtime. `config.ini` is the thin **application** config: a minimal rDSN bootstrap, the app's own `[apps.rasn.<app>]` section, and the two things an app cares about — the runtime location (`[rasn.runtime]`) and the LLM serving endpoint (`[rasn.model]`). It carries no `[rasn.service]` endpoint map and no `[apps.rasn.*]` service-deployment sections. `config.rasn.ini` is the complete **runtime** (services, deployments, tuning), a **single shared file** (`src/plugins/rasn/config.rasn.ini`) that every app binplaces verbatim. A default `codepilot` loads only its thin `config.ini` and runs the runtime in-process on defaults; `codepilot --dsn` loads `config.rasn.ini` (which `@include?`s the local `config.ini`) to launch the whole stack in one process; a remote runtime node deploys `config.rasn.ini` alone. See `docs/DISTRIBUTED_RUNTIME.md` §6.1.
+Configuration is split into two files, but an **app never carries service config**. The rASN plugin does **not** modify rDSN's config parser; it uses only rDSN's stock mandatory `@include`, and *which* file a binary loads is chosen in the app (`main.cpp`), never on the command line. `config.ini` is the thin **application** config: a minimal rDSN bootstrap, the app's own `[apps.rasn.<app>]` section, and the two things an app cares about — the runtime location (`[rasn.runtime]`) and the LLM serving endpoint (`[rasn.model]`). It is **self-contained and `@include`s nothing**, and carries no `[rasn.service]` endpoint map and no `[apps.rasn.*]` service-deployment sections of its own. `config.rasn.ini` is the complete **runtime** (services, deployments, tuning), a **single shared** file (`src/plugins/rasn/config.rasn.ini`) that an operator drops beside a binary — or onto a runtime node — to host the runtime; it is not shipped next to an app by default, and it **ends with `@include config.ini`** to co-host the loading binary's own gateway (it carries no gateway section itself, since rDSN validates every `[apps.*]` type at load and each binary registers only its own). A default `codepilot` loads only its thin `config.ini` and runs the runtime in-process on defaults; drop `config.rasn.ini` beside the binary and `codepilot --dsn` auto-loads it to launch the whole stack in one process — **no config path on the command line** — and without it `--dsn` falls back to the thin config and still runs on defaults. Because the include runs last, app values override the overlay. Run a binary from its bin/install dir so the relative include resolves. See `docs/DISTRIBUTED_RUNTIME.md` §6.1.
 
 Application CLIs share the same path-startup convention through the reusable
 `cli_support` helper: a single existing directory argument switches the process
@@ -1267,10 +1267,12 @@ role so it can be deployed on its own process or node:
 
 Launch a single module service with a state authority available for hydration by
 passing the state service plus module name (module name or role) after the config;
-the app-list is normalized to the matching standalone role:
+the app-list is normalized to the matching standalone role. Deploy `config.rasn.ini`
+beside the binary — it carries the service sections and `@include`s the app's
+`config.ini`:
 
 ```bat
-codepilot.exe --dsn config.ini "rasn.state;resource_budget"
+codepilot.exe --dsn config.rasn.ini "rasn.state;resource_budget"
 ```
 
 When `rasn_runtime_registry_registration_enabled` is true, each runtime module

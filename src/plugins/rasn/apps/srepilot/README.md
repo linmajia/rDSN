@@ -139,12 +139,20 @@ resilience sections documented in the top-level rASN README.
 ## Service mode
 
 Direct commands start an inline rASN service graph in-process. Service mode runs
-the rDSN app roles and the SREPilot gateway:
+the rDSN app roles and the SREPilot gateway. You never name a config file on the
+command line — SREPilot loads its own thin `config.ini` by default, and in
+`--dsn` mode auto-loads the shared runtime `config.rasn.ini` when it is deployed
+next to the binary:
 
 ```bat
 srepilot.exe --dsn
-srepilot.exe --dsn C:\path\to\config.ini
 ```
 
-The `--dsn` path selects the SREPilot app list explicitly, so this executable
-does not need to register CodePilot's service-app type.
+To host the full service fleet in this one process, drop the shared
+`config.rasn.ini` (from `src/plugins/rasn/config.rasn.ini`) next to the executable;
+`--dsn` auto-loads it, and it `@include`s SREPilot's own `config.ini` to co-host
+the gateway. Without that overlay, `--dsn` falls back to the thin `config.ini` and
+still starts on built-in default configuration values. (Run the binary from the
+directory holding these files so the relative include resolves.) The `--dsn` path
+selects the SREPilot app list explicitly, so this executable does not need to
+register CodePilot's service-app type.

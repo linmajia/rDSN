@@ -215,7 +215,7 @@ Design notes:
   plus any explicitly hosted shard labels.
 - **Standalone roles.** Each module has a `rasn.runtime.<module>` role and a
   standalone app; launch it with a reachable state service for hydration (for
-  example `--dsn config.ini "rasn.state;resource_budget"`, or a remote
+  example `--dsn config.rasn.ini "rasn.state;resource_budget"`, or a remote
   `[rasn.service] state_uri`). The app-list is normalized to the role. This is
   what makes modules independently deployable.
 - **Compatibility aliases.** App-list normalization and app registration still
@@ -231,37 +231,52 @@ Design notes:
 ### 6.1 Configuration file layout
 
 A rASN application is a thin TUI/GUI; all agent logic and services live in the
-rASN **runtime**. Configuration splits into two files, composed with rDSN's
-optional `@include?` directive (resolved relative to the process working
-directory). Crucially, an **app never carries runtime/service config** — the
-composition runs *runtime → app*, not app → runtime:
+rASN **runtime**. Configuration splits into two files. The app's `config.ini` is
+**self-contained and never includes another file** — the rASN plugin does not
+modify rDSN's config parser, so it relies only on rDSN's stock, mandatory
+`@include`. Which file a binary loads is chosen **in the app** (`main.cpp`), not
+on the command line:
+
+- A plain `./app` always loads its own thin `config.ini` and boots on built-in
+  defaults.
+- `./app --dsn` auto-detects the shared `config.rasn.ini` next to the binary and
+  loads *that* instead; when the overlay is absent it falls back to the thin
+  `config.ini` and still runs on defaults.
+
+The shared runtime file composes *runtime → app*: `config.rasn.ini` **ends with a
+mandatory `@include config.ini`** that pulls in the co-hosted binary's own thin
+config so the app gateway is launched beside the services. (The include is a
+stock rDSN relative include resolved against the launch directory, so run a binary
+from the directory that holds its config files — its bin/install dir.)
 
 | File | Audience | Contents |
 | --- | --- | --- |
-| `config.ini` | applications | **One per app** (`apps/<app>/config.ini`), thin. Only a minimal rDSN bootstrap (`[modules]` + `[core]`), the app's own `[apps.rasn.<app>]` section, and the two things an app cares about: the runtime **location** (`[rasn.runtime]`) and, optionally, the LLM serving endpoint (`[rasn.model]`). It carries **no** `[rasn.service]` endpoint map and **no** `[apps.rasn.*]` service-deployment sections. |
-| `config.rasn.ini` | runtime nodes | **Single shared file** (`src/plugins/rasn/config.rasn.ini`), binplaced identically next to every app. The **complete rASN runtime**: rDSN `[modules]`/`[core]`/thread pools, the `[rasn.service]` endpoint map + `[rasn.rpc]` timeouts, every `[apps.rasn.*]` service/module app, and all agent-logic tuning (`[rasn.model]`, `[rasn.tool]`, `[rasn.overload]`, `[rasn.policy]`, `[rasn.coordination]`, …). Loaded only on a node that *hosts* the runtime. At its top it `@include?`s the co-hosted app's thin `config.ini`, so an all-in-one node runs the app beside the services in one process. |
+| `config.ini` | applications | **One per app** (`apps/<app>/config.ini`), thin, self-contained, always loaded by a plain `./app`. A minimal rDSN bootstrap (`[modules]` + `[core]`), the app's own `[apps.rasn.<app>]` section, and the two things an app cares about: the runtime **location** (`[rasn.runtime]`) and, optionally, the LLM serving endpoint (`[rasn.model]`). It carries **no** `[rasn.service]` endpoint map and **no** `[apps.rasn.*]` service-deployment sections of its own, and it does **not** `@include` anything. |
+| `config.rasn.ini` | runtime nodes | **Single shared runtime config** (`src/plugins/rasn/config.rasn.ini`). The **complete rASN runtime**: rDSN `[modules]`/`[core]`/thread pools, the `[rasn.service]` endpoint map + `[rasn.rpc]` timeouts, every `[apps.rasn.*]` service/module app, and all agent-logic tuning (`[rasn.model]`, `[rasn.tool]`, `[rasn.overload]`, `[rasn.policy]`, `[rasn.coordination]`, …). It carries **no** app-gateway section of its own — rDSN validates every `[apps.*]` type at load and each binary registers only its own gateway type — so it **ends with `@include config.ini`** to co-host exactly the loading binary's gateway. An operator drops it beside a binary (or onto a dedicated runtime node); it is **not** binplaced next to an app by default. Because the include runs last, the app's own sections override the overlay. |
 
 Who loads what:
 
-- **Default `<app>` (local, no args)** loads only its thin `config.ini`. The
-  runtime modules are built in-process on built-in defaults; the app sees no
-  service/deployment config at all.
-- **All-in-one runtime host (`<app> --dsn`)** loads `config.rasn.ini` (the app's
-  `--dsn` mode resolves the runtime file first), which `@include?`s the local
-  `config.ini` to pull in `[apps.rasn.<app>]` + `[rasn.runtime]`. The service
-  apps launch alongside the app in one process; the app reaches them via LPC.
-- **Dedicated remote runtime node** deploys `config.rasn.ini` with no local
-  `config.ini` present — the optional include is skipped and the node runs the
-  service stack headless.
+- **Default `<app>` (local, no args)** loads only its thin `config.ini`. No
+  `config.rasn.ini` is consulted, the runtime modules are built in-process on
+  built-in defaults, and the app sees no service/deployment config at all.
+- **All-in-one runtime host (`<app> --dsn`)** auto-loads the shared
+  `config.rasn.ini` when it is deployed next to the binary; its trailing
+  `@include config.ini` co-hosts the app gateway, so the service apps launch
+  alongside the app in one process (the app reaches them via LPC). With **no**
+  overlay present, `--dsn` falls back to the thin `config.ini` and runs on
+  defaults. **No config path is ever named on the command line.**
+- **Dedicated remote runtime node** runs an app binary with `--dsn` and a service
+  `-app_list`, with `config.rasn.ini` deployed beside it, to run the service stack
+  headless.
 - **Thin client → remote runtime.** The app keeps only its `config.ini`, sets
   `[rasn.runtime] rasn_runtime_mode = distributed`, and gives the remote runtime
   address in a small `[rasn.service]` block (`rasn_runtime_host`/`_port`). It
-  still never loads the runtime's service-deployment config.
+  never deploys the runtime's service-deployment config.
 
-Both files are binplaced next to each executable so the relative `@include?`
-resolves at runtime. Each app ships its own thin `config.ini`; they all binplace
-the **same** shared `config.rasn.ini`, so there is exactly one runtime config to
-maintain.
+Only `config.ini` is binplaced next to each executable (each app ships its own).
+`config.rasn.ini` lives once in the source tree as the runtime config/template;
+copy it beside a binary — or onto a runtime node — to host the runtime, so there
+is exactly one runtime config to maintain.
 
 ## 7. Resilience and idempotency (runtime-owned)
 
@@ -531,10 +546,12 @@ resource_budget_mode = remote
 resource_budget_host = budget-node
 ```
 
-Launch one standalone module service:
+Launch one standalone module service (deploy `config.rasn.ini` beside the binary
+— it carries the service sections and `@include`s the app's `config.ini`; the
+app-list selects which roles start):
 
 ```bat
-codepilot.exe --dsn config.ini "rasn.state;resource_budget"
+codepilot.exe --dsn config.rasn.ini "rasn.state;resource_budget"
 ```
 
 ## 11. Roadmap
@@ -569,7 +586,7 @@ which gaps are resolved in code, mitigated client-side, or tracked as framework 
 | Reusable circuit breaker engine | `circuit_breaker.h` / `circuit_breaker.cpp` |
 | Provider/endpoint/resilience config | `[rasn.runtime]` in each app's `config.ini`; `[rasn.service]`/`[rasn.rpc]` in the shared `config.rasn.ini` |
 | Coordination config | `[rasn.coordination]` in the shared `config.rasn.ini` |
-| Config file layout (app / runtime split via optional `@include?`) | `config.ini` + `config.rasn.ini` (see §6.1) |
+| Config file layout (thin app `config.ini`; runtime `config.rasn.ini` `@include`s it) | `config.ini` + `config.rasn.ini` (see §6.1) |
 | Tests | `tests/rasn_unit_tests.cpp`, `tests/rasn_coordination_test.cpp` |
 
 ## 13. Production-readiness audit — findings, remediation, and status

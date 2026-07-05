@@ -1268,15 +1268,24 @@ Responsibilities:
 
 rDSN design:
 
-- Packaging remains source-tree local: each app's own thin `config.ini` plus the
-  single shared runtime `config.rasn.ini` are copied beside the built executable by
-  CMake, and examples are stored under `examples/`. The composition runs *runtime →
-  app*: `config.ini` holds only a minimal rDSN bootstrap, the app's `[apps.rasn.<app>]`
-  section, and app-facing config (`[rasn.runtime]` location + `[rasn.model]`), with no
-  service/deployment sections; the full runtime — the `[apps.rasn.*]` service
-  deployment sections, the `[rasn.service]` endpoint map, and all tuning — lives once
-  in the shared `src/plugins/rasn/config.rasn.ini`, which `@include?`s the local
-  `config.ini` when a node co-hosts an app (`<app> --dsn`). See
+- Packaging remains source-tree local: only each app's own thin `config.ini` is
+  copied beside the built executable by CMake, and examples are stored under
+  `examples/`. The rASN plugin does **not** modify rDSN's config parser; it uses
+  only rDSN's stock mandatory `@include`, and which file a binary loads is chosen
+  in the app (`main.cpp`), never on the command line. `config.ini` is
+  self-contained (it `@include`s nothing): a minimal rDSN bootstrap, the app's
+  `[apps.rasn.<app>]` section, and app-facing config (`[rasn.runtime]` location +
+  `[rasn.model]`), with no service/deployment sections of its own. The full
+  runtime — the `[apps.rasn.*]` service deployment sections, the `[rasn.service]`
+  endpoint map, and all tuning — lives once in the shared
+  `src/plugins/rasn/config.rasn.ini`, which is *not* binplaced by default; an
+  operator drops it beside a binary (or onto a runtime node) to host the runtime.
+  `config.rasn.ini` **ends with `@include config.ini`** to co-host the loading
+  binary's own gateway (it carries no gateway section itself, since rDSN validates
+  every `[apps.*]` type at load and each binary registers only its own). A plain
+  `./app` loads only `config.ini`; `<app> --dsn` auto-loads `config.rasn.ini` when
+  present and otherwise falls back to the thin config — so, absent the overlay,
+  apps (including `<app> --dsn`) run on built-in default configuration values. See
   `docs/DISTRIBUTED_RUNTIME.md` §6.1.
 - rASN builds as a reusable `rasn` static library containing the engine, while
   CodePilot (`apps/codepilot/`), SREPilot (`apps/srepilot/`), and the
