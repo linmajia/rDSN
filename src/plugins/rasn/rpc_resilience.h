@@ -69,6 +69,21 @@ inline bool rpc_should_retry(::dsn::error_code code, bool idempotent)
     return idempotent && rpc_error_is_ambiguous_transient(code);
 }
 
+// Circuit-breaker key for a core-service RPC. Failures are aggregated per
+// (service, endpoint) -- NOT per (operation, endpoint). An unhealthy endpoint
+// fails *every* operation it serves, so all operations to it must share one
+// breaker and trip together. Keying per operation would split failures across
+// keys (e.g. "state.put@ep", "state.get@ep", "state.query@ep") so no single key
+// reaches the failure threshold and the breaker never opens even though the
+// endpoint is plainly down. The service is the token before the first '.' in
+// `op` (e.g. "state.put" -> "state"); an op with no '.' is its own service.
+inline std::string core_service_breaker_key(const std::string &op, const std::string &endpoint)
+{
+    const std::string::size_type dot = op.find('.');
+    const std::string service = (dot == std::string::npos) ? op : op.substr(0, dot);
+    return service + "@" + endpoint;
+}
+
 // Shared per-endpoint circuit-breaker registry and config for rASN core-service
 // client RPC. Defined in rpc_resilience.cpp so the breaker state and tunables are
 // process-global and shared across every translation unit that makes core RPC.

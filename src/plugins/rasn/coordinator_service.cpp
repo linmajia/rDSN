@@ -80,7 +80,8 @@ coordinator_route coordinator_router::resolve(const agent_request &request,
         // breaker plus bounded retries for this idempotent read. Static/in-process
         // discovery (the else branch) needs no RPC hardening.
         ensure_rasn_core_breaker_config();
-        const std::string breaker_key = std::string("registry.query@") + registry_address.to_string();
+        const std::string breaker_key =
+            core_service_breaker_key("registry.query", registry_address.to_string());
         std::tie(err, response) = resilient_rpc_call<registry_query_response>(
             global_rasn_core_breakers(),
             breaker_key,

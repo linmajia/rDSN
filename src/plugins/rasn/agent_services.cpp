@@ -45,11 +45,12 @@ void set_rdsn_rpc_enabled(bool enabled)
 }
 
 // Wrap a core-service client RPC (state / workflow / observability / registry)
-// with the shared rASN client resilience policy: a per-endpoint circuit breaker
-// and idempotency-aware retries with linear backoff. `call` performs the actual
-// one-shot `*_sync` RPC and returns {error_code, response}. `idempotent` must be
-// false for operations that must not be re-applied on an ambiguous timeout (e.g.
-// starting a workflow run or a compare-and-swap); those are only retried on
+// with the shared rASN client resilience policy: a per-(service, endpoint)
+// circuit breaker and idempotency-aware retries with linear backoff. `call`
+// performs the actual one-shot `*_sync` RPC and returns {error_code, response}.
+// `idempotent` must be false for operations that must not be re-applied on an
+// ambiguous timeout (e.g. starting a workflow run, a compare-and-swap, or a plain
+// state put that allocates a fresh sequence per apply); those are only retried on
 // transport errors that prove the request never reached the server.
 template <typename TResponse, typename FCall>
 std::pair<::dsn::error_code, TResponse>
@@ -57,9 +58,9 @@ core_rpc_with_resilience(const char *op, const ::dsn::rpc_address &address, bool
 {
     ensure_rasn_core_breaker_config();
     const rpc_resilience_options options = read_rasn_core_resilience_options();
-    std::string key(op);
-    key += "@";
-    key += address.to_string();
+    // Key the breaker by service+endpoint (not operation+endpoint) so every
+    // operation to a down endpoint trips the same breaker together.
+    const std::string key = core_service_breaker_key(op, address.to_string());
     return resilient_rpc_call<TResponse>(
         global_rasn_core_breakers(), key, options, idempotent, default_rpc_timeout(), std::forward<FCall>(call));
 }
@@ -3074,8 +3075,13 @@ state_response rasn_service_graph::put_state(const state_record &record)
         rasn_state_client client(_state_address);
         ::dsn::error_code err;
         state_response response;
+        // A plain put is NOT idempotent: state_store::put allocates a fresh
+        // sequence and appends a new journal record on every apply (runtime
+        // mirror writes arrive with sequence 0), so re-applying it after an
+        // ambiguous timeout would double-journal and advance the sequence twice.
+        // Retry only on transport errors that prove the request never applied.
         std::tie(err, response) = core_rpc_with_resilience<state_response>(
-            "state.put", _state_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
+            "state.put", _state_address, /*idempotent=*/false, [&](std::chrono::milliseconds timeout) {
                 return client.put_sync(record, timeout);
             });
         if (err == ::dsn::ERR_OK)

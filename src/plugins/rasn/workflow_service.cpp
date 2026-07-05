@@ -1364,6 +1364,18 @@ workflow_response workflow_store::cancel(const workflow_run_query &request)
         return error_response("workflow run not found: " + request.run_id);
     }
 
+    // A cancel that already succeeded leaves the run in the terminal "cancelled"
+    // state. If that success reply was lost, the client (which treats cancel as
+    // idempotent) retries; the retry must observe the same success, not a
+    // spurious "already terminal" failure. Return the persisted cancelled record.
+    // Other terminal states ("completed"/"failed") mean the run reached a
+    // different outcome before the cancel took effect -- a genuine failure.
+    if (current.status == "cancelled")
+    {
+        workflow_response response;
+        response.run = current;
+        return response;
+    }
     if (terminal_status(current.status))
     {
         return error_response("workflow run is already terminal: " + request.run_id);

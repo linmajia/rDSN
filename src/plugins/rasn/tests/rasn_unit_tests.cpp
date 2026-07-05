@@ -2567,6 +2567,54 @@ TEST(rasn_workflow_service, cancel_reports_state_persist_failures)
     EXPECT_NE(std::string::npos, stored.record.value.find("status=running"));
 }
 
+TEST(rasn_workflow_service, cancel_is_idempotent_for_already_cancelled_run)
+{
+    // A cancel whose success reply was lost is retried by the (idempotent) client.
+    // The retry observes the run already in the terminal "cancelled" state and
+    // must return that same success rather than an "already terminal" error, and
+    // must not re-persist or advance the sequence.
+    const std::string run_id = "unit-cancel-idempotent-" + make_trace_id();
+    const std::string workflow_id = "unit.workflow.cancel-idempotent";
+    const uint64_t cancelled_sequence = 31;
+    const state_response persisted =
+        put_workflow_run_state(run_id, workflow_id, "cancelled", cancelled_sequence);
+    ASSERT_TRUE(persisted.ok) << persisted.error;
+
+    workflow_store store;
+    workflow_run_query query;
+    query.run_id = run_id;
+    const workflow_response response = store.cancel(query);
+    ASSERT_TRUE(response.ok) << response.error;
+    EXPECT_EQ("cancelled", response.run.status);
+    EXPECT_EQ(cancelled_sequence, response.run.sequence);
+
+    state_key_request get;
+    get.key = "workflow/" + run_id;
+    const state_response stored = global_state_store().get(get);
+    ASSERT_TRUE(stored.ok) << stored.error;
+    EXPECT_EQ(cancelled_sequence, stored.record.sequence);
+}
+
+TEST(rasn_workflow_service, cancel_rejects_non_cancelled_terminal_run)
+{
+    // A run that reached a *different* terminal outcome ("completed"/"failed")
+    // before any cancel took effect is a genuine failure: cancel must still
+    // report "already terminal" so the retry-safety carve-out is limited to the
+    // cancelled state only.
+    const std::string run_id = "unit-cancel-terminal-" + make_trace_id();
+    const std::string workflow_id = "unit.workflow.cancel-terminal";
+    const state_response persisted =
+        put_workflow_run_state(run_id, workflow_id, "completed", 41);
+    ASSERT_TRUE(persisted.ok) << persisted.error;
+
+    workflow_store store;
+    workflow_run_query query;
+    query.run_id = run_id;
+    const workflow_response response = store.cancel(query);
+    EXPECT_FALSE(response.ok);
+    EXPECT_NE(std::string::npos, response.error.find("workflow run is already terminal"));
+}
+
 TEST(rasn_workflow_service, rejects_duplicate_active_execution_lease)
 {
     const std::string run_id = "unit-active-" + make_trace_id();
@@ -3331,6 +3379,67 @@ TEST(rasn_rpc_resilience, retries_are_idempotency_aware_and_breaker_short_circui
         EXPECT_EQ(::dsn::ERR_BUSY, result.first);
         EXPECT_FALSE(invoked);
     }
+}
+
+TEST(rasn_rpc_resilience, breaker_key_is_service_scoped_so_ops_trip_together)
+{
+    // Finding: keying the breaker per (operation, endpoint) splits an endpoint's
+    // failures across keys, so no single operation reaches the threshold and the
+    // breaker never opens even though the endpoint is down. The key must be
+    // service-scoped: every operation of a service to one endpoint shares it.
+    EXPECT_EQ("state@host:34801", core_service_breaker_key("state.put", "host:34801"));
+    EXPECT_EQ(core_service_breaker_key("state.put", "host:34801"),
+              core_service_breaker_key("state.get", "host:34801"));
+    EXPECT_NE(core_service_breaker_key("state.put", "host:34801"),
+              core_service_breaker_key("workflow.cancel", "host:34801"));
+    EXPECT_NE(core_service_breaker_key("state.put", "host:34801"),
+              core_service_breaker_key("state.put", "host:34802"));
+    // An op with no '.' is treated as its own service.
+    EXPECT_EQ("ping@host:34801", core_service_breaker_key("ping", "host:34801"));
+
+    breaker_config cfg;
+    cfg.enabled = true;
+    cfg.failure_threshold = 2;
+    cfg.open_ms = 600000;
+    circuit_breaker_registry breakers(cfg);
+
+    rpc_resilience_options options;
+    options.breaker_enabled = true;
+    options.max_attempts = 1; // one shot per call so each failure is one report
+    options.backoff_ms = 0;
+
+    struct fake_response
+    {
+        bool ok = false;
+    };
+    const std::string endpoint = "host:34801";
+    const auto always_fail = [](std::chrono::milliseconds) {
+        return std::make_pair(::dsn::ERR_NETWORK_FAILURE, fake_response());
+    };
+
+    // Two DIFFERENT operations of the same service each fail once. Because they
+    // share the service-scoped breaker key, the two failures aggregate and trip
+    // the breaker (threshold == 2).
+    resilient_rpc_call<fake_response>(breakers,
+                                      core_service_breaker_key("state.put", endpoint),
+                                      options, false, std::chrono::milliseconds(10), always_fail);
+    resilient_rpc_call<fake_response>(breakers,
+                                      core_service_breaker_key("state.get", endpoint),
+                                      options, false, std::chrono::milliseconds(10), always_fail);
+
+    // A third operation of the same service to the same endpoint now short-
+    // circuits WITHOUT invoking the dependency -- the breaker is open for the
+    // whole service, not just one operation.
+    bool invoked = false;
+    const std::pair<::dsn::error_code, fake_response> result =
+        resilient_rpc_call<fake_response>(
+            breakers, core_service_breaker_key("state.query", endpoint), options, true,
+            std::chrono::milliseconds(10), [&](std::chrono::milliseconds) {
+                invoked = true;
+                return std::make_pair(::dsn::ERR_OK, fake_response());
+            });
+    EXPECT_EQ(::dsn::ERR_BUSY, result.first);
+    EXPECT_FALSE(invoked);
 }
 
 TEST(rasn_circuit_breaker, half_open_admits_single_probe_then_recovers)
