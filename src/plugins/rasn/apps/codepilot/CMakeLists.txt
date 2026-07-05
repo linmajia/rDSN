@@ -23,7 +23,11 @@ set(MY_SRC_SEARCH_MODE "GLOB")
 # Allow app sources to include reusable rASN headers as `<rasn/<header>.h>`.
 set(MY_PROJ_INC_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../..")
 
-# Only the rasn static library is needed here. rDSN already links the platform
+# Only the rasn static library is needed here. rasn re-exports its own link
+# requirements: when the rDSN.dist.service plugin is in the build, rasn's
+# coordination backend pulls its distributed_lock_service / meta_state_service
+# provider closure in as a PUBLIC dependency, so it propagates here transitively
+# and this executable does not repeat the list. rDSN also links the platform
 # thread library into every executable (CMAKE_THREAD_LIBS_INIT, carried in
 # DSN_SYSTEM_LIBS) and adds -pthread globally on UNIX, and it auto-appends
 # dsn.dev.cpp/dsn.core/dsn.dev.utility + boost. So we do not list pthread or the

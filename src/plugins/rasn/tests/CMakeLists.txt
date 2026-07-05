@@ -28,9 +28,15 @@ set(MY_PROJ_INC_PATH
     "${CMAKE_CURRENT_SOURCE_DIR}/.."
     "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 
-# gtest plus the rasn static library. The platform thread library that gtest
-# needs is linked automatically by rDSN (CMAKE_THREAD_LIBS_INIT, carried in
-# DSN_SYSTEM_LIBS and appended after these libs), so pthread is not listed here.
+# gtest plus the rasn static library. rasn re-exports its coordination provider
+# closure (distributed_lock_service / meta_state_service) and the
+# RASN_HAS_DIST_COORDINATION guard as PUBLIC usage requirements when the
+# rDSN.dist.service plugin is in the build, so both propagate here transitively:
+# this executable links only `gtest rasn`, and the test sources that reference
+# the guard inherit the definition automatically. The platform thread library
+# that gtest needs is linked automatically by rDSN (CMAKE_THREAD_LIBS_INIT,
+# carried in DSN_SYSTEM_LIBS and appended after these libs), so pthread is not
+# listed here.
 set(MY_PROJ_LIBS gtest rasn)
 
 set(MY_PROJ_LIB_PATH "")

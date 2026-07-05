@@ -362,7 +362,11 @@ than reinventing consensus in rASN.
 > `consistency=<intended>(intended) actual=single_writer_in_memory` to make this
 > explicit. Use `<module>_shard_count` and per-shard endpoints only to partition
 > sharded modules by key; replicated modules still need exactly one active writer
-> until a real replicated backend fronts them.
+> until a real replicated backend fronts them. That single-writer constraint is now
+> *enforceable* rather than operator-discipline-only: the coordination module
+> (§13.7) elects exactly one owner per shard via rDSN `distributed_lock_service`, so
+> a module can acquire ownership before serving writes even before quorum
+> replication lands.
 
 ## 9. Discovery and security
 
@@ -500,6 +504,11 @@ codepilot.exe --dsn config.ini "rasn.state;resource_budget"
 
 ## 11. Roadmap
 
+- **Distributed coordination — DELIVERED (§13.7):** a coordination module reusing
+  rDSN `distributed_lock_service` (leader election / single-writer ownership) and
+  `meta_state_service` (cluster-shared state), with `inproc`/`simple`/`zookeeper`
+  backends. Remaining: wire runtime modules to acquire ownership before serving
+  writes, and move breaker/dedup/quota counters onto the shared store (finding 1.5).
 - Multi-process integration tests for the distributed/hybrid RPC paths.
 - Generated typed RPC schemas per module (replace the generic envelope payload).
 - State-mirror compaction/watermarks promotion is partially complete: watermarks
@@ -508,7 +517,7 @@ codepilot.exe --dsn config.ini "rasn.state;resource_budget"
   tooling remain.
 - Real replicated storage and shard durability via rDSN-native replication/partitioning.
 - Deployment examples/tests for multi-node and URI-backed module clusters.
-- End-to-end trace propagation across core/module RPC envelopes (design in §13.4).
+- End-to-end trace propagation across core/module RPC envelopes — **DONE** (§13.4).
 
 See §13 for the full production-readiness audit that drives this roadmap, including
 which gaps are resolved in code, mitigated client-side, or tracked as framework work.
@@ -520,10 +529,12 @@ which gaps are resolved in code, mitigated client-side, or tracked as framework 
 | Facade + provider base, envelopes, descriptors | `runtime_provider.h` |
 | Providers (`local`/`distributed`/`hybrid`), transport helpers, breaker, dedup, service store, apps | `runtime_provider.cpp` |
 | Core-service client RPC resilience (breaker + idempotency-aware retries) | `rpc_resilience.h` / `rpc_resilience.cpp` |
+| Distributed coordination facade (ownership election + cluster-shared state) reusing rDSN `distributed_lock_service` / `meta_state_service` | `coordination_service.h` / `coordination_service.cpp` |
 | RPC/LPC task codes | `rasn.code.definition.h` |
 | Reusable circuit breaker engine | `circuit_breaker.h` / `circuit_breaker.cpp` |
 | Provider/endpoint/resilience config | `[rasn.runtime]` + `[rasn.service]` in `config.ini` (and `apps/srepilot/config.ini`) |
-| Tests | `tests/rasn_unit_tests.cpp` |
+| Coordination config | `[rasn.coordination]` in `config.ini` (and `apps/srepilot/config.ini`) |
+| Tests | `tests/rasn_unit_tests.cpp`, `tests/rasn_coordination_test.cpp` |
 
 ## 13. Production-readiness audit — findings, remediation, and status
 
@@ -547,18 +558,20 @@ bespoke mechanism, the audit names the rDSN facility that should back it.
 
 | # | Sev | Finding | Status |
 | --- | --- | --- | --- |
-| 1.1 | P0 | **Stateful modules are single-writer in-memory, not quorum-replicated.** The 11 runtime modules and the state service realize `replicated`/`sharded` intent (§8) as single-writer singletons mirrored to `rasn.state`; running >1 active writer per shard is split-brain, not HA. | DOCUMENTED → §13.5 (`replicated_service_app_type_1`) |
+| 1.1 | P0 | **Stateful modules are single-writer in-memory, not quorum-replicated.** The 11 runtime modules and the state service realize `replicated`/`sharded` intent (§8) as single-writer singletons mirrored to `rasn.state`; running >1 active writer per shard is split-brain, not HA. | **MITIGATED (code)** — the new coordination module (§13.7) reuses rDSN `distributed_lock_service` to elect **exactly one** active owner per shard (single-writer enforcement / leader election). Quorum **replication** of the state itself still DOCUMENTED → §13.5 (`replicated_service_app_type_1`) |
 | 1.2 | P0 | **Core services had no RPC resilience.** `rasn.state` / `rasn.workflow` / `rasn.observability` clients made one-shot RPCs — no breaker, no retry — while the module path was fully hardened. A single transient blip failed the call. | **RESOLVED (code)** — §7.1, `rpc_resilience.h`, wrapped in `agent_services.cpp` |
 | 1.3 | P0 | **Registry discovery is an in-memory SPOF on the request path.** Routing resolves live endpoints through a single `rasn.registry`; if that lookup blips the request fails, and the registry itself is not replicated. | **MITIGATED (code)** — the routing-critical discovery query in `coordinator_service.cpp` now goes through `resilient_rpc_call` (breaker + idempotent retry). Registry **HA** still DOCUMENTED → §13.5 (meta-server / ZooKeeper) |
 | 1.4 | P1 | **RPC envelopes carry no end-to-end trace id.** `agent_request`/`response` carry `trace_id`, but the runtime-module envelope (`make_module_request`) didn't propagate it, so a call couldn't be followed across nodes in logs. | **RESOLVED (code)** — §13.4; `trace_id` added to the runtime-module envelope (EOF-safe), stamped from an ambient scope on egress, restored/echoed on ingress |
-| 1.5 | P1 | **Resilience/quota/dedup state is per serving process.** Breaker, dedup, admission, and rate state live on whichever node serves the RPC; there is no shared view, so protection is per-replica, not cluster-global. | DOCUMENTED → §13.5 (shared store / coordinator chokepoint) |
+| 1.5 | P1 | **Resilience/quota/dedup state is per serving process.** Breaker, dedup, admission, and rate state live on whichever node serves the RPC; there is no shared view, so protection is per-replica, not cluster-global. | **MITIGATED (code)** — the coordination module (§13.7) reuses rDSN `meta_state_service` to provide a cluster-shared, authoritative state store (`put/get/list/delete_state`); wiring each breaker/dedup/quota counter onto it is the remaining per-module integration. |
 | 1.6 | P2 | **Core service endpoints are bound at construction.** Some core clients resolve their peer once; combined with 1.3 this limits failover for non-discovery paths. | MITIGATED by 1.2/1.3 breaker keying; full dynamic rebind DOCUMENTED |
 
 ### 13.2 Lens 2 — Reinvention vs. reuse of rDSN
 
 rASN correctly reuses `serverlet`/`clientlet` RPC, `perf_counter` metrics,
-`command_manager`, `zlock`, `exp_delay` backpressure, and NFS
-(`dsn::file::copy_remote_files`) in the state service. The audit found four places
+`command_manager`, `zlock`, `exp_delay` backpressure, NFS
+(`dsn::file::copy_remote_files`) in the state service, and — as of the coordination
+module (§13.7) — `dist::distributed_lock_service` and `dist::meta_state_service` for
+ownership election and cluster-shared state. The audit found four places
 where rASN grew a parallel mechanism that an existing rDSN facility should own:
 
 | Concern | rASN today | rDSN facility to reuse | Status |
@@ -568,12 +581,15 @@ where rASN grew a parallel mechanism that an existing rDSN facility should own:
 | Discovery + failure detection | `rasn.registry` heartbeat/lease table (single instance) | meta-server + `failure_detector` + `ext/zookeeper` for HA membership | DOCUMENTED |
 | Wire schema / IDL | generic envelope with a field-map payload + `schema_manifest` codegen | Thrift IDL + `dsn.tools` codegen (typed, versioned RPC structs) | DOCUMENTED |
 
-None of these can be landed as a rASN-only change and honestly verified in this
-worktree: the rDSN framework's Thrift/boost/ZooKeeper dependencies are CMake
-`ExternalProject`s that are only fetched during a full framework bootstrap, and no
-`DSN_ROOT` build is provisioned here. Shipping half of a replication or IDL
-migration without the ability to build it would be worse than a precise roadmap, so
-these are documented with their exact target facility rather than stubbed.
+The coordination module (§13.7) proves this reuse pattern is viable end-to-end: the
+`rDSN.dist.service` ext plugin builds and links into rASN under a full
+`--build_plugins` checkout, and its `distributed_lock_service`/`meta_state_service`
+providers are consumed directly (validated on real hardware). The four migrations
+above are larger in scope — each swaps a core data-plane mechanism (replication state
+machine, partition resolver, HA membership, or the entire wire schema) and pulls in
+the framework's Thrift/boost/ZooKeeper `ExternalProject` toolchain — so they are
+documented with their exact target facility and sequenced behind the coordination
+groundwork rather than stubbed.
 
 ### 13.3 Lens 3 — Missing critical modules
 
@@ -583,10 +599,12 @@ roadmap items, ordered by importance):
 - **P0 durable/vector agent memory** — a first-class long-term memory module
   (semantic + episodic) with a durable, queryable backend, distinct from the
   short-lived blackboard/session stores.
-- **P0 distributed coordination** — leader election, distributed locks, and a
-  **global** quota/rate authority, so single-writer modules (§8) can elect one
-  owner and quotas hold cluster-wide. Target: meta-server/ZooKeeper primitives,
-  not a rASN-local lock.
+- **P0 distributed coordination** — **DELIVERED (code, §13.7).** Leader election and
+  distributed locks now reuse rDSN `distributed_lock_service`, and a cluster-shared
+  state store reuses `meta_state_service`, so single-writer modules (§8) can elect
+  exactly one owner cluster-wide via real rDSN primitives (meta-server/ZooKeeper
+  under the ZooKeeper backend), not a rASN-local lock. Making a **global** quota/rate
+  authority consume this shared store is the remaining per-module wiring.
 - **P0 secrets vault** — a real secret provider behind the existing `env:`/`file:`/
   `cmd:` credential handles (see DESIGN "Credential storage").
 - **P0 multi-tenancy / isolation** — per-tenant identity, quota, and data
@@ -651,13 +669,16 @@ contract (§4) exactly as they are, and swaps the *backing* of stateful modules:
   `ext/zookeeper`, removing the single-registry SPOF (1.3) and giving 1.5 a shared,
   authoritative view for cluster-global quotas and coordination.
 
-Until those land, the operational contract in §8 stands: **exactly one active
-writer per shard**, with the client-side resilience from §7/§7.1 masking transient
+Until quorum replication lands, the operational contract in §8 stands: **exactly
+one active writer per shard** — now *enforceable* through the coordination module's
+`distributed_lock_service`-backed ownership election (§13.7) rather than by operator
+discipline alone — with the client-side resilience from §7/§7.1 masking transient
 failures but not providing replication.
 
-### 13.6 What changed in this refinement round
+### 13.6 What changed — core-service resilience + trace round
 
-Resolved/mitigated **in code and validated**:
+Resolved/mitigated **in code and validated** (committed as
+`rasn: core-service RPC resilience + end-to-end trace propagation`):
 
 - Core-service client RPC resilience (§7.1) — new `rpc_resilience.{h,cpp}` reusing
   the `circuit_breaker` engine; all `rasn_service_graph` state/workflow/
@@ -674,6 +695,66 @@ Resolved/mitigated **in code and validated**:
   four focused tests for wire round-trip, legacy back-compat, scope nesting, and
   dispatch echo.
 
-Everything else above is DOCUMENTED with its rDSN-native target because it depends
-on framework subsystems not buildable in isolation here. This section is the source
-of truth for the roadmap in §11.
+Everything else above is either landed in the coordination round (§13.7) or
+DOCUMENTED with its rDSN-native target because it depends on framework subsystems
+(replication SM, partition resolver, IDL codegen) that are larger data-plane
+migrations. This section, together with §13.7, is the source of truth for the
+roadmap in §11.
+
+### 13.7 Distributed coordination module (findings 1.1 ownership, 1.5 shared state) — RESOLVED (code)
+
+The latest refinement round lands a first-class **coordination module** that reuses
+rDSN's own distributed facilities instead of reinventing them, directly closing the
+ownership half of finding 1.1 and the shared-state half of finding 1.5. Validated on
+real hardware (Ubuntu, `--build_plugins`): all four coordination unit tests pass,
+including the two that drive the real rDSN provider, and `codepilot`/`srepilot` link
+the module cleanly.
+
+**Facade.** `coordination_service.h` defines `rasn_coordination_service`, a small
+provider-agnostic interface with two concerns:
+
+- *Ownership / leader election* — `acquire_ownership(resource, owner_id[, timeout])`,
+  `release_ownership`, `query_owner`. Exactly one caller holds a resource at a time;
+  re-acquire by the same owner is idempotent; a lease is handed off after release.
+- *Cluster-shared state* — `put_state` / `get_state` / `delete_state` / `list_state`
+  over a hierarchical, znode-style key space rooted at a configured namespace.
+
+**Three backends, selected by `[rasn.coordination] provider`:**
+
+| Backend | Reuses | Use |
+| --- | --- | --- |
+| `inproc` | in-process maps (no external dep) | default single-node fallback; always compiled |
+| `simple` | rDSN `distributed_lock_service_simple` + `meta_state_service_simple` | single box / multi-app / unit tests; durable simple meta-state log |
+| `zookeeper` | rDSN `distributed_lock_service_zookeeper` + `meta_state_service_zookeeper` | production HA over a ZooKeeper ensemble (`[zookeeper] hosts_list`) |
+
+The `simple`/`zookeeper` backends come from the `rDSN.dist.service` ext plugin
+(`src/plugins_ext/`). The facade wraps their async, `error_code`-returning task API
+behind blocking helpers (used only off the `THREAD_POOL_META_SERVER` pool to avoid
+self-deadlock), creating parent znodes on demand and tracking held lease tasks.
+
+**Build wiring (reuse, not reinvent).** `src/CMakeLists.txt` now configures
+`plugins_ext` before `plugins` so rASN can see the dist targets. The rASN library,
+`codepilot`, `srepilot`, and `rasn.unit_tests` gate the dist include paths, link the
+`dsn.dist.service.*` closure, and define `RASN_HAS_DIST_COORDINATION=1` **only when**
+`TARGET dsn.dist.service.meta_server_lib` exists (i.e. a `--build_plugins` build).
+A plain build without the ext plugin still compiles rASN with just the `inproc`
+fallback, so nothing regresses for lightweight checkouts.
+
+**Config.** `[rasn.coordination]` in `config.ini` and `apps/srepilot/config.ini`:
+`provider` (`inproc`|`simple`|`zookeeper`), `lock_namespace`, `state_namespace`,
+`acquire_timeout_ms`, and `state_work_dir` (durable-log directory for the `simple`
+backend; ignored by the others).
+
+**Tests.** `tests/rasn_coordination_test.cpp` asserts the ownership contract
+(acquire / idempotent re-acquire / mutual exclusion / hand-off / query) and the
+shared-state contract (absent-get / put / overwrite / list / delete / idempotent
+delete) against the facade. The `inproc` path and config defaults always run; the two
+`simple`-provider cases run under `RASN_HAS_DIST_COORDINATION` and exercise the real
+rDSN lock + meta-state providers.
+
+**What remains.** The module delivers the *facility*; consuming it inside the runtime
+modules is the follow-up: (a) have each `replicated`/`sharded` module acquire
+ownership before serving writes (turns §8's operator-discipline single-writer into an
+*enforced* one), and (b) move breaker/dedup/admission/rate counters onto the shared
+state store for cluster-global protection (finding 1.5 wiring). Quorum **replication**
+of the state itself remains the §13.5 `replicated_service_app_type_1` item.

@@ -1334,7 +1334,11 @@ remaining limitations are:
 - **State availability:** the state service has checkpoints, journals,
   conditional writes, workflow leases, optional local replica mirroring, and
   optional rDSN NFS import, but it is not quorum-replicated and does not yet use
-  an external HA database or replicated SKV backend.
+  an external HA database or replicated SKV backend. The single-writer constraint
+  is now *enforceable* rather than operator-discipline-only: the coordination
+  module (below) elects exactly one owner per shard via rDSN
+  `distributed_lock_service`, so a module can acquire ownership before serving
+  writes even before quorum replication lands.
 - **Tool isolation:** local tools are default-deny, policy-gated,
   approval-gated, allowlist-aware, workspace-rooted, timeout-bound, and can be
   routed through a configured container command wrapper. rASN still lacks a
@@ -1392,15 +1396,30 @@ remaining limitations are:
   `rasn_runtime_trace_scope` on egress and restored/echoed on ingress, so a single
   operation can be followed across nodes in logs (DISTRIBUTED_RUNTIME.md §13.4,
   audit finding 1.4 — RESOLVED).
+- **Distributed coordination:** a coordination module
+  (`coordination_service.h/.cpp`) reuses rDSN's own facilities instead of
+  reinventing them — `distributed_lock_service` for single-writer ownership /
+  leader election and `meta_state_service` for cluster-shared state — behind a
+  small facade with `inproc` (default fallback), `simple` (in-process rDSN
+  provider), and `zookeeper` (HA) backends selected by `[rasn.coordination]`. This
+  closes the ownership half of audit finding 1.1 and gives finding 1.5 a
+  cluster-shared, authoritative store; it is validated by unit tests on real
+  hardware (DISTRIBUTED_RUNTIME.md §13.7). Remaining work is wiring: having each
+  replicated/sharded module acquire ownership before serving writes, and moving
+  breaker/dedup/quota counters onto the shared store for cluster-global protection.
 - **Full-distribution audit:** a severity-ranked production-readiness audit across
   three lenses — is rASN fully distributed, does it reuse rDSN instead of
   reinventing, and are critical modules missing — is recorded in
   DISTRIBUTED_RUNTIME.md §13. It marks each finding RESOLVED (core-service and
-  registry-discovery resilience, this round), MITIGATED, or DOCUMENTED, and maps the
-  documented gaps to the exact rDSN facility that should back them:
+  registry-discovery resilience, and distributed coordination via reused rDSN
+  `distributed_lock_service`/`meta_state_service` primitives — §13.7), MITIGATED
+  (single-writer ownership 1.1 and cluster-shared state 1.5, now backed by that
+  coordination module), or DOCUMENTED, and maps the documented gaps to the exact
+  rDSN facility that should back them:
   `replicated_service_app_type_1` for quorum-replicated module/state storage,
   `dist::partition_resolver` for shard routing, meta-server / `failure_detector` /
-  `ext/zookeeper` for HA discovery and coordination, and Thrift IDL for typed RPC
-  schemas. Missing-module gaps (durable/vector agent memory, distributed
-  coordination and global quota, secrets vault, multi-tenancy, distributed
-  scheduler/placement) are tracked there as roadmap items.
+  `ext/zookeeper` for HA discovery, and Thrift IDL for typed RPC
+  schemas. Remaining missing-module gaps (durable/vector agent memory, a
+  **global** quota/rate authority consuming the new shared store, secrets vault,
+  multi-tenancy, distributed scheduler/placement) are tracked there as roadmap
+  items.

@@ -71,7 +71,7 @@ bool write_default_config(const std::string &path)
            << "type = dsn.app.mimic\n"
            << "run = true\n"
            << "count = 1\n"
-           << "pools = THREAD_POOL_DEFAULT\n"
+           << "pools = THREAD_POOL_DEFAULT, THREAD_POOL_META_SERVER\n"
            << "\n"
            << "[core]\n"
            << "tool = nativerun\n"
@@ -112,6 +112,11 @@ bool write_default_config(const std::string &path)
            << "[threadpool.THREAD_POOL_DEFAULT]\n"
            << "partitioned = false\n"
            << "worker_count = 1\n"
+           << "worker_priority = THREAD_xPRIORITY_NORMAL\n"
+           << "\n"
+           << "[threadpool.THREAD_POOL_META_SERVER]\n"
+           << "partitioned = false\n"
+           << "worker_count = 2\n"
            << "worker_priority = THREAD_xPRIORITY_NORMAL\n";
     return output.good();
 }

@@ -18,6 +18,10 @@ set(MY_SRC_SEARCH_MODE "GLOB")
 
 set(MY_PROJ_INC_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../..")
 
+# Only the rasn static library is needed here. rasn re-exports its coordination
+# provider closure (distributed_lock_service / meta_state_service) as a PUBLIC
+# link dependency when the rDSN.dist.service plugin is in the build, so it
+# propagates here transitively and this executable does not repeat the list.
 set(MY_PROJ_LIBS rasn)
 
 set(MY_PROJ_LIB_PATH "")
