@@ -56,6 +56,7 @@ struct rasn_runtime_response
     std::string operation;
     std::string key;
     std::string payload;
+    uint32_t route_partition = (std::numeric_limits<uint32_t>::max)();
 };
 
 inline void marshall(::dsn::binary_writer &writer, const rasn_runtime_request &value, ::dsn_msg_serialize_format fmt)
@@ -112,6 +113,7 @@ inline void marshall(::dsn::binary_writer &writer, const rasn_runtime_response &
     writer.write(value.operation);
     writer.write(value.key);
     writer.write(value.payload);
+    writer.write(value.route_partition);
 }
 
 inline void unmarshall(::dsn::binary_reader &reader, rasn_runtime_response &value, ::dsn_msg_serialize_format fmt)
@@ -123,6 +125,14 @@ inline void unmarshall(::dsn::binary_reader &reader, rasn_runtime_response &valu
     reader.read(value.operation);
     reader.read(value.key);
     reader.read(value.payload);
+    if (!reader.is_eof())
+    {
+        reader.read(value.route_partition);
+    }
+    else
+    {
+        value.route_partition = (std::numeric_limits<uint32_t>::max)();
+    }
 }
 
 struct rasn_runtime_config
@@ -350,10 +360,11 @@ protected:
         return "in-process";
     }
     std::vector<rasn_runtime_response> call_module_api_shards(const rasn_runtime_request &request) const;
-    void mirror_state_after_success(const std::string &module,
+    bool mirror_state_after_success(const std::string &module,
                                     const std::string &kind,
                                     const std::string &key,
-                                    const std::string &value);
+                                    const std::string &value,
+                                    std::string *error = nullptr);
     std::string state_key(const std::string &module, const std::string &kind, const std::string &key) const;
 
 private:

@@ -845,6 +845,7 @@ rasn_runtime_response make_rasn_runtime_response(const rasn_runtime_request &req
     response.operation = request.operation;
     response.key = request.key;
     response.payload = request.payload;
+    response.route_partition = request.route_partition;
     return response;
 }
 
@@ -1186,6 +1187,7 @@ bool verify_runtime_state_watermarks(const std::vector<state_record> &records,
 {
     std::map<std::string, uint64_t> max_record_sequence;
     std::map<std::string, runtime_state_watermark> watermarks;
+    std::set<std::string> modules_with_data;
     for (const state_record &record : records)
     {
         std::string module;
@@ -1237,6 +1239,19 @@ bool verify_runtime_state_watermarks(const std::vector<state_record> &records,
         }
         uint64_t &max_sequence = max_record_sequence[module];
         max_sequence = (std::max)(max_sequence, record.sequence);
+        modules_with_data.insert(module);
+    }
+
+    for (const std::string &module : modules_with_data)
+    {
+        if (watermarks.count(module) == 0)
+        {
+            if (error != nullptr)
+            {
+                *error = "missing runtime state watermark for module " + module;
+            }
+            return false;
+        }
     }
 
     for (const std::map<std::string, runtime_state_watermark>::value_type &entry : watermarks)
@@ -2017,12 +2032,32 @@ public:
         if (idempotency_dedup_enabled(request))
         {
             rasn_runtime_response cached;
-            if (!begin_dedup(request, &cached))
+            std::string dedup_key_value;
+            const dedup_begin_result dedup = begin_dedup(request, &cached, &dedup_key_value);
+            if (dedup == dedup_begin_result::cached)
             {
                 return cached;
             }
-            const rasn_runtime_response response = route_module_request(request);
-            finish_dedup(request, response);
+            bool finished = false;
+            dedup_completion_guard guard(this, dedup_key_value, dedup == dedup_begin_result::owner, &finished);
+            rasn_runtime_response response;
+            try
+            {
+                response = route_module_request(request);
+            }
+            catch (const std::exception &ex)
+            {
+                response = make_rasn_runtime_error(request, std::string("runtime module dispatch threw: ") + ex.what());
+            }
+            catch (...)
+            {
+                response = make_rasn_runtime_error(request, "runtime module dispatch threw an unknown exception");
+            }
+            if (dedup == dedup_begin_result::owner)
+            {
+                finish_dedup(dedup_key_value, response);
+                finished = true;
+            }
             return response;
         }
         return route_module_request(request);
@@ -2179,6 +2214,46 @@ private:
         uint32_t waiters = 0;
     };
 
+    enum class dedup_begin_result
+    {
+        owner,
+        cached,
+        uncached_retry
+    };
+
+    class dedup_completion_guard
+    {
+    public:
+        dedup_completion_guard(rasn_runtime_service_store *store,
+                               std::string key,
+                               bool active,
+                               bool *finished)
+            : _store(store), _key(std::move(key)), _active(active), _finished(finished)
+        {
+        }
+
+        ~dedup_completion_guard()
+        {
+            if (_active && _finished != nullptr && !*_finished && _store != nullptr)
+            {
+                try
+                {
+                    _store->abort_dedup(_key);
+                }
+                catch (...)
+                {
+                }
+                *_finished = true;
+            }
+        }
+
+    private:
+        rasn_runtime_service_store *_store;
+        std::string _key;
+        bool _active;
+        bool *_finished;
+    };
+
     static size_t dedup_capacity()
     {
         const uint64_t configured = ::dsn_config_get_value_uint64(
@@ -2201,6 +2276,14 @@ private:
                                              "rasn_runtime_dedup_ttl_ms",
                                              300000,
                                              "rASN runtime module idempotency cache TTL in milliseconds (0 disables TTL expiry)");
+    }
+
+    static uint64_t dedup_wait_timeout_ms()
+    {
+        return ::dsn_config_get_value_uint64("rasn.service",
+                                             "rasn_runtime_dedup_wait_timeout_ms",
+                                             5000,
+                                             "Maximum time a duplicate runtime request waits for an in-flight idempotency response");
     }
 
     static bool idempotency_dedup_enabled(const rasn_runtime_request &request)
@@ -2294,9 +2377,15 @@ private:
         }
     }
 
-    bool begin_dedup(const rasn_runtime_request &request, rasn_runtime_response *cached)
+    dedup_begin_result begin_dedup(const rasn_runtime_request &request,
+                                   rasn_runtime_response *cached,
+                                   std::string *dedup_key_value)
     {
         const std::string key = dedup_key(request);
+        if (dedup_key_value != nullptr)
+        {
+            *dedup_key_value = key;
+        }
         std::unique_lock<std::mutex> guard(_dedup_lock);
         while (true)
         {
@@ -2311,7 +2400,7 @@ private:
                 _dedup_order.push_back(key);
                 record_dedup_metric("miss");
                 enforce_dedup_capacity_locked();
-                return true;
+                return dedup_begin_result::owner;
             }
 
             if (!it->second.in_flight)
@@ -2321,38 +2410,66 @@ private:
                     *cached = it->second.response;
                 }
                 record_dedup_metric("hit");
-                return false;
+                return dedup_begin_result::cached;
             }
 
             ++it->second.waiters;
             record_dedup_metric("wait");
-            _dedup_cv.wait(guard, [&]() {
+            const bool ready = _dedup_cv.wait_for(guard, std::chrono::milliseconds(dedup_wait_timeout_ms()), [&]() {
                 const std::map<std::string, dedup_entry>::const_iterator current = _dedup_index.find(key);
                 return current == _dedup_index.end() || !current->second.in_flight;
             });
             it = _dedup_index.find(key);
+            if (it != _dedup_index.end() && it->second.waiters != 0)
+            {
+                --it->second.waiters;
+            }
+            if (!ready)
+            {
+                return dedup_begin_result::uncached_retry;
+            }
             if (it != _dedup_index.end() && !it->second.in_flight)
             {
                 if (cached != nullptr)
                 {
                     *cached = it->second.response;
                 }
-                if (it->second.waiters != 0)
-                {
-                    --it->second.waiters;
-                }
                 record_dedup_metric("hit");
-                return false;
+                return dedup_begin_result::cached;
             }
         }
     }
 
-    void finish_dedup(const rasn_runtime_request &request, const rasn_runtime_response &response)
+    void abort_dedup(const std::string &key)
     {
-        const std::string key = dedup_key(request);
+        std::lock_guard<std::mutex> guard(_dedup_lock);
+        _dedup_index.erase(key);
+        for (std::deque<std::string>::iterator it = _dedup_order.begin(); it != _dedup_order.end();)
+        {
+            if (*it == key)
+            {
+                it = _dedup_order.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+        _dedup_cv.notify_all();
+    }
+
+    void finish_dedup(const std::string &key, const rasn_runtime_response &response)
+    {
         const uint64_t now_ms = ::dsn_now_ms();
         const uint64_t ttl_ms = dedup_ttl_ms();
         std::lock_guard<std::mutex> guard(_dedup_lock);
+        if (!response.ok)
+        {
+            _dedup_index.erase(key);
+            rebuild_dedup_order_locked();
+            _dedup_cv.notify_all();
+            return;
+        }
         dedup_entry &entry = _dedup_index[key];
         entry.in_flight = false;
         entry.response = response;
@@ -2894,6 +3011,17 @@ rasn_runtime_response invoke_remote_module(const rasn_runtime_request &request)
     const std::string endpoint = std::string(address.to_string());
     const std::string breaker_key =
         module + "#" + std::to_string(resolved_endpoint.partition_index) + "@" + endpoint;
+    rasn_runtime_request sending = request;
+    if (sending.request_id.empty() && rasn_runtime_idempotency_enabled())
+    {
+        sending.request_id = generate_rasn_runtime_request_id();
+    }
+    std::string auth_error;
+    if (!prepare_rasn_runtime_rpc_request(&sending, &auth_error))
+    {
+        return make_rasn_runtime_error(request, auth_error);
+    }
+
     const bool breaker_enabled = rasn_runtime_breaker_enabled();
     if (breaker_enabled)
     {
@@ -2909,17 +3037,6 @@ rasn_runtime_response invoke_remote_module(const rasn_runtime_request &request)
             return make_rasn_runtime_error(
                 request, std::string("runtime module circuit breaker ") + to_string(decision.state));
         }
-    }
-
-    rasn_runtime_request sending = request;
-    if (sending.request_id.empty() && rasn_runtime_idempotency_enabled())
-    {
-        sending.request_id = generate_rasn_runtime_request_id();
-    }
-    std::string auth_error;
-    if (!prepare_rasn_runtime_rpc_request(&sending, &auth_error))
-    {
-        return make_rasn_runtime_error(request, auth_error);
     }
 
     const std::chrono::milliseconds timeout = rasn_runtime_rpc_timeout(module);
@@ -3835,21 +3952,32 @@ bool rasn_runtime_provider::mirror_state(const std::string &module,
     return write_state(module, kind, key, value, error);
 }
 
-void rasn_runtime_provider::mirror_state_after_success(const std::string &module,
+bool rasn_runtime_provider::mirror_state_after_success(const std::string &module,
                                                        const std::string &kind,
                                                        const std::string &key,
-                                                       const std::string &value)
+                                                       const std::string &value,
+                                                       std::string *error)
 {
-    std::string error;
-    if (!write_state(module, kind, key, value, &error))
+    std::string write_error;
+    if (!write_state(module, kind, key, value, &write_error))
     {
         dwarn("%s runtime module state mirror failed for %s/%s/%s: %s",
               strict() ? "strict" : "distributed",
               module.c_str(),
               kind.c_str(),
               key.c_str(),
-              error.c_str());
+              write_error.c_str());
+        if (strict())
+        {
+            if (error != nullptr)
+            {
+                *error = write_error;
+            }
+            return false;
+        }
     }
+    clear_error(error);
+    return true;
 }
 
 bool rasn_runtime_provider::ping_module(const std::string &module, std::string *error) const
@@ -3877,8 +4005,10 @@ rasn_runtime_provider::call_module_api_shards(const rasn_runtime_request &reques
             continue;
         }
         rasn_runtime_request shard_request = request;
-        shard_request.route_partition = i;
-        responses.push_back(call_module_api(shard_request));
+        shard_request.route_partition = endpoint.partition_index;
+        rasn_runtime_response response = call_module_api(shard_request);
+        response.route_partition = endpoint.partition_index;
+        responses.push_back(response);
     }
     return responses;
 }
@@ -3950,7 +4080,8 @@ bool rasn_runtime_provider::upsert_agent(const agent_control_record &record, std
     agent_control_record stored;
     if (find_agent(record.descriptor.agent_id, &stored))
     {
-        mirror_state_after_success("agent_control_plane", "agent", stored.descriptor.agent_id, encode_agent_control_payload(stored));
+        return mirror_state_after_success(
+            "agent_control_plane", "agent", stored.descriptor.agent_id, encode_agent_control_payload(stored), error);
     }
     return true;
 }
@@ -3984,7 +4115,16 @@ agent_control_lease rasn_runtime_provider::acquire_agent_lease(const std::string
         agent_control_record stored;
         if (find_agent(agent_id, &stored))
         {
-            mirror_state_after_success("agent_control_plane", "agent", stored.descriptor.agent_id, encode_agent_control_payload(stored));
+            std::string mirror_error;
+            if (!mirror_state_after_success("agent_control_plane",
+                                            "agent",
+                                            stored.descriptor.agent_id,
+                                            encode_agent_control_payload(stored),
+                                            &mirror_error))
+            {
+                lease.ok = false;
+                lease.error = mirror_error;
+            }
         }
     }
     return lease;
@@ -4001,7 +4141,8 @@ bool rasn_runtime_provider::heartbeat_agent(const std::string &agent_id, uint64_
     agent_control_record stored;
     if (find_agent(agent_id, &stored))
     {
-        mirror_state_after_success("agent_control_plane", "agent", stored.descriptor.agent_id, encode_agent_control_payload(stored));
+        return mirror_state_after_success(
+            "agent_control_plane", "agent", stored.descriptor.agent_id, encode_agent_control_payload(stored), error);
     }
     return true;
 }
@@ -4085,9 +4226,8 @@ bool rasn_runtime_provider::publish_message(const agent_message &message, agent_
     {
         *stored = stored_message;
     }
-    mirror_state_after_success("agent_message_bus", "message", stored_message.message_id, encode_message_payload(stored_message));
-    clear_error(error);
-    return true;
+    return mirror_state_after_success(
+        "agent_message_bus", "message", stored_message.message_id, encode_message_payload(stored_message), error);
 }
 
 bool rasn_runtime_provider::ack_message(const std::string &message_id, std::string *error)
@@ -4100,7 +4240,8 @@ bool rasn_runtime_provider::ack_message(const std::string &message_id, std::stri
     agent_message stored;
     if (find_message(message_id, &stored))
     {
-        mirror_state_after_success("agent_message_bus", "message", stored.message_id, encode_message_payload(stored));
+        return mirror_state_after_success(
+            "agent_message_bus", "message", stored.message_id, encode_message_payload(stored), error);
     }
     return true;
 }
@@ -4118,7 +4259,8 @@ bool rasn_runtime_provider::dead_letter_message(const std::string &message_id,
     agent_message stored;
     if (find_message(message_id, &stored))
     {
-        mirror_state_after_success("agent_message_bus", "message", stored.message_id, encode_message_payload(stored));
+        return mirror_state_after_success(
+            "agent_message_bus", "message", stored.message_id, encode_message_payload(stored), error);
     }
     return true;
 }
@@ -4142,9 +4284,22 @@ std::vector<agent_message> rasn_runtime_provider::message_snapshot() const
     {
         std::vector<agent_message> shard_messages;
         std::string error;
-        if (response.ok && decode_items(response.payload, &shard_messages, decode_message_payload, &error))
+        if (!response.ok)
+        {
+            dwarn("agent_message_bus snapshot shard %u failed: %s",
+                  static_cast<unsigned int>(response.route_partition),
+                  response.error.c_str());
+            continue;
+        }
+        if (decode_items(response.payload, &shard_messages, decode_message_payload, &error))
         {
             messages.insert(messages.end(), shard_messages.begin(), shard_messages.end());
+        }
+        else
+        {
+            dwarn("agent_message_bus snapshot shard %u decode failed: %s",
+                  static_cast<unsigned int>(response.route_partition),
+                  error.c_str());
         }
     }
     return messages;
@@ -4161,7 +4316,8 @@ bool rasn_runtime_provider::add_task(const orchestration_task &task, std::string
     orchestration_task stored;
     if (find_task(task.task_id, &stored))
     {
-        mirror_state_after_success("task_orchestration_kernel", "task", stored.task_id, encode_task_payload(stored));
+        return mirror_state_after_success(
+            "task_orchestration_kernel", "task", stored.task_id, encode_task_payload(stored), error);
     }
     return true;
 }
@@ -4177,7 +4333,8 @@ bool rasn_runtime_provider::start_task(const std::string &task_id, const std::st
     orchestration_task stored;
     if (find_task(task_id, &stored))
     {
-        mirror_state_after_success("task_orchestration_kernel", "task", stored.task_id, encode_task_payload(stored));
+        return mirror_state_after_success(
+            "task_orchestration_kernel", "task", stored.task_id, encode_task_payload(stored), error);
     }
     return true;
 }
@@ -4193,7 +4350,8 @@ bool rasn_runtime_provider::complete_task(const std::string &task_id, const std:
     orchestration_task stored;
     if (find_task(task_id, &stored))
     {
-        mirror_state_after_success("task_orchestration_kernel", "task", stored.task_id, encode_task_payload(stored));
+        return mirror_state_after_success(
+            "task_orchestration_kernel", "task", stored.task_id, encode_task_payload(stored), error);
     }
     return true;
 }
@@ -4215,7 +4373,8 @@ bool rasn_runtime_provider::fail_task(const std::string &task_id,
     orchestration_task stored;
     if (find_task(task_id, &stored))
     {
-        mirror_state_after_success("task_orchestration_kernel", "task", stored.task_id, encode_task_payload(stored));
+        return mirror_state_after_success(
+            "task_orchestration_kernel", "task", stored.task_id, encode_task_payload(stored), error);
     }
     return true;
 }
@@ -4299,9 +4458,11 @@ bool rasn_runtime_provider::record_choice(const std::string &task_id,
     {
         *choice = stored_choice;
     }
-    mirror_state_after_success("determinism_ledger", "choice", stored_choice.task_id + "/" + stored_choice.key, encode_choice_payload(stored_choice));
-    clear_error(error);
-    return true;
+    return mirror_state_after_success("determinism_ledger",
+                                      "choice",
+                                      stored_choice.task_id + "/" + stored_choice.key,
+                                      encode_choice_payload(stored_choice),
+                                      error);
 }
 
 std::vector<deterministic_choice> rasn_runtime_provider::choice_snapshot() const
@@ -4331,8 +4492,8 @@ bool rasn_runtime_provider::upsert_capability_provider(const capability_provider
     {
         return false;
     }
-    mirror_state_after_success("capability_directory", "provider", stored.descriptor.agent_id, encode_capability_provider_payload(stored));
-    return true;
+    return mirror_state_after_success(
+        "capability_directory", "provider", stored.descriptor.agent_id, encode_capability_provider_payload(stored), error);
 }
 
 std::string rasn_runtime_provider::describe_capabilities() const
@@ -4349,11 +4510,14 @@ bool rasn_runtime_provider::configure_budget(const resource_quota &quota, std::s
     {
         return false;
     }
-    mirror_state_after_success("resource_budget", "quota", quota.scope, encode_quota_payload(quota));
+    if (!mirror_state_after_success("resource_budget", "quota", quota.scope, encode_quota_payload(quota), error))
+    {
+        return false;
+    }
     resource_usage usage;
     if (budget_usage(quota.scope, &usage))
     {
-        mirror_state_after_success("resource_budget", "usage", usage.scope, encode_usage_payload(usage));
+        return mirror_state_after_success("resource_budget", "usage", usage.scope, encode_usage_payload(usage), error);
     }
     return true;
 }
@@ -4378,7 +4542,13 @@ resource_budget_decision rasn_runtime_provider::reserve_budget(const resource_re
     }
     if (decision.allowed)
     {
-        mirror_state_after_success("resource_budget", "usage", decision.usage_after.scope, encode_usage_payload(decision.usage_after));
+        std::string mirror_error;
+        if (!mirror_state_after_success(
+                "resource_budget", "usage", decision.usage_after.scope, encode_usage_payload(decision.usage_after), &mirror_error))
+        {
+            decision.allowed = false;
+            decision.reason = mirror_error;
+        }
     }
     return decision;
 }
@@ -4394,7 +4564,7 @@ bool rasn_runtime_provider::release_budget(const resource_request &request_value
     resource_usage usage;
     if (budget_usage(request_value.scope, &usage))
     {
-        mirror_state_after_success("resource_budget", "usage", usage.scope, encode_usage_payload(usage));
+        return mirror_state_after_success("resource_budget", "usage", usage.scope, encode_usage_payload(usage), error);
     }
     return true;
 }
@@ -4414,7 +4584,8 @@ std::string rasn_runtime_provider::describe_budgets() const
 {
     const std::vector<rasn_runtime_response> responses =
         call_module_api_shards(make_module_request("resource_budget", "describe"));
-    if (responses.size() <= 1)
+    const uint32_t partition_count = rasn_runtime_partition_count("resource_budget");
+    if (responses.size() <= 1 && (!module_routed_remote("resource_budget") || partition_count <= 1))
     {
         return responses.empty() ? "" : (responses[0].ok ? responses[0].payload : responses[0].error);
     }
@@ -4425,7 +4596,8 @@ std::string rasn_runtime_provider::describe_budgets() const
         {
             output << "\n";
         }
-        output << "shard" << i << ": " << (responses[i].ok ? responses[i].payload : responses[i].error);
+        output << "shard" << responses[i].route_partition << ": "
+               << (responses[i].ok ? responses[i].payload : responses[i].error);
     }
     return output.str();
 }
@@ -4440,8 +4612,8 @@ bool rasn_runtime_provider::set_recovery_policy(const recovery_policy &policy, s
     {
         return false;
     }
-    mirror_state_after_success("recovery_supervisor", "policy", policy.failure_class, encode_recovery_policy_payload(policy));
-    return true;
+    return mirror_state_after_success(
+        "recovery_supervisor", "policy", policy.failure_class, encode_recovery_policy_payload(policy), error);
 }
 
 recovery_action rasn_runtime_provider::observe_failure(const failure_observation &failure)
@@ -4470,7 +4642,11 @@ recovery_action rasn_runtime_provider::observe_failure(const failure_observation
                                 stored_failure.failure_class + "/" + stored_failure.code + "/" +
                                 std::to_string(stored_failure.attempt) + "/" +
                                 std::to_string(stored_failure.time_ms);
-        mirror_state_after_success("recovery_supervisor", "failure", key, encode_failure_payload(stored_failure));
+        std::string mirror_error;
+        if (!mirror_state_after_success("recovery_supervisor", "failure", key, encode_failure_payload(stored_failure), &mirror_error))
+        {
+            action.reason = mirror_error;
+        }
     }
     return action;
 }
@@ -4504,9 +4680,8 @@ bool rasn_runtime_provider::put_blackboard(const blackboard_entry &entry, blackb
     {
         *stored = stored_entry;
     }
-    mirror_state_after_success("blackboard", "entry", stored_entry.key, encode_blackboard_payload(stored_entry));
-    clear_error(error);
-    return true;
+    return mirror_state_after_success(
+        "blackboard", "entry", stored_entry.key, encode_blackboard_payload(stored_entry), error);
 }
 
 bool rasn_runtime_provider::get_blackboard(const std::string &key, blackboard_entry *entry) const
@@ -4532,9 +4707,22 @@ std::vector<blackboard_entry> rasn_runtime_provider::blackboard_snapshot(bool in
     {
         std::vector<blackboard_entry> shard_entries;
         std::string error;
-        if (response.ok && decode_items(response.payload, &shard_entries, decode_blackboard_payload, &error))
+        if (!response.ok)
+        {
+            dwarn("blackboard snapshot shard %u failed: %s",
+                  static_cast<unsigned int>(response.route_partition),
+                  response.error.c_str());
+            continue;
+        }
+        if (decode_items(response.payload, &shard_entries, decode_blackboard_payload, &error))
         {
             entries.insert(entries.end(), shard_entries.begin(), shard_entries.end());
+        }
+        else
+        {
+            dwarn("blackboard snapshot shard %u decode failed: %s",
+                  static_cast<unsigned int>(response.route_partition),
+                  error.c_str());
         }
     }
     return entries;
@@ -4548,8 +4736,8 @@ bool rasn_runtime_provider::register_contract(const agent_contract &contract, st
     {
         return false;
     }
-    mirror_state_after_success("contract_verifier", "contract", contract.contract_id, encode_contract_payload(contract));
-    return true;
+    return mirror_state_after_success(
+        "contract_verifier", "contract", contract.contract_id, encode_contract_payload(contract), error);
 }
 
 contract_evaluation rasn_runtime_provider::evaluate_input(const std::string &contract_id, const std::string &input) const

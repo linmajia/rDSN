@@ -1395,8 +1395,11 @@ service store realizes each shard/replica as a single-writer service store.
 > replication fronts them. The state-service mirror written in `distributed` mode
 > is replayed by module services on startup. Each mirrored mutation also writes a
 > per-module watermark by default; hydration verifies those watermarks before
-> replay so a torn or incomplete mirror fails closed instead of serving partial
-> state. `codepilot state compact [--prefix <state-prefix>] [checkpoint-path]`
+> replay so a torn, incomplete, or pre-watermark mirror fails closed instead of
+> serving partial state. In strict runtime mode, a mutation whose state mirror or
+> watermark write fails is returned as a failed facade call rather than success
+> with only a warning. `codepilot state compact [--prefix <state-prefix>]
+> [checkpoint-path]`
 > lets operators verify existing watermarks and fold the shared state service into
 > a compact checkpoint/journal baseline. When hydration is enabled, a module
 > service refuses to open its RPC API if the configured state service cannot be

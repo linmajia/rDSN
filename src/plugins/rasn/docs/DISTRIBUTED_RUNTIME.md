@@ -167,8 +167,10 @@ Design notes:
   `rasn_runtime_state_watermark_enabled` is true, each mirrored mutation also
   writes a per-module `watermark` record containing the committed state-record
   sequence; hydration verifies those watermarks before replay when
-  `rasn_runtime_state_watermark_verify_enabled` is true. A torn or incomplete
-  mirror therefore fails closed instead of silently serving partial state.
+  `rasn_runtime_state_watermark_verify_enabled` is true. Any hosted module that
+  has mirrored data records must also have a valid watermark, so a torn,
+  incomplete, or pre-watermark mirror fails closed instead of silently serving
+  partial state.
   Operators can run `codepilot state compact` with an optional `--prefix` and
   checkpoint path to query the mirror, verify existing watermarks, and fold the
   shared state service into a compact checkpoint/journal baseline. Locally
@@ -284,13 +286,19 @@ sequenceDiagram
   key, shard, or payload is treated as a distinct request. Read-only operations
   are not retained in the dedup cache. The
   window is bounded by `rasn_runtime_dedup_capacity` and
-  `rasn_runtime_dedup_ttl_ms`, and exposed through metrics
+  `rasn_runtime_dedup_ttl_ms`; duplicate waiters are additionally capped by
+  `rasn_runtime_dedup_wait_timeout_ms` so a slow or failed owner cannot occupy
+  RPC handler threads indefinitely. Only successful responses are cached; failed
+  responses clear the placeholder and let later retries re-execute. Dedup
+  activity is exposed through metrics
   (`rasn_runtime_dedup_{hit,miss,wait,evicted,expired}_total`). This suppresses
   lost-reply double-apply within one service process; it is not cross-process
   exactly-once.
-- **Strict vs. degrade.** Facade calls return explicit errors to their caller; for
-  best-effort mirror writes, `rasn_runtime_strict` labels failures as strict
-  provider failures instead of ordinary distributed-runtime degradation.
+- **Strict vs. degrade.** Facade calls return explicit errors to their caller;
+  when `rasn_runtime_strict` is true, a successful in-memory mutation whose
+  state mirror or watermark write fails is surfaced as a failed facade call
+  instead of being reported as success with only a warning. In non-strict mode,
+  mirror failures remain degradation warnings.
 
 ## 8. Consistency models
 
