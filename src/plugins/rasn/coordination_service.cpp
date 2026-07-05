@@ -15,6 +15,9 @@
 #ifdef RASN_HAS_DIST_COORDINATION
 #include <dsn/dist/distributed_lock_service.h>
 #include <dsn/dist/meta_state_service.h>
+// ERR_NODE_ALREADY_EXIST and other dist-service error codes are declared by the
+// rDSN.dist.service plugin, not core rDSN (dsn/cpp/auto_codes.h).
+#include <dsn/dist/error_code.h>
 
 // Concrete providers live in the rDSN.dist.service submodule's private headers
 // (reached via include paths added in the rASN CMake files).
@@ -189,9 +192,16 @@ private:
 
 #ifdef RASN_HAS_DIST_COORDINATION
 
-// Coordination callbacks are delivered on THREAD_POOL_META_SERVER, matching the
-// pool the dist providers already use internally. rASN never processes requests
-// on this pool, so the blocking facade calls below cannot self-deadlock.
+// Coordination callbacks are delivered on THREAD_POOL_META_SERVER. This is the
+// pool the rDSN dist providers themselves require: distributed_lock_service_simple
+// (and the zookeeper provider) enqueue their own internal work -- notably the
+// LPC_DIST_LOCK_SVC_RANDOM_EXPIRE lease timer -- on THREAD_POOL_META_SERVER, so any
+// app running the simple/zookeeper backend must declare that pool regardless. rASN
+// never processes requests on it (rASN handlers run on THREAD_POOL_DEFAULT /
+// THREAD_POOL_RASN_WORKFLOW), so the blocking facade calls below wait() for their
+// completion callbacks on a pool distinct from the caller's and cannot self-deadlock.
+// Every rASN app declares THREAD_POOL_META_SERVER in its `pools` list
+// (config.ini / apps/srepilot/config.ini).
 DEFINE_TASK_CODE(LPC_RASN_COORDINATION, TASK_PRIORITY_COMMON, THREAD_POOL_META_SERVER)
 
 // Wrap a std::string in an owning blob (copies the bytes).
@@ -211,8 +221,9 @@ std::string blob_to_string(const ::dsn::blob &b)
 // ---------------------------------------------------------------------------
 // Distributed backend reusing rDSN's distributed_lock_service (ownership /
 // leader election) and meta_state_service (cluster-shared state). Provider is
-// "simple" (in-process, single box) or "zookeeper" (HA). The async rDSN APIs
-// are driven synchronously here so the rASN facade stays blocking.
+// "simple" (rDSN in-process provider; coordinates within one facade instance
+// only) or "zookeeper" (cross-process HA). The async rDSN APIs are driven
+// synchronously here so the rASN facade stays blocking.
 // ---------------------------------------------------------------------------
 class dist_coordination_service : public rasn_coordination_service
 {
@@ -238,6 +249,13 @@ public:
             _lock = new ::dsn::dist::distributed_lock_service_zookeeper();
             _state_svc = new ::dsn::dist::meta_state_service_zookeeper();
         } else {
+            // "simple" backend: rDSN's in-process providers. Their lock table and
+            // state tree live in per-instance members of the objects created here,
+            // so coordination is scoped to THIS facade instance only -- a second
+            // dist_coordination_service (another instance in this process, or any
+            // other process) constructs its own providers and shares nothing.
+            // Adequate for unit tests and single-writer dev; use "zookeeper" for
+            // real cross-process / multi-app coordination.
             _lock = new ::dsn::dist::distributed_lock_service_simple();
             _state_svc = new ::dsn::dist::meta_state_service_simple();
         }
@@ -273,8 +291,15 @@ public:
             return ec;
         }
 
-        // Make sure the shared-state root path exists before first use.
-        ensure_path(_cfg.state_namespace);
+        // Materialize the shared-state root before first use. Fail closed if the
+        // namespace cannot be created: a missing root means every later put/get
+        // would fail confusingly, so surface the error at start() instead.
+        ::dsn::error_code path_ec = ensure_path(_cfg.state_namespace);
+        if (path_ec != ::dsn::ERR_OK) {
+            derror("rasn.coordination failed to create state namespace '%s': %s",
+                   _cfg.state_namespace.c_str(), path_ec.to_string());
+            return path_ec;
+        }
         return ::dsn::ERR_OK;
     }
 
@@ -334,12 +359,42 @@ public:
 
         const bool completed = tasks.first->wait(timeout_ms);
         if (!completed) {
-            // Timed out while still pending: cancel the attempt and lease task.
-            _lock->cancel_pending_lock(resource_id, owner_id, LPC_RASN_COORDINATION,
-                                       [](::dsn::error_code ec, const std::string &, uint64_t) {
-                                           ec.end_tracking();
-                                       })
+            // Timed out while (apparently) still pending. Cancel the attempt, but
+            // the grant may have won the race between our wait() deadline and the
+            // cancel: rDSN's cancel_pending_lock reports ERR_OBJECT_NOT_FOUND and
+            // the *current owner* when the caller is no longer in the pending list
+            // because it already acquired the lock (distributed_lock_service.h).
+            // If that owner is us -- or the grant callback already stored ERR_OK --
+            // we actually hold the lock and must not leak it: record the hold (with
+            // its live lease task) and return success, matching the documented
+            // contract (ERR_OK == granted). Only a genuine timeout unwinds the lease.
+            auto cancel_ec = std::make_shared<std::atomic<int>>(
+                static_cast<int>(::dsn::ERR_TIMEOUT.get()));
+            auto cancel_owner_ptr = std::make_shared<std::string>();
+            _lock->cancel_pending_lock(
+                      resource_id, owner_id, LPC_RASN_COORDINATION,
+                      [cancel_ec, cancel_owner_ptr](::dsn::error_code ec,
+                                                    const std::string &owner, uint64_t) {
+                          cancel_ec->store(static_cast<int>(ec.get()));
+                          *cancel_owner_ptr = owner;
+                      })
                 ->wait();
+
+            const bool grant_won =
+                ::dsn::error_code(static_cast<dsn_error_t>(granted->load())) == ::dsn::ERR_OK;
+            const bool cancel_saw_us =
+                ::dsn::error_code(static_cast<dsn_error_t>(cancel_ec->load())) ==
+                    ::dsn::ERR_OBJECT_NOT_FOUND &&
+                *cancel_owner_ptr == owner_id;
+            if (grant_won || cancel_saw_us) {
+                std::lock_guard<std::mutex> guard(_mu);
+                hold h;
+                h.owner = owner_id;
+                h.lease_task = tasks.second;
+                _holds[resource_id] = h;
+                return ::dsn::ERR_OK;
+            }
+
             if (tasks.second != nullptr)
                 tasks.second->cancel(false);
             return ::dsn::ERR_TIMEOUT;
@@ -400,7 +455,14 @@ public:
             return ec;
         if (exists)
             return set_data_sync(node, value);
-        return create_node_sync(node, value);
+        // node_exist-then-create is not atomic: a concurrent writer may create the
+        // node in between. create_node then returns ERR_NODE_ALREADY_EXIST; fall
+        // back to set_data so our value still lands (last-writer-wins), exactly as
+        // the exists branch above would have done had we observed it first.
+        ec = create_node_sync(node, value);
+        if (ec == ::ERR_NODE_ALREADY_EXIST)
+            return set_data_sync(node, value);
+        return ec;
     }
 
     ::dsn::error_code get_state(const std::string &key, std::string &value) override
@@ -529,10 +591,13 @@ private:
                     return ec;
                 if (!exists) {
                     ::dsn::error_code cec = create_node_sync(prefix, std::string());
-                    if (cec != ::dsn::ERR_OK && cec != ::dsn::ERR_OBJECT_NOT_FOUND) {
-                        // Tolerate concurrent creation races; fail on real errors.
-                        cec.end_tracking();
-                    }
+                    // Tolerate only a concurrent creation of the same ancestor
+                    // (ERR_NODE_ALREADY_EXIST). Any other failure is real -- e.g. the
+                    // backend is unreachable -- and must abort path materialization
+                    // rather than being swallowed, so callers don't proceed against a
+                    // parent path that was never created.
+                    if (cec != ::dsn::ERR_OK && cec != ::ERR_NODE_ALREADY_EXIST)
+                        return cec;
                 }
             }
             if (slash == std::string::npos)

@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace dsn;
@@ -150,6 +151,45 @@ TEST(rasn_coordination, simple_provider_shared_state)
     ASSERT_EQ(ERR_OK, svc->start());
 
     run_shared_state_contract(svc.get());
+
+    svc->stop();
+}
+
+TEST(rasn_coordination, simple_provider_concurrent_put_state_is_lww)
+{
+    rasn_coordination_config cfg;
+    cfg.provider = "simple";
+    cfg.lock_namespace = "/rasn_test/locks";
+    cfg.state_namespace = unique_state_ns();
+    cfg.state_work_dir = fresh_work_dir();
+    auto svc = create_rasn_coordination_service(cfg);
+    ASSERT_NE(nullptr, svc.get());
+    ASSERT_EQ(ERR_OK, svc->start());
+
+    // Many writers race to create the SAME previously-absent key. put_state does a
+    // non-atomic node_exist-then-create, so all but one create_node call come back
+    // ERR_NODE_ALREADY_EXIST; the facade must fall back to set_data so every writer
+    // observes success (last-writer-wins), never a spurious ERR_NODE_ALREADY_EXIST.
+    const int kWriters = 8;
+    std::vector<error_code> results(kWriters, ERR_UNKNOWN);
+    std::vector<std::thread> threads;
+    threads.reserve(kWriters);
+    for (int i = 0; i < kWriters; ++i) {
+        threads.emplace_back([&svc, &results, i]() {
+            results[i] = svc->put_state("contended/key",
+                                        std::string("writer-") + std::to_string(i));
+        });
+    }
+    for (auto &t : threads)
+        t.join();
+
+    for (int i = 0; i < kWriters; ++i)
+        EXPECT_EQ(ERR_OK, results[i]) << "writer " << i << " should succeed via LWW fallback";
+
+    // Exactly one of the raced writes must be visible afterwards.
+    std::string value;
+    ASSERT_EQ(ERR_OK, svc->get_state("contended/key", value));
+    EXPECT_EQ(std::string("writer-"), value.substr(0, 7));
 
     svc->stop();
 }

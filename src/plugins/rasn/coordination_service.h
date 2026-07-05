@@ -15,8 +15,16 @@
 //   * "inproc"    : single-node in-memory fallback (always available). Keeps
 //                   the app self-contained for local/dev runs and for builds
 //                   that do not include the dist.service plugin.
-//   * "simple"    : rDSN in-process provider (unit-test / single-box multi-app).
-//   * "zookeeper" : rDSN ZooKeeper-backed provider (production, HA).
+//   * "simple"    : rDSN in-process provider. Coordinates only *within a single
+//                   coordination-service instance in one process* -- the provider
+//                   keeps its lock/state maps in per-instance members, so two
+//                   facade instances (or two processes) do NOT see each other's
+//                   locks or state. Use it for unit tests and single-writer dev,
+//                   where exactly one facade instance is the coordinator. For
+//                   real cross-process / multi-app coordination on one box or many,
+//                   use "zookeeper".
+//   * "zookeeper" : rDSN ZooKeeper-backed provider (production, HA). The only
+//                   backend that coordinates across independent processes/apps.
 //
 // The "simple"/"zookeeper" backends are only compiled when the dist.service
 // plugin is present in the build (RASN_HAS_DIST_COORDINATION). When it is not,
@@ -59,9 +67,11 @@ rasn_coordination_config load_rasn_coordination_config();
 // implementation drives rDSN's async APIs internally and blocks the caller.
 //
 // Threading contract: the blocking methods must NOT be invoked from a
-// THREAD_POOL_META_SERVER worker, because the dist backend delivers its
-// completion callbacks on that pool. rASN's runtime never uses that pool for
-// request processing, so ordinary rASN call sites are safe.
+// THREAD_POOL_META_SERVER worker, because the dist backend delivers its completion
+// callbacks on that pool (and the reused rDSN dist providers also run their own
+// internal tasks there, e.g. the lock lease timer). rASN's runtime never processes
+// requests on THREAD_POOL_META_SERVER, so ordinary rASN call sites are safe; every
+// rASN app that may run the simple/zookeeper backend declares that pool in config.
 class rasn_coordination_service
 {
 public:

@@ -724,13 +724,41 @@ provider-agnostic interface with two concerns:
 | Backend | Reuses | Use |
 | --- | --- | --- |
 | `inproc` | in-process maps (no external dep) | default single-node fallback; always compiled |
-| `simple` | rDSN `distributed_lock_service_simple` + `meta_state_service_simple` | single box / multi-app / unit tests; durable simple meta-state log |
-| `zookeeper` | rDSN `distributed_lock_service_zookeeper` + `meta_state_service_zookeeper` | production HA over a ZooKeeper ensemble (`[zookeeper] hosts_list`) |
+| `simple` | rDSN `distributed_lock_service_simple` + `meta_state_service_simple` | unit tests / single-writer dev; **coordinates only within one in-process facade instance** (see note); durable simple meta-state log |
+| `zookeeper` | rDSN `distributed_lock_service_zookeeper` + `meta_state_service_zookeeper` | production HA over a ZooKeeper ensemble (`[zookeeper] hosts_list`); the only backend that coordinates across independent processes/apps |
+
+> **`simple` is single-instance.** The rDSN simple providers keep their lock table
+> and state tree in per-object members, so each `dist_coordination_service` that
+> constructs them coordinates only with itself. Two facade instances in one process
+> — or two processes — share nothing. Use `simple` where exactly one facade instance
+> is the coordinator (unit tests, single-writer dev); use `zookeeper` for real
+> cross-process / multi-app coordination, whether the participants are on one box or
+> many.
 
 The `simple`/`zookeeper` backends come from the `rDSN.dist.service` ext plugin
 (`src/plugins_ext/`). The facade wraps their async, `error_code`-returning task API
-behind blocking helpers (used only off the `THREAD_POOL_META_SERVER` pool to avoid
-self-deadlock), creating parent znodes on demand and tracking held lease tasks.
+behind blocking helpers. Those helpers `wait()` for completion callbacks delivered on
+**`THREAD_POOL_META_SERVER`** — the pool the reused rDSN dist providers themselves
+depend on: `distributed_lock_service_simple`/`_zookeeper` enqueue their own internal
+work there (notably the `LPC_DIST_LOCK_SVC_RANDOM_EXPIRE` lease timer), so any app
+running the `simple`/`zookeeper` backend must declare that pool regardless of where
+callbacks land. It is distinct from `THREAD_POOL_DEFAULT` / `THREAD_POOL_RASN_WORKFLOW`
+(which run rASN request handlers), so a caller blocked in `wait()` can never starve
+the worker that runs its own callback. Every rASN app declares `THREAD_POOL_META_SERVER`
+in its `pools` list, and both configs define a matching
+`[threadpool.THREAD_POOL_META_SERVER]` section. The helpers create parent znodes on
+demand and track held lease tasks.
+
+**Correctness hardening (as-built).** Beyond the happy path, the facade fails closed
+and stays retry-safe under races: (a) a lock acquire that *times out* re-checks the
+grant/cancel outcome and, if it actually won the race (`cancel_pending_lock` reports
+`ERR_OBJECT_NOT_FOUND` with our own `owner_id`, or the grant callback already stored
+`ERR_OK`), records the hold and returns `ERR_OK` instead of leaking a granted-but-
+abandoned lock; (b) `put_state` treats a lost `node_exist`→`create_node` race
+(`ERR_NODE_ALREADY_EXIST`) as last-writer-wins by falling back to `set_data`, so
+concurrent first-writers all succeed; (c) namespace/parent-znode creation tolerates
+only `ERR_NODE_ALREADY_EXIST` and surfaces every other error — `start()` aborts if the
+state namespace cannot be materialized rather than limping on against a missing root.
 
 **Build wiring (reuse, not reinvent).** `src/CMakeLists.txt` now configures
 `plugins_ext` before `plugins` so rASN can see the dist targets. The rASN library,
@@ -748,9 +776,10 @@ backend; ignored by the others).
 **Tests.** `tests/rasn_coordination_test.cpp` asserts the ownership contract
 (acquire / idempotent re-acquire / mutual exclusion / hand-off / query) and the
 shared-state contract (absent-get / put / overwrite / list / delete / idempotent
-delete) against the facade. The `inproc` path and config defaults always run; the two
+delete) against the facade. The `inproc` path and config defaults always run; the
 `simple`-provider cases run under `RASN_HAS_DIST_COORDINATION` and exercise the real
-rDSN lock + meta-state providers.
+rDSN lock + meta-state providers, including a concurrent-`put_state` case that races
+eight writers on one fresh key and asserts they all succeed (last-writer-wins).
 
 **What remains.** The module delivers the *facility*; consuming it inside the runtime
 modules is the follow-up: (a) have each `replicated`/`sharded` module acquire
