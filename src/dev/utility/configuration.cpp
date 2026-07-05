@@ -213,10 +213,24 @@ bool configuration::load(const char* file_name, const char* arguments, const cha
         if (*p == '\0')    goto Next; 
 
         // collect include line and skip
+        //   @include  <file>   -- mandatory: parsing fails when <file> is missing
+        //   @include? <file>   -- optional: a missing <file> is skipped so the
+        //                         includer falls back to built-in default values
         if (strstr(p, "@include") == p)
         {
             auto pinclude = (p + strlen("@include"));
+            bool optional = false;
+            if (*pinclude == '?')
+            {
+                optional = true;
+                ++pinclude;
+            }
             pinclude = utils::trim_string(pinclude);
+            if (optional && !dsn::utils::filesystem::file_exists(std::string(pinclude)))
+            {
+                printf("optional included configuration file %s not found, using defaults ...\n", pinclude);
+                goto Next;
+            }
             if (!load_include(pinclude, arguments))
                 goto err;            
             goto Next;

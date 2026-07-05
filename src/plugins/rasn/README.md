@@ -92,6 +92,8 @@ resolved by `dsn.dist.uri.resolver`; otherwise it falls back to `<name>_host` an
 
 Standalone one-shot CLI mode still initializes the rDSN runtime with the plugin `config.ini`, but starts no rDSN service apps. It lazily starts the shared graph for the duration of the command and uses the same service implementations inline for fast local commands, while service mode starts the full rDSN app graph and routes through RPC.
 
+Configuration is split into two files composed with rDSN's optional `@include?`, but an **app never carries service config** — the composition runs *runtime → app*, not app → runtime. `config.ini` is the thin **application** config: a minimal rDSN bootstrap, the app's own `[apps.rasn.<app>]` section, and the two things an app cares about — the runtime location (`[rasn.runtime]`) and the LLM serving endpoint (`[rasn.model]`). It carries no `[rasn.service]` endpoint map and no `[apps.rasn.*]` service-deployment sections. `config.rasn.ini` is the complete **runtime** (services, deployments, tuning), a **single shared file** (`src/plugins/rasn/config.rasn.ini`) that every app binplaces verbatim. A default `codepilot` loads only its thin `config.ini` and runs the runtime in-process on defaults; `codepilot --dsn` loads `config.rasn.ini` (which `@include?`s the local `config.ini`) to launch the whole stack in one process; a remote runtime node deploys `config.rasn.ini` alone. See `docs/DISTRIBUTED_RUNTIME.md` §6.1.
+
 Application CLIs share the same path-startup convention through the reusable
 `cli_support` helper: a single existing directory argument switches the process
 workspace, loads a bounded source-file index plus selected file excerpts as

@@ -4847,7 +4847,7 @@ rasn_runtime_config load_rasn_runtime_config()
     const std::string provider =
         config_string("rasn_runtime_provider", "", "rASN runtime module provider: local, distributed, or hybrid");
     const std::string legacy_mode =
-        config_string("rasn_runtime_mode", "local", "legacy rASN runtime module mode: embedded or distributed");
+        config_string("rasn_runtime_mode", "local", "legacy rASN runtime module mode: local, distributed, or hybrid (embedded = alias for local)");
     config.provider = normalize_rasn_runtime_provider_name(provider.empty() ? legacy_mode : provider);
     config.state_prefix = trim(config_string(
         "rasn_runtime_state_prefix", "rasn/runtime", "State key prefix for distributed rASN runtime modules"));

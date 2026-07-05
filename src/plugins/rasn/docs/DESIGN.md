@@ -1268,8 +1268,16 @@ Responsibilities:
 
 rDSN design:
 
-- Packaging remains source-tree local: `config.ini` is copied beside the built
-  executable by CMake, and examples are stored under `examples/`.
+- Packaging remains source-tree local: each app's own thin `config.ini` plus the
+  single shared runtime `config.rasn.ini` are copied beside the built executable by
+  CMake, and examples are stored under `examples/`. The composition runs *runtime →
+  app*: `config.ini` holds only a minimal rDSN bootstrap, the app's `[apps.rasn.<app>]`
+  section, and app-facing config (`[rasn.runtime]` location + `[rasn.model]`), with no
+  service/deployment sections; the full runtime — the `[apps.rasn.*]` service
+  deployment sections, the `[rasn.service]` endpoint map, and all tuning — lives once
+  in the shared `src/plugins/rasn/config.rasn.ini`, which `@include?`s the local
+  `config.ini` when a node co-hosts an app (`<app> --dsn`). See
+  `docs/DISTRIBUTED_RUNTIME.md` §6.1.
 - rASN builds as a reusable `rasn` static library containing the engine, while
   CodePilot (`apps/codepilot/`), SREPilot (`apps/srepilot/`), and the
   `rasn.unit_tests` binary are thin consumers that link it. This keeps the

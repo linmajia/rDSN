@@ -1321,7 +1321,7 @@ std::string rasn_cli_app_base::runtime_modules_summary() const
 
 bool rasn_cli_app_base::runtime_modules_ready(std::string *detail) const
 {
-    // Ping every runtime module through the runtime facade. In local/embedded mode
+    // Ping every runtime module through the runtime facade. In local mode
     // this resolves in-process; in distributed mode it verifies each module's
     // service endpoint is actually reachable on its (possibly remote) node, so a
     // down module surfaces here instead of being masked by a static summary.

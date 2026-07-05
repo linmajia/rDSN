@@ -33,14 +33,14 @@ void register_rasn_apps()
             "register rasn.srepilot app failed");
 }
 
-std::string find_config_path(const std::string &program)
+std::string find_config_file(const std::string &program, const char *filename)
 {
     if (!program.empty())
     {
         const std::string exe_dir = ::dsn::utils::filesystem::remove_file_name(program);
         if (!exe_dir.empty())
         {
-            const std::string beside_exe = ::dsn::utils::filesystem::path_combine(exe_dir, "config.ini");
+            const std::string beside_exe = ::dsn::utils::filesystem::path_combine(exe_dir, filename);
             if (::dsn::utils::filesystem::file_exists(beside_exe))
             {
                 return beside_exe;
@@ -49,7 +49,7 @@ std::string find_config_path(const std::string &program)
             const std::string parent_dir = ::dsn::utils::filesystem::remove_file_name(exe_dir);
             if (!parent_dir.empty())
             {
-                const std::string beside_target = ::dsn::utils::filesystem::path_combine(parent_dir, "config.ini");
+                const std::string beside_target = ::dsn::utils::filesystem::path_combine(parent_dir, filename);
                 if (::dsn::utils::filesystem::file_exists(beside_target))
                 {
                     return beside_target;
@@ -58,16 +58,34 @@ std::string find_config_path(const std::string &program)
         }
     }
 
-    if (::dsn::utils::filesystem::file_exists("config.ini"))
+    if (::dsn::utils::filesystem::file_exists(filename))
     {
-        return "config.ini";
+        return filename;
     }
 
-    if (::dsn::utils::filesystem::file_exists("..\\config.ini"))
+    const std::string parent_rel = std::string("..\\") + filename;
+    if (::dsn::utils::filesystem::file_exists(parent_rel))
     {
-        return "..\\config.ini";
+        return parent_rel;
     }
-    return "config.ini";
+    return filename;
+}
+
+std::string find_config_path(const std::string &program)
+{
+    return find_config_file(program, "config.ini");
+}
+
+// For `--dsn` (runtime host / all-in-one): prefer the full runtime config so the
+// service apps launch; fall back to the thin app config if it is not present.
+std::string find_runtime_config_path(const std::string &program)
+{
+    const std::string runtime = find_config_file(program, "config.rasn.ini");
+    if (::dsn::utils::filesystem::file_exists(runtime))
+    {
+        return runtime;
+    }
+    return find_config_path(program);
 }
 
 } // namespace
@@ -93,7 +111,7 @@ int main(int argc, char **argv)
         return cli.run(command_args);
     }
 
-    const std::string config_path = explicit_dsn_config.empty() ? find_config_path(program) : explicit_dsn_config;
+    const std::string config_path = explicit_dsn_config.empty() ? find_runtime_config_path(program) : explicit_dsn_config;
     const std::string default_srepilot_app_list =
         "rasn.registry;rasn.llm.agent;rasn.tool.agent;rasn.state;rasn.coordinator;rasn.workflow;"
         "rasn.observability;rasn.runtime;rasn.srepilot";

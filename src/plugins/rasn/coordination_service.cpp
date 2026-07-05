@@ -67,8 +67,12 @@ rasn_coordination_config load_rasn_coordination_config()
 // never processes requests on it (rASN handlers run on THREAD_POOL_DEFAULT /
 // THREAD_POOL_RASN_WORKFLOW), so the blocking facade calls below wait() for their
 // completion callbacks on a pool distinct from the caller's and cannot self-deadlock.
-// Every rASN app declares THREAD_POOL_META_SERVER in its `pools` list
-// (config.ini / apps/srepilot/config.ini).
+// The default 'inproc' backend uses no dist provider and never enqueues
+// LPC_RASN_COORDINATION, so THREAD_POOL_META_SERVER is declared in the rASN
+// runtime deployment config (the single shared src/plugins/rasn/config.rasn.ini)
+// only when provider = simple|zookeeper.
+// Declaring it under the default config would fail config parsing ("invalid enum
+// configuration") because the providers that register the pool are not loaded.
 //
 // Defined here in the named dsn::rasn namespace (not the anonymous namespace
 // below): the DEFINE_TASK_CODE macro emits a weak symbol, which must have

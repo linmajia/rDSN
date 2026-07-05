@@ -228,6 +228,41 @@ Design notes:
   model, and statefulness — the operator's view for validating a multi-node
   layout.
 
+### 6.1 Configuration file layout
+
+A rASN application is a thin TUI/GUI; all agent logic and services live in the
+rASN **runtime**. Configuration splits into two files, composed with rDSN's
+optional `@include?` directive (resolved relative to the process working
+directory). Crucially, an **app never carries runtime/service config** — the
+composition runs *runtime → app*, not app → runtime:
+
+| File | Audience | Contents |
+| --- | --- | --- |
+| `config.ini` | applications | **One per app** (`apps/<app>/config.ini`), thin. Only a minimal rDSN bootstrap (`[modules]` + `[core]`), the app's own `[apps.rasn.<app>]` section, and the two things an app cares about: the runtime **location** (`[rasn.runtime]`) and, optionally, the LLM serving endpoint (`[rasn.model]`). It carries **no** `[rasn.service]` endpoint map and **no** `[apps.rasn.*]` service-deployment sections. |
+| `config.rasn.ini` | runtime nodes | **Single shared file** (`src/plugins/rasn/config.rasn.ini`), binplaced identically next to every app. The **complete rASN runtime**: rDSN `[modules]`/`[core]`/thread pools, the `[rasn.service]` endpoint map + `[rasn.rpc]` timeouts, every `[apps.rasn.*]` service/module app, and all agent-logic tuning (`[rasn.model]`, `[rasn.tool]`, `[rasn.overload]`, `[rasn.policy]`, `[rasn.coordination]`, …). Loaded only on a node that *hosts* the runtime. At its top it `@include?`s the co-hosted app's thin `config.ini`, so an all-in-one node runs the app beside the services in one process. |
+
+Who loads what:
+
+- **Default `<app>` (local, no args)** loads only its thin `config.ini`. The
+  runtime modules are built in-process on built-in defaults; the app sees no
+  service/deployment config at all.
+- **All-in-one runtime host (`<app> --dsn`)** loads `config.rasn.ini` (the app's
+  `--dsn` mode resolves the runtime file first), which `@include?`s the local
+  `config.ini` to pull in `[apps.rasn.<app>]` + `[rasn.runtime]`. The service
+  apps launch alongside the app in one process; the app reaches them via LPC.
+- **Dedicated remote runtime node** deploys `config.rasn.ini` with no local
+  `config.ini` present — the optional include is skipped and the node runs the
+  service stack headless.
+- **Thin client → remote runtime.** The app keeps only its `config.ini`, sets
+  `[rasn.runtime] rasn_runtime_mode = distributed`, and gives the remote runtime
+  address in a small `[rasn.service]` block (`rasn_runtime_host`/`_port`). It
+  still never loads the runtime's service-deployment config.
+
+Both files are binplaced next to each executable so the relative `@include?`
+resolves at runtime. Each app ships its own thin `config.ini`; they all binplace
+the **same** shared `config.rasn.ini`, so there is exactly one runtime config to
+maintain.
+
 ## 7. Resilience and idempotency (runtime-owned)
 
 Because the network is on the path in `distributed`/`hybrid`, the runtime — not
@@ -532,8 +567,9 @@ which gaps are resolved in code, mitigated client-side, or tracked as framework 
 | Distributed coordination facade (ownership election + cluster-shared state) reusing rDSN `distributed_lock_service` / `meta_state_service` | `coordination_service.h` / `coordination_service.cpp` |
 | RPC/LPC task codes | `rasn.code.definition.h` |
 | Reusable circuit breaker engine | `circuit_breaker.h` / `circuit_breaker.cpp` |
-| Provider/endpoint/resilience config | `[rasn.runtime]` + `[rasn.service]` in `config.ini` (and `apps/srepilot/config.ini`) |
-| Coordination config | `[rasn.coordination]` in `config.ini` (and `apps/srepilot/config.ini`) |
+| Provider/endpoint/resilience config | `[rasn.runtime]` in each app's `config.ini`; `[rasn.service]`/`[rasn.rpc]` in the shared `config.rasn.ini` |
+| Coordination config | `[rasn.coordination]` in the shared `config.rasn.ini` |
+| Config file layout (app / runtime split via optional `@include?`) | `config.ini` + `config.rasn.ini` (see §6.1) |
 | Tests | `tests/rasn_unit_tests.cpp`, `tests/rasn_coordination_test.cpp` |
 
 ## 13. Production-readiness audit — findings, remediation, and status
@@ -686,7 +722,7 @@ Resolved/mitigated **in code and validated** (committed as
   registry discovery query in `coordinator_service.cpp` now fail fast on unhealthy
   endpoints and retry transient transport errors with idempotency-aware policy
   (findings 1.2 fully, 1.3/1.6 client-side).
-- Config knobs `rasn_core_rpc_*` in `config.ini` and `apps/srepilot/config.ini`.
+- Config knobs `rasn_core_rpc_*` (`[rasn.service]`) in the shared `config.rasn.ini`.
 - Focused unit coverage: `rasn_rpc_resilience` in `tests/rasn_unit_tests.cpp`
   (pre-apply retry, idempotency-aware timeout policy, breaker short-circuit).
 - End-to-end trace propagation across the runtime-module envelope (§13.4, finding
@@ -744,10 +780,19 @@ work there (notably the `LPC_DIST_LOCK_SVC_RANDOM_EXPIRE` lease timer), so any a
 running the `simple`/`zookeeper` backend must declare that pool regardless of where
 callbacks land. It is distinct from `THREAD_POOL_DEFAULT` / `THREAD_POOL_RASN_WORKFLOW`
 (which run rASN request handlers), so a caller blocked in `wait()` can never starve
-the worker that runs its own callback. Every rASN app declares `THREAD_POOL_META_SERVER`
-in its `pools` list, and both configs define a matching
-`[threadpool.THREAD_POOL_META_SERVER]` section. The helpers create parent znodes on
-demand and track held lease tasks.
+the worker that runs its own callback.
+
+Because the shipped configs default to `provider = inproc`, they deliberately do
+**not** declare `THREAD_POOL_META_SERVER`. That pool is registered by the
+`rDSN.dist.service` providers, which the default `[modules]` list does not load, so
+declaring it (in a `pools` list or a `[threadpool.*]` section) under the default
+config fails config parsing with `invalid enum configuration ... THREAD_POOL_META_SERVER`
+at startup. To run a distributed backend: (1) build with `--build_plugins` so the
+providers register the pool, (2) set `provider = simple|zookeeper`, (3) add
+`THREAD_POOL_META_SERVER` to each rASN app's `pools` list, and (4) uncomment the
+`[threadpool.THREAD_POOL_META_SERVER]` section that both configs ship (commented) for
+exactly this purpose. The helpers create parent znodes on demand and track held lease
+tasks.
 
 **Correctness hardening (as-built).** Beyond the happy path, the facade fails closed
 and stays retry-safe under races: (a) a lock acquire that *times out* re-checks the
@@ -768,7 +813,7 @@ state namespace cannot be materialized rather than limping on against a missing 
 A plain build without the ext plugin still compiles rASN with just the `inproc`
 fallback, so nothing regresses for lightweight checkouts.
 
-**Config.** `[rasn.coordination]` in `config.ini` and `apps/srepilot/config.ini`:
+**Config.** `[rasn.coordination]` in the shared `config.rasn.ini`:
 `provider` (`inproc`|`simple`|`zookeeper`), `lock_namespace`, `state_namespace`,
 `acquire_timeout_ms`, and `state_work_dir` (durable-log directory for the `simple`
 backend; ignored by the others).

@@ -36,6 +36,10 @@ set(MY_PROJ_LIBS rasn)
 
 set(MY_PROJ_LIB_PATH "")
 
-set(MY_BINPLACES "${CMAKE_CURRENT_SOURCE_DIR}/../../config.ini")
+# config.ini is this app's own thin config; config.rasn.ini is the single shared
+# rASN runtime config (src/plugins/rasn/config.rasn.ini) used by every app.
+set(MY_BINPLACES
+    "${CMAKE_CURRENT_SOURCE_DIR}/config.ini"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../config.rasn.ini")
 
 dsn_add_executable()
