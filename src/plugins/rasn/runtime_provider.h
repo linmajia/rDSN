@@ -45,6 +45,10 @@ struct rasn_runtime_request
     // and LPC paths leave this empty; RPC services verify it only when auth is
     // enabled in [rasn.service].
     std::string auth_token;
+    // Optional end-to-end trace id propagated from the originating operation so a
+    // module request can be correlated across nodes in logs and metrics. Stamped
+    // from the ambient trace scope by make_module_request; empty for untraced calls.
+    std::string trace_id;
 };
 
 struct rasn_runtime_response
@@ -57,6 +61,8 @@ struct rasn_runtime_response
     std::string key;
     std::string payload;
     uint32_t route_partition = (std::numeric_limits<uint32_t>::max)();
+    // Echoes the request trace id so a caller can correlate the reply in logs.
+    std::string trace_id;
 };
 
 inline void marshall(::dsn::binary_writer &writer, const rasn_runtime_request &value, ::dsn_msg_serialize_format fmt)
@@ -69,6 +75,7 @@ inline void marshall(::dsn::binary_writer &writer, const rasn_runtime_request &v
     writer.write(value.request_id);
     writer.write(value.route_partition);
     writer.write(value.auth_token);
+    writer.write(value.trace_id);
 }
 
 inline void unmarshall(::dsn::binary_reader &reader, rasn_runtime_request &value, ::dsn_msg_serialize_format fmt)
@@ -102,6 +109,14 @@ inline void unmarshall(::dsn::binary_reader &reader, rasn_runtime_request &value
     {
         value.auth_token.clear();
     }
+    if (!reader.is_eof())
+    {
+        reader.read(value.trace_id);
+    }
+    else
+    {
+        value.trace_id.clear();
+    }
 }
 
 inline void marshall(::dsn::binary_writer &writer, const rasn_runtime_response &value, ::dsn_msg_serialize_format fmt)
@@ -114,6 +129,7 @@ inline void marshall(::dsn::binary_writer &writer, const rasn_runtime_response &
     writer.write(value.key);
     writer.write(value.payload);
     writer.write(value.route_partition);
+    writer.write(value.trace_id);
 }
 
 inline void unmarshall(::dsn::binary_reader &reader, rasn_runtime_response &value, ::dsn_msg_serialize_format fmt)
@@ -133,7 +149,39 @@ inline void unmarshall(::dsn::binary_reader &reader, rasn_runtime_response &valu
     {
         value.route_partition = (std::numeric_limits<uint32_t>::max)();
     }
+    if (!reader.is_eof())
+    {
+        reader.read(value.trace_id);
+    }
+    else
+    {
+        value.trace_id.clear();
+    }
 }
+
+// Ambient end-to-end trace propagation for runtime module RPC.
+//
+// make_module_request stamps the request envelope with the trace id currently in
+// scope on this thread, so a logical operation's trace flows onto every module
+// request it triggers without threading the id through dozens of call sites. An
+// operation origin (e.g. the coordinator/service-graph invoke) or the server RPC
+// ingress installs a scope for the duration of the call; nested module calls and
+// the echoed response then share the id. An empty id leaves the ambient unchanged.
+std::string current_rasn_runtime_trace_id();
+
+class rasn_runtime_trace_scope
+{
+public:
+    explicit rasn_runtime_trace_scope(const std::string &trace_id);
+    ~rasn_runtime_trace_scope();
+
+    rasn_runtime_trace_scope(const rasn_runtime_trace_scope &) = delete;
+    rasn_runtime_trace_scope &operator=(const rasn_runtime_trace_scope &) = delete;
+
+private:
+    std::string _previous;
+    bool _changed;
+};
 
 struct rasn_runtime_config
 {

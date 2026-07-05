@@ -300,6 +300,42 @@ sequenceDiagram
   instead of being reported as success with only a warning. In non-strict mode,
   mirror failures remain degradation warnings.
 
+### 7.1 Core-service client resilience
+
+The failure contracts above cover the 11 runtime **modules** reached through
+`invoke_remote_module`. rASN also depends on a handful of older, always-on **core
+services** reached over ordinary rDSN RPC — `rasn.state`, `rasn.workflow`,
+`rasn.observability`, and the `rasn.registry` discovery lookup that gates request
+routing. Historically each of those made a single one-shot `::dsn::rpc::call`, so a
+transient blip on any of those hops surfaced as a hard failure with no breaker and
+no retry, even though the module path was fully hardened. That asymmetry is closed
+by the shared `resilient_rpc_call` helper in `rpc_resilience.h`, which gives every
+cross-node core dependency the *same* policy, reusing the shared `circuit_breaker`
+engine rather than introducing another bespoke mechanism:
+
+- **Per-endpoint circuit breaker.** A process-global `circuit_breaker_registry`
+  (`global_rasn_core_breakers()`) keyed by service + resolved endpoint. While an
+  endpoint is unhealthy, calls short-circuit with `ERR_BUSY` without touching the
+  dependency, exactly as the module path does.
+- **Idempotency-aware retries.** Errors that prove the request never applied
+  (`ERR_NETWORK_FAILURE`, `ERR_NETWORK_INIT_FAILED`, `ERR_BUSY`,
+  `ERR_CAPACITY_EXCEEDED`, `ERR_TRY_AGAIN`) are retried for *any* operation. The
+  ambiguous `ERR_TIMEOUT` — where the server may already have applied the write —
+  is retried **only** for operations the caller declares idempotent. Reads and
+  key-overwrite writes are idempotent; compare-and-swap (`put_conditional`) and
+  starting a workflow run are not, so a lost reply on those fails fast instead of
+  risking a double-apply. Linear backoff (`backoff_ms * attempt`) separates
+  retries; total attempts are `rasn_core_rpc_retries + 1`.
+- **Config.** `[rasn.service] rasn_core_rpc_retries`, `rasn_core_rpc_backoff_ms`,
+  `rasn_core_rpc_breaker_enabled`, `rasn_core_rpc_breaker_failures`, and
+  `rasn_core_rpc_breaker_open_ms`. The RPC timeout reuses `[rasn.rpc] timeout_ms`.
+  The in-process (non-distributed) path is unchanged: resilience wraps only the
+  RPC-client branch, so single-process runs pay nothing.
+
+Like module dedup, this is per-service-process resilience; it suppresses transient
+transport failures and fast-fails dead endpoints, but it is not cross-process
+exactly-once and does not replace the replicated backends discussed in §8 and §13.
+
 ## 8. Consistency models
 
 Stateful modules are not all the same, so each declares an **intended** consistency
@@ -472,6 +508,10 @@ codepilot.exe --dsn config.ini "rasn.state;resource_budget"
   tooling remain.
 - Real replicated storage and shard durability via rDSN-native replication/partitioning.
 - Deployment examples/tests for multi-node and URI-backed module clusters.
+- End-to-end trace propagation across core/module RPC envelopes (design in §13.4).
+
+See §13 for the full production-readiness audit that drives this roadmap, including
+which gaps are resolved in code, mitigated client-side, or tracked as framework work.
 
 ## 12. Code map
 
@@ -479,7 +519,161 @@ codepilot.exe --dsn config.ini "rasn.state;resource_budget"
 | --- | --- |
 | Facade + provider base, envelopes, descriptors | `runtime_provider.h` |
 | Providers (`local`/`distributed`/`hybrid`), transport helpers, breaker, dedup, service store, apps | `runtime_provider.cpp` |
+| Core-service client RPC resilience (breaker + idempotency-aware retries) | `rpc_resilience.h` / `rpc_resilience.cpp` |
 | RPC/LPC task codes | `rasn.code.definition.h` |
 | Reusable circuit breaker engine | `circuit_breaker.h` / `circuit_breaker.cpp` |
 | Provider/endpoint/resilience config | `[rasn.runtime]` + `[rasn.service]` in `config.ini` (and `apps/srepilot/config.ini`) |
 | Tests | `tests/rasn_unit_tests.cpp` |
+
+## 13. Production-readiness audit — findings, remediation, and status
+
+This section merges a focused production-readiness audit of `src/plugins/rasn`
+against the "fully distributed, reuse rDSN, no missing critical modules" bar this
+document sets. Findings are grouped by three lenses and severity-ranked. Each
+carries an explicit **status**:
+
+- **RESOLVED (code)** — fixed in this codebase and behaviorally validated.
+- **MITIGATED (code)** — materially improved client-side; full fix needs a
+  framework-backed component below.
+- **DOCUMENTED (roadmap)** — the correct rDSN-native design is identified and
+  captured here; implementation is framework work that depends on rDSN subsystems
+  (replication, meta-server/ZooKeeper, Thrift codegen) that a rASN-only change
+  cannot honestly land or verify in isolation.
+
+The guiding principle is **reuse rDSN, don't reinvent it**: wherever rASN grew a
+bespoke mechanism, the audit names the rDSN facility that should back it.
+
+### 13.1 Lens 1 — Is rASN *fully* distributed?
+
+| # | Sev | Finding | Status |
+| --- | --- | --- | --- |
+| 1.1 | P0 | **Stateful modules are single-writer in-memory, not quorum-replicated.** The 11 runtime modules and the state service realize `replicated`/`sharded` intent (§8) as single-writer singletons mirrored to `rasn.state`; running >1 active writer per shard is split-brain, not HA. | DOCUMENTED → §13.5 (`replicated_service_app_type_1`) |
+| 1.2 | P0 | **Core services had no RPC resilience.** `rasn.state` / `rasn.workflow` / `rasn.observability` clients made one-shot RPCs — no breaker, no retry — while the module path was fully hardened. A single transient blip failed the call. | **RESOLVED (code)** — §7.1, `rpc_resilience.h`, wrapped in `agent_services.cpp` |
+| 1.3 | P0 | **Registry discovery is an in-memory SPOF on the request path.** Routing resolves live endpoints through a single `rasn.registry`; if that lookup blips the request fails, and the registry itself is not replicated. | **MITIGATED (code)** — the routing-critical discovery query in `coordinator_service.cpp` now goes through `resilient_rpc_call` (breaker + idempotent retry). Registry **HA** still DOCUMENTED → §13.5 (meta-server / ZooKeeper) |
+| 1.4 | P1 | **RPC envelopes carry no end-to-end trace id.** `agent_request`/`response` carry `trace_id`, but the runtime-module envelope (`make_module_request`) didn't propagate it, so a call couldn't be followed across nodes in logs. | **RESOLVED (code)** — §13.4; `trace_id` added to the runtime-module envelope (EOF-safe), stamped from an ambient scope on egress, restored/echoed on ingress |
+| 1.5 | P1 | **Resilience/quota/dedup state is per serving process.** Breaker, dedup, admission, and rate state live on whichever node serves the RPC; there is no shared view, so protection is per-replica, not cluster-global. | DOCUMENTED → §13.5 (shared store / coordinator chokepoint) |
+| 1.6 | P2 | **Core service endpoints are bound at construction.** Some core clients resolve their peer once; combined with 1.3 this limits failover for non-discovery paths. | MITIGATED by 1.2/1.3 breaker keying; full dynamic rebind DOCUMENTED |
+
+### 13.2 Lens 2 — Reinvention vs. reuse of rDSN
+
+rASN correctly reuses `serverlet`/`clientlet` RPC, `perf_counter` metrics,
+`command_manager`, `zlock`, `exp_delay` backpressure, and NFS
+(`dsn::file::copy_remote_files`) in the state service. The audit found four places
+where rASN grew a parallel mechanism that an existing rDSN facility should own:
+
+| Concern | rASN today | rDSN facility to reuse | Status |
+| --- | --- | --- | --- |
+| State replication / HA | in-memory map + file checkpoint/journal + optional local replica copy | `replicated_service_app_type_1` (layer-2 replication SM: `checkpoint`/`learn`/`apply`) | DOCUMENTED |
+| Partition routing | hand-rolled `fnv1a64(key) % shard_count` in the module bus/budget/blackboard | `dist::partition_resolver` (partition→endpoint resolution with config/meta integration) | DOCUMENTED |
+| Discovery + failure detection | `rasn.registry` heartbeat/lease table (single instance) | meta-server + `failure_detector` + `ext/zookeeper` for HA membership | DOCUMENTED |
+| Wire schema / IDL | generic envelope with a field-map payload + `schema_manifest` codegen | Thrift IDL + `dsn.tools` codegen (typed, versioned RPC structs) | DOCUMENTED |
+
+None of these can be landed as a rASN-only change and honestly verified in this
+worktree: the rDSN framework's Thrift/boost/ZooKeeper dependencies are CMake
+`ExternalProject`s that are only fetched during a full framework bootstrap, and no
+`DSN_ROOT` build is provisioned here. Shipping half of a replication or IDL
+migration without the ability to build it would be worse than a precise roadmap, so
+these are documented with their exact target facility rather than stubbed.
+
+### 13.3 Lens 3 — Missing critical modules
+
+Toward a production agent nucleus, the audit flags these gaps (all DOCUMENTED
+roadmap items, ordered by importance):
+
+- **P0 durable/vector agent memory** — a first-class long-term memory module
+  (semantic + episodic) with a durable, queryable backend, distinct from the
+  short-lived blackboard/session stores.
+- **P0 distributed coordination** — leader election, distributed locks, and a
+  **global** quota/rate authority, so single-writer modules (§8) can elect one
+  owner and quotas hold cluster-wide. Target: meta-server/ZooKeeper primitives,
+  not a rASN-local lock.
+- **P0 secrets vault** — a real secret provider behind the existing `env:`/`file:`/
+  `cmd:` credential handles (see DESIGN "Credential storage").
+- **P0 multi-tenancy / isolation** — per-tenant identity, quota, and data
+  isolation across all modules.
+- **P0 distributed scheduler / placement** — placement of module shards and agent
+  work across nodes (today placement is static config + deterministic hashing).
+- **P1** — centralized durable **audit log**, automatic cross-node **recovery**
+  (supervisor promotes a new owner on node loss), cross-node **exactly-once/saga**
+  (current dedup is per-process), and cross-node **backpressure / distributed
+  cache**.
+
+### 13.4 Trace propagation (finding 1.4) — RESOLVED
+
+One trace id now threads through every runtime-module hop so a request can be
+followed across nodes. As built:
+
+1. **Ambient context.** `runtime_provider.cpp` holds a `thread_local` ambient
+   trace id exposed via `current_rasn_runtime_trace_id()` and the RAII
+   `rasn_runtime_trace_scope` (declared in `runtime_provider.h`). An operation
+   origin installs a scope for the duration of the call; nested module requests
+   inherit it. An empty id is a no-op, so callers install unconditionally.
+2. **Stamp on egress.** `make_module_request(...)` reads the ambient trace id and
+   stamps it onto the envelope. A `trace_id` field was appended to both
+   `rasn_runtime_request` and `rasn_runtime_response`, unmarshalled EOF-safe
+   exactly like `route_partition`/`auth_token`, so old and new peers interoperate.
+3. **Restore + echo on ingress.** `rasn_runtime_rpc_service::reply_module_request`
+   installs a `rasn_runtime_trace_scope` from the incoming envelope before
+   dispatch, so server-side logs and any nested module calls share the id. The
+   central response builder `make_rasn_runtime_response` echoes `request.trace_id`
+   onto every response (success and error), so a caller can correlate the reply.
+4. **Origins.** `rasn_coordinator_service::invoke` and `rasn_service_graph::invoke`
+   seed the scope from the operation's `agent_request.trace_id`, falling back to
+   `nucleus_runtime::trace_id()`, so module RPCs issued while coordinating share
+   one end-to-end trace.
+
+Coverage: `request_marshalling_round_trips_request_metadata` (extended),
+`response_marshalling_round_trips_trace_id`,
+`trace_scope_sets_and_restores_ambient_trace_id`, and
+`dispatch_echoes_request_trace_id_onto_response` in `tests/rasn_unit_tests.cpp`
+assert wire round-trip, legacy back-compat (empty on decode), scope
+nesting/restore, and end-to-end echo. The change is purely additive to the wire
+and logs — no behavior change.
+
+The id now flows and is echoed end-to-end; surfacing it as an explicit label on
+individual resilience/dedup/auth metrics and log lines is a small additive
+follow-up (the ambient id is already readable via `current_rasn_runtime_trace_id()`
+inside the server dispatch scope) and does not change the propagation contract.
+
+### 13.5 rDSN-native target architecture (findings 1.1, 1.3, 1.5)
+
+The end state keeps the app-facing `rasn_runtime` facade and the module API
+contract (§4) exactly as they are, and swaps the *backing* of stateful modules:
+
+- Back each `replicated` module and the state service with
+  `replicated_service_app_type_1`, so `checkpoint`/`learn`/`apply` provide quorum
+  durability and automatic learning of a new replica — replacing the single-writer
+  mirror. `describe_topology()` would then report `actual=replicated` instead of
+  `single_writer_in_memory`.
+- Resolve `sharded` modules through `dist::partition_resolver` instead of
+  `fnv1a64 % count`, so partitions map to replica groups managed by the meta-server.
+- Make membership/discovery HA via the meta-server + `failure_detector` +
+  `ext/zookeeper`, removing the single-registry SPOF (1.3) and giving 1.5 a shared,
+  authoritative view for cluster-global quotas and coordination.
+
+Until those land, the operational contract in §8 stands: **exactly one active
+writer per shard**, with the client-side resilience from §7/§7.1 masking transient
+failures but not providing replication.
+
+### 13.6 What changed in this refinement round
+
+Resolved/mitigated **in code and validated**:
+
+- Core-service client RPC resilience (§7.1) — new `rpc_resilience.{h,cpp}` reusing
+  the `circuit_breaker` engine; all `rasn_service_graph` state/workflow/
+  observability call sites in `agent_services.cpp` and the routing-critical
+  registry discovery query in `coordinator_service.cpp` now fail fast on unhealthy
+  endpoints and retry transient transport errors with idempotency-aware policy
+  (findings 1.2 fully, 1.3/1.6 client-side).
+- Config knobs `rasn_core_rpc_*` in `config.ini` and `apps/srepilot/config.ini`.
+- Focused unit coverage: `rasn_rpc_resilience` in `tests/rasn_unit_tests.cpp`
+  (pre-apply retry, idempotency-aware timeout policy, breaker short-circuit).
+- End-to-end trace propagation across the runtime-module envelope (§13.4, finding
+  1.4) — `trace_id` added to the request/response envelope (EOF-safe), an ambient
+  `rasn_runtime_trace_scope` stamped on egress and restored/echoed on ingress, with
+  four focused tests for wire round-trip, legacy back-compat, scope nesting, and
+  dispatch echo.
+
+Everything else above is DOCUMENTED with its rDSN-native target because it depends
+on framework subsystems not buildable in isolation here. This section is the source
+of truth for the roadmap in §11.

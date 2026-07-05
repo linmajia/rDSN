@@ -26,6 +26,7 @@
 #include <rasn/recovery_supervisor.h>
 #include <rasn/redaction.h>
 #include <rasn/resource_budget.h>
+#include <rasn/rpc_resilience.h>
 #include <rasn/sandbox_runtime.h>
 #include <rasn/state_service.h>
 #include <rasn/schema_manifest.h>
@@ -3228,6 +3229,110 @@ TEST(rasn_circuit_breaker, opens_after_consecutive_failures_and_short_circuits)
     EXPECT_EQ(breaker_state::open, blocked.state);
 }
 
+TEST(rasn_rpc_resilience, retries_are_idempotency_aware_and_breaker_short_circuits)
+{
+    // Fake typed response so the test exercises resilient_rpc_call end to end
+    // without any rDSN transport, mirroring the core-service call sites in
+    // agent_services.cpp / coordinator_service.cpp.
+    struct fake_response
+    {
+        std::string value;
+        bool ok = false;
+    };
+
+    breaker_config cfg;
+    cfg.enabled = true;
+    cfg.failure_threshold = 2;
+    cfg.open_ms = 600000; // long cooldown so the breaker stays open for the test
+    circuit_breaker_registry breakers(cfg);
+
+    rpc_resilience_options options;
+    options.breaker_enabled = true;
+    options.max_attempts = 3;
+    options.backoff_ms = 0; // keep the unit test instantaneous
+
+    // 1. A pre-apply transport error is retried until the endpoint recovers, even
+    //    for a non-idempotent operation (the request provably never applied).
+    {
+        int attempts = 0;
+        const std::pair<::dsn::error_code, fake_response> result =
+            resilient_rpc_call<fake_response>(
+                breakers, "case.pre_apply", options, /*idempotent=*/false,
+                std::chrono::milliseconds(10),
+                [&](std::chrono::milliseconds) {
+                    ++attempts;
+                    if (attempts < 2)
+                    {
+                        return std::make_pair(::dsn::ERR_NETWORK_FAILURE, fake_response());
+                    }
+                    fake_response ok;
+                    ok.value = "ok";
+                    ok.ok = true;
+                    return std::make_pair(::dsn::ERR_OK, ok);
+                });
+        EXPECT_EQ(::dsn::ERR_OK, result.first);
+        EXPECT_EQ(2, attempts);
+        EXPECT_TRUE(result.second.ok);
+    }
+
+    // 2. An ambiguous ERR_TIMEOUT is NOT retried for a non-idempotent operation:
+    //    exactly one attempt, and the timeout is surfaced to the caller.
+    {
+        int attempts = 0;
+        const std::pair<::dsn::error_code, fake_response> result =
+            resilient_rpc_call<fake_response>(
+                breakers, "case.timeout_non_idempotent", options, /*idempotent=*/false,
+                std::chrono::milliseconds(10),
+                [&](std::chrono::milliseconds) {
+                    ++attempts;
+                    return std::make_pair(::dsn::ERR_TIMEOUT, fake_response());
+                });
+        EXPECT_EQ(::dsn::ERR_TIMEOUT, result.first);
+        EXPECT_EQ(1, attempts);
+    }
+
+    // 3. The same ERR_TIMEOUT IS retried up to max_attempts for an idempotent op.
+    {
+        int attempts = 0;
+        const std::pair<::dsn::error_code, fake_response> result =
+            resilient_rpc_call<fake_response>(
+                breakers, "case.timeout_idempotent", options, /*idempotent=*/true,
+                std::chrono::milliseconds(10),
+                [&](std::chrono::milliseconds) {
+                    ++attempts;
+                    return std::make_pair(::dsn::ERR_TIMEOUT, fake_response());
+                });
+        EXPECT_EQ(::dsn::ERR_TIMEOUT, result.first);
+        EXPECT_EQ(3, attempts);
+    }
+
+    // 4. After enough hard failures the per-endpoint breaker opens and the next
+    //    call short-circuits with ERR_BUSY WITHOUT invoking the dependency.
+    {
+        const auto always_fail = [](std::chrono::milliseconds) {
+            return std::make_pair(::dsn::ERR_NETWORK_FAILURE, fake_response());
+        };
+        // Two calls -> two reported failures -> breaker trips (threshold == 2).
+        resilient_rpc_call<fake_response>(breakers, "case.breaker", options, false,
+                                          std::chrono::milliseconds(10), always_fail);
+        resilient_rpc_call<fake_response>(breakers, "case.breaker", options, false,
+                                          std::chrono::milliseconds(10), always_fail);
+
+        bool invoked = false;
+        const std::pair<::dsn::error_code, fake_response> result =
+            resilient_rpc_call<fake_response>(
+                breakers, "case.breaker", options, false, std::chrono::milliseconds(10),
+                [&](std::chrono::milliseconds) {
+                    invoked = true;
+                    fake_response unreached;
+                    unreached.ok = true;
+                    return std::make_pair(::dsn::ERR_OK, unreached);
+                });
+        EXPECT_EQ(::dsn::ERR_BUSY, result.first);
+        EXPECT_FALSE(invoked);
+    }
+}
+
 TEST(rasn_circuit_breaker, half_open_admits_single_probe_then_recovers)
 {
     breaker_config cfg;
@@ -4131,6 +4236,7 @@ TEST(rasn_runtime, request_marshalling_round_trips_request_metadata)
     request.request_id = "idem-1234";
     request.route_partition = 7;
     request.auth_token = "shared-runtime-token";
+    request.trace_id = "trace-abc-9f2";
 
     ::dsn::binary_writer writer;
     marshall(writer, request, DSF_THRIFT_BINARY);
@@ -4148,6 +4254,8 @@ TEST(rasn_runtime, request_marshalling_round_trips_request_metadata)
     EXPECT_EQ(request.request_id, decoded.request_id);
     EXPECT_EQ(request.route_partition, decoded.route_partition);
     EXPECT_EQ(request.auth_token, decoded.auth_token);
+    // The end-to-end trace id survives so a module request stays correlated.
+    EXPECT_EQ(request.trace_id, decoded.trace_id);
 
     ::dsn::binary_writer legacy_writer;
     legacy_writer.write(request.schema_version);
@@ -4163,6 +4271,75 @@ TEST(rasn_runtime, request_marshalling_round_trips_request_metadata)
     EXPECT_TRUE(legacy_decoded.request_id.empty());
     EXPECT_EQ((std::numeric_limits<uint32_t>::max)(), legacy_decoded.route_partition);
     EXPECT_TRUE(legacy_decoded.auth_token.empty());
+    EXPECT_TRUE(legacy_decoded.trace_id.empty());
+}
+
+TEST(rasn_runtime, response_marshalling_round_trips_trace_id)
+{
+    rasn_runtime_response response;
+    response.module = "blackboard";
+    response.operation = "get";
+    response.ok = true;
+    response.route_partition = 3;
+    response.trace_id = "trace-resp-77";
+
+    ::dsn::binary_writer writer;
+    marshall(writer, response, DSF_THRIFT_BINARY);
+    ::dsn::binary_reader reader(writer.get_buffer());
+    rasn_runtime_response decoded;
+    unmarshall(reader, decoded, DSF_THRIFT_BINARY);
+    EXPECT_EQ(response.route_partition, decoded.route_partition);
+    EXPECT_EQ(response.trace_id, decoded.trace_id);
+
+    // A legacy peer that predates trace_id (encodes only through route_partition)
+    // still decodes cleanly, leaving the trace id empty.
+    ::dsn::binary_writer legacy_writer;
+    legacy_writer.write(response.schema_version);
+    legacy_writer.write(response.ok);
+    legacy_writer.write(response.error);
+    legacy_writer.write(response.module);
+    legacy_writer.write(response.operation);
+    legacy_writer.write(response.key);
+    legacy_writer.write(response.payload);
+    legacy_writer.write(response.route_partition);
+    ::dsn::binary_reader legacy_reader(legacy_writer.get_buffer());
+    rasn_runtime_response legacy_decoded;
+    unmarshall(legacy_reader, legacy_decoded, DSF_THRIFT_BINARY);
+    EXPECT_EQ(response.route_partition, legacy_decoded.route_partition);
+    EXPECT_TRUE(legacy_decoded.trace_id.empty());
+}
+
+TEST(rasn_runtime, trace_scope_sets_and_restores_ambient_trace_id)
+{
+    EXPECT_TRUE(current_rasn_runtime_trace_id().empty());
+    {
+        rasn_runtime_trace_scope outer("trace-outer");
+        EXPECT_EQ("trace-outer", current_rasn_runtime_trace_id());
+        {
+            rasn_runtime_trace_scope inner("trace-inner");
+            EXPECT_EQ("trace-inner", current_rasn_runtime_trace_id());
+            {
+                // An empty id is a no-op so callers can install unconditionally.
+                rasn_runtime_trace_scope noop("");
+                EXPECT_EQ("trace-inner", current_rasn_runtime_trace_id());
+            }
+            EXPECT_EQ("trace-inner", current_rasn_runtime_trace_id());
+        }
+        EXPECT_EQ("trace-outer", current_rasn_runtime_trace_id());
+    }
+    EXPECT_TRUE(current_rasn_runtime_trace_id().empty());
+}
+
+TEST(rasn_runtime, dispatch_echoes_request_trace_id_onto_response)
+{
+    // dispatch runs the central response builder for both success and error paths,
+    // so the caller's trace id is echoed regardless of the module's verdict.
+    rasn_runtime_request request;
+    request.module = "determinism_ledger";
+    request.operation = "ping";
+    request.trace_id = "trace-dispatch-echo";
+    const rasn_runtime_response response = dispatch_rasn_runtime_request(request);
+    EXPECT_EQ(request.trace_id, response.trace_id);
 }
 
 TEST(rasn_runtime, dispatch_dedups_repeated_request_signatures)

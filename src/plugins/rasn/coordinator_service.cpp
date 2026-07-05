@@ -1,6 +1,7 @@
 #include <rasn/coordinator_service.h>
 
 #include <rasn/agent_clients.h>
+#include <rasn/rpc_resilience.h>
 
 #include <algorithm>
 #include <limits>
@@ -73,7 +74,20 @@ coordinator_route coordinator_router::resolve(const agent_request &request,
         query.healthy_only = true;
         ::dsn::error_code err;
         registry_query_response response;
-        std::tie(err, response) = registry.query_sync(query, request_rpc_timeout(request));
+        // The registry lookup gates every routed request, so a transient blip on
+        // the (single-instance) registry would otherwise fail the request outright.
+        // Reuse the shared core-service resilience policy: a per-endpoint circuit
+        // breaker plus bounded retries for this idempotent read. Static/in-process
+        // discovery (the else branch) needs no RPC hardening.
+        ensure_rasn_core_breaker_config();
+        const std::string breaker_key = std::string("registry.query@") + registry_address.to_string();
+        std::tie(err, response) = resilient_rpc_call<registry_query_response>(
+            global_rasn_core_breakers(),
+            breaker_key,
+            read_rasn_core_resilience_options(),
+            /*idempotent=*/true,
+            request_rpc_timeout(request),
+            [&](std::chrono::milliseconds timeout) { return registry.query_sync(query, timeout); });
         if (err != ::dsn::ERR_OK)
         {
             return route_error(request,

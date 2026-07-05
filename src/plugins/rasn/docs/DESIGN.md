@@ -1379,3 +1379,28 @@ remaining limitations are:
   passthrough by default). Remaining gap: in RPC-client mode model/tool resilience
   state lives on the serving node while remote-agent and process-wide overload state
   live on the coordinator.
+- **Core-service RPC resilience:** the distributed runtime-module path and, as of
+  the latest refinement, the always-on core services reached over rDSN RPC
+  (`rasn.state`, `rasn.workflow`, `rasn.observability`, and the routing-critical
+  `rasn.registry` discovery lookup) all fail fast on an unhealthy endpoint via a
+  shared per-endpoint circuit breaker and retry transient transport errors with an
+  idempotency-aware policy (see `rpc_resilience.h` and DISTRIBUTED_RUNTIME.md §7.1).
+  This is per-service-process protection; it is not cross-process exactly-once and
+  does not add replication.
+- **End-to-end trace propagation:** the runtime-module RPC envelope now carries a
+  `trace_id` (EOF-safe on the wire) that is stamped from an ambient
+  `rasn_runtime_trace_scope` on egress and restored/echoed on ingress, so a single
+  operation can be followed across nodes in logs (DISTRIBUTED_RUNTIME.md §13.4,
+  audit finding 1.4 — RESOLVED).
+- **Full-distribution audit:** a severity-ranked production-readiness audit across
+  three lenses — is rASN fully distributed, does it reuse rDSN instead of
+  reinventing, and are critical modules missing — is recorded in
+  DISTRIBUTED_RUNTIME.md §13. It marks each finding RESOLVED (core-service and
+  registry-discovery resilience, this round), MITIGATED, or DOCUMENTED, and maps the
+  documented gaps to the exact rDSN facility that should back them:
+  `replicated_service_app_type_1` for quorum-replicated module/state storage,
+  `dist::partition_resolver` for shard routing, meta-server / `failure_detector` /
+  `ext/zookeeper` for HA discovery and coordination, and Thrift IDL for typed RPC
+  schemas. Missing-module gaps (durable/vector agent memory, distributed
+  coordination and global quota, secrets vault, multi-tenancy, distributed
+  scheduler/placement) are tracked there as roadmap items.

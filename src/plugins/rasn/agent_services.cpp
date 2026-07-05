@@ -6,6 +6,8 @@
 #include <rasn/metrics.h>
 #include <rasn/policy_manager.h>
 #include <rasn/redaction.h>
+#include <rasn/rpc_resilience.h>
+#include <rasn/runtime_provider.h>
 #include <rasn/state_service.h>
 #include <rasn/workflow_service.h>
 
@@ -40,6 +42,26 @@ struct service_endpoint_config
 void set_rdsn_rpc_enabled(bool enabled)
 {
     g_rdsn_rpc_enabled = enabled;
+}
+
+// Wrap a core-service client RPC (state / workflow / observability / registry)
+// with the shared rASN client resilience policy: a per-endpoint circuit breaker
+// and idempotency-aware retries with linear backoff. `call` performs the actual
+// one-shot `*_sync` RPC and returns {error_code, response}. `idempotent` must be
+// false for operations that must not be re-applied on an ambiguous timeout (e.g.
+// starting a workflow run or a compare-and-swap); those are only retried on
+// transport errors that prove the request never reached the server.
+template <typename TResponse, typename FCall>
+std::pair<::dsn::error_code, TResponse>
+core_rpc_with_resilience(const char *op, const ::dsn::rpc_address &address, bool idempotent, FCall &&call)
+{
+    ensure_rasn_core_breaker_config();
+    const rpc_resilience_options options = read_rasn_core_resilience_options();
+    std::string key(op);
+    key += "@";
+    key += address.to_string();
+    return resilient_rpc_call<TResponse>(
+        global_rasn_core_breakers(), key, options, idempotent, default_rpc_timeout(), std::forward<FCall>(call));
 }
 
 ::dsn::rpc_address make_ipv4_address(const std::string &host, uint16_t port)
@@ -2139,6 +2161,12 @@ agent_response rasn_coordinator_service::invoke(const agent_request &request, nu
     }
     scoped_agent_request request_scope(*this, request);
 
+    // Seed the runtime-module trace scope from this operation's trace id so every
+    // module RPC issued while coordinating shares one end-to-end trace (finding 1.4).
+    // Falls back to the runtime's own trace id when the request carries none.
+    rasn_runtime_trace_scope runtime_trace(request.trace_id.empty() ? runtime.trace_id()
+                                                                     : request.trace_id);
+
     // Process-wide overload budget (Round 11): a single global concurrency
     // bulkhead + request-rate ceiling bounding total in-flight work across every
     // dependency (model, tool, remote-agent) in both inline and RPC modes.
@@ -3014,6 +3042,10 @@ tool_result rasn_service_graph::run_tool(const std::string &name,
 agent_response rasn_service_graph::invoke(const agent_request &request)
 {
     start();
+    // Client-origin trace scope so inline coordination and any direct module RPC
+    // issued from this operation carry one end-to-end trace id (finding 1.4).
+    rasn_runtime_trace_scope runtime_trace(request.trace_id.empty() ? _runtime.trace_id()
+                                                                     : request.trace_id);
     if (_rpc_clients_enabled)
     {
         rasn_agent_client client(_coordinator_address);
@@ -3042,7 +3074,10 @@ state_response rasn_service_graph::put_state(const state_record &record)
         rasn_state_client client(_state_address);
         ::dsn::error_code err;
         state_response response;
-        std::tie(err, response) = client.put_sync(record, default_rpc_timeout());
+        std::tie(err, response) = core_rpc_with_resilience<state_response>(
+            "state.put", _state_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
+                return client.put_sync(record, timeout);
+            });
         if (err == ::dsn::ERR_OK)
         {
             return response;
@@ -3063,7 +3098,10 @@ state_response rasn_service_graph::put_state(const state_put_request &request)
         rasn_state_client client(_state_address);
         ::dsn::error_code err;
         state_response response;
-        std::tie(err, response) = client.put_conditional_sync(request, default_rpc_timeout());
+        std::tie(err, response) = core_rpc_with_resilience<state_response>(
+            "state.put_conditional", _state_address, /*idempotent=*/false, [&](std::chrono::milliseconds timeout) {
+                return client.put_conditional_sync(request, timeout);
+            });
         if (err == ::dsn::ERR_OK)
         {
             return response;
@@ -3084,7 +3122,10 @@ state_response rasn_service_graph::get_state(const state_key_request &request)
         rasn_state_client client(_state_address);
         ::dsn::error_code err;
         state_response response;
-        std::tie(err, response) = client.get_sync(request, default_rpc_timeout());
+        std::tie(err, response) = core_rpc_with_resilience<state_response>(
+            "state.get", _state_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
+                return client.get_sync(request, timeout);
+            });
         if (err == ::dsn::ERR_OK)
         {
             return response;
@@ -3105,7 +3146,10 @@ state_response rasn_service_graph::query_state(const state_query_request &reques
         rasn_state_client client(_state_address);
         ::dsn::error_code err;
         state_response response;
-        std::tie(err, response) = client.query_sync(request, default_rpc_timeout());
+        std::tie(err, response) = core_rpc_with_resilience<state_response>(
+            "state.query", _state_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
+                return client.query_sync(request, timeout);
+            });
         if (err == ::dsn::ERR_OK)
         {
             return response;
@@ -3126,7 +3170,10 @@ state_response rasn_service_graph::checkpoint_state(const state_checkpoint_reque
         rasn_state_client client(_state_address);
         ::dsn::error_code err;
         state_response response;
-        std::tie(err, response) = client.checkpoint_sync(request, default_rpc_timeout());
+        std::tie(err, response) = core_rpc_with_resilience<state_response>(
+            "state.checkpoint", _state_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
+                return client.checkpoint_sync(request, timeout);
+            });
         if (err == ::dsn::ERR_OK)
         {
             return response;
@@ -3147,7 +3194,10 @@ state_response rasn_service_graph::recover_state(const state_checkpoint_request 
         rasn_state_client client(_state_address);
         ::dsn::error_code err;
         state_response response;
-        std::tie(err, response) = client.recover_sync(request, default_rpc_timeout());
+        std::tie(err, response) = core_rpc_with_resilience<state_response>(
+            "state.recover", _state_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
+                return client.recover_sync(request, timeout);
+            });
         if (err == ::dsn::ERR_OK)
         {
             return response;
@@ -3168,7 +3218,10 @@ workflow_response rasn_service_graph::validate_workflow(const workflow_source &s
         rasn_workflow_client client(_workflow_address);
         ::dsn::error_code err;
         workflow_response response;
-        std::tie(err, response) = client.validate_sync(source, default_rpc_timeout());
+        std::tie(err, response) = core_rpc_with_resilience<workflow_response>(
+            "workflow.validate", _workflow_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
+                return client.validate_sync(source, timeout);
+            });
         if (err == ::dsn::ERR_OK)
         {
             return response;
@@ -3189,7 +3242,10 @@ workflow_response rasn_service_graph::compile_workflow(const workflow_source &so
         rasn_workflow_client client(_workflow_address);
         ::dsn::error_code err;
         workflow_response response;
-        std::tie(err, response) = client.compile_sync(source, default_rpc_timeout());
+        std::tie(err, response) = core_rpc_with_resilience<workflow_response>(
+            "workflow.compile", _workflow_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
+                return client.compile_sync(source, timeout);
+            });
         if (err == ::dsn::ERR_OK)
         {
             return response;
@@ -3210,7 +3266,10 @@ workflow_response rasn_service_graph::start_workflow(const workflow_start_reques
         rasn_workflow_client client(_workflow_address);
         ::dsn::error_code err;
         workflow_response response;
-        std::tie(err, response) = client.start_sync(request, default_rpc_timeout());
+        std::tie(err, response) = core_rpc_with_resilience<workflow_response>(
+            "workflow.start", _workflow_address, /*idempotent=*/false, [&](std::chrono::milliseconds timeout) {
+                return client.start_sync(request, timeout);
+            });
         if (err == ::dsn::ERR_OK)
         {
             return response;
@@ -3231,7 +3290,10 @@ workflow_response rasn_service_graph::query_workflow(const workflow_run_query &r
         rasn_workflow_client client(_workflow_address);
         ::dsn::error_code err;
         workflow_response response;
-        std::tie(err, response) = client.query_sync(request, default_rpc_timeout());
+        std::tie(err, response) = core_rpc_with_resilience<workflow_response>(
+            "workflow.query", _workflow_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
+                return client.query_sync(request, timeout);
+            });
         if (err == ::dsn::ERR_OK)
         {
             return response;
@@ -3252,7 +3314,10 @@ workflow_response rasn_service_graph::cancel_workflow(const workflow_run_query &
         rasn_workflow_client client(_workflow_address);
         ::dsn::error_code err;
         workflow_response response;
-        std::tie(err, response) = client.cancel_sync(request, default_rpc_timeout());
+        std::tie(err, response) = core_rpc_with_resilience<workflow_response>(
+            "workflow.cancel", _workflow_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
+                return client.cancel_sync(request, timeout);
+            });
         if (err == ::dsn::ERR_OK)
         {
             return response;
@@ -3272,7 +3337,10 @@ observability_response rasn_service_graph::query_events(const observability_quer
         rasn_observability_client client(_observability_address);
         ::dsn::error_code err;
         observability_response response;
-        std::tie(err, response) = client.query_sync(request, default_rpc_timeout());
+        std::tie(err, response) = core_rpc_with_resilience<observability_response>(
+            "observability.query", _observability_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
+                return client.query_sync(request, timeout);
+            });
         if (err == ::dsn::ERR_OK)
         {
             return response;
@@ -3292,7 +3360,10 @@ observability_response rasn_service_graph::query_failures(const observability_qu
         rasn_observability_client client(_observability_address);
         ::dsn::error_code err;
         observability_response response;
-        std::tie(err, response) = client.failures_sync(request, default_rpc_timeout());
+        std::tie(err, response) = core_rpc_with_resilience<observability_response>(
+            "observability.failures", _observability_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
+                return client.failures_sync(request, timeout);
+            });
         if (err == ::dsn::ERR_OK)
         {
             return response;
@@ -3312,7 +3383,10 @@ observability_response rasn_service_graph::load_replay(const replay_load_request
         rasn_observability_client client(_observability_address);
         ::dsn::error_code err;
         observability_response response;
-        std::tie(err, response) = client.load_replay_sync(request, default_rpc_timeout());
+        std::tie(err, response) = core_rpc_with_resilience<observability_response>(
+            "observability.load_replay", _observability_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
+                return client.load_replay_sync(request, timeout);
+            });
         if (err == ::dsn::ERR_OK)
         {
             return response;
@@ -3343,7 +3417,10 @@ observability_response rasn_service_graph::observability_snapshot() const
         rasn_observability_client client(_observability_address);
         ::dsn::error_code err;
         observability_response response;
-        std::tie(err, response) = client.snapshot_sync("", default_rpc_timeout());
+        std::tie(err, response) = core_rpc_with_resilience<observability_response>(
+            "observability.snapshot", _observability_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
+                return client.snapshot_sync("", timeout);
+            });
         if (err == ::dsn::ERR_OK)
         {
             return response;

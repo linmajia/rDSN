@@ -28,6 +28,34 @@
 namespace dsn {
 namespace rasn {
 
+// Thread-local ambient trace id backing rasn_runtime_trace_scope (declared in the
+// header). Internal linkage but visible throughout this translation unit, so the
+// file-local make_module_request below can stamp it onto each envelope.
+static std::string &rasn_runtime_ambient_trace_id()
+{
+    static thread_local std::string ambient;
+    return ambient;
+}
+
+std::string current_rasn_runtime_trace_id() { return rasn_runtime_ambient_trace_id(); }
+
+rasn_runtime_trace_scope::rasn_runtime_trace_scope(const std::string &trace_id)
+    : _previous(rasn_runtime_ambient_trace_id()), _changed(!trace_id.empty())
+{
+    if (_changed)
+    {
+        rasn_runtime_ambient_trace_id() = trace_id;
+    }
+}
+
+rasn_runtime_trace_scope::~rasn_runtime_trace_scope()
+{
+    if (_changed)
+    {
+        rasn_runtime_ambient_trace_id() = _previous;
+    }
+}
+
 namespace {
 
 std::string config_string(const char *key, const char *fallback, const char *description)
@@ -846,6 +874,7 @@ rasn_runtime_response make_rasn_runtime_response(const rasn_runtime_request &req
     response.key = request.key;
     response.payload = request.payload;
     response.route_partition = request.route_partition;
+    response.trace_id = request.trace_id;
     return response;
 }
 
@@ -2861,6 +2890,9 @@ rasn_runtime_request make_module_request(const std::string &module,
     request.operation = operation;
     request.key = key;
     request.payload = payload;
+    // Propagate the ambient trace id (installed by the operation origin or the
+    // server RPC ingress) so this module request is correlated with its cause.
+    request.trace_id = current_rasn_runtime_trace_id();
     return request;
 }
 
@@ -4979,6 +5011,9 @@ void rasn_runtime_rpc_service::reply_module_request(const std::string &module,
         return;
     }
     copy.auth_token.clear();
+    // Adopt the incoming trace id for the duration of dispatch so server-side
+    // logs and any nested module requests share the originating operation's trace.
+    rasn_runtime_trace_scope trace(copy.trace_id);
     reply(dispatch_rasn_runtime_request(copy));
 }
 
