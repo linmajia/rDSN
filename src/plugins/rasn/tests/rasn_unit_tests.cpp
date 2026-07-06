@@ -18,6 +18,7 @@
 #include <rasn/apps/codepilot/local_tools.h>
 #include <rasn/determinism_ledger.h>
 #include <rasn/human_interaction.h>
+#include <rasn/llm_provider.h>
 #include <rasn/metrics.h>
 #include <rasn/model_cost.h>
 #include <rasn/policy_manager.h>
@@ -4565,6 +4566,79 @@ TEST(rasn_runtime, ownership_resources_expand_modules_and_shards)
 
     // No modules means nothing to own (the gate opens handlers immediately).
     EXPECT_TRUE(rasn_runtime_module_ownership_resources({}).empty());
+}
+
+// --- parse_chat_completion: provider response interpretation -----------------
+// Regression coverage for the empty-"content" fallback that used to surface the
+// raw JSON body as the model's answer (llm_provider.cpp). See rASN robustness
+// testing against reasoning models (empty content) and provider error envelopes.
+
+TEST(rasn_llm_provider, chat_completion_extracts_content)
+{
+    const std::string body =
+        "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hello world\"}}]}";
+    const chat_completion_parse parsed = parse_chat_completion(body, "openai.chat");
+    EXPECT_TRUE(parsed.ok);
+    EXPECT_EQ("hello world", parsed.text);
+}
+
+TEST(rasn_llm_provider, chat_completion_reasoning_content_fallback)
+{
+    // Reasoning models (gemma, DeepSeek-R1, o1-style) can leave "content" empty
+    // and place the answer in "reasoning_content". That text must be surfaced,
+    // NOT the raw JSON envelope.
+    const std::string body =
+        "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"\","
+        "\"reasoning_content\":\"the real answer\"}}]}";
+    const chat_completion_parse parsed = parse_chat_completion(body, "openai.chat");
+    EXPECT_TRUE(parsed.ok);
+    EXPECT_EQ("the real answer", parsed.text);
+    // The raw JSON blob must never leak through as the completion.
+    EXPECT_EQ(std::string::npos, parsed.text.find("reasoning_content"));
+}
+
+TEST(rasn_llm_provider, chat_completion_error_envelope_is_failure)
+{
+    // An HTTP-200 body carrying an OpenAI-style error envelope must be reported
+    // as a failure -- not returned as a successful completion -- so provider
+    // errors are not masked or persisted downstream as real output.
+    const std::string body =
+        "{\"error\":{\"message\":\"model not found\",\"type\":\"invalid_request_error\"}}";
+    const chat_completion_parse parsed = parse_chat_completion(body, "openai.chat");
+    EXPECT_FALSE(parsed.ok);
+    EXPECT_EQ("model not found", parsed.error_detail);
+    EXPECT_TRUE(parsed.text.empty());
+}
+
+TEST(rasn_llm_provider, chat_completion_empty_message_is_failure)
+{
+    // A well-formed JSON response with a genuinely empty completion is a failure,
+    // not a success that emits the raw JSON.
+    const std::string body =
+        "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"\"}}]}";
+    const chat_completion_parse parsed = parse_chat_completion(body, "openai.chat");
+    EXPECT_FALSE(parsed.ok);
+    EXPECT_FALSE(parsed.error_detail.empty());
+    EXPECT_TRUE(parsed.text.empty());
+}
+
+TEST(rasn_llm_provider, chat_completion_non_json_passthrough)
+{
+    // Unknown/plain-text providers keep the historical best-effort passthrough.
+    const std::string body = "plain text answer";
+    const chat_completion_parse parsed = parse_chat_completion(body, "openai.chat");
+    EXPECT_TRUE(parsed.ok);
+    EXPECT_EQ("plain text answer", parsed.text);
+}
+
+TEST(rasn_llm_provider, chat_completion_ollama_generate_response_field)
+{
+    // ollama.generate responses carry the text in "response", and the
+    // reasoning_content fallback must not apply to that payload format.
+    const std::string body = "{\"response\":\"ollama answer\",\"done\":true}";
+    const chat_completion_parse parsed = parse_chat_completion(body, "ollama.generate");
+    EXPECT_TRUE(parsed.ok);
+    EXPECT_EQ("ollama answer", parsed.text);
 }
 
 } // namespace

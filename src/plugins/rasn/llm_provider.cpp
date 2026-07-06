@@ -860,15 +860,27 @@ public:
             return response;
         }
 
-        std::string text = _payload_format == "ollama.generate" ? extract_json_string_field(output, "response")
-                                                                 : extract_json_string_field(output, "content");
-        if (text.empty())
+        const chat_completion_parse parsed = parse_chat_completion(output, _payload_format);
+        if (!parsed.ok)
         {
-            text = output;
+            // The HTTP call succeeded but the body carried no usable completion:
+            // a provider error envelope (e.g. {"error":{...}}) or a well-formed
+            // but empty message. Surfacing the raw JSON as the model's answer
+            // (the previous behavior) masked provider failures and corrupted
+            // downstream state/workflow/session data, so report it as a failure.
+            response.ok = false;
+            response.error = "llm provider returned no usable content: " + parsed.error_detail;
+            runtime.record_failure(task,
+                                   "provider",
+                                   "llm_provider_empty_response",
+                                   response.error,
+                                   true,
+                                   _provider_name);
+            return response;
         }
 
         response.ok = true;
-        response.text = trim(text);
+        response.text = parsed.text;
         runtime.record_llm_response(task, _provider_name, response.text);
         timing_guard.mark_recorded();
         return response;
@@ -898,6 +910,53 @@ std::unique_ptr<llm_provider> make_profile_provider(const model_provider_profile
 }
 
 } // namespace
+
+chat_completion_parse parse_chat_completion(const std::string &output, const std::string &payload_format)
+{
+    chat_completion_parse result;
+
+    std::string text = payload_format == "ollama.generate" ? extract_json_string_field(output, "response")
+                                                            : extract_json_string_field(output, "content");
+
+    // Reasoning models (e.g. gemma, DeepSeek-R1, o1-style) can return an empty
+    // assistant "content" while placing the answer in "reasoning_content". Prefer
+    // that before concluding the response carried no usable text.
+    if (text.empty() && payload_format != "ollama.generate")
+    {
+        text = extract_json_string_field(output, "reasoning_content");
+    }
+
+    if (!text.empty())
+    {
+        result.ok = true;
+        result.text = trim(text);
+        return result;
+    }
+
+    const std::string trimmed = trim(output);
+    const bool looks_like_json = !trimmed.empty() && (trimmed.front() == '{' || trimmed.front() == '[');
+    if (looks_like_json)
+    {
+        // A JSON body with no extractable completion is either a provider error
+        // envelope ({"error":{"message":...}}) or a well-formed but empty
+        // completion. Report it as a failure and surface the provider's own error
+        // message when present rather than returning the raw JSON as an answer.
+        std::string detail = extract_json_string_field(output, "message");
+        if (detail.empty())
+        {
+            detail = "provider returned an empty completion";
+        }
+        result.ok = false;
+        result.error_detail = detail;
+        return result;
+    }
+
+    // Non-JSON body: preserve the historical best-effort passthrough so unknown
+    // or plain-text providers keep working.
+    result.ok = true;
+    result.text = trimmed;
+    return result;
+}
 
 void emit_llm_stream_chunks(const agent_task &task,
                             const std::string &provider,

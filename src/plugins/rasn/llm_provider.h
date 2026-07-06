@@ -31,6 +31,17 @@ struct llm_response
     std::string error;
 };
 
+// Outcome of interpreting a raw provider HTTP response body.
+struct chat_completion_parse
+{
+    // True when a usable completion was extracted, or a non-JSON body was passed
+    // through best-effort. False when the body carried no usable completion, e.g.
+    // a JSON error envelope or a well-formed but empty message.
+    bool ok = false;
+    std::string text;         // Completion text; valid when ok.
+    std::string error_detail; // Provider-supplied diagnostic; set when !ok.
+};
+
 typedef std::function<void(const std::string &chunk)> llm_stream_callback;
 
 class llm_provider
@@ -65,6 +76,16 @@ std::unique_ptr<llm_provider> create_provider_from_environment();
 std::unique_ptr<llm_provider> create_provider(const std::string &provider_name);
 std::unique_ptr<llm_provider> create_provider(const std::string &provider_name, const std::string &model_name);
 std::string describe_provider_environment();
+
+// Interpret a raw provider response body (OpenAI/Ollama/llama.cpp-compatible)
+// into a completion or a failure. Prefers the standard content/response field,
+// then falls back to "reasoning_content" for reasoning models that leave
+// "content" empty. A JSON body with no usable completion (an error envelope or
+// an empty message) is reported as !ok instead of being surfaced as the model's
+// answer, which would otherwise mask provider failures and corrupt downstream
+// state. Non-JSON bodies are passed through unchanged for unknown/plain-text
+// providers. Exposed for unit testing of the extraction logic.
+chat_completion_parse parse_chat_completion(const std::string &output, const std::string &payload_format);
 
 } // namespace rasn
 } // namespace dsn

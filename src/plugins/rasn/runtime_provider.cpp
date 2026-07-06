@@ -486,6 +486,29 @@ std::chrono::milliseconds rasn_runtime_state_hydration_timeout()
     return std::chrono::milliseconds(timeout_ms);
 }
 
+uint32_t rasn_runtime_state_hydration_max_attempts()
+{
+    const uint64_t attempts = config_service_uint64(
+        "rasn_runtime_state_hydration_max_attempts",
+        20,
+        "Max attempts for the rASN runtime state hydration query while the co-located state service "
+        "becomes ready at startup");
+    if (attempts == 0)
+    {
+        return 1;
+    }
+    return static_cast<uint32_t>(attempts > 1000 ? 1000 : attempts);
+}
+
+std::chrono::milliseconds rasn_runtime_state_hydration_retry_backoff()
+{
+    const uint64_t backoff_ms = config_service_uint64(
+        "rasn_runtime_state_hydration_retry_backoff_ms",
+        250,
+        "Backoff between rASN runtime state hydration retries in milliseconds");
+    return std::chrono::milliseconds(backoff_ms);
+}
+
 bool rasn_runtime_state_watermark_enabled()
 {
     return config_service_bool(
@@ -3083,7 +3106,6 @@ rasn_runtime_response invoke_remote_module(const rasn_runtime_request &request)
     const std::chrono::milliseconds timeout = rasn_runtime_rpc_timeout(module);
     const uint32_t max_attempts = rasn_runtime_rpc_max_attempts(module);
     const uint64_t backoff_ms = rasn_runtime_rpc_backoff_ms(module);
-    ::dsn::error_code last_error = ::dsn::ERR_UNKNOWN;
     for (uint32_t attempt = 1; attempt <= max_attempts; ++attempt)
     {
         rasn_runtime_client client(address);
@@ -3096,10 +3118,21 @@ rasn_runtime_response invoke_remote_module(const rasn_runtime_request &request)
             }
             return result.second;
         }
-        last_error = result.first;
         if (attempt >= max_attempts || !is_retryable_rasn_runtime_error(result.first))
         {
-            break;
+            if (breaker_enabled)
+            {
+                circuit_breaker &breaker = global_rasn_runtime_breakers().get(breaker_key);
+                if (breaker.report(false, ::dsn_now_ms()))
+                {
+                    dwarn("runtime module '%s' endpoint '%s' circuit breaker opened after %u consecutive failures",
+                          module.c_str(),
+                          endpoint.c_str(),
+                          static_cast<unsigned int>(breaker.consecutive_failures()));
+                }
+            }
+            return make_rasn_runtime_error(
+                request, std::string("runtime module RPC failed: ") + result.first.to_string());
         }
         dwarn("runtime module '%s' RPC attempt %u/%u failed (%s); retrying",
               module.c_str(),
@@ -3111,18 +3144,11 @@ rasn_runtime_response invoke_remote_module(const rasn_runtime_request &request)
             std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms * attempt));
         }
     }
-    if (breaker_enabled)
-    {
-        circuit_breaker &breaker = global_rasn_runtime_breakers().get(breaker_key);
-        if (breaker.report(false, ::dsn_now_ms()))
-        {
-            dwarn("runtime module '%s' endpoint '%s' circuit breaker opened after %u consecutive failures",
-                  module.c_str(),
-                  endpoint.c_str(),
-                  static_cast<unsigned int>(breaker.consecutive_failures()));
-        }
-    }
-    return make_rasn_runtime_error(request, std::string("runtime module RPC failed: ") + last_error.to_string());
+    // Unreachable: max_attempts >= 1 guarantees a return inside the loop. Keeping a
+    // bare fallback avoids parking an unread error_code across the hot success
+    // return, which rDSN's TRACK_ERROR_CODE would otherwise report as a dropped
+    // error on every successful module RPC.
+    return make_rasn_runtime_error(request, std::string("runtime module RPC failed"));
 }
 
 // Health ping over RPC: uses a dedicated short timeout and a single attempt, and
@@ -5202,13 +5228,36 @@ rasn_runtime_app::rasn_runtime_app(::dsn_gpid gpid, std::vector<std::string> mod
     request.key_prefix = rasn_runtime_state_prefix(config.state_prefix);
 
     rasn_state_client state(rasn_service_address("state", 27104));
-    ::dsn::error_code err;
+    const uint32_t max_attempts = rasn_runtime_state_hydration_max_attempts();
+    const std::chrono::milliseconds retry_backoff = rasn_runtime_state_hydration_retry_backoff();
+    ::dsn::error_code err = ::dsn::ERR_OK;
     state_response response;
-    std::tie(err, response) = state.query_sync(request, rasn_runtime_state_hydration_timeout());
-    if (err != ::dsn::ERR_OK)
+    for (uint32_t attempt = 1; attempt <= max_attempts; ++attempt)
     {
-        dwarn("runtime state hydration RPC query failed (%s); refusing to open module APIs", err.to_string());
-        return err;
+        std::tie(err, response) = state.query_sync(request, rasn_runtime_state_hydration_timeout());
+        if (err == ::dsn::ERR_OK)
+        {
+            break;
+        }
+        // A co-located state service may still be registering its RPC handlers
+        // when this runtime service starts, so the first hydration query can hit
+        // a transient ERR_TIMEOUT (the state node logs "unknown rpc name" and the
+        // client times out). Wait for the dependency to become ready instead of
+        // aborting on the first miss, mirroring recover_workflow_state_after_start().
+        // Fail closed only after the readiness budget is exhausted or on a
+        // non-transient error.
+        if (attempt >= max_attempts || !is_retryable_rasn_runtime_error(err))
+        {
+            dwarn("runtime state hydration RPC query failed (%s) after %u attempt(s); refusing to open module APIs",
+                  err.to_string(),
+                  static_cast<unsigned int>(attempt));
+            return err;
+        }
+        dinfo("runtime state hydration RPC not ready yet (%s); retry %u/%u",
+              err.to_string(),
+              static_cast<unsigned int>(attempt),
+              static_cast<unsigned int>(max_attempts));
+        std::this_thread::sleep_for(retry_backoff);
     }
     if (!response.ok)
     {

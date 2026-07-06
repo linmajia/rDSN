@@ -120,7 +120,6 @@ std::pair<::dsn::error_code, TResponse> resilient_rpc_call(circuit_breaker_regis
     }
 
     const uint32_t max_attempts = options.max_attempts == 0 ? 1 : options.max_attempts;
-    ::dsn::error_code last_error = ::dsn::ERR_UNKNOWN;
     for (uint32_t attempt = 1; attempt <= max_attempts; ++attempt)
     {
         std::pair<::dsn::error_code, TResponse> result = call(timeout);
@@ -132,7 +131,6 @@ std::pair<::dsn::error_code, TResponse> resilient_rpc_call(circuit_breaker_regis
             }
             return result;
         }
-        last_error = result.first;
         if (attempt >= max_attempts || !rpc_should_retry(result.first, idempotent))
         {
             if (options.breaker_enabled)
@@ -146,7 +144,11 @@ std::pair<::dsn::error_code, TResponse> resilient_rpc_call(circuit_breaker_regis
             std::this_thread::sleep_for(std::chrono::milliseconds(options.backoff_ms * attempt));
         }
     }
-    return std::make_pair(last_error, TResponse());
+    // Unreachable: max_attempts >= 1 guarantees the loop returns above. A bare
+    // fallback keeps the function well-formed without parking an unread
+    // error_code across the hot success return (which rDSN's TRACK_ERROR_CODE
+    // would otherwise flag as a dropped error on every successful call).
+    return std::make_pair(::dsn::ERR_UNKNOWN, TResponse());
 }
 
 } // namespace rasn

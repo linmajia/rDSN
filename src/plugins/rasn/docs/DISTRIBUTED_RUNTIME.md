@@ -160,9 +160,15 @@ Design notes:
   owner. A runtime module service queries `rasn_runtime_state_prefix` on startup,
   filters records by hosted module, sorts by state sequence, and replays typed
   hydration operations before opening its RPC handlers. If hydration is enabled
-  and the configured state service cannot be queried, startup fails closed instead
-  of serving empty state; set `rasn_runtime_state_hydration_enabled = false` only
-  for intentionally cold local experiments. This gives standalone module services
+  and the configured state service cannot be queried, the service retries the query
+  while a co-located state service is still registering its handlers — up to
+  `rasn_runtime_state_hydration_max_attempts` (default 20) spaced by
+  `rasn_runtime_state_hydration_retry_backoff_ms` (default 250 ms) — and fails
+  closed instead of serving empty state only after that readiness budget is
+  exhausted or on a non-transient error. This keeps a cold multi-process start,
+  where `rasn.state` may still be coming up, from aborting on the first miss while
+  still refusing to serve empty state; set `rasn_runtime_state_hydration_enabled = false`
+  only for intentionally cold local experiments. This gives standalone module services
   restart recovery from the mirror. When
   `rasn_runtime_state_watermark_enabled` is true, each mirrored mutation also
   writes a per-module `watermark` record containing the committed state-record
@@ -621,6 +627,11 @@ codepilot.exe --dsn config.rasn.ini "rasn.state;resource_budget"
 - Real replicated storage and shard durability via rDSN-native replication/partitioning.
 - Deployment examples/tests for multi-node and URI-backed module clusters.
 - End-to-end trace propagation across core/module RPC envelopes — **DONE** (§13.4).
+- **Robustness hardening — DELIVERED (§13.8):** cold multi-process start no longer
+  aborts on a state-hydration race (readiness retry), the `ERR_UNKNOWN` diagnostic-log
+  storm is cleared in both modes, and LLM chat-completion parsing handles
+  reasoning-only / error-envelope replies. Validated by unit tests, a single-box
+  multi-process `--dsn` run, and a libfiu fault-injection campaign.
 
 See §13 for the full production-readiness audit that drives this roadmap, including
 which gaps are resolved in code, mitigated client-side, or tracked as framework work.
@@ -638,7 +649,7 @@ which gaps are resolved in code, mitigated client-side, or tracked as framework 
 | Provider/endpoint/resilience config | `[rasn.runtime]` in each app's `config.ini`; `[rasn.service]`/`[rasn.rpc]` in the shared `config.rasn.ini` |
 | Coordination config | `[rasn.coordination]` in the shared `config.rasn.ini` |
 | Config file layout (thin app `config.ini`; runtime `config.rasn.ini` `@include`s it) | `config.ini` + `config.rasn.ini` (see §6.1) |
-| Tests | `tests/rasn_unit_tests.cpp`, `tests/rasn_coordination_test.cpp` |
+| Tests | `tests/rasn_unit_tests.cpp`, `tests/rasn_coordination_test.cpp`; opt-in libfiu fault-injection harness `tests/fault_injection/run_fault_injection.sh` (§13.8) |
 
 ## 13. Production-readiness audit — findings, remediation, and status
 
@@ -912,3 +923,45 @@ state store for cluster-global protection (finding 1.5 wiring). (b) Validate
 cross-process single-writer on a `simple`/`zookeeper` backend under multi-node (the
 `inproc` backend only coordinates within one process). Quorum **replication** of the
 state itself remains the §13.5 `replicated_service_app_type_1` item.
+
+### 13.8 Robustness hardening — cold-start readiness, diagnostic-leak cleanup, LLM parsing — RESOLVED (code)
+
+A robustness pass validated on real hardware (Ubuntu, `--build_plugins`: 151/151
+unit tests, a single-box multi-process `--dsn` deployment, and a libfiu
+fault-injection campaign) lands three rASN-confined fixes:
+
+- **Cold-start state-hydration readiness retry** (`runtime_provider.cpp`,
+  `hydrate_modules_from_state()`). The startup hydration query previously made a
+  single `rasn.state` attempt; on a cold multi-process start the co-located state
+  service may still be registering its RPC handlers, so that attempt could
+  `ERR_TIMEOUT`, `start()` returned the error, and rDSN escalated it to a fatal
+  `dassert(err == ERR_OK)` / "start app failed" abort. The query now retries on
+  transient errors (`is_retryable_rasn_runtime_error`) up to
+  `rasn_runtime_state_hydration_max_attempts` (default 20) with
+  `rasn_runtime_state_hydration_retry_backoff_ms` (default 250 ms) backoff, mirroring
+  the workflow app's `recover_workflow_state_after_start()`. It still fails closed
+  after the budget or on a non-transient error, so the §5 durability contract is
+  unchanged — only the cold-start race is closed. (The hard-abort-on-`start()`-error
+  policy itself lives in rDSN core, outside rASN.)
+
+- **Diagnostic error-code leak cleanup** (`rpc_resilience.h` `resilient_rpc_call`,
+  `runtime_provider.cpp` `invoke_remote_module`). Both parked an unread `ERR_UNKNOWN`
+  sentinel across their success return; in a `TRACK_ERROR_CODE` build that tripped
+  rDSN's "error code is not handled" destructor diagnostic on every successful call —
+  one line per startup and ~29 lines per distributed ask — burying real warnings. The
+  sentinels are removed (failure paths already return the true error), so success and
+  failure behaviour is otherwise identical. This is log hygiene, not a semantics
+  change, and clears the storm in both local and distributed modes.
+
+- **LLM response parsing** (`llm_provider.{h,cpp}`, `parse_chat_completion()`).
+  Chat-completion decoding is centralised so a reply whose text arrives in
+  `reasoning_content` (with empty `content`) is no longer surfaced as raw JSON, and a
+  provider error envelope is reported as an error instead of being mistaken for a
+  successful answer. Covered by six new `rasn_llm_provider` unit tests.
+
+**Fault-injection outcome.** Under injected `malloc`/`strdup`/POSIX-I/O/network
+failures (libfiu `fiu-run`, 8 targets × 8 fault profiles), the binaries either
+fail-stop cleanly (allocation faults → `std::bad_alloc` → `SIGABRT`) or propagate
+graceful non-zero-exit errors — no `SIGSEGV`/`SIGBUS`/`SIGFPE`/`SIGILL` and no
+reproducible hang. The harness is `tests/fault_injection/run_fault_injection.sh`
+(opt-in, POSIX-only, not wired into CMake/CI).
