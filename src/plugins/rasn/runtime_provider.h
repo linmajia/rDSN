@@ -18,6 +18,7 @@
 
 #include <chrono>
 #include <limits>
+#include <map>
 #include <memory>
 #include <string>
 #include <utility>
@@ -429,6 +430,13 @@ std::vector<std::string> rasn_runtime_module_names();
 // sharded. Used by the default-off single-writer ownership gate; exported so it
 // can be unit-tested independently of a live app host.
 std::vector<std::string> rasn_runtime_module_ownership_resources(const std::vector<std::string> &modules);
+// Ingress shard-ownership guard: true when a runtime service that hosts
+// `hosted_shards` of a module should serve `request`. An empty hosted set means
+// the service owns the whole module (or the module is unsharded) and serves every
+// request; otherwise the request must route to a hosted shard. Exported so the
+// guard can be unit-tested independently of a live RPC host.
+bool rasn_runtime_service_hosts_request(const rasn_runtime_request &request,
+                                        const std::vector<uint32_t> &hosted_shards);
 std::vector<rasn_runtime_descriptor> rasn_runtime_module_descriptors();
 std::string rasn_runtime_module_app_role(const std::string &module_or_role);
 std::string normalize_rasn_runtime_app_list(const std::string &app_list);
@@ -466,6 +474,12 @@ private:
                               ::dsn::rpc_replier<rasn_runtime_response> &reply);
 
     std::vector<std::string> _modules;
+    // Shards this service hosts per module, populated from config at construction
+    // for sharded modules that host only a subset of partitions. A module absent
+    // from the map (or mapped to an empty vector) hosts the whole module, so the
+    // ingress guard admits every request for it. Used to reject requests routed to
+    // a shard this service does not host before they reach the module store.
+    std::map<std::string, std::vector<uint32_t>> _hosted_shards;
 };
 
 class rasn_runtime_client : public virtual ::dsn::clientlet

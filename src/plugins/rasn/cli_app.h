@@ -90,6 +90,14 @@ bool wait_for_cli_service_dependencies(const rasn_service_graph &services,
 
 std::vector<std::string> cli_args_from_argv(int argc, char **argv, int begin = 0);
 void run_dsn_with_cli_args(const std::vector<std::string> &args, bool sleep_after_init);
+// Make a co-located runtime config's `@include config.ini` resolve beside the
+// selected config rather than against an unrelated launch directory. rDSN opens
+// @include paths relative to the process working directory, so when config.rasn.ini
+// is auto-detected next to the binary this switches into its directory and returns
+// the absolute config path to hand to run_dsn_with_cli_args. Intended for the
+// `--dsn` service path; a no-op-equivalent when already launched from that
+// directory. Returns the input unchanged if the path cannot be resolved.
+std::string align_working_directory_to_runtime_config(const std::string &config_path);
 
 class rasn_cli_app_base
 {

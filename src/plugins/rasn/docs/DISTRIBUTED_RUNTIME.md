@@ -251,9 +251,11 @@ on the command line:
 
 The shared runtime file composes *runtime → app*: `config.rasn.ini` **ends with a
 mandatory `@include config.ini`** that pulls in the co-hosted binary's own thin
-config so the app gateway is launched beside the services. (The include is a
-stock rDSN relative include resolved against the launch directory, so run a binary
-from the directory that holds its config files — its bin/install dir.)
+config so the app gateway is launched beside the services. The include is a stock
+rDSN relative include resolved against the working directory; the `--dsn` entry
+point switches into the runtime config's own directory before loading it
+(`align_working_directory_to_runtime_config`, finding 4 in §13.9) so it resolves
+beside `config.rasn.ini` regardless of the launch directory.
 
 | File | Audience | Contents |
 | --- | --- | --- |
@@ -423,12 +425,26 @@ than reinventing consensus in rASN.
 > `rasn_runtime_ownership_gate_enabled = true`, each standalone module service
 > acquires ownership of every module (or hosted shard) it serves through the
 > coordination module (§13.7) — reusing rDSN `distributed_lock_service` — **before**
-> opening its RPC API, and fails closed if another node already owns that
-> module/shard. The gate is wired into `rasn_runtime_app::start()` (between state
-> hydration and `open_service`) and defaults **off**: the `inproc` backend only
-> coordinates within one process, so real cross-process single-writer enforcement
-> needs `provider = simple|zookeeper`. This lands the ownership half of finding 1.1
-> even before quorum replication of the state itself.
+> hydrating its state and opening its RPC API, and fails closed if another node
+> already owns that module/shard. Acquiring ownership *before* hydration means a
+> standby that waits for the active owner to release cannot open handlers on a
+> snapshot the active owner has since superseded — once it owns the resource no
+> other node writes, so its hydration observes the latest committed state. The gate
+> is wired into `rasn_runtime_app::start()` (acquire → hydrate → `open_service`) and
+> defaults **off**: the `inproc` backend only coordinates within one process, so
+> real cross-process single-writer enforcement needs `provider = simple|zookeeper`.
+> This lands the ownership half of finding 1.1 even before quorum replication of the
+> state itself.
+>
+> **Shard-ingress enforcement (always on when sharded).** Independently of the
+> ownership gate, a runtime service that hosts only a subset of a sharded module's
+> partitions (`<module>_hosted_shards` / `<module>_shard_index`) now rejects any
+> request that routes to a shard it does **not** host, before that request reaches
+> the module store. This closes the gap where a stale registry entry, a static
+> endpoint, or a direct client could send a shard-1 request to the shard-0 owner and
+> mutate state the process does not own. Services that host the whole module (the
+> default single-process case) admit every request, so this is a no-op outside
+> multi-shard deployments.
 
 ## 9. Discovery and security
 
@@ -532,8 +548,15 @@ blackboard_hosted_shards = 0
 Single-writer ownership across two nodes (active/standby for one shard). Deploy the
 **same** stanza on two nodes that both host `blackboard` shard 0. With a cross-process
 coordination backend, exactly one node acquires ownership and opens its RPC API; the
-other **fails closed** at startup (`refusing to open module APIs`) and can be left
-running as a warm standby that wins ownership once the primary's lease lapses:
+other **fails closed** at startup (`refusing to open module APIs`). Failing closed
+aborts the losing process — rDSN asserts on a non-`ERR_OK` app start — so the loser
+does **not** stay alive on its own. To run a true active/standby pair, put both nodes
+under an external supervisor (systemd `Restart=always`, a Kubernetes Deployment, etc.)
+that restarts the loser; on each restart it retries ownership and wins once the active
+node releases (clean stop) or its lease lapses (crash). Raising
+`rasn_runtime_ownership_acquire_max_attempts` lets the standby retry in-process first,
+so it can ride out a brief ownership handover during a rolling restart without a full
+process restart:
 
 ```ini
 [rasn.service]
@@ -542,6 +565,10 @@ blackboard_shard_count = 2
 blackboard_hosted_shards = 0
 ; Acquire single-writer ownership of the hosted shard before serving writes.
 rasn_runtime_ownership_gate_enabled = true
+; Optional: retry a contended acquire a few times (spaced by the backoff below)
+; before failing closed, so a brief handover does not force a supervised restart.
+rasn_runtime_ownership_acquire_max_attempts = 5
+rasn_runtime_ownership_acquire_retry_backoff_ms = 1000
 
 [rasn.coordination]
 ; inproc coordinates only within one process; use zookeeper for real cross-node
@@ -557,13 +584,16 @@ hosts_list = zk-1:2181,zk-2:2181,zk-3:2181
 > **Multi-process test procedure (needs a `--build_plugins` build + a ZooKeeper
 > ensemble; not runnable in a single-node local build).** (1) Start ZooKeeper. (2)
 > Launch two module services with the stanza above on different ports/hosts, both
-> `blackboard_hosted_shards = 0`. (3) Assert exactly one logs a successful start and
-> serves `put_blackboard` for a shard-0 key, while the other logs `failed to acquire
-> ownership of rasn.runtime.blackboard.shard.0 ... refusing to open module APIs`. (4)
-> Stop the owner; within one lease interval the standby acquires ownership and begins
-> serving. With `provider = inproc` this test degenerates to a single process (the
-> `inproc` backend does not coordinate across processes), so it must run against
-> `simple` (one process) or `zookeeper` (many processes).
+> `blackboard_hosted_shards = 0`, each under a supervisor that restarts it on exit.
+> (3) Assert exactly one logs a successful start and serves `put_blackboard` for a
+> shard-0 key, while the other exhausts its acquire attempts, logs `failed to acquire
+> ownership of rasn.runtime.blackboard.shard.0 ... refusing to open module APIs`, and
+> exits. (4) Stop the owner; the supervised standby restarts, acquires ownership on a
+> subsequent attempt, and begins serving. With `provider = inproc` this test
+> degenerates to a single process (the `inproc` backend does not coordinate across
+> processes), so it must run against `simple` (one process) or `zookeeper` (many
+> processes).
+
 
 State mirror durability watermarks:
 
@@ -907,16 +937,24 @@ eight writers on one fresh key and asserts they all succeed (last-writer-wins).
 
 **Wired into the runtime (as-built).** Consuming the facility inside the module
 services is now landed for the ownership half: `rasn_runtime_app::start()` calls
-`acquire_module_ownership()` between state hydration and `open_service()`. When
+`acquire_module_ownership()` **before** state hydration and `open_service()`. When
 `rasn_runtime_ownership_gate_enabled = true`, it builds a coordination service from
 `[rasn.coordination]`, then acquires ownership of each module (or hosted shard) the
 service serves — resources named `rasn.runtime.<module>[.shard.<n>]`, owner id = the
 node's primary address — and **fails closed** (refuses to open the RPC API, releasing
-anything it took) if a resource is already owned. `stop()` releases all held
-ownership. The resource derivation is unit-tested
-(`rasn_runtime_module_ownership_resources`). Default off, so single-node/local runs
-and the `inproc` backend are unaffected; turning §8's operator-discipline
-single-writer into an *enforced* one requires `provider = simple|zookeeper`.
+anything it took) if a resource is already owned. Ownership is acquired before
+hydration so a standby that waits for the active owner to release then hydrates the
+*latest* committed snapshot rather than a stale one (review finding 1); a contended
+acquire is retried up to `rasn_runtime_ownership_acquire_max_attempts` (default 1)
+before failing closed, and an always-on standby relies on a supervisor restart to
+retry past that (§10). `stop()` releases all held ownership. Independently of the
+gate, the RPC ingress path (`reply_module_request`) rejects any request routed to a
+shard the service does not host, so a misrouted request cannot mutate unowned state
+(review finding 2). The resource derivation and the ingress guard are unit-tested
+(`rasn_runtime_module_ownership_resources`, `rasn_runtime_service_hosts_request`).
+Default off, so single-node/local runs and the `inproc` backend are unaffected;
+turning §8's operator-discipline single-writer into an *enforced* one requires
+`provider = simple|zookeeper`.
 
 **What remains.** (a) Move breaker/dedup/admission/rate counters onto the shared
 state store for cluster-global protection (finding 1.5 wiring). (b) Validate
@@ -965,3 +1003,46 @@ fail-stop cleanly (allocation faults → `std::bad_alloc` → `SIGABRT`) or prop
 graceful non-zero-exit errors — no `SIGSEGV`/`SIGBUS`/`SIGFPE`/`SIGILL` and no
 reproducible hang. The harness is `tests/fault_injection/run_fault_injection.sh`
 (opt-in, POSIX-only, not wired into CMake/CI).
+
+### 13.9 Ownership-gate review follow-ups — stale-read, shard ingress, failover honesty, config include — RESOLVED (code)
+
+Review of the single-writer ownership gate (§13.7) surfaced four issues; all are now
+fixed within `src/plugins/rasn`:
+
+- **Acquire ownership before hydration (finding 1).** `rasn_runtime_app::start()`
+  previously hydrated in-memory state and *then* waited for ownership, so a standby
+  could hydrate snapshot N, block while the active owner committed N+1, win the lock,
+  and open handlers on stale state. `start()` now runs `acquire_module_ownership()`
+  **before** `hydrate_modules_from_state()` (and releases ownership if hydration then
+  fails). Once a node owns the resource no other node writes, so the subsequent
+  hydration always observes the latest committed snapshot. Gate-off deployments are
+  unaffected (acquire/release are no-ops).
+
+- **Shard-ownership enforced on RPC ingress (finding 2).** `reply_module_request()`
+  dispatched any request for a hosted module regardless of the shard it routed to, so
+  a stale registry entry or a direct client could drive a shard-1 request into the
+  shard-0 owner and mutate unowned state. The ingress path now rejects a request whose
+  resolved partition is not in this service's hosted-shard set
+  (`rasn_runtime_service_hosts_request`, cached per module), returning a clear error
+  and a `runtime.shard.misrouted` metric. It is a no-op for unsharded modules and for
+  services that host the whole module, and applies whether or not the ownership gate
+  is enabled.
+
+- **Honest active/standby failover (finding 3).** A losing node fails closed, which
+  aborts the process (rDSN asserts on a non-`ERR_OK` app start); it does not stay alive
+  as a self-healing warm standby. §10 now states that an external supervisor must
+  restart the loser to retry ownership, and a bounded in-process retry knob
+  (`rasn_runtime_ownership_acquire_max_attempts`, default 1;
+  `rasn_runtime_ownership_acquire_retry_backoff_ms`, default 1000 ms) lets a standby
+  ride out a brief handover before failing closed.
+
+- **Runtime-config `@include` resolves beside the config (finding 4).**
+  `config.rasn.ini` ends with `@include config.ini`, but rDSN resolves includes
+  relative to the process working directory, so auto-detecting the runtime config next
+  to the binary while launching from another directory could miss the sibling app
+  config (or pull in an unrelated `config.ini`). The `--dsn` entry point now switches
+  into the selected runtime config's directory
+  (`align_working_directory_to_runtime_config`) and passes its absolute path to
+  `dsn_run`, so the include resolves beside the config regardless of launch directory.
+  No rDSN core change.
+

@@ -198,7 +198,11 @@ int main(int argc, char **argv)
     const std::string codepilot_app_list =
         explicit_dsn_app_list.empty() ? default_codepilot_app_list
                                       : ::dsn::rasn::normalize_rasn_runtime_app_list(explicit_dsn_app_list);
+    // Ensure config.rasn.ini's trailing `@include config.ini` resolves beside the
+    // selected runtime config even when the binary is launched from another
+    // directory (rDSN resolves includes relative to the working directory).
+    const std::string runtime_config_path = ::dsn::rasn::align_working_directory_to_runtime_config(config_path);
     ::dsn::rasn::run_dsn_with_cli_args(
-        std::vector<std::string>{program, config_path, "-app_list", codepilot_app_list}, true);
+        std::vector<std::string>{program, runtime_config_path, "-app_list", codepilot_app_list}, true);
     return 0;
 }

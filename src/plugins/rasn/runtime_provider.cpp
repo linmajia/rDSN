@@ -509,6 +509,29 @@ std::chrono::milliseconds rasn_runtime_state_hydration_retry_backoff()
     return std::chrono::milliseconds(backoff_ms);
 }
 
+uint32_t rasn_runtime_ownership_acquire_max_attempts()
+{
+    const uint64_t attempts = config_service_uint64(
+        "rasn_runtime_ownership_acquire_max_attempts",
+        1,
+        "Max attempts the single-writer ownership gate makes to acquire a contended resource before "
+        "failing closed; raise it to let a standby ride out a brief ownership handover during failover");
+    if (attempts == 0)
+    {
+        return 1;
+    }
+    return static_cast<uint32_t>(attempts > 1000 ? 1000 : attempts);
+}
+
+std::chrono::milliseconds rasn_runtime_ownership_acquire_retry_backoff()
+{
+    const uint64_t backoff_ms = config_service_uint64(
+        "rasn_runtime_ownership_acquire_retry_backoff_ms",
+        1000,
+        "Backoff between single-writer ownership acquisition retries in milliseconds");
+    return std::chrono::milliseconds(backoff_ms);
+}
+
 bool rasn_runtime_state_watermark_enabled()
 {
     return config_service_bool(
@@ -3495,6 +3518,26 @@ std::vector<std::string> rasn_runtime_module_ownership_resources(const std::vect
     return resources;
 }
 
+// Defined at dsn::rasn scope (not the anonymous namespace above) so the unit
+// tests can link against it via the declaration in runtime_provider.h. It still
+// calls the anonymous-namespace partition helpers, which remain visible in the
+// enclosing namespace within this translation unit.
+bool rasn_runtime_service_hosts_request(const rasn_runtime_request &request,
+                                        const std::vector<uint32_t> &hosted_shards)
+{
+    // An empty hosted set means the service owns the whole module (or the module
+    // is unsharded), so it serves every partition. Otherwise the request must
+    // route to one of the shards this service actually hosts; a request for any
+    // other shard is a misroute (stale registry entry, static endpoint, or a
+    // direct client) and must not be allowed to mutate state this node does not own.
+    if (hosted_shards.empty())
+    {
+        return true;
+    }
+    const uint32_t partition = rasn_runtime_partition_for_request(request);
+    return std::find(hosted_shards.begin(), hosted_shards.end(), partition) != hosted_shards.end();
+}
+
 std::vector<rasn_runtime_descriptor> rasn_runtime_module_descriptors()
 {
     std::vector<rasn_runtime_descriptor> descriptors;
@@ -4954,6 +4997,18 @@ rasn_runtime_rpc_service::rasn_runtime_rpc_service(std::vector<std::string> modu
     : ::dsn::serverlet<rasn_runtime_rpc_service>("rasn.runtime"),
       _modules(modules.empty() ? rasn_runtime_module_names() : std::move(modules))
 {
+    // Cache the hosted-shard set for any sharded module that hosts only a subset
+    // of partitions so the ingress guard can reject misrouted requests without a
+    // per-request config lookup. Modules that host the whole module (the common
+    // single-process case) contribute nothing and are admitted unconditionally.
+    for (const std::string &module : _modules)
+    {
+        std::vector<uint32_t> shards = rasn_runtime_hosted_shards(module);
+        if (!shards.empty())
+        {
+            _hosted_shards.emplace(module, std::move(shards));
+        }
+    }
 }
 
 void rasn_runtime_rpc_service::open_service()
@@ -5067,6 +5122,25 @@ void rasn_runtime_rpc_service::reply_module_request(const std::string &module,
         return;
     }
     copy.auth_token.clear();
+
+    // Shard-ownership ingress guard (review finding 2): when this service hosts
+    // only a subset of a sharded module's partitions, refuse a request that routes
+    // to a shard we do not host so a stale registry entry, a static endpoint, or a
+    // direct client cannot mutate state owned by another node. No-op for unsharded
+    // modules and for services that host the whole module.
+    const auto hosted = _hosted_shards.find(module);
+    if (hosted != _hosted_shards.end() && !rasn_runtime_service_hosts_request(copy, hosted->second))
+    {
+        metrics_registry::instance().on_event("runtime.shard.misrouted", module);
+        const uint32_t partition = rasn_runtime_partition_for_request(copy);
+        dwarn("runtime module '%s' rejected request routed to non-hosted shard %u",
+              module.c_str(),
+              static_cast<unsigned int>(partition));
+        reply(make_rasn_runtime_error(
+            copy, "rasn runtime service does not host shard " + std::to_string(partition) + " of module " + module));
+        return;
+    }
+
     // Adopt the incoming trace id for the duration of dispatch so server-side
     // logs and any nested module requests share the originating operation's trace.
     rasn_runtime_trace_scope trace(copy.trace_id);
@@ -5190,15 +5264,26 @@ agent_descriptor make_rasn_runtime_module_descriptor(const std::string &module,
 ::dsn::error_code rasn_runtime_app::start(int argc, char **argv)
 {
     global_rasn_services().acquire();
-    const ::dsn::error_code hydration_error = hydrate_modules_from_state();
-    if (hydration_error != ::dsn::ERR_OK)
-    {
-        return hydration_error;
-    }
+    // Acquire single-writer ownership BEFORE hydrating (review finding 1). If a
+    // standby hydrates first and then blocks waiting for the active owner to
+    // release, the active can commit a newer snapshot in the meantime and the
+    // standby would open handlers on stale in-memory state. Acquiring first means
+    // that once we own the resource no other node serves writes for it, so the
+    // subsequent hydration observes the latest committed snapshot and it stays
+    // current through open_service(). The gate is default-off, in which case
+    // acquire/release are no-ops and ordering is immaterial.
     const ::dsn::error_code ownership_error = acquire_module_ownership();
     if (ownership_error != ::dsn::ERR_OK)
     {
         return ownership_error;
+    }
+    const ::dsn::error_code hydration_error = hydrate_modules_from_state();
+    if (hydration_error != ::dsn::ERR_OK)
+    {
+        // Do not keep ownership we are not going to serve: release it so another
+        // node can take over instead of parking the resource behind an aborting start.
+        release_module_ownership();
+        return hydration_error;
     }
     _rpc.open_service();
     register_modules_with_registry();
@@ -5323,10 +5408,37 @@ rasn_runtime_app::rasn_runtime_app(::dsn_gpid gpid, std::vector<std::string> mod
     // runtime service serves writes for a given module/shard. Fail closed on
     // contention: a node that loses the race releases what it took and does not
     // open handlers for a resource another node owns.
+    //
+    // Each acquire_ownership() call already blocks up to the configured
+    // acquire_timeout_ms for the current owner to release. On sustained contention
+    // it returns an error and this app fails closed (rDSN aborts a non-OK start),
+    // so an always-on active/standby pair relies on an external supervisor to
+    // restart the loser, which then retries and wins once the active releases
+    // (see DISTRIBUTED_RUNTIME.md §10). rasn_runtime_ownership_acquire_max_attempts
+    // adds bounded in-process retries so a standby can also ride out a brief
+    // ownership handover without a restart; it defaults to 1 (unchanged fail-closed
+    // behavior).
     const std::vector<std::string> resources = rasn_runtime_module_ownership_resources(_rpc.modules());
+    const uint32_t max_attempts = rasn_runtime_ownership_acquire_max_attempts();
+    const std::chrono::milliseconds retry_backoff = rasn_runtime_ownership_acquire_retry_backoff();
     for (const std::string &resource : resources)
     {
-        const ::dsn::error_code acquired = _coordination->acquire_ownership(resource, _owner_id);
+        ::dsn::error_code acquired = ::dsn::ERR_OK;
+        for (uint32_t attempt = 1; attempt <= max_attempts; ++attempt)
+        {
+            acquired = _coordination->acquire_ownership(resource, _owner_id);
+            if (acquired == ::dsn::ERR_OK || attempt >= max_attempts)
+            {
+                break;
+            }
+            dwarn("rASN runtime app %s could not acquire ownership of %s yet (%s); retry %u/%u after backoff",
+                  name().c_str(),
+                  resource.c_str(),
+                  acquired.to_string(),
+                  static_cast<unsigned int>(attempt),
+                  static_cast<unsigned int>(max_attempts));
+            std::this_thread::sleep_for(retry_backoff);
+        }
         if (acquired != ::dsn::ERR_OK)
         {
             derror("rASN runtime app %s failed to acquire ownership of %s: %s; refusing to open module APIs",

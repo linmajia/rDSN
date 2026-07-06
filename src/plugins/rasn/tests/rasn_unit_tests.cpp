@@ -4568,6 +4568,36 @@ TEST(rasn_runtime, ownership_resources_expand_modules_and_shards)
     EXPECT_TRUE(rasn_runtime_module_ownership_resources({}).empty());
 }
 
+TEST(rasn_runtime, ingress_guard_admits_hosted_shards_and_rejects_others)
+{
+    rasn_runtime_request request;
+    request.module = "agent_message_bus";
+    request.operation = "publish";
+    request.key = "topic";
+
+    // An empty hosted set means the service owns the whole module, so every
+    // request is admitted regardless of the routing hint it carries.
+    request.route_partition = 5;
+    EXPECT_TRUE(rasn_runtime_service_hosts_request(request, {}));
+
+    // With no shard_count configured in the unit-test host the module is
+    // single-partition, so requests resolve to shard 0. A service that hosts shard
+    // 0 admits them; one that hosts only other shards rejects them.
+    EXPECT_TRUE(rasn_runtime_service_hosts_request(request, {0}));
+    EXPECT_TRUE(rasn_runtime_service_hosts_request(request, {0, 2}));
+    EXPECT_FALSE(rasn_runtime_service_hosts_request(request, {1}));
+    EXPECT_FALSE(rasn_runtime_service_hosts_request(request, {1, 2, 3}));
+
+    // The guard keys off the resolved partition, not the module name, so an
+    // unsharded module (always partition 0) is admitted only by a set covering 0.
+    rasn_runtime_request unsharded;
+    unsharded.module = "agent_control_plane";
+    unsharded.operation = "describe";
+    EXPECT_TRUE(rasn_runtime_service_hosts_request(unsharded, {}));
+    EXPECT_TRUE(rasn_runtime_service_hosts_request(unsharded, {0}));
+    EXPECT_FALSE(rasn_runtime_service_hosts_request(unsharded, {4}));
+}
+
 // --- parse_chat_completion: provider response interpretation -----------------
 // Regression coverage for the empty-"content" fallback that used to surface the
 // raw JSON body as the model's answer (llm_provider.cpp). See rASN robustness

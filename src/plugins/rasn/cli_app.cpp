@@ -3,9 +3,14 @@
 #include <rasn/agent_clients.h>
 #include <rasn/agent_registry.h>
 
+#include <dsn/cpp/utils.h>
+
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
+#include <cstdio>
+#include <cstring>
 #include <iostream>
 #include <sstream>
 #include <thread>
@@ -604,6 +609,45 @@ void run_dsn_with_cli_args(const std::vector<std::string> &args, bool sleep_afte
         dsn_args.push_back(const_cast<char *>(arg.c_str()));
     }
     ::dsn_run(static_cast<int>(dsn_args.size()), dsn_args.data(), sleep_after_init);
+}
+
+std::string align_working_directory_to_runtime_config(const std::string &config_path)
+{
+    if (config_path.empty())
+    {
+        return config_path;
+    }
+
+    std::string absolute;
+    if (!::dsn::utils::filesystem::get_absolute_path(config_path, absolute) || absolute.empty())
+    {
+        absolute = config_path;
+    }
+
+    const std::string config_dir = ::dsn::utils::filesystem::remove_file_name(absolute);
+    if (config_dir.empty())
+    {
+        return absolute;
+    }
+
+#if !defined(_WIN32)
+    // rDSN resolves a config file's `@include <relative>` against the process
+    // working directory, so switch into the runtime config's own directory before
+    // handing it to dsn_run. Passing the absolute config path keeps the main file
+    // openable after the chdir while its sibling `@include config.ini` now resolves
+    // beside it. Chdir'ing into the directory that already is the CWD is a harmless
+    // no-op, so this only changes behavior for launches from another directory.
+    if (::chdir(config_dir.c_str()) != 0)
+    {
+        fprintf(stderr,
+                "rasn: warning: could not switch to runtime config directory '%s' (%s); an "
+                "@include in %s will resolve against the current directory instead\n",
+                config_dir.c_str(),
+                std::strerror(errno),
+                absolute.c_str());
+    }
+#endif
+    return absolute;
 }
 
 bool wait_for_cli_service_dependencies(const rasn_service_graph &services,
