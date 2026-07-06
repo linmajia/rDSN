@@ -4640,6 +4640,18 @@ TEST(rasn_llm_provider, chat_completion_error_envelope_is_failure)
     EXPECT_TRUE(parsed.text.empty());
 }
 
+TEST(rasn_llm_provider, chat_completion_flat_error_string_is_failure)
+{
+    // Ollama-style providers report failures as a flat {"error":"..."} string with
+    // no nested "message"; that provider error text must be surfaced instead of the
+    // generic "empty completion" fallback (review finding 2).
+    const std::string body = "{\"error\":\"model 'gemma' not found, try pulling it first\"}";
+    const chat_completion_parse parsed = parse_chat_completion(body, "ollama.generate");
+    EXPECT_FALSE(parsed.ok);
+    EXPECT_EQ("model 'gemma' not found, try pulling it first", parsed.error_detail);
+    EXPECT_TRUE(parsed.text.empty());
+}
+
 TEST(rasn_llm_provider, chat_completion_empty_message_is_failure)
 {
     // A well-formed JSON response with a genuinely empty completion is a failure,

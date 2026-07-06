@@ -162,10 +162,10 @@ Design notes:
   hydration operations before opening its RPC handlers. If hydration is enabled
   and the configured state service cannot be queried, the service retries the query
   while a co-located state service is still registering its handlers — up to
-  `rasn_runtime_state_hydration_max_attempts` (default 20) spaced by
-  `rasn_runtime_state_hydration_retry_backoff_ms` (default 250 ms) — and fails
-  closed instead of serving empty state only after that readiness budget is
-  exhausted or on a non-transient error. This keeps a cold multi-process start,
+  `rasn_runtime_state_hydration_max_attempts` (default 20, honored as configured
+  with no hidden cap) spaced by `rasn_runtime_state_hydration_retry_backoff_ms`
+  (default 250 ms) — and fails closed instead of serving empty state only after
+  that readiness budget is exhausted or on a non-transient error. This keeps a cold multi-process start,
   where `rasn.state` may still be coming up, from aborting on the first miss while
   still refusing to serve empty state; set `rasn_runtime_state_hydration_enabled = false`
   only for intentionally cold local experiments. This gives standalone module services

@@ -944,6 +944,14 @@ chat_completion_parse parse_chat_completion(const std::string &output, const std
         std::string detail = extract_json_string_field(output, "message");
         if (detail.empty())
         {
+            // Ollama-style providers report failures as a flat {"error":"..."}
+            // string. (OpenAI-style {"error":{"message":...}} is already covered by
+            // the "message" lookup above, which finds the nested field.) Surface the
+            // provider's own error string before the generic fallback.
+            detail = extract_json_string_field(output, "error");
+        }
+        if (detail.empty())
+        {
             detail = "provider returned an empty completion";
         }
         result.ok = false;

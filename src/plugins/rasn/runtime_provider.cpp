@@ -497,7 +497,14 @@ uint32_t rasn_runtime_state_hydration_max_attempts()
     {
         return 1;
     }
-    return static_cast<uint32_t>(attempts > 1000 ? 1000 : attempts);
+    // Honor the operator's configured readiness budget as-is: clamp only to the
+    // uint32_t return width to avoid truncation (a type-safety guard, not a policy
+    // cap), so a deployment can raise the budget for an unusually long cold start.
+    if (attempts > std::numeric_limits<uint32_t>::max())
+    {
+        return std::numeric_limits<uint32_t>::max();
+    }
+    return static_cast<uint32_t>(attempts);
 }
 
 std::chrono::milliseconds rasn_runtime_state_hydration_retry_backoff()
@@ -520,7 +527,13 @@ uint32_t rasn_runtime_ownership_acquire_max_attempts()
     {
         return 1;
     }
-    return static_cast<uint32_t>(attempts > 1000 ? 1000 : attempts);
+    // Honor the configured attempt count as-is: clamp only to the uint32_t return
+    // width to avoid truncation (a type-safety guard, not a policy cap).
+    if (attempts > std::numeric_limits<uint32_t>::max())
+    {
+        return std::numeric_limits<uint32_t>::max();
+    }
+    return static_cast<uint32_t>(attempts);
 }
 
 std::chrono::milliseconds rasn_runtime_ownership_acquire_retry_backoff()
