@@ -59,20 +59,28 @@ rasn_coordination_config load_rasn_coordination_config()
 }
 
 #ifdef RASN_HAS_DIST_COORDINATION
-// Coordination callbacks are delivered on THREAD_POOL_META_SERVER. This is the
-// pool the rDSN dist providers themselves require: distributed_lock_service_simple
-// (and the zookeeper provider) enqueue their own internal work -- notably the
-// LPC_DIST_LOCK_SVC_RANDOM_EXPIRE lease timer -- on THREAD_POOL_META_SERVER, so any
-// app running the simple/zookeeper backend must declare that pool regardless. rASN
-// never processes requests on it (rASN handlers run on THREAD_POOL_DEFAULT /
-// THREAD_POOL_RASN_WORKFLOW), so the blocking facade calls below wait() for their
-// completion callbacks on a pool distinct from the caller's and cannot self-deadlock.
-// The default 'inproc' backend uses no dist provider and never enqueues
-// LPC_RASN_COORDINATION, so THREAD_POOL_META_SERVER is declared in the rASN
-// runtime deployment config (the single shared src/plugins/rasn/config.rasn.ini)
-// only when provider = simple|zookeeper.
-// Declaring it under the default config would fail config parsing ("invalid enum
-// configuration") because the providers that register the pool are not loaded.
+// This facade delivers its OWN completion callbacks (grant/lease) on
+// THREAD_POOL_META_SERVER via LPC_RASN_COORDINATION, so every app running the
+// simple|zookeeper backend must declare THREAD_POOL_META_SERVER. The two dist
+// backends additionally run provider-internal work on DIFFERENT pools, and the
+// hosting app must declare whichever pool its backend uses or rDSN aborts at
+// startup ("pool <NAME> not ready ... not designated in [apps.<app>] pools"):
+//   * simple    -> distributed_lock_service_simple runs its lease timer
+//                  (LPC_DIST_LOCK_SVC_RANDOM_EXPIRE) on THREAD_POOL_META_SERVER,
+//                  so THREAD_POOL_META_SERVER alone suffices.
+//   * zookeeper -> distributed_lock_service_zookeeper runs its lock tasks
+//                  (TASK_CODE_DLOCK) on THREAD_POOL_DLOCK (declare it
+//                  partitioned = true; the provider asserts single-thread access
+//                  per lock). So a zookeeper-backed app must declare BOTH
+//                  THREAD_POOL_META_SERVER and THREAD_POOL_DLOCK.
+// rASN never processes requests on either pool (rASN handlers run on
+// THREAD_POOL_DEFAULT / THREAD_POOL_RASN_WORKFLOW), so the blocking facade calls
+// below wait() for their completion callbacks on a pool distinct from the caller's
+// and cannot self-deadlock. The default 'inproc' backend uses no dist provider and
+// never enqueues LPC_RASN_COORDINATION, so these pools are declared in the rASN
+// runtime deployment config only when provider = simple|zookeeper. Declaring them
+// under the default config would fail config parsing ("invalid enum configuration")
+// because the providers that register the pools are not loaded.
 //
 // Defined here in the named dsn::rasn namespace (not the anonymous namespace
 // below): the DEFINE_TASK_CODE macro emits a weak symbol, which must have

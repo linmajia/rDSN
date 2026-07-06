@@ -572,13 +572,28 @@ rasn_runtime_ownership_acquire_retry_backoff_ms = 1000
 
 [rasn.coordination]
 ; inproc coordinates only within one process; use zookeeper for real cross-node
-; single-writer. Requires a --build_plugins build + THREAD_POOL_META_SERVER (see §13.7).
+; single-writer. Requires a --build_plugins build + the THREAD_POOL_META_SERVER and
+; THREAD_POOL_DLOCK pools (see below and §13.7).
 provider = zookeeper
 lock_namespace = /rasn/locks
 acquire_timeout_ms = 5000
 
 [zookeeper]
 hosts_list = zk-1:2181,zk-2:2181,zk-3:2181
+timeout_ms = 8000
+
+; The zookeeper backend needs two thread pools declared AND listed in the hosting
+; app's `pools` (e.g. pools = THREAD_POOL_DEFAULT,THREAD_POOL_META_SERVER,THREAD_POOL_DLOCK).
+; THREAD_POOL_META_SERVER carries the rASN facade's grant/lease callbacks;
+; THREAD_POOL_DLOCK carries the zookeeper lock provider's own lock tasks and MUST be
+; partitioned (the provider asserts single-thread access per lock). Omitting
+; THREAD_POOL_DLOCK core-dumps at startup ("pool THREAD_POOL_DLOCK not ready").
+[threadpool.THREAD_POOL_META_SERVER]
+partitioned = false
+worker_count = 2
+
+[threadpool.THREAD_POOL_DLOCK]
+partitioned = true
 ```
 
 > **Multi-process test procedure (needs a `--build_plugins` build + a ZooKeeper
@@ -1075,4 +1090,50 @@ are fixed within `src/plugins/rasn`:
   resolves beside the runtime config regardless of launch directory or OS. No rDSN core
   change.
 
+### 13.11 Distributed robustness testing — cross-process single-writer + coordination pool wiring — RESOLVED (docs/config) + REPORTED
 
+A dedicated robustness round exercised the ownership gate **cross-process** on real
+hardware (Ubuntu, `--build_plugins`) against a live single-node ZooKeeper ensemble
+(`provider = zookeeper`), plus a re-run of the libfiu fault-injection campaign on the
+current build. Two standalone `rasn.runtime.blackboard` processes were launched on
+different ports, both hosting `blackboard` shard 0 with the gate enabled.
+
+- **Cross-process single-writer confirmed.** Exactly one process acquired the
+  `rasn.runtime.blackboard.shard.0` ZooKeeper lock and opened its module handlers; the
+  other blocked for `acquire_timeout_ms`, got `ERR_TIMEOUT`, logged `failed to acquire
+  ownership of rasn.runtime.blackboard.shard.0: ERR_TIMEOUT; refusing to open module
+  APIs`, and registered **zero** module handlers. This is the first end-to-end,
+  cross-*process* validation of the gate (previously only `inproc`/`simple` single-process
+  and unit coverage); it confirms the split-brain-fix resource derivation (§13.10) denies a
+  second writer through a real distributed lock backend.
+
+- **Coordination thread-pool wiring corrected (docs/config bug — FIXED).** The zookeeper
+  backend does **not** run its lock work on `THREAD_POOL_META_SERVER` (only the `simple`
+  backend and the rASN facade's own callbacks do). The zookeeper lock provider
+  (`distributed_lock_service_zookeeper`) runs `TASK_CODE_DLOCK` on **`THREAD_POOL_DLOCK`**
+  and asserts single-thread access per lock, so a zookeeper-backed app must declare BOTH
+  `THREAD_POOL_META_SERVER` and `THREAD_POOL_DLOCK` (the latter `partitioned = true`).
+  Following the previous guidance (only `THREAD_POOL_META_SERVER`) core-dumped at startup
+  with `pool THREAD_POOL_DLOCK not ready`. `config.rasn.ini`, this document's §10 example,
+  and the `coordination_service` comments now document the correct per-backend pool set.
+  (`THREAD_POOL_META_STATE` from the canonical `config-zk.ini` is the replication
+  meta-server's pool and is **not** required by the coordination facade — verified by a
+  minimal-pool start.)
+
+- **Loser lingers instead of aborting (REPORTED, launch-path dependent).** §10 states the
+  fail-closed loser aborts (`rDSN asserts on a non-ERR_OK app start`) and relies on a
+  supervisor restart. In the observed `codepilot --dsn` path (with `enable_default_app_mimic
+  = true`) the loser process instead **stayed alive** with its node port bound but no module
+  handlers — correctness is preserved (it serves nothing), but a process-liveness supervisor
+  would not restart it and it does not re-attempt ownership on its own. The hard-abort policy
+  lives in rDSN core (`tool_api.cpp` `dassert(err == ERR_OK)`), whose reachability depends on
+  the launch/mimic path; the reliable active/standby failover story therefore needs either an
+  rASN-side retry/exit loop or a readiness/health probe that checks *handlers open*, not just
+  *process alive*. Deferred pending the planned distributed-mode redesign (standalone runtime
+  service).
+
+- **libfiu campaign PASS on the current build.** Re-running the fault-injection harness
+  (8 targets × 8 fault classes × 10 runs, now covering the ownership/coordination/split-brain
+  code via the `rasn_*` gtests) produced no `SIGSEGV/SIGBUS/SIGFPE/SIGILL` and no reproducible
+  hang: `malloc` faults fail-stop via `std::bad_alloc` (`SIGABRT`); I/O and network faults
+  propagate as graceful errors. Matches the reference result.

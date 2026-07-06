@@ -68,10 +68,13 @@ rasn_coordination_config load_rasn_coordination_config();
 //
 // Threading contract: the blocking methods must NOT be invoked from a
 // THREAD_POOL_META_SERVER worker, because the dist backend delivers its completion
-// callbacks on that pool (and the reused rDSN dist providers also run their own
-// internal tasks there, e.g. the lock lease timer). rASN's runtime never processes
-// requests on THREAD_POOL_META_SERVER, so ordinary rASN call sites are safe; every
-// rASN app that may run the simple/zookeeper backend declares that pool in config.
+// callbacks on that pool. rASN's runtime never processes requests on
+// THREAD_POOL_META_SERVER, so ordinary rASN call sites are safe. Every rASN app that
+// may run the simple|zookeeper backend must declare THREAD_POOL_META_SERVER in
+// config; a zookeeper-backed app must ALSO declare THREAD_POOL_DLOCK
+// (partitioned = true), the pool the zookeeper lock provider runs its own lock/lease
+// tasks on. See config.rasn.ini and DISTRIBUTED_RUNTIME.md for the full per-backend
+// pool wiring.
 class rasn_coordination_service
 {
 public:
