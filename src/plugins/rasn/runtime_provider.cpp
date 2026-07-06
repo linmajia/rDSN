@@ -3098,6 +3098,26 @@ rasn_runtime_response invoke_local_module(const rasn_runtime_request &request)
     return future.get();
 }
 
+// A remote module call issues an rDSN RPC, which the core only permits from a
+// thread attached to a service node. A thin app in `distributed` mode running an
+// ordinary CLI command executes on a plain CLI/io thread with no node attached, so
+// the core would otherwise fail-stop the whole process ("tasks without explicit
+// service node can only be created inside threads which is attached to specific
+// node"). Detect the missing node context here and surface a graceful error,
+// mirroring invoke_local_module's no-node fallback, instead of letting the core
+// assert.
+bool rasn_runtime_rpc_context_available()
+{
+    return ::dsn::task::get_current_node2() != nullptr;
+}
+
+std::string rasn_runtime_no_node_context_error(const std::string &module)
+{
+    return std::string("distributed runtime module '") + module +
+           "' is only reachable over RPC from an rDSN service node context; run the app under --dsn "
+           "or embed it in a hosted runtime node";
+}
+
 // Remote invocation with the runtime-owned resilience policy: a per-endpoint
 // circuit breaker fast-fails while a module endpoint is unhealthy, an idempotency
 // id makes retries safe against lost replies, and transient transport errors are
@@ -3106,6 +3126,10 @@ rasn_runtime_response invoke_local_module(const rasn_runtime_request &request)
 rasn_runtime_response invoke_remote_module(const rasn_runtime_request &request)
 {
     const std::string &module = request.module;
+    if (!rasn_runtime_rpc_context_available())
+    {
+        return make_rasn_runtime_error(request, rasn_runtime_no_node_context_error(module));
+    }
     const runtime_endpoint resolved_endpoint = resolve_rasn_runtime_endpoint(request);
     const ::dsn::rpc_address address = resolved_endpoint.address;
     const std::string endpoint = std::string(address.to_string());
@@ -3192,6 +3216,14 @@ rasn_runtime_response invoke_remote_module(const rasn_runtime_request &request)
 // readiness sweep stays fast when an endpoint is down.
 bool ping_remote_module(const std::string &module, std::string *error)
 {
+    if (!rasn_runtime_rpc_context_available())
+    {
+        if (error != nullptr)
+        {
+            *error = rasn_runtime_no_node_context_error(module);
+        }
+        return false;
+    }
     const uint32_t partition_count = rasn_runtime_partition_count(module);
     bool all_ok = true;
     std::string first_error;
