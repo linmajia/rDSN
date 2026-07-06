@@ -430,6 +430,17 @@ std::vector<std::string> rasn_runtime_module_names();
 // sharded. Used by the default-off single-writer ownership gate; exported so it
 // can be unit-tested independently of a live app host.
 std::vector<std::string> rasn_runtime_module_ownership_resources(const std::vector<std::string> &modules);
+// Pure expansion of a single hosted module into the coordination resources its
+// runtime app must single-writer own, kept free of configuration lookups (callers
+// pass the resolved hosted-shard subset, sharded flag, and partition count) so the
+// split-brain-avoidance rules stay deterministically unit-testable: an explicit
+// shard subset locks those shards; a whole-module host of a sharded module locks
+// EVERY shard (never the unqualified module resource, which would not contend with
+// a shard-specific peer); an unsharded module locks one module-level resource.
+std::vector<std::string> rasn_runtime_module_ownership_resources_for(const std::string &module,
+                                                                     const std::vector<uint32_t> &hosted_shards,
+                                                                     bool sharded,
+                                                                     uint32_t partition_count);
 // Ingress shard-ownership guard: true when a runtime service that hosts
 // `hosted_shards` of a module should serve `request`. An empty hosted set means
 // the service owns the whole module (or the module is unsharded) and serves every

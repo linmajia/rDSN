@@ -940,8 +940,10 @@ services is now landed for the ownership half: `rasn_runtime_app::start()` calls
 `acquire_module_ownership()` **before** state hydration and `open_service()`. When
 `rasn_runtime_ownership_gate_enabled = true`, it builds a coordination service from
 `[rasn.coordination]`, then acquires ownership of each module (or hosted shard) the
-service serves — resources named `rasn.runtime.<module>[.shard.<n>]`, owner id = the
-node's primary address — and **fails closed** (refuses to open the RPC API, releasing
+service serves — resources named `rasn.runtime.<module>` for an unsharded module or
+`rasn.runtime.<module>.shard.<n>` per served shard (a host of the whole sharded module
+locks *every* shard resource, so it still contends with any shard-specific peer), owner
+id = the node's primary address — and **fails closed** (refuses to open the RPC API, releasing
 anything it took) if a resource is already owned. Ownership is acquired before
 hydration so a standby that waits for the active owner to release then hydrates the
 *latest* committed snapshot rather than a stale one (review finding 1); a contended
@@ -1045,4 +1047,32 @@ fixed within `src/plugins/rasn`:
   (`align_working_directory_to_runtime_config`) and passes its absolute path to
   `dsn_run`, so the include resolves beside the config regardless of launch directory.
   No rDSN core change.
+
+### 13.10 Ownership-gate review follow-ups (round 2) — whole-module split brain, Windows `--dsn` chdir — RESOLVED (code)
+
+A second review pass on the ownership gate (§13.7, §13.9) surfaced two more issues; both
+are fixed within `src/plugins/rasn`:
+
+- **A whole-module host of a sharded module now locks every shard (split brain).**
+  `rasn_runtime_module_ownership_resources()` mapped an unqualified sharded module to the
+  bare `rasn.runtime.<module>` resource, while shard-specific services lock
+  `rasn.runtime.<module>.shard.<n>`. Those are *distinct* locks, so a node hosting the
+  whole module (`blackboard_shard_count = 2`, no `blackboard_hosted_shards`) and a node
+  hosting shard 0 (`blackboard_hosted_shards = 0`) never contended — both could serve
+  shard 0. The resource derivation now expands a whole-module host of a sharded module to
+  the full `rasn.runtime.<module>.shard.0 … shard.N-1` lock set, so it contends with every
+  shard-specific peer; an unsharded module still takes a single module-level lock. The
+  branch logic is factored into a pure, config-free
+  `rasn_runtime_module_ownership_resources_for()` and unit-tested across the explicit
+  shard-subset, whole-sharded-module, and unsharded cases.
+
+- **Windows `--dsn` chdir is no longer a no-op.**
+  `align_working_directory_to_runtime_config()` guarded its `chdir` under
+  `#if !defined(_WIN32)`, so on Windows `codepilot.exe --dsn` / `srepilot.exe --dsn` only
+  passed an absolute config path while rDSN still resolved `@include config.ini` against
+  the process working directory — reintroducing finding 4 on Windows. The chdir is now
+  cross-platform (`::_chdir` on Windows, `::chdir` elsewhere), so the sibling include
+  resolves beside the runtime config regardless of launch directory or OS. No rDSN core
+  change.
+
 

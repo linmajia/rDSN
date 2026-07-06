@@ -3510,23 +3510,52 @@ std::vector<std::string> rasn_runtime_module_names()
                                     "sandbox_runtime"};
 }
 
+std::vector<std::string> rasn_runtime_module_ownership_resources_for(const std::string &module,
+                                                                     const std::vector<uint32_t> &hosted_shards,
+                                                                     bool sharded,
+                                                                     uint32_t partition_count)
+{
+    std::vector<std::string> resources;
+    if (!hosted_shards.empty())
+    {
+        // Explicit hosted-shard subset: lock exactly those shards.
+        for (const uint32_t shard : hosted_shards)
+        {
+            resources.push_back(rasn_runtime_module_shard_capability(module, shard));
+        }
+        return resources;
+    }
+
+    if (sharded && partition_count > 1)
+    {
+        // Whole-module host of a sharded module (no explicit hosted subset): it
+        // serves EVERY shard, so it must single-writer own every shard resource.
+        // Locking only the unqualified rasn.runtime.<module> resource would not
+        // contend with a peer that locks rasn.runtime.<module>.shard.N, letting a
+        // whole-module owner and a shard-N owner both mutate shard N (split brain).
+        for (uint32_t shard = 0; shard < partition_count; ++shard)
+        {
+            resources.push_back(rasn_runtime_module_shard_capability(module, shard));
+        }
+        return resources;
+    }
+
+    // Unsharded module (a single logical partition): one module-level lock.
+    resources.push_back(rasn_runtime_module_capability(module));
+    return resources;
+}
+
 std::vector<std::string> rasn_runtime_module_ownership_resources(const std::vector<std::string> &modules)
 {
     std::vector<std::string> resources;
     for (const std::string &module : modules)
     {
-        const std::vector<uint32_t> shards = rasn_runtime_hosted_shards(module);
-        if (shards.empty())
-        {
-            resources.push_back(rasn_runtime_module_capability(module));
-        }
-        else
-        {
-            for (const uint32_t shard : shards)
-            {
-                resources.push_back(rasn_runtime_module_shard_capability(module, shard));
-            }
-        }
+        const std::vector<std::string> module_resources =
+            rasn_runtime_module_ownership_resources_for(module,
+                                                        rasn_runtime_hosted_shards(module),
+                                                        rasn_runtime_module_is_sharded(module),
+                                                        rasn_runtime_partition_count(module));
+        resources.insert(resources.end(), module_resources.begin(), module_resources.end());
     }
     return resources;
 }

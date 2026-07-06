@@ -4549,8 +4549,9 @@ TEST(rasn_runtime, dispatch_dedups_repeated_request_signatures)
 
 TEST(rasn_runtime, ownership_resources_expand_modules_and_shards)
 {
-    // No hosted shards are configured in the unit-test host, so each module maps
-    // to exactly one module-level ownership resource, in the given order.
+    // No hosted shards are configured in the unit-test host and the sharded modules
+    // default to a single partition, so each module maps to exactly one
+    // module-level ownership resource, in the given order.
     const std::vector<std::string> resources =
         rasn_runtime_module_ownership_resources({"determinism_ledger", "blackboard"});
     ASSERT_EQ(2u, resources.size());
@@ -4566,6 +4567,35 @@ TEST(rasn_runtime, ownership_resources_expand_modules_and_shards)
 
     // No modules means nothing to own (the gate opens handlers immediately).
     EXPECT_TRUE(rasn_runtime_module_ownership_resources({}).empty());
+}
+
+TEST(rasn_runtime, ownership_resources_whole_sharded_module_locks_every_shard)
+{
+    // An unsharded module takes exactly one module-level lock.
+    EXPECT_EQ(std::vector<std::string>({"rasn.runtime.determinism_ledger"}),
+              rasn_runtime_module_ownership_resources_for(
+                  "determinism_ledger", {}, /*sharded=*/false, /*partition_count=*/1));
+
+    // A sharded module pinned to a single partition is likewise one module-level lock.
+    EXPECT_EQ(std::vector<std::string>({"rasn.runtime.blackboard"}),
+              rasn_runtime_module_ownership_resources_for(
+                  "blackboard", {}, /*sharded=*/true, /*partition_count=*/1));
+
+    // A service that hosts an explicit shard subset locks exactly those shards.
+    EXPECT_EQ(std::vector<std::string>({"rasn.runtime.blackboard.shard.0",
+                                        "rasn.runtime.blackboard.shard.2"}),
+              rasn_runtime_module_ownership_resources_for(
+                  "blackboard", {0, 2}, /*sharded=*/true, /*partition_count=*/4));
+
+    // A whole-module host of a sharded module (no explicit hosted subset) must lock
+    // EVERY shard rather than the unqualified module resource. Otherwise it would
+    // not contend with a peer that locks rasn.runtime.blackboard.shard.N, and both
+    // processes would serve shard N -- the split brain this expansion guards against.
+    EXPECT_EQ(std::vector<std::string>({"rasn.runtime.blackboard.shard.0",
+                                        "rasn.runtime.blackboard.shard.1",
+                                        "rasn.runtime.blackboard.shard.2"}),
+              rasn_runtime_module_ownership_resources_for(
+                  "blackboard", {}, /*sharded=*/true, /*partition_count=*/3));
 }
 
 TEST(rasn_runtime, ingress_guard_admits_hosted_shards_and_rejects_others)

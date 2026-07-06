@@ -16,7 +16,9 @@
 #include <thread>
 #include <tuple>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#include <direct.h>
+#else
 #include <termios.h>
 #include <unistd.h>
 #endif
@@ -630,14 +632,21 @@ std::string align_working_directory_to_runtime_config(const std::string &config_
         return absolute;
     }
 
-#if !defined(_WIN32)
     // rDSN resolves a config file's `@include <relative>` against the process
     // working directory, so switch into the runtime config's own directory before
     // handing it to dsn_run. Passing the absolute config path keeps the main file
     // openable after the chdir while its sibling `@include config.ini` now resolves
     // beside it. Chdir'ing into the directory that already is the CWD is a harmless
     // no-op, so this only changes behavior for launches from another directory.
-    if (::chdir(config_dir.c_str()) != 0)
+    // Windows resolves the include the same CWD-relative way, so chdir there too
+    // (via ::_chdir); guarding this block to POSIX made the Windows `--dsn` fix a
+    // no-op and left the include binding against the caller's directory.
+#if defined(_WIN32)
+    const int chdir_rc = ::_chdir(config_dir.c_str());
+#else
+    const int chdir_rc = ::chdir(config_dir.c_str());
+#endif
+    if (chdir_rc != 0)
     {
         fprintf(stderr,
                 "rasn: warning: could not switch to runtime config directory '%s' (%s); an "
@@ -646,7 +655,6 @@ std::string align_working_directory_to_runtime_config(const std::string &config_
                 std::strerror(errno),
                 absolute.c_str());
     }
-#endif
     return absolute;
 }
 
