@@ -34,6 +34,7 @@
  */
 
 # include <dsn/utility/configuration.h>
+# include <dsn/utility/logging.h>
 # include <dsn/cpp/utils.h>
 # include <cassert>
 # include <errno.h>
@@ -54,16 +55,55 @@ configuration::~configuration()
 {
 }
 
+static bool cfg_is_absolute_path(const char* path)
+{
+    if (path == nullptr || path[0] == '\0')
+    {
+        return false;
+    }
+    if (path[0] == '/' || path[0] == '\\')
+    {
+        return true;
+    }
+#ifdef _WIN32
+    if (((path[0] >= 'a' && path[0] <= 'z') || (path[0] >= 'A' && path[0] <= 'Z'))
+        && path[1] == ':')
+    {
+        return true;
+    }
+#endif
+    return false;
+}
+
 bool configuration::load_include(const char* inc, const char* arguments)
 {
-    configuration conf;
-    if (!conf.load(inc, arguments))
+    // Resolve a relative @include path against the directory of the parent
+    // configuration file (like the C preprocessor / nginx), rather than the
+    // process working directory, so that a config and its includes stay
+    // relocatable. Fall back to the original (working-directory relative) path
+    // when the parent-relative file does not exist, for backward compatibility.
+    std::string include_file = inc;
+    if (!cfg_is_absolute_path(inc))
     {
-        fprintf(stderr, "load included configuration file %s failed\n", inc);
+        std::string parent_dir = dsn::utils::filesystem::remove_file_name(_file_name);
+        if (!parent_dir.empty())
+        {
+            std::string candidate = dsn::utils::filesystem::path_combine(parent_dir, inc);
+            if (!candidate.empty() && dsn::utils::filesystem::file_exists(candidate))
+            {
+                include_file = candidate;
+            }
+        }
+    }
+
+    configuration conf;
+    if (!conf.load(include_file.c_str(), arguments))
+    {
+        dutil_error("load included configuration file %s failed", include_file.c_str());
         return false;
     }
 
-    printf("load included configuration file %s ...\n", inc);
+    dutil_info("load included configuration file %s ...", include_file.c_str());
     for (auto& sec : conf._configs)
     {
         for (auto& kv : sec.second)
@@ -87,25 +127,25 @@ bool configuration::load(const char* file_name, const char* arguments, const cha
     {
         std::string cdir;
         dsn::utils::filesystem::get_current_directory(cdir);
-        fprintf(stderr, "ERROR: cannot open file %s in %s, err = %s\n", file_name, cdir.c_str(), strerror(errno));
+        dutil_error("cannot open file %s in %s, err = %s", file_name, cdir.c_str(), strerror(errno));
         return false;
     }
     if (::fseek(fd, 0, SEEK_END) != 0)
     {
-        fprintf(stderr, "ERROR: cannot seek to end of %s, err = %s\n", file_name, strerror(errno));
+        dutil_error("cannot seek to end of %s, err = %s", file_name, strerror(errno));
         if (::fclose(fd) != 0)
         {
-            fprintf(stderr, "ERROR: cannot close file %s, err = %s\n", file_name, strerror(errno));
+            dutil_error("cannot close file %s, err = %s", file_name, strerror(errno));
         }
         return false;
     }
     long len = ftell(fd);
     if (len == -1 || len == 0)
     {
-        fprintf(stderr, "ERROR: cannot get length of %s, err = %s\n", file_name, strerror(errno));
+        dutil_error("cannot get length of %s, err = %s", file_name, strerror(errno));
         if (::fclose(fd) != 0)
         {
-            fprintf(stderr, "ERROR: cannot close file %s, err = %s\n", file_name, strerror(errno));
+            dutil_error("cannot close file %s, err = %s", file_name, strerror(errno));
         }
         return false;
     }
@@ -113,22 +153,22 @@ bool configuration::load(const char* file_name, const char* arguments, const cha
     _file_data.resize(len + 1);
     if (::fseek(fd, 0, SEEK_SET) != 0)
     {
-        fprintf(stderr, "ERROR: cannot seek to beginning of %s, err = %s\n", file_name, strerror(errno));
+        dutil_error("cannot seek to beginning of %s, err = %s", file_name, strerror(errno));
         if (::fclose(fd) != 0)
         {
-            fprintf(stderr, "ERROR: cannot close file %s, err = %s\n", file_name, strerror(errno));
+            dutil_error("cannot close file %s, err = %s", file_name, strerror(errno));
         }
         return false;
     }
     auto sz = ::fread((char*)_file_data.c_str(), static_cast<size_t>(len), 1, fd);
     if (::fclose(fd) != 0)
     {
-        fprintf(stderr, "ERROR: cannot close file %s, err = %s\n", file_name, strerror(errno));
+        dutil_error("cannot close file %s, err = %s", file_name, strerror(errno));
         return false;
     }
     if (sz != 1)
     {
-        fprintf(stderr, "ERROR: cannot read correct data of %s, err = %s\n", file_name, strerror(errno));
+        dutil_error("cannot read correct data of %s, err = %s", file_name, strerror(errno));
         return false;
     }
     _file_data[len] = '\n';
@@ -147,7 +187,7 @@ bool configuration::load(const char* file_name, const char* arguments, const cha
             utils::split_args(kv.c_str(), vs, '=');
             if (vs.size() != 2)
             {
-                fprintf(stderr, "ERROR: invalid configuration argument: '%s' in '%s'\n", kv.c_str(), arguments);
+                dutil_error("invalid configuration argument: '%s' in '%s'", kv.c_str(), arguments);
                 return false;
             }
 
@@ -156,7 +196,7 @@ bool configuration::load(const char* file_name, const char* arguments, const cha
 
             _file_data = utils::replace_string(_file_data, key, value);
 
-            printf("config.replace: %s => %s\n", key.c_str(), value.c_str());
+            dutil_info("config.replace: %s => %s", key.c_str(), value.c_str());
         }
     }
     
@@ -236,7 +276,7 @@ bool configuration::load(const char* file_name, const char* arguments, const cha
         {
 ConfReg:
             if (pSection == nullptr) {
-                fprintf(stderr, "ERROR: configuration section not defined\n");
+                dutil_error("configuration section not defined");
                 goto err;
             }
             if (pEqual)    *pEqual = '\0';
@@ -249,14 +289,12 @@ ConfReg:
             {
                 auto it = pSection->find((const char*)pKey);
 
-                fprintf(stderr, "WARNING: overwrite option [%s] %s = (%s => %s) (line %u => %u)\n",
-                    pSectionName,
+                dutil_warn("overwrite option [%s] %s = (%s => %s) (line %u => %u)", pSectionName,
                     pKey,
                     it->second->value.c_str(),
                     pValue,
                     it->second->line,
-                    lineno
-                );
+                    lineno);
 
                 it->second->value = pValue ? pValue : "";
                 it->second->line = lineno;
@@ -349,11 +387,9 @@ Next:
                             value // 12345
                         );
 
-                        printf("config.config.args: [%s] %s = %s\n",
-                            kv.second->section.c_str(),
+                        dutil_info("config.config.args: [%s] %s = %s", kv.second->section.c_str(),
                             kv.second->key.c_str(),
-                            kv.second->value.c_str()
-                        );
+                            kv.second->value.c_str());
                     }
                 }
             }
@@ -374,7 +410,7 @@ Next:
             utils::split_args(kv.c_str(), vs, '=');
             if (vs.size() != 2 && vs.size() != 1)
             {
-                fprintf(stderr, "ERROR: invalid configuration overwrites: '%s' in '%s'\n", kv.c_str(), arguments);
+                dutil_error("invalid configuration overwrites: '%s' in '%s'", kv.c_str(), arguments);
                 return false;
             }
 
@@ -384,10 +420,7 @@ Next:
             auto pos = section_and_key.find_last_of('.');
             if (pos == std::string::npos)
             {
-                fprintf(stderr, "ERROR: invalid configuration overwrites: "
-                    "'%s' does not represent section.key\n", 
-                    section_and_key.c_str()
-                );
+                dutil_error("invalid configuration overwrites: '%s' does not represent section.key", section_and_key.c_str());
                 return false;
             }
 
@@ -403,7 +436,7 @@ Next:
     return true;
     
 err:
-    fprintf(stderr, "ERROR: unexpected configuration in %s(line %d): %s\n", file_name, lineno, pLine);
+    dutil_error("unexpected configuration in %s(line %d): %s", file_name, lineno, pLine);
     return false;
 }
 
@@ -431,7 +464,7 @@ void configuration::get_all_keys(const char* section, std::vector<const char*>& 
     keys.clear();
     if (section == nullptr || section[0] == '\0')
     {
-        fprintf(stderr, "ERROR: configuration section cannot be null or empty\n");
+        dutil_error("configuration section cannot be null or empty");
         return;
     }
 
@@ -454,25 +487,25 @@ bool configuration::get_string_value_internal(const char* section, const char* k
 {
     if (ov == nullptr)
     {
-        fprintf(stderr, "ERROR: configuration output value cannot be null\n");
+        dutil_error("configuration output value cannot be null");
         return false;
     }
 
     if (section == nullptr || section[0] == '\0')
     {
-        fprintf(stderr, "ERROR: configuration section cannot be null or empty\n");
+        dutil_error("configuration section cannot be null or empty");
         return false;
     }
 
     if (key == nullptr || key[0] == '\0')
     {
-        fprintf(stderr, "ERROR: configuration key cannot be null or empty\n");
+        dutil_error("configuration key cannot be null or empty");
         return false;
     }
 
     if (default_value == nullptr)
     {
-        fprintf(stderr, "ERROR: configuration default value cannot be null\n");
+        dutil_error("configuration default value cannot be null");
         *ov = nullptr;
         return false;
     }
@@ -497,8 +530,7 @@ bool configuration::get_string_value_internal(const char* section, const char* k
             {
                 if (it2->second->value != default_value)
                 {
-                    fprintf(stderr, "ERROR: configuration default value is different for '[%s] %s': %s <--> %s\n",
-                        section, key, it2->second->value.c_str(), default_value);
+                    dutil_error("configuration default value is different for '[%s] %s': %s <--> %s", section, key, it2->second->value.c_str(), default_value);
                     ::abort();
                 }
             }
@@ -544,11 +576,9 @@ const char* configuration::get_string_value(const char* section, const char* key
     {
         if (_warning)
         {
-            fprintf(stderr, "WARNING: configuration '[%s] %s' is not defined, default value is '%s'\n",
-                section,
+            dutil_warn("configuration '[%s] %s' is not defined, default value is '%s'", section,
                 key,
-                default_value
-                );
+                default_value);
         }
     }
     return ov;
@@ -561,11 +591,9 @@ std::list<std::string> configuration::get_string_value_list(const char* section,
     {
         if (_warning)
         {
-            fprintf(stderr, "WARNING: configuration '[%s] %s' is not defined, default value is '%s'\n",
-                section,
+            dutil_warn("configuration '[%s] %s' is not defined, default value is '%s'", section,
                 key,
-                ""
-                );
+                "");
         }
     }
 
@@ -636,12 +664,10 @@ void configuration::set(const char* section, const char* key, const char* value,
     }
     else
     {        
-        fprintf(stderr, "WARNING: overwrite [%s] %s = (%s => %s)\n",
-            section,
+        dutil_warn("overwrite [%s] %s = (%s => %s)", section,
             key, 
             it2->second->value.c_str(),
-            value
-            );
+            value);
 
         it2->second->value = value;
     }
@@ -651,7 +677,7 @@ void configuration::set(const char* section, const char* key, const char* value,
 
 void configuration::register_config_change_notification(config_file_change_notifier notifier)
 {
-    fprintf(stderr, "ERROR: method register_config_change_notification() not implemented\n");
+    dutil_error("method register_config_change_notification() not implemented");
     ::abort();
 }
 
@@ -661,7 +687,7 @@ bool configuration::has_section(const char* section)
     bool r = (it != _configs.end());
     if (!r && _warning)
     {
-        fprintf(stderr, "WARNING: configuration section '[%s]' is not defined, using default settings\n", section);
+        dutil_warn("configuration section '[%s]' is not defined, using default settings", section);
     }
     return r;
 }
