@@ -42,8 +42,23 @@
 # include <algorithm>
 # include <cstring>
 # include <utility>
+# include <set>
 
 namespace dsn {
+
+namespace {
+// Per-thread set of configuration files currently being loaded on this thread
+// (the active @include ancestry). The entire @include recursion runs
+// synchronously on one thread, so a thread-local set lets nested load() /
+// load_include() calls detect a circular @include chain -- which would
+// otherwise recurse until the stack overflows and the process crashes --
+// without exposing any state in configuration.h.
+std::set<std::string>& active_include_stack()
+{
+    static thread_local std::set<std::string> stack;
+    return stack;
+}
+}
 
 
 configuration::configuration()
@@ -121,6 +136,54 @@ bool configuration::load_include(const char* inc, const char* arguments)
 bool configuration::load(const char* file_name, const char* arguments, const char* overwrites)
 {
     _file_name = std::string(file_name);
+
+    // Detect circular @include chains (e.g. a.ini -> b.ini -> a.ini), which
+    // would otherwise recurse through load()/load_include() until the stack
+    // overflows and the process crashes. Track the files currently being loaded
+    // on this thread (the active include ancestry): if a file tries to include
+    // one of its own ancestors, reject it with a clear error. The canonical
+    // (realpath) form is used so different spellings of the same file (relative
+    // paths, symlinks, ..) are recognized as the same file.
+    std::string canonical_name;
+    if (!dsn::utils::filesystem::get_absolute_path(_file_name, canonical_name)
+        || canonical_name.empty())
+    {
+        canonical_name = _file_name;
+    }
+
+    std::set<std::string>& active_includes = active_include_stack();
+
+    // The outermost (root) load owns the per-thread set. Detecting the root
+    // here lets it clear the whole set when it finishes, guaranteeing the set
+    // is empty again after every top-level load -- whether it succeeded, failed,
+    // or unwound through an exception -- so no stale state can leak into a later
+    // load on the same thread. The root always inserts into an empty set, so it
+    // never triggers the cycle rejection below.
+    const bool is_root_load = active_includes.empty();
+
+    if (!active_includes.insert(canonical_name).second)
+    {
+        dutil_error("circular @include detected for configuration file '%s'", canonical_name.c_str());
+        return false;
+    }
+
+    // Remove this file from the active ancestry on every exit path, so the same
+    // file can still be included via a different, non-cyclic path (a diamond);
+    // the root load additionally clears the whole set as a safety net.
+    struct include_guard
+    {
+        std::set<std::string>& active;
+        const std::string& key;
+        bool is_root;
+        ~include_guard()
+        {
+            active.erase(key);
+            if (is_root)
+            {
+                active.clear();
+            }
+        }
+    } guard{active_includes, canonical_name, is_root_load};
 
     FILE* fd = ::fopen(file_name, "rb");
     if (fd == nullptr)
@@ -516,7 +579,7 @@ bool configuration::get_string_value_internal(const char* section, const char* k
     }
 
     *ov = default_value;
-    _lock.lock();
+    std::lock_guard<std::mutex> guard(_lock);
 
     std::map<std::string, conf*> *ps = nullptr;
     auto it = _configs.find(section);
@@ -541,7 +604,6 @@ bool configuration::get_string_value_internal(const char* section, const char* k
             *ov = it2->second->value.c_str();
             bool ret = it2->second->present ? true : false;
 
-            _lock.unlock();
             return ret;
         }
     }
@@ -565,7 +627,6 @@ bool configuration::get_string_value_internal(const char* section, const char* k
 
     *ov = cf->value.c_str();
 
-    _lock.unlock();
     return false;
 }
 
@@ -609,7 +670,7 @@ std::list<std::string> configuration::get_string_value_list(const char* section,
 
 void configuration::dump(std::ostream& os)
 {
-    _lock.lock();
+    std::lock_guard<std::mutex> guard(_lock);
 
     for (auto& s : _configs)
     {
@@ -629,16 +690,14 @@ void configuration::dump(std::ostream& os)
 
         os << std::endl;
     }
-
-    _lock.unlock();
 }
 
 void configuration::set(const char* section, const char* key, const char* value, const char* dsptr)
 {
     std::map<std::string, conf*>* psection;
 
-    _lock.lock();
-    
+    std::lock_guard<std::mutex> guard(_lock);
+
     auto it = _configs.find(section);
     if (it != _configs.end())
     {
@@ -671,8 +730,6 @@ void configuration::set(const char* section, const char* key, const char* value,
 
         it2->second->value = value;
     }
-
-    _lock.unlock();
 }
 
 void configuration::register_config_change_notification(config_file_change_notifier notifier)
