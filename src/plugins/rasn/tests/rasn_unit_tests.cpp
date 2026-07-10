@@ -2402,6 +2402,46 @@ TEST(rasn_state, recovers_past_a_torn_trailing_journal_record)
     EXPECT_TRUE(saw_second);
     EXPECT_FALSE(saw_torn);
 
+    state_record fourth;
+    fourth.key = "unit/torn-d";
+    fourth.kind = "observation";
+    fourth.scope = "unit";
+    fourth.value = "fourth-value";
+    const state_response appended = reader.put(fourth);
+    ASSERT_TRUE(appended.ok) << appended.error;
+
+    state_store final_reader;
+    const state_response recovered_after_append = final_reader.recover(request);
+    ASSERT_TRUE(recovered_after_append.ok) << recovered_after_append.error;
+
+    saw_first = false;
+    saw_second = false;
+    saw_torn = false;
+    bool saw_fourth = false;
+    for (const state_record &record : recovered_after_append.records)
+    {
+        if (record.key == "unit/torn-a")
+        {
+            saw_first = true;
+        }
+        else if (record.key == "unit/torn-b")
+        {
+            saw_second = true;
+        }
+        else if (record.key == "unit/torn-c")
+        {
+            saw_torn = true;
+        }
+        else if (record.key == "unit/torn-d")
+        {
+            saw_fourth = true;
+        }
+    }
+    EXPECT_TRUE(saw_first);
+    EXPECT_TRUE(saw_second);
+    EXPECT_FALSE(saw_torn);
+    EXPECT_TRUE(saw_fourth);
+
     std::remove(checkpoint_path.c_str());
     std::remove((checkpoint_path + ".tmp").c_str());
     std::remove((checkpoint_path + ".bak").c_str());
@@ -2440,6 +2480,39 @@ TEST(rasn_state, rejects_corrupt_newline_terminated_journal_record)
     const state_response recovered = reader.recover(request);
     EXPECT_FALSE(recovered.ok);
     EXPECT_NE(std::string::npos, recovered.error.find("invalid checkpoint record"));
+
+    std::remove(checkpoint_path.c_str());
+    std::remove((checkpoint_path + ".tmp").c_str());
+    std::remove((checkpoint_path + ".bak").c_str());
+    std::remove(journal_path.c_str());
+}
+
+TEST(rasn_state, recovers_past_an_interrupted_first_journal_append)
+{
+    const std::string journal_path = configured_state_journal_path();
+    const std::string checkpoint_path = configured_state_checkpoint_path();
+    ASSERT_FALSE(journal_path.empty());
+    ASSERT_FALSE(checkpoint_path.empty());
+
+    std::remove(checkpoint_path.c_str());
+    std::remove((checkpoint_path + ".tmp").c_str());
+    std::remove((checkpoint_path + ".bak").c_str());
+    std::remove(journal_path.c_str());
+
+    state_checkpoint_request request;
+    request.path = checkpoint_path;
+
+    write_text_file(journal_path, "");
+    state_store empty_reader;
+    const state_response recovered_empty = empty_reader.recover(request);
+    ASSERT_TRUE(recovered_empty.ok) << recovered_empty.error;
+    EXPECT_TRUE(recovered_empty.records.empty());
+
+    write_text_file(journal_path, "rasn-state-journ");
+    state_store torn_header_reader;
+    const state_response recovered_torn_header = torn_header_reader.recover(request);
+    ASSERT_TRUE(recovered_torn_header.ok) << recovered_torn_header.error;
+    EXPECT_TRUE(recovered_torn_header.records.empty());
 
     std::remove(checkpoint_path.c_str());
     std::remove((checkpoint_path + ".tmp").c_str());

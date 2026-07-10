@@ -65,8 +65,9 @@ RASN_BIN_DIR=/path/to/builder/bin \
 Core dumps are disabled by default (`ulimit -c 0`). rDSN installs a crash
 handler that writes a core to `data/coredumps` on abort; under heavy repeated
 allocation-fault injection that write can take longer than the per-run timeout.
-CodePilot installs a non-allocating C++ allocation-failure handler before its
-first allocation, so it exits immediately instead of entering that teardown.
+CodePilot and SREPilot install a non-allocating C++ allocation-failure handler
+before their first allocation, so they exit immediately instead of entering
+that teardown.
 The harness also enforces the per-run timeout with **SIGKILL** rather than the
 default SIGTERM: rDSN installs a SIGTERM handler that runs a full, allocating
 `dsn_exit()` cleanup, which can itself stall under continuous allocation-fault
@@ -95,7 +96,7 @@ Targets, chosen for attribution:
 1. **`codepilot schema {json,idl}`** -- pure rASN string/serialization work that
    runs *before* the rDSN runtime is initialized, so faults are cleanly
    attributable to rASN.
-2. **`rasn.unit_tests`** (filter `rasn_*.*:codepilot_*.*`, 90 tests) -- the whole
+2. **`rasn.unit_tests`** (filter `rasn_*.*:codepilot_*.*`, 91 tests) -- the whole
    engine: state checkpoints/journals, workflow leases and recovery, LLM replay,
    agent runtime, and the resilience gates.
 3. **`codepilot workflow validate|compile <file>`** -- filesystem read + parse.
@@ -109,9 +110,9 @@ the outcome distribution (`ok` = exit 0, `exitN` = graceful error, `SIGABRT` =
 `bad_alloc` fail-stop). **No `SIGSEGV`, `SIGBUS`, or deadlock was observed on any
 target under any fault mode.**
 
-These historical CodePilot results predate its allocation-failure handler.
-Current CodePilot allocation failures terminate promptly with a non-zero exit
-instead of entering the `SIGABRT` teardown path.
+These historical CodePilot and SREPilot results predate their allocation-failure
+handler. Current CLI allocation failures terminate promptly with a non-zero
+exit instead of entering the `SIGABRT` teardown path.
 
 ```
 codepilot.schema.json     malloc_* -> SIGABRT (100%)   io/net/str -> ok (no I/O on path)
@@ -126,10 +127,10 @@ codepilot.providers/tools io/net   -> ok                    malloc_* -> SIGABRT
 srepilot.help             io/net   -> ok                    malloc_* -> SIGABRT
 ```
 
-Interpretation: rASN's I/O paths check every stream/rename/flush result (see
-`state_service.cpp`), so injected I/O failures surface as errors rather than
-crashes or half-written state. CodePilot handles process-wide C++ allocation
-failure with a fixed diagnostic and immediate non-zero exit, avoiding
-allocation-dependent teardown. Per-request overload and dependency failures are
-contained earlier by the circuit breaker, admission gate, rate limiter, and
-token/cost budget.
+Interpretation: rASN encodes each state-journal record before I/O and appends it
+with one write. A short write is rolled back, and a later append discards only
+an unterminated tail, so injected I/O failures cannot poison subsequent
+recovery. CodePilot and SREPilot handle process-wide C++ allocation failure with
+a fixed diagnostic and immediate non-zero exit, avoiding allocation-dependent
+teardown. Per-request overload and dependency failures are contained earlier by
+the circuit breaker, admission gate, rate limiter, and token/cost budget.

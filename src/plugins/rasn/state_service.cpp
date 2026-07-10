@@ -6,12 +6,28 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <limits>
 #include <memory>
 #include <sstream>
+
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#include <share.h>
+#include <sys/locking.h>
+#include <sys/stat.h>
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#endif
 
 namespace dsn {
 namespace rasn {
@@ -46,6 +62,304 @@ struct state_replica_config
 
 bool ensure_parent_directory(const std::string &path, std::string *error);
 void write_state_record_line(std::ostream &output, const state_record &record);
+
+const char kStateJournalHeader[] = "rasn-state-journal-v1\n";
+
+int open_state_journal(const std::string &path)
+{
+#if defined(_WIN32)
+    int fd = -1;
+    const errno_t result = _sopen_s(&fd,
+                                    path.c_str(),
+                                    _O_BINARY | _O_CREAT | _O_RDWR | _O_APPEND,
+                                    _SH_DENYNO,
+                                    _S_IREAD | _S_IWRITE);
+    return result == 0 ? fd : -1;
+#else
+    return ::open(path.c_str(),
+                  O_CREAT | O_RDWR | O_APPEND,
+                  S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
+#endif
+}
+
+int64_t seek_state_journal(int fd, int64_t offset, int origin)
+{
+#if defined(_WIN32)
+    return static_cast<int64_t>(::_lseeki64(fd, offset, origin));
+#else
+    return static_cast<int64_t>(::lseek(fd, static_cast<off_t>(offset), origin));
+#endif
+}
+
+bool lock_state_journal(int fd)
+{
+#if defined(_WIN32)
+    return seek_state_journal(fd, 0, SEEK_SET) == 0 && ::_locking(fd, _LK_LOCK, 1) == 0;
+#else
+    int result = -1;
+    do
+    {
+        result = ::flock(fd, LOCK_EX);
+    } while (result != 0 && errno == EINTR);
+    return result == 0;
+#endif
+}
+
+int64_t read_state_journal(int fd, char *data, size_t size)
+{
+#if defined(_WIN32)
+    return static_cast<int64_t>(::_read(fd, data, static_cast<unsigned int>(size)));
+#else
+    return static_cast<int64_t>(::read(fd, data, size));
+#endif
+}
+
+int64_t write_state_journal(int fd, const char *data, size_t size)
+{
+#if defined(_WIN32)
+    return static_cast<int64_t>(::_write(fd, data, static_cast<unsigned int>(size)));
+#else
+    return static_cast<int64_t>(::write(fd, data, size));
+#endif
+}
+
+bool truncate_state_journal(int fd, int64_t size)
+{
+#if defined(_WIN32)
+    return ::_chsize_s(fd, size) == 0;
+#else
+    return ::ftruncate(fd, static_cast<off_t>(size)) == 0;
+#endif
+}
+
+void close_state_journal(int fd)
+{
+#if defined(_WIN32)
+    (void)::_close(fd);
+#else
+    (void)::close(fd);
+#endif
+}
+
+bool read_state_journal_at(int fd, int64_t offset, char *data, size_t size)
+{
+    if (seek_state_journal(fd, offset, SEEK_SET) != offset)
+    {
+        return false;
+    }
+
+    size_t consumed = 0;
+    while (consumed < size)
+    {
+        const int64_t result = read_state_journal(fd, data + consumed, size - consumed);
+        if (result < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        if (result <= 0)
+        {
+            return false;
+        }
+        consumed += static_cast<size_t>(result);
+    }
+    return true;
+}
+
+bool find_complete_state_journal_size(int fd,
+                                      int64_t file_size,
+                                      const std::string &path,
+                                      const std::string &description,
+                                      int64_t *complete_size,
+                                      std::string *error)
+{
+    if (file_size == 0)
+    {
+        *complete_size = 0;
+        return true;
+    }
+
+    const size_t header_size = sizeof(kStateJournalHeader) - 1;
+    const size_t prefix_size =
+        static_cast<size_t>((std::min)(file_size, static_cast<int64_t>(header_size)));
+    char header[sizeof(kStateJournalHeader) - 1];
+    if (!read_state_journal_at(fd, 0, header, prefix_size))
+    {
+        if (error != nullptr)
+        {
+            *error = "failed to inspect " + description + " before append: " + path;
+        }
+        return false;
+    }
+    if (std::memcmp(header, kStateJournalHeader, prefix_size) != 0)
+    {
+        if (error != nullptr)
+        {
+            *error = "invalid " + description + " header before append: " + path;
+        }
+        return false;
+    }
+    if (file_size < static_cast<int64_t>(header_size))
+    {
+        *complete_size = 0;
+        return true;
+    }
+
+    char last = '\0';
+    if (!read_state_journal_at(fd, file_size - 1, &last, 1))
+    {
+        if (error != nullptr)
+        {
+            *error = "failed to inspect " + description + " tail before append: " + path;
+        }
+        return false;
+    }
+    if (last == '\n')
+    {
+        *complete_size = file_size;
+        return true;
+    }
+
+    char buffer[4096];
+    int64_t cursor = file_size;
+    while (cursor > 0)
+    {
+        const int64_t begin = (std::max)(int64_t{0}, cursor - static_cast<int64_t>(sizeof(buffer)));
+        const size_t length = static_cast<size_t>(cursor - begin);
+        if (!read_state_journal_at(fd, begin, buffer, length))
+        {
+            if (error != nullptr)
+            {
+                *error = "failed to inspect " + description + " tail before append: " + path;
+            }
+            return false;
+        }
+        for (size_t i = length; i > 0; --i)
+        {
+            if (buffer[i - 1] == '\n')
+            {
+                *complete_size = begin + static_cast<int64_t>(i);
+                return true;
+            }
+        }
+        cursor = begin;
+    }
+
+    if (error != nullptr)
+    {
+        *error = "invalid " + description + " before append: " + path;
+    }
+    return false;
+}
+
+bool append_state_journal_file(const std::string &path,
+                               const state_record &record,
+                               const std::string &description,
+                               std::string *error)
+{
+    std::ostringstream encoded;
+    write_state_record_line(encoded, record);
+    if (!encoded)
+    {
+        if (error != nullptr)
+        {
+            *error = "failed to encode " + description + " record";
+        }
+        return false;
+    }
+    const std::string record_line = encoded.str();
+
+#if defined(_WIN32)
+    const size_t max_write_size = static_cast<size_t>((std::numeric_limits<int>::max)());
+#else
+    const size_t max_write_size = static_cast<size_t>((std::numeric_limits<ssize_t>::max)());
+#endif
+    const size_t header_size = sizeof(kStateJournalHeader) - 1;
+    if (record_line.size() > max_write_size - header_size)
+    {
+        if (error != nullptr)
+        {
+            *error = description + " record is too large: " + path;
+        }
+        return false;
+    }
+
+    const int fd = open_state_journal(path);
+    if (fd < 0)
+    {
+        if (error != nullptr)
+        {
+            *error = "failed to open " + description + " for append: " + path;
+        }
+        return false;
+    }
+    if (!lock_state_journal(fd))
+    {
+        close_state_journal(fd);
+        if (error != nullptr)
+        {
+            *error = "failed to lock " + description + " for append: " + path;
+        }
+        return false;
+    }
+
+    const int64_t file_size = seek_state_journal(fd, 0, SEEK_END);
+    int64_t append_offset = 0;
+    if (file_size < 0 ||
+        !find_complete_state_journal_size(fd, file_size, path, description, &append_offset, error))
+    {
+        close_state_journal(fd);
+        return false;
+    }
+
+    if (append_offset != file_size)
+    {
+        if (!truncate_state_journal(fd, append_offset))
+        {
+            close_state_journal(fd);
+            if (error != nullptr)
+            {
+                *error = "failed to discard torn " + description + " tail: " + path;
+            }
+            return false;
+        }
+        dwarn("discarded torn %s tail path=%s offset=%lld",
+              description.c_str(),
+              path.c_str(),
+              static_cast<long long>(append_offset));
+    }
+
+    std::string payload;
+    payload.reserve((append_offset == 0 ? header_size : 0) + record_line.size());
+    if (append_offset == 0)
+    {
+        payload.append(kStateJournalHeader, header_size);
+    }
+    payload.append(record_line);
+
+    int64_t written = -1;
+    do
+    {
+        written = write_state_journal(fd, payload.data(), payload.size());
+    } while (written < 0 && errno == EINTR);
+
+    if (written != static_cast<int64_t>(payload.size()))
+    {
+        const bool rolled_back = truncate_state_journal(fd, append_offset);
+        close_state_journal(fd);
+        if (error != nullptr)
+        {
+            *error = "failed to append " + description + ": " + path;
+            if (!rolled_back)
+            {
+                *error += " (partial record could not be rolled back)";
+            }
+        }
+        return false;
+    }
+
+    close_state_journal(fd);
+    return true;
+}
 
 std::string hex_encode(const std::string &value)
 {
@@ -312,31 +626,7 @@ bool mirror_journal_record_to_replica(const std::string &journal_path, const sta
     {
         return false;
     }
-    const bool write_header = !::dsn::utils::filesystem::file_exists(replica_journal);
-    std::ofstream journal(replica_journal.c_str(), std::ios::binary | std::ios::app);
-    if (!journal)
-    {
-        if (error != nullptr)
-        {
-            *error = "failed to open replicated state journal for append: " + replica_journal;
-        }
-        return false;
-    }
-    if (write_header)
-    {
-        journal << "rasn-state-journal-v1\n";
-    }
-    write_state_record_line(journal, record);
-    journal.flush();
-    if (!journal)
-    {
-        if (error != nullptr)
-        {
-            *error = "failed to flush replicated state journal: " + replica_journal;
-        }
-        return false;
-    }
-    return true;
+    return append_state_journal_file(replica_journal, record, "replicated state journal", error);
 }
 
 bool import_state_recovery_files_from_replica(const std::string &checkpoint_path,
@@ -1125,18 +1415,40 @@ state_response state_store::recover(const state_checkpoint_request &request)
             return error_response("failed to open state journal for recovery: " + journal_path);
         }
 
+        const std::string expected_header = "rasn-state-journal-v1";
         std::string header;
+        bool replay_records = true;
         if (!std::getline(journal, header))
         {
-            return error_response("empty state journal: " + journal_path);
+            if (!journal.eof() || journal.bad())
+            {
+                return error_response("failed to read state journal header: " + journal_path);
+            }
+            dwarn("ignoring empty state journal left by an interrupted first append: %s",
+                  journal_path.c_str());
+            replay_records = false;
         }
-        if (header != "rasn-state-journal-v1")
+        else if (header != expected_header)
         {
-            return error_response("invalid state journal header: " + journal_path);
+            const bool torn_header =
+                journal.eof() && !journal.bad() && header.size() < expected_header.size() &&
+                expected_header.compare(0, header.size(), header) == 0;
+            if (!torn_header)
+            {
+                return error_response("invalid state journal header: " + journal_path);
+            }
+            dwarn("ignoring torn state journal header left by an interrupted first append: %s",
+                  journal_path.c_str());
+            replay_records = false;
+        }
+        else if (journal.eof())
+        {
+            dwarn("ignoring unterminated state journal header: %s", journal_path.c_str());
+            replay_records = false;
         }
 
         std::string line;
-        while (std::getline(journal, line))
+        while (replay_records && std::getline(journal, line))
         {
             if (line.empty())
             {
@@ -1231,36 +1543,14 @@ std::string state_store::default_journal_path() const
 
 bool state_store::append_journal_record(const state_record &record, std::string *error) const
 {
-    const std::string checkpoint_path = default_checkpoint_path();
     const std::string journal_path = default_journal_path();
     if (!ensure_parent_directory(journal_path, error))
     {
         return false;
     }
 
-    const bool write_header = !::dsn::utils::filesystem::file_exists(journal_path);
-    std::ofstream journal(journal_path.c_str(), std::ios::binary | std::ios::app);
-    if (!journal)
+    if (!append_state_journal_file(journal_path, record, "state journal", error))
     {
-        if (error != nullptr)
-        {
-            *error = "failed to open state journal for append: " + journal_path;
-        }
-        return false;
-    }
-
-    if (write_header)
-    {
-        journal << "rasn-state-journal-v1\n";
-    }
-    write_state_record_line(journal, record);
-    journal.flush();
-    if (!journal)
-    {
-        if (error != nullptr)
-        {
-            *error = "failed to flush state journal: " + journal_path;
-        }
         return false;
     }
     if (!mirror_journal_record_to_replica(journal_path, record, error))

@@ -95,6 +95,7 @@ std::string find_runtime_config_path(const std::string &program)
 
 int main(int argc, char **argv)
 {
+    ::dsn::rasn::install_rasn_cli_out_of_memory_handler();
     register_rasn_apps();
     const std::vector<std::string> process_args = ::dsn::rasn::cli_args_from_argv(argc, argv);
     const std::vector<std::string> command_args = ::dsn::rasn::cli_args_from_argv(argc, argv, 1);

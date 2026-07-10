@@ -233,7 +233,7 @@ echo
 run_target "codepilot.schema.json" "$CODEPILOT" schema json
 run_target "codepilot.schema.idl"  "$CODEPILOT" schema idl
 
-# 2. Whole-engine surface: 90 rASN/CodePilot gtests covering state I/O, workflow
+# 2. Whole-engine surface: 91 rASN/CodePilot gtests covering state I/O, workflow
 #    leases/recovery, replay, agents, and the resilience gates.
 if [ -x "$UNIT_TESTS" ]; then
     run_target "rasn.unit_tests" "$UNIT_TESTS" --gtest_filter='rasn_*.*:codepilot_*.*'
