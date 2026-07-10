@@ -161,6 +161,7 @@ int maybe_run_direct_schema_command(const std::vector<std::string> &args)
 
 int main(int argc, char **argv)
 {
+    ::dsn::rasn::install_rasn_cli_out_of_memory_handler();
     const std::vector<std::string> process_args = ::dsn::rasn::cli_args_from_argv(argc, argv);
     const std::vector<std::string> command_args = ::dsn::rasn::cli_args_from_argv(argc, argv, 1);
     const int schema_result = maybe_run_direct_schema_command(command_args);

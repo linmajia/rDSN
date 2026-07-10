@@ -89,6 +89,7 @@ bool wait_for_cli_service_dependencies(const rasn_service_graph &services,
                                        std::string *error);
 
 std::vector<std::string> cli_args_from_argv(int argc, char **argv, int begin = 0);
+void install_rasn_cli_out_of_memory_handler();
 void run_dsn_with_cli_args(const std::vector<std::string> &args, bool sleep_after_init);
 // Make a co-located runtime config's `@include config.ini` resolve beside the
 // selected config rather than against an unrelated launch directory. rDSN opens

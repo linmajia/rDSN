@@ -18,9 +18,9 @@ Every run is classified by how the process terminated:
 | --- | --- | --- |
 | `SIGSEGV` / `SIGBUS` / `SIGFPE` / `SIGILL` | memory unsafety or bad arithmetic | **genuine defect** |
 | `HANG` (a `TIMEOUT` that still timed out on a much longer re-run) | deadlock | **genuine defect** |
-| `SIGABRT` | uncaught `std::bad_alloc` or assertion -- fail-stop | acceptable |
+| `SIGABRT` | assertion or allocation failure in a target without a CLI handler -- fail-stop | acceptable |
 | `TIMEOUT_transient` (a `TIMEOUT` that completed within a longer re-run) | slow fail-stop teardown artifact | acceptable |
-| non-zero exit | operation returned an error that propagated cleanly | acceptable |
+| non-zero exit | operation returned an error, or a CLI allocation handler terminated promptly | acceptable |
 | exit `0` | fault absorbed, or not on the exercised path | acceptable |
 
 The script exits non-zero only if it sees a genuine crash-class outcome.
@@ -35,10 +35,9 @@ under test:
   load *before any application code runs* (the kept log is empty) -- does not
   recur and is reported as `<sig>_transient`.
 * A **`TIMEOUT`** is re-run with a much longer timeout (`max(4×, 60s)`). A genuine
-  deadlock still never returns and is promoted to `HANG`; a slow `std::bad_alloc`
-  fail-stop teardown -- the runtime's crash handler symbolising a backtrace while
-  allocation faults keep firing -- completes when given more time and is reported
-  as `TIMEOUT_transient`.
+  deadlock still never returns and is promoted to `HANG`; slow fail-stop teardown
+  in a target without an allocation handler completes when given more time and is
+  reported as `TIMEOUT_transient`.
 
 ## Requirements
 
@@ -66,6 +65,8 @@ RASN_BIN_DIR=/path/to/builder/bin \
 Core dumps are disabled by default (`ulimit -c 0`). rDSN installs a crash
 handler that writes a core to `data/coredumps` on abort; under heavy repeated
 allocation-fault injection that write can take longer than the per-run timeout.
+CodePilot installs a non-allocating C++ allocation-failure handler before its
+first allocation, so it exits immediately instead of entering that teardown.
 The harness also enforces the per-run timeout with **SIGKILL** rather than the
 default SIGTERM: rDSN installs a SIGTERM handler that runs a full, allocating
 `dsn_exit()` cleanup, which can itself stall under continuous allocation-fault
@@ -108,6 +109,10 @@ the outcome distribution (`ok` = exit 0, `exitN` = graceful error, `SIGABRT` =
 `bad_alloc` fail-stop). **No `SIGSEGV`, `SIGBUS`, or deadlock was observed on any
 target under any fault mode.**
 
+These historical CodePilot results predate its allocation-failure handler.
+Current CodePilot allocation failures terminate promptly with a non-zero exit
+instead of entering the `SIGABRT` teardown path.
+
 ```
 codepilot.schema.json     malloc_* -> SIGABRT (100%)   io/net/str -> ok (no I/O on path)
 rasn.unit_tests           io_rw_5  -> 86/90 pass; the 4 failures are exactly the
@@ -123,8 +128,8 @@ srepilot.help             io/net   -> ok                    malloc_* -> SIGABRT
 
 Interpretation: rASN's I/O paths check every stream/rename/flush result (see
 `state_service.cpp`), so injected I/O failures surface as errors rather than
-crashes or half-written state. Allocation failures fail-stop through
-`std::bad_alloc`, which is the expected behaviour for a one-shot CLI; for the
-long-running service modes, per-request overload and dependency failures are
+crashes or half-written state. CodePilot handles process-wide C++ allocation
+failure with a fixed diagnostic and immediate non-zero exit, avoiding
+allocation-dependent teardown. Per-request overload and dependency failures are
 contained earlier by the circuit breaker, admission gate, rate limiter, and
-token/cost budget rather than by allocation faults.
+token/cost budget.

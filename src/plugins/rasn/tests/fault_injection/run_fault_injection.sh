@@ -253,9 +253,9 @@ run_target "codepilot.tools"     "$CODEPILOT" tools
 echo "=================================================================="
 if [ "$GENUINE_DEFECTS" -eq 0 ]; then
     echo "PASS: no reproducible crash-class outcomes (no SIGSEGV/SIGBUS/SIGFPE/"
-    echo "      SIGILL, no reproducible hang) in the code under test. malloc faults"
-    echo "      fail-stop via std::bad_alloc (SIGABRT); I/O and network faults"
-    echo "      propagate as graceful errors. A '*_transient' count is a rare"
+    echo "      SIGILL, no reproducible hang) in the code under test. Allocation faults"
+    echo "      terminate promptly (non-zero CLI exit or SIGABRT fail-stop); I/O and"
+    echo "      network faults propagate as graceful errors. A '*_transient' count is a rare"
     echo "      runtime-bootstrap artifact that did not reproduce on re-run and is"
     echo "      not counted as a defect (inspect its kept log under $OUT_DIR)."
     exit 0

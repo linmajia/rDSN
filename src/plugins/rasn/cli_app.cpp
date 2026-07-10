@@ -10,14 +10,17 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <new>
 #include <sstream>
 #include <thread>
 #include <tuple>
 
 #if defined(_WIN32)
 #include <direct.h>
+#include <io.h>
 #else
 #include <termios.h>
 #include <unistd.h>
@@ -27,6 +30,17 @@ namespace dsn {
 namespace rasn {
 
 namespace {
+
+[[noreturn]] void exit_on_allocation_failure() noexcept
+{
+    static const char message[] = "rASN CLI: memory allocation failed\n";
+#if defined(_WIN32)
+    (void)::_write(2, message, static_cast<unsigned int>(sizeof(message) - 1));
+#else
+    (void)::write(STDERR_FILENO, message, sizeof(message) - 1);
+#endif
+    std::_Exit(EXIT_FAILURE);
+}
 
 std::string join_args(const std::vector<std::string> &args, size_t begin)
 {
@@ -600,6 +614,11 @@ std::vector<std::string> cli_args_from_argv(int argc, char **argv, int begin)
         args.push_back(argv[i] == nullptr ? "" : argv[i]);
     }
     return args;
+}
+
+void install_rasn_cli_out_of_memory_handler()
+{
+    std::set_new_handler(exit_on_allocation_failure);
 }
 
 void run_dsn_with_cli_args(const std::vector<std::string> &args, bool sleep_after_init)
