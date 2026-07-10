@@ -494,7 +494,7 @@ void rasn_registry_rpc_service::on_heartbeat(const agent_descriptor &request,
     reply(registry_response(request.agent_id, ok, error));
 }
 
-std::pair<::dsn::error_code, agent_response>
+std::pair< ::dsn::error_code, agent_response>
 rasn_registry_client::register_sync(const agent_descriptor &request,
                                     std::chrono::milliseconds timeout,
                                     int thread_hash,
@@ -504,7 +504,7 @@ rasn_registry_client::register_sync(const agent_descriptor &request,
         _server, RPC_RASN_REGISTRY_REGISTER, request, nullptr, empty_callback, timeout, thread_hash, partition_hash));
 }
 
-std::pair<::dsn::error_code, agent_response>
+std::pair< ::dsn::error_code, agent_response>
 rasn_registry_client::unregister_sync(const std::string &agent_id,
                                       std::chrono::milliseconds timeout,
                                       int thread_hash,
@@ -514,7 +514,7 @@ rasn_registry_client::unregister_sync(const std::string &agent_id,
         _server, RPC_RASN_REGISTRY_UNREGISTER, agent_id, nullptr, empty_callback, timeout, thread_hash, partition_hash));
 }
 
-std::pair<::dsn::error_code, registry_query_response>
+std::pair< ::dsn::error_code, registry_query_response>
 rasn_registry_client::query_sync(const registry_query_request &request,
                                  std::chrono::milliseconds timeout,
                                  int thread_hash,
@@ -524,7 +524,7 @@ rasn_registry_client::query_sync(const registry_query_request &request,
         _server, RPC_RASN_REGISTRY_QUERY, request, nullptr, empty_callback, timeout, thread_hash, partition_hash));
 }
 
-std::pair<::dsn::error_code, registry_query_response>
+std::pair< ::dsn::error_code, registry_query_response>
 rasn_registry_client::list_sync(const std::string &request,
                                 std::chrono::milliseconds timeout,
                                 int thread_hash,
@@ -534,7 +534,7 @@ rasn_registry_client::list_sync(const std::string &request,
         _server, RPC_RASN_REGISTRY_LIST, request, nullptr, empty_callback, timeout, thread_hash, partition_hash));
 }
 
-std::pair<::dsn::error_code, agent_response>
+std::pair< ::dsn::error_code, agent_response>
 rasn_registry_client::heartbeat_sync(const agent_descriptor &request,
                                      std::chrono::milliseconds timeout,
                                      int thread_hash,

@@ -3169,7 +3169,7 @@ rasn_runtime_response invoke_remote_module(const rasn_runtime_request &request)
     for (uint32_t attempt = 1; attempt <= max_attempts; ++attempt)
     {
         rasn_runtime_client client(address);
-        const std::pair<::dsn::error_code, rasn_runtime_response> result = client.call_sync(sending, timeout);
+        const std::pair< ::dsn::error_code, rasn_runtime_response> result = client.call_sync(sending, timeout);
         if (result.first == ::dsn::ERR_OK)
         {
             if (breaker_enabled)
@@ -3260,7 +3260,7 @@ bool ping_remote_module(const std::string &module, std::string *error)
             continue;
         }
         rasn_runtime_client client(address);
-        const std::pair<::dsn::error_code, rasn_runtime_response> result =
+        const std::pair< ::dsn::error_code, rasn_runtime_response> result =
             client.call_sync(ping, rasn_runtime_ping_timeout(module));
         if (result.first != ::dsn::ERR_OK)
         {
@@ -5287,7 +5287,7 @@ void rasn_runtime_rpc_service::on_sandbox_runtime(const rasn_runtime_request &re
     reply_module_request("sandbox_runtime", request, reply);
 }
 
-std::pair<::dsn::error_code, rasn_runtime_response>
+std::pair< ::dsn::error_code, rasn_runtime_response>
 rasn_runtime_client::call_sync(const rasn_runtime_request &request,
                                      std::chrono::milliseconds timeout,
                                      int thread_hash,

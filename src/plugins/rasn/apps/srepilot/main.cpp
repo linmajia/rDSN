@@ -14,22 +14,22 @@ namespace {
 
 void register_rasn_apps()
 {
-    dassert(::dsn::register_app<::dsn::rasn::rasn_registry_app>("rasn.registry"),
+    dassert(::dsn::register_app< ::dsn::rasn::rasn_registry_app>("rasn.registry"),
             "register rasn.registry app failed");
-    dassert(::dsn::register_app<::dsn::rasn::rasn_state_app>("rasn.state"),
+    dassert(::dsn::register_app< ::dsn::rasn::rasn_state_app>("rasn.state"),
             "register rasn.state app failed");
-    dassert(::dsn::register_app<::dsn::rasn::rasn_workflow_app>("rasn.workflow"),
+    dassert(::dsn::register_app< ::dsn::rasn::rasn_workflow_app>("rasn.workflow"),
             "register rasn.workflow app failed");
-    dassert(::dsn::register_app<::dsn::rasn::rasn_observability_app>("rasn.observability"),
+    dassert(::dsn::register_app< ::dsn::rasn::rasn_observability_app>("rasn.observability"),
             "register rasn.observability app failed");
     ::dsn::rasn::register_rasn_runtime_apps();
-    dassert(::dsn::register_app<::dsn::rasn::rasn_llm_agent_app>("rasn.llm.agent"),
+    dassert(::dsn::register_app< ::dsn::rasn::rasn_llm_agent_app>("rasn.llm.agent"),
             "register rasn.llm.agent app failed");
-    dassert(::dsn::register_app<::dsn::rasn::rasn_tool_agent_app>("rasn.tool.agent"),
+    dassert(::dsn::register_app< ::dsn::rasn::rasn_tool_agent_app>("rasn.tool.agent"),
             "register rasn.tool.agent app failed");
-    dassert(::dsn::register_app<::dsn::rasn::rasn_coordinator_app>("rasn.coordinator"),
+    dassert(::dsn::register_app< ::dsn::rasn::rasn_coordinator_app>("rasn.coordinator"),
             "register rasn.coordinator app failed");
-    dassert(::dsn::register_app<::dsn::rasn::srepilot_app>("rasn.srepilot"),
+    dassert(::dsn::register_app< ::dsn::rasn::srepilot_app>("rasn.srepilot"),
             "register rasn.srepilot app failed");
 }
 

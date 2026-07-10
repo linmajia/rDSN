@@ -319,25 +319,25 @@ class rasn_observability_client : public virtual ::dsn::clientlet
 public:
     explicit rasn_observability_client(::dsn::rpc_address server) : _server(server) {}
 
-    std::pair<::dsn::error_code, observability_response>
+    std::pair< ::dsn::error_code, observability_response>
     query_sync(const observability_query_request &request,
                std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                int thread_hash = 0,
                uint64_t partition_hash = 0);
 
-    std::pair<::dsn::error_code, observability_response>
+    std::pair< ::dsn::error_code, observability_response>
     failures_sync(const observability_query_request &request,
                   std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                   int thread_hash = 0,
                   uint64_t partition_hash = 0);
 
-    std::pair<::dsn::error_code, observability_response>
+    std::pair< ::dsn::error_code, observability_response>
     load_replay_sync(const replay_load_request &request,
                      std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                      int thread_hash = 0,
                      uint64_t partition_hash = 0);
 
-    std::pair<::dsn::error_code, observability_response>
+    std::pair< ::dsn::error_code, observability_response>
     snapshot_sync(const std::string &request,
                   std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                   int thread_hash = 0,

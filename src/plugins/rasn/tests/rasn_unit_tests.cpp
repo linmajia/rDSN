@@ -465,7 +465,7 @@ TEST(rasn_agent_types, schema_manifest_exposes_core_contracts)
     const std::string cpp_clients = rasn_schema_manifest_cpp_clients();
     EXPECT_NE(std::string::npos, cpp_clients.find("class workflow_rpc_client"));
     EXPECT_NE(std::string::npos, cpp_clients.find("RPC_RASN_OBSERVABILITY_LOAD_REPLAY"));
-    EXPECT_NE(std::string::npos, cpp_clients.find("std::pair<::dsn::error_code, state_response>"));
+    EXPECT_NE(std::string::npos, cpp_clients.find("std::pair< ::dsn::error_code, state_response>"));
 
     const std::string typescript = rasn_schema_manifest_typescript();
     EXPECT_NE(std::string::npos, typescript.find("export interface agent_request"));
@@ -3304,7 +3304,7 @@ TEST(rasn_rpc_resilience, retries_are_idempotency_aware_and_breaker_short_circui
     //    for a non-idempotent operation (the request provably never applied).
     {
         int attempts = 0;
-        const std::pair<::dsn::error_code, fake_response> result =
+        const std::pair< ::dsn::error_code, fake_response> result =
             resilient_rpc_call<fake_response>(
                 breakers, "case.pre_apply", options, /*idempotent=*/false,
                 std::chrono::milliseconds(10),
@@ -3328,7 +3328,7 @@ TEST(rasn_rpc_resilience, retries_are_idempotency_aware_and_breaker_short_circui
     //    exactly one attempt, and the timeout is surfaced to the caller.
     {
         int attempts = 0;
-        const std::pair<::dsn::error_code, fake_response> result =
+        const std::pair< ::dsn::error_code, fake_response> result =
             resilient_rpc_call<fake_response>(
                 breakers, "case.timeout_non_idempotent", options, /*idempotent=*/false,
                 std::chrono::milliseconds(10),
@@ -3343,7 +3343,7 @@ TEST(rasn_rpc_resilience, retries_are_idempotency_aware_and_breaker_short_circui
     // 3. The same ERR_TIMEOUT IS retried up to max_attempts for an idempotent op.
     {
         int attempts = 0;
-        const std::pair<::dsn::error_code, fake_response> result =
+        const std::pair< ::dsn::error_code, fake_response> result =
             resilient_rpc_call<fake_response>(
                 breakers, "case.timeout_idempotent", options, /*idempotent=*/true,
                 std::chrono::milliseconds(10),
@@ -3368,7 +3368,7 @@ TEST(rasn_rpc_resilience, retries_are_idempotency_aware_and_breaker_short_circui
                                           std::chrono::milliseconds(10), always_fail);
 
         bool invoked = false;
-        const std::pair<::dsn::error_code, fake_response> result =
+        const std::pair< ::dsn::error_code, fake_response> result =
             resilient_rpc_call<fake_response>(
                 breakers, "case.breaker", options, false, std::chrono::milliseconds(10),
                 [&](std::chrono::milliseconds) {
@@ -3432,7 +3432,7 @@ TEST(rasn_rpc_resilience, breaker_key_is_service_scoped_so_ops_trip_together)
     // circuits WITHOUT invoking the dependency -- the breaker is open for the
     // whole service, not just one operation.
     bool invoked = false;
-    const std::pair<::dsn::error_code, fake_response> result =
+    const std::pair< ::dsn::error_code, fake_response> result =
         resilient_rpc_call<fake_response>(
             breakers, core_service_breaker_key("state.query", endpoint), options, true,
             std::chrono::milliseconds(10), [&](std::chrono::milliseconds) {

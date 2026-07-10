@@ -301,7 +301,7 @@ void emit_line_comment(std::ostringstream &output, const std::string &text, cons
 
 void emit_cpp_client_method(std::ostringstream &output, const rpc_operation_descriptor &op)
 {
-    output << "    std::pair<::dsn::error_code, " << op.response_type << ">\n";
+    output << "    std::pair< ::dsn::error_code, " << op.response_type << ">\n";
     output << "    " << op.method << "_sync(const " << op.request_type << " &request,\n";
     output << "                  std::chrono::milliseconds timeout = std::chrono::milliseconds(0),\n";
     output << "                  int thread_hash = 0,\n";

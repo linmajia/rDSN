@@ -53,7 +53,7 @@ void set_rdsn_rpc_enabled(bool enabled)
 // state put that allocates a fresh sequence per apply); those are only retried on
 // transport errors that prove the request never reached the server.
 template <typename TResponse, typename FCall>
-std::pair<::dsn::error_code, TResponse>
+std::pair< ::dsn::error_code, TResponse>
 core_rpc_with_resilience(const char *op, const ::dsn::rpc_address &address, bool idempotent, FCall &&call)
 {
     ensure_rasn_core_breaker_config();
@@ -2452,7 +2452,7 @@ void rasn_service_graph::register_ops_commands_once()
             "rasn.metrics - dump rASN runtime metrics",
             "rasn.metrics [text|prometheus|json] - dump rASN runtime metrics in the "
             "requested format (default text)",
-            [](const ::dsn::safe_vector<::dsn::safe_string> &args) -> ::dsn::safe_string {
+            [](const ::dsn::safe_vector< ::dsn::safe_string> &args) -> ::dsn::safe_string {
                 std::string format = "text";
                 if (!args.empty())
                 {
@@ -2484,7 +2484,7 @@ void rasn_service_graph::register_ops_commands_once()
             "admission-control state (in-flight vs concurrency cap), and its "
             "rate-limiter state (requests/min, burst, available tokens), plus "
             "tool admission/rate limiter state and remote-agent dispatch guards",
-            [](const ::dsn::safe_vector<::dsn::safe_string> &args) -> ::dsn::safe_string {
+            [](const ::dsn::safe_vector< ::dsn::safe_string> &args) -> ::dsn::safe_string {
                 (void)args;
                 const std::string out = global_rasn_services().resilience_report();
                 return ::dsn::safe_string(out.c_str());
@@ -3701,7 +3701,7 @@ void rasn_coordinator_rpc_service::on_agent_query(const std::string &request,
     reply(services._coordinator.descriptor());
 }
 
-std::pair<::dsn::error_code, model_gateway_response>
+std::pair< ::dsn::error_code, model_gateway_response>
 rasn_llm_agent_client::describe_model_sync(const std::string &request,
                                            std::chrono::milliseconds timeout,
                                            int thread_hash,
@@ -3711,7 +3711,7 @@ rasn_llm_agent_client::describe_model_sync(const std::string &request,
         _server, RPC_RASN_MODEL_DESCRIBE, request, nullptr, empty_callback, timeout, thread_hash, partition_hash));
 }
 
-std::pair<::dsn::error_code, model_gateway_response>
+std::pair< ::dsn::error_code, model_gateway_response>
 rasn_llm_agent_client::set_provider_sync(const model_provider_request &request,
                                          std::chrono::milliseconds timeout,
                                          int thread_hash,
@@ -3721,7 +3721,7 @@ rasn_llm_agent_client::set_provider_sync(const model_provider_request &request,
         _server, RPC_RASN_MODEL_SET_PROVIDER, request, nullptr, empty_callback, timeout, thread_hash, partition_hash));
 }
 
-std::pair<::dsn::error_code, model_gateway_response>
+std::pair< ::dsn::error_code, model_gateway_response>
 rasn_llm_agent_client::health_sync(const std::string &request,
                                    std::chrono::milliseconds timeout,
                                    int thread_hash,

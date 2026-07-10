@@ -144,31 +144,31 @@ class rasn_registry_client : public virtual ::dsn::clientlet
 public:
     explicit rasn_registry_client(::dsn::rpc_address server) : _server(server) {}
 
-    std::pair<::dsn::error_code, agent_response>
+    std::pair< ::dsn::error_code, agent_response>
     register_sync(const agent_descriptor &request,
                   std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                   int thread_hash = 0,
                   uint64_t partition_hash = 0);
 
-    std::pair<::dsn::error_code, agent_response>
+    std::pair< ::dsn::error_code, agent_response>
     unregister_sync(const std::string &agent_id,
                     std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                     int thread_hash = 0,
                     uint64_t partition_hash = 0);
 
-    std::pair<::dsn::error_code, registry_query_response>
+    std::pair< ::dsn::error_code, registry_query_response>
     query_sync(const registry_query_request &request,
                std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                int thread_hash = 0,
                uint64_t partition_hash = 0);
 
-    std::pair<::dsn::error_code, registry_query_response>
+    std::pair< ::dsn::error_code, registry_query_response>
     list_sync(const std::string &request,
               std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
               int thread_hash = 0,
               uint64_t partition_hash = 0);
 
-    std::pair<::dsn::error_code, agent_response>
+    std::pair< ::dsn::error_code, agent_response>
     heartbeat_sync(const agent_descriptor &request,
                    std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                    int thread_hash = 0,

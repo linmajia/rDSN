@@ -1520,7 +1520,7 @@ int codepilot_cli::run_registry(const std::vector<std::string> &args)
         rasn_registry_client client(_services.registry_address());
         if (args.empty() || args[0] == "list")
         {
-            const std::pair<::dsn::error_code, registry_query_response> result =
+            const std::pair< ::dsn::error_code, registry_query_response> result =
                 client.list_sync("registry", default_rpc_timeout());
             if (result.first != ::dsn::ERR_OK)
             {
@@ -1546,7 +1546,7 @@ int codepilot_cli::run_registry(const std::vector<std::string> &args)
             registry_query_request request;
             request.capability = args[1];
             request.healthy_only = true;
-            const std::pair<::dsn::error_code, registry_query_response> result =
+            const std::pair< ::dsn::error_code, registry_query_response> result =
                 client.query_sync(request, default_rpc_timeout());
             if (result.first != ::dsn::ERR_OK)
             {
@@ -1569,7 +1569,7 @@ int codepilot_cli::run_registry(const std::vector<std::string> &args)
                 std::cout << "usage: registry get <agent-id>\n";
                 return 1;
             }
-            const std::pair<::dsn::error_code, registry_query_response> result =
+            const std::pair< ::dsn::error_code, registry_query_response> result =
                 client.list_sync("registry", default_rpc_timeout());
             if (result.first != ::dsn::ERR_OK)
             {
@@ -1679,7 +1679,7 @@ int codepilot_cli::run_agent_control(const std::vector<std::string> &args)
     rasn_agent_client client(address);
     if (args[0] == "describe")
     {
-        const std::pair<::dsn::error_code, agent_descriptor> result =
+        const std::pair< ::dsn::error_code, agent_descriptor> result =
             client.describe_sync("agentctl", default_rpc_timeout());
         if (result.first != ::dsn::ERR_OK)
         {
@@ -1691,7 +1691,7 @@ int codepilot_cli::run_agent_control(const std::vector<std::string> &args)
     }
     if (args[0] == "heartbeat")
     {
-        const std::pair<::dsn::error_code, agent_descriptor> result =
+        const std::pair< ::dsn::error_code, agent_descriptor> result =
             client.heartbeat_sync("agentctl", default_rpc_timeout());
         if (result.first != ::dsn::ERR_OK)
         {
@@ -1703,7 +1703,7 @@ int codepilot_cli::run_agent_control(const std::vector<std::string> &args)
     }
     if (args[0] == "query")
     {
-        const std::pair<::dsn::error_code, agent_descriptor> result =
+        const std::pair< ::dsn::error_code, agent_descriptor> result =
             client.query_sync("agentctl", default_rpc_timeout());
         if (result.first != ::dsn::ERR_OK)
         {
@@ -1721,7 +1721,7 @@ int codepilot_cli::run_agent_control(const std::vector<std::string> &args)
         request.task.id = request.request_id;
         request.task.name = "agentctl.cancel";
         request.capability = "agent.cancel";
-        const std::pair<::dsn::error_code, agent_response> result =
+        const std::pair< ::dsn::error_code, agent_response> result =
             client.cancel_sync(request, default_rpc_timeout());
         if (result.first != ::dsn::ERR_OK)
         {
@@ -1956,13 +1956,13 @@ int codepilot_cli::run_selftest(const std::vector<std::string> &args)
     if (_services.rpc_clients_enabled())
     {
         rasn_agent_client llm_client(_services.llm_agent_address());
-        const std::pair<::dsn::error_code, agent_descriptor> heartbeat =
+        const std::pair< ::dsn::error_code, agent_descriptor> heartbeat =
             llm_client.heartbeat_sync("selftest", std::chrono::milliseconds(5000));
         check(heartbeat.first == ::dsn::ERR_OK && heartbeat.second.agent_id == "rasn.llm.agent",
               "agent heartbeat RPC",
               heartbeat.first == ::dsn::ERR_OK ? heartbeat.second.agent_id : heartbeat.first.to_string());
 
-        const std::pair<::dsn::error_code, agent_descriptor> query =
+        const std::pair< ::dsn::error_code, agent_descriptor> query =
             llm_client.query_sync("selftest", std::chrono::milliseconds(5000));
         check(query.first == ::dsn::ERR_OK && query.second.agent_id == "rasn.llm.agent",
               "agent query RPC",
@@ -1972,7 +1972,7 @@ int codepilot_cli::run_selftest(const std::vector<std::string> &args)
         cancel_request.request_id = "cancel-" + completion.task.id;
         cancel_request.trace_id = completion.task.id;
         cancel_request.task.id = completion.task.id;
-        const std::pair<::dsn::error_code, agent_response> cancel =
+        const std::pair< ::dsn::error_code, agent_response> cancel =
             llm_client.cancel_sync(cancel_request, std::chrono::milliseconds(5000));
         check(cancel.first == ::dsn::ERR_OK && !cancel.second.ok &&
                   cancel.second.error.code == "cancel_not_found",

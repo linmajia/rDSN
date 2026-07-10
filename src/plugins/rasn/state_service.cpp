@@ -1330,7 +1330,7 @@ void rasn_state_rpc_service::on_recover(const state_checkpoint_request &request,
     reply(global_state_store().recover(request));
 }
 
-std::pair<::dsn::error_code, state_response>
+std::pair< ::dsn::error_code, state_response>
 rasn_state_client::put_sync(const state_record &request,
                             std::chrono::milliseconds timeout,
                             int thread_hash,
@@ -1340,7 +1340,7 @@ rasn_state_client::put_sync(const state_record &request,
         _server, RPC_RASN_STATE_PUT, request, nullptr, empty_callback, timeout, thread_hash, partition_hash));
 }
 
-std::pair<::dsn::error_code, state_response>
+std::pair< ::dsn::error_code, state_response>
 rasn_state_client::put_conditional_sync(const state_put_request &request,
                                         std::chrono::milliseconds timeout,
                                         int thread_hash,
@@ -1356,7 +1356,7 @@ rasn_state_client::put_conditional_sync(const state_put_request &request,
                                                                         partition_hash));
 }
 
-std::pair<::dsn::error_code, state_response>
+std::pair< ::dsn::error_code, state_response>
 rasn_state_client::get_sync(const state_key_request &request,
                             std::chrono::milliseconds timeout,
                             int thread_hash,
@@ -1366,7 +1366,7 @@ rasn_state_client::get_sync(const state_key_request &request,
         _server, RPC_RASN_STATE_GET, request, nullptr, empty_callback, timeout, thread_hash, partition_hash));
 }
 
-std::pair<::dsn::error_code, state_response>
+std::pair< ::dsn::error_code, state_response>
 rasn_state_client::query_sync(const state_query_request &request,
                               std::chrono::milliseconds timeout,
                               int thread_hash,
@@ -1376,7 +1376,7 @@ rasn_state_client::query_sync(const state_query_request &request,
         _server, RPC_RASN_STATE_QUERY, request, nullptr, empty_callback, timeout, thread_hash, partition_hash));
 }
 
-std::pair<::dsn::error_code, state_response>
+std::pair< ::dsn::error_code, state_response>
 rasn_state_client::checkpoint_sync(const state_checkpoint_request &request,
                                    std::chrono::milliseconds timeout,
                                    int thread_hash,
@@ -1386,7 +1386,7 @@ rasn_state_client::checkpoint_sync(const state_checkpoint_request &request,
         _server, RPC_RASN_STATE_CHECKPOINT, request, nullptr, empty_callback, timeout, thread_hash, partition_hash));
 }
 
-std::pair<::dsn::error_code, state_response>
+std::pair< ::dsn::error_code, state_response>
 rasn_state_client::recover_sync(const state_checkpoint_request &request,
                                 std::chrono::milliseconds timeout,
                                 int thread_hash,

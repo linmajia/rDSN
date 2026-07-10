@@ -445,7 +445,7 @@ void rasn_observability_rpc_service::on_snapshot(const std::string &request,
     reply(snapshot);
 }
 
-std::pair<::dsn::error_code, observability_response>
+std::pair< ::dsn::error_code, observability_response>
 rasn_observability_client::query_sync(const observability_query_request &request,
                                       std::chrono::milliseconds timeout,
                                       int thread_hash,
@@ -455,7 +455,7 @@ rasn_observability_client::query_sync(const observability_query_request &request
         _server, RPC_RASN_OBSERVABILITY_QUERY, request, nullptr, empty_callback, timeout, thread_hash, partition_hash));
 }
 
-std::pair<::dsn::error_code, observability_response>
+std::pair< ::dsn::error_code, observability_response>
 rasn_observability_client::failures_sync(const observability_query_request &request,
                                          std::chrono::milliseconds timeout,
                                          int thread_hash,
@@ -465,7 +465,7 @@ rasn_observability_client::failures_sync(const observability_query_request &requ
         _server, RPC_RASN_OBSERVABILITY_FAILURES, request, nullptr, empty_callback, timeout, thread_hash, partition_hash));
 }
 
-std::pair<::dsn::error_code, observability_response>
+std::pair< ::dsn::error_code, observability_response>
 rasn_observability_client::load_replay_sync(const replay_load_request &request,
                                             std::chrono::milliseconds timeout,
                                             int thread_hash,
@@ -475,7 +475,7 @@ rasn_observability_client::load_replay_sync(const replay_load_request &request,
         _server, RPC_RASN_OBSERVABILITY_LOAD_REPLAY, request, nullptr, empty_callback, timeout, thread_hash, partition_hash));
 }
 
-std::pair<::dsn::error_code, observability_response>
+std::pair< ::dsn::error_code, observability_response>
 rasn_observability_client::snapshot_sync(const std::string &request,
                                          std::chrono::milliseconds timeout,
                                          int thread_hash,

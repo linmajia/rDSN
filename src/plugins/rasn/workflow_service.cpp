@@ -1965,7 +1965,7 @@ void rasn_workflow_rpc_service::on_cancel(const workflow_run_query &request,
     reply(global_workflow_store().cancel(request));
 }
 
-std::pair<::dsn::error_code, workflow_response>
+std::pair< ::dsn::error_code, workflow_response>
 rasn_workflow_client::validate_sync(const workflow_source &request,
                                     std::chrono::milliseconds timeout,
                                     int thread_hash,
@@ -1975,7 +1975,7 @@ rasn_workflow_client::validate_sync(const workflow_source &request,
         _server, RPC_RASN_WORKFLOW_VALIDATE, request, nullptr, empty_callback, timeout, thread_hash, partition_hash));
 }
 
-std::pair<::dsn::error_code, workflow_response>
+std::pair< ::dsn::error_code, workflow_response>
 rasn_workflow_client::compile_sync(const workflow_source &request,
                                    std::chrono::milliseconds timeout,
                                    int thread_hash,
@@ -1985,7 +1985,7 @@ rasn_workflow_client::compile_sync(const workflow_source &request,
         _server, RPC_RASN_WORKFLOW_COMPILE, request, nullptr, empty_callback, timeout, thread_hash, partition_hash));
 }
 
-std::pair<::dsn::error_code, workflow_response>
+std::pair< ::dsn::error_code, workflow_response>
 rasn_workflow_client::start_sync(const workflow_start_request &request,
                                  std::chrono::milliseconds timeout,
                                  int thread_hash,
@@ -1995,7 +1995,7 @@ rasn_workflow_client::start_sync(const workflow_start_request &request,
         _server, RPC_RASN_WORKFLOW_START, request, nullptr, empty_callback, timeout, thread_hash, partition_hash));
 }
 
-std::pair<::dsn::error_code, workflow_response>
+std::pair< ::dsn::error_code, workflow_response>
 rasn_workflow_client::query_sync(const workflow_run_query &request,
                                  std::chrono::milliseconds timeout,
                                  int thread_hash,
@@ -2005,7 +2005,7 @@ rasn_workflow_client::query_sync(const workflow_run_query &request,
         _server, RPC_RASN_WORKFLOW_QUERY, request, nullptr, empty_callback, timeout, thread_hash, partition_hash));
 }
 
-std::pair<::dsn::error_code, workflow_response>
+std::pair< ::dsn::error_code, workflow_response>
 rasn_workflow_client::cancel_sync(const workflow_run_query &request,
                                   std::chrono::milliseconds timeout,
                                   int thread_hash,

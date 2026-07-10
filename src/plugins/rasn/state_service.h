@@ -237,37 +237,37 @@ class rasn_state_client : public virtual ::dsn::clientlet
 public:
     explicit rasn_state_client(::dsn::rpc_address server) : _server(server) {}
 
-    std::pair<::dsn::error_code, state_response>
+    std::pair< ::dsn::error_code, state_response>
     put_sync(const state_record &request,
              std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
              int thread_hash = 0,
              uint64_t partition_hash = 0);
 
-    std::pair<::dsn::error_code, state_response>
+    std::pair< ::dsn::error_code, state_response>
     put_conditional_sync(const state_put_request &request,
                          std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                          int thread_hash = 0,
                          uint64_t partition_hash = 0);
 
-    std::pair<::dsn::error_code, state_response>
+    std::pair< ::dsn::error_code, state_response>
     get_sync(const state_key_request &request,
              std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
              int thread_hash = 0,
              uint64_t partition_hash = 0);
 
-    std::pair<::dsn::error_code, state_response>
+    std::pair< ::dsn::error_code, state_response>
     query_sync(const state_query_request &request,
                std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                int thread_hash = 0,
                uint64_t partition_hash = 0);
 
-    std::pair<::dsn::error_code, state_response>
+    std::pair< ::dsn::error_code, state_response>
     checkpoint_sync(const state_checkpoint_request &request,
                     std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                     int thread_hash = 0,
                     uint64_t partition_hash = 0);
 
-    std::pair<::dsn::error_code, state_response>
+    std::pair< ::dsn::error_code, state_response>
     recover_sync(const state_checkpoint_request &request,
                  std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                  int thread_hash = 0,

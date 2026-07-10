@@ -364,7 +364,7 @@ public:
         ::dsn::dist::distributed_lock_service::lock_options opt = {true, true};
         auto granted = std::make_shared<std::atomic<int>>(static_cast<int>(::dsn::ERR_TIMEOUT.get()));
 
-        std::pair<::dsn::task_ptr, ::dsn::task_ptr> tasks = _lock->lock(
+        std::pair< ::dsn::task_ptr, ::dsn::task_ptr> tasks = _lock->lock(
             resource_id, owner_id, LPC_RASN_COORDINATION,
             [granted](::dsn::error_code ec, const std::string &, uint64_t) {
                 granted->store(static_cast<int>(ec.get()));

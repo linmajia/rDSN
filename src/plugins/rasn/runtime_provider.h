@@ -497,7 +497,7 @@ class rasn_runtime_client : public virtual ::dsn::clientlet
 {
 public:
     explicit rasn_runtime_client(::dsn::rpc_address server) : _server(server) {}
-    std::pair<::dsn::error_code, rasn_runtime_response>
+    std::pair< ::dsn::error_code, rasn_runtime_response>
     call_sync(const rasn_runtime_request &request,
               std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
               int thread_hash = 0,

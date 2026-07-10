@@ -21,31 +21,31 @@ class rasn_agent_client : public virtual ::dsn::clientlet
 public:
     explicit rasn_agent_client(::dsn::rpc_address server) : _server(server) {}
 
-    std::pair<::dsn::error_code, agent_descriptor>
+    std::pair< ::dsn::error_code, agent_descriptor>
     describe_sync(const std::string &request,
                   std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                   int thread_hash = 0,
                   uint64_t partition_hash = 0);
 
-    std::pair<::dsn::error_code, agent_response>
+    std::pair< ::dsn::error_code, agent_response>
     invoke_sync(const agent_request &request,
                 std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                 int thread_hash = 0,
                 uint64_t partition_hash = 0);
 
-    std::pair<::dsn::error_code, agent_response>
+    std::pair< ::dsn::error_code, agent_response>
     cancel_sync(const agent_request &request,
                 std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                 int thread_hash = 0,
                 uint64_t partition_hash = 0);
 
-    std::pair<::dsn::error_code, agent_descriptor>
+    std::pair< ::dsn::error_code, agent_descriptor>
     heartbeat_sync(const std::string &request,
                    std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                    int thread_hash = 0,
                    uint64_t partition_hash = 0);
 
-    std::pair<::dsn::error_code, agent_descriptor>
+    std::pair< ::dsn::error_code, agent_descriptor>
     query_sync(const std::string &request,
                std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                int thread_hash = 0,

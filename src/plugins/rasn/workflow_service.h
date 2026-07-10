@@ -230,31 +230,31 @@ class rasn_workflow_client : public virtual ::dsn::clientlet
 public:
     explicit rasn_workflow_client(::dsn::rpc_address server) : _server(server) {}
 
-    std::pair<::dsn::error_code, workflow_response>
+    std::pair< ::dsn::error_code, workflow_response>
     validate_sync(const workflow_source &request,
                   std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                   int thread_hash = 0,
                   uint64_t partition_hash = 0);
 
-    std::pair<::dsn::error_code, workflow_response>
+    std::pair< ::dsn::error_code, workflow_response>
     compile_sync(const workflow_source &request,
                  std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                  int thread_hash = 0,
                  uint64_t partition_hash = 0);
 
-    std::pair<::dsn::error_code, workflow_response>
+    std::pair< ::dsn::error_code, workflow_response>
     start_sync(const workflow_start_request &request,
                std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                int thread_hash = 0,
                uint64_t partition_hash = 0);
 
-    std::pair<::dsn::error_code, workflow_response>
+    std::pair< ::dsn::error_code, workflow_response>
     query_sync(const workflow_run_query &request,
                std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                int thread_hash = 0,
                uint64_t partition_hash = 0);
 
-    std::pair<::dsn::error_code, workflow_response>
+    std::pair< ::dsn::error_code, workflow_response>
     cancel_sync(const workflow_run_query &request,
                 std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                 int thread_hash = 0,

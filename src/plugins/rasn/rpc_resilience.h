@@ -92,7 +92,7 @@ rpc_resilience_options read_rasn_core_resilience_options();
 void ensure_rasn_core_breaker_config();
 
 // Generic resilient client RPC. `call` is invoked as `call(timeout)` and must
-// return `std::pair<::dsn::error_code, TResponse>`. Applies a per-key circuit
+// return `std::pair< ::dsn::error_code, TResponse>`. Applies a per-key circuit
 // breaker (fast-fail while the endpoint is unhealthy) and idempotency-aware
 // retries with linear backoff.
 //
@@ -102,7 +102,7 @@ void ensure_rasn_core_breaker_config();
 // pre-existing one-shot path did. Exactly one breaker probe is consumed per call
 // and exactly one outcome is reported, mirroring invoke_remote_module().
 template <typename TResponse, typename FCall>
-std::pair<::dsn::error_code, TResponse> resilient_rpc_call(circuit_breaker_registry &breakers,
+std::pair< ::dsn::error_code, TResponse> resilient_rpc_call(circuit_breaker_registry &breakers,
                                                            const std::string &breaker_key,
                                                            const rpc_resilience_options &options,
                                                            bool idempotent,
@@ -122,7 +122,7 @@ std::pair<::dsn::error_code, TResponse> resilient_rpc_call(circuit_breaker_regis
     const uint32_t max_attempts = options.max_attempts == 0 ? 1 : options.max_attempts;
     for (uint32_t attempt = 1; attempt <= max_attempts; ++attempt)
     {
-        std::pair<::dsn::error_code, TResponse> result = call(timeout);
+        std::pair< ::dsn::error_code, TResponse> result = call(timeout);
         if (result.first == ::dsn::ERR_OK)
         {
             if (options.breaker_enabled)

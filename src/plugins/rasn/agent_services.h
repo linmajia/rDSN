@@ -492,17 +492,17 @@ class rasn_llm_agent_client : public virtual ::dsn::clientlet
 {
 public:
     explicit rasn_llm_agent_client(::dsn::rpc_address server) : _server(server) {}
-    std::pair<::dsn::error_code, model_gateway_response>
+    std::pair< ::dsn::error_code, model_gateway_response>
     describe_model_sync(const std::string &request,
                         std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                         int thread_hash = 0,
                         uint64_t partition_hash = 0);
-    std::pair<::dsn::error_code, model_gateway_response>
+    std::pair< ::dsn::error_code, model_gateway_response>
     set_provider_sync(const model_provider_request &request,
                       std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                       int thread_hash = 0,
                       uint64_t partition_hash = 0);
-    std::pair<::dsn::error_code, model_gateway_response>
+    std::pair< ::dsn::error_code, model_gateway_response>
     health_sync(const std::string &request,
                 std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                 int thread_hash = 0,
