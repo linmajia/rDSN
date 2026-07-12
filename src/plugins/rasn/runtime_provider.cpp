@@ -8,12 +8,14 @@
 
 #include <dsn/cpp/zlocks.h>
 #include <dsn/tool-api/task.h>
+#include <dsn/utility/configuration.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <condition_variable>
 #include <deque>
+#include <fstream>
 #include <future>
 #include <iomanip>
 #include <limits>
@@ -156,6 +158,48 @@ std::string config_service_string(const std::string &key, const std::string &fal
     return value == nullptr ? fallback : value;
 }
 
+std::string config_service_override(const std::string &key,
+                                    const std::string &fallback,
+                                    const std::string &description,
+                                    bool *configured)
+{
+    static const std::string unset = "__rasn_config_value_not_set__";
+    const std::string value = config_service_string(key, unset, description);
+    const bool present = value != unset;
+    if (configured != nullptr)
+    {
+        *configured = present;
+    }
+    return present ? value : fallback;
+}
+
+uint16_t config_service_port_override(const std::string &key,
+                                      uint16_t fallback,
+                                      bool *configured)
+{
+    const uint64_t unset = (std::numeric_limits<uint64_t>::max)();
+    const uint64_t value = ::dsn_config_get_value_uint64(
+        "rasn.service", key.c_str(), unset, "rASN runtime module RPC port override");
+    const bool present = value != unset;
+    if (configured != nullptr)
+    {
+        *configured = present;
+    }
+    if (!present)
+    {
+        return fallback;
+    }
+    if (value == 0 || value > (std::numeric_limits<uint16_t>::max)())
+    {
+        dwarn("rasn.service.%s=%llu is outside the valid RPC port range; using inherited port %u",
+              key.c_str(),
+              static_cast<unsigned long long>(value),
+              static_cast<unsigned int>(fallback));
+        return fallback;
+    }
+    return static_cast<uint16_t>(value);
+}
+
 uint64_t config_service_uint64(const std::string &key, uint64_t fallback, const std::string &description)
 {
     return ::dsn_config_get_value_uint64("rasn.service", key.c_str(), fallback, description.c_str());
@@ -195,6 +239,13 @@ struct runtime_endpoint
     std::string source;
     uint32_t partition_index = 0;
     uint32_t partition_count = 1;
+    // True when the operator explicitly declared this endpoint (a URI, host, or
+    // port override) in [rasn.service] rather than falling through to the localhost
+    // default. An explicitly declared endpoint is authoritative: the app was told
+    // exactly where the runtime lives, so it routes there directly instead of
+    // second-guessing through registry discovery (which may advertise a
+    // primary_address() -- an auto-selected, possibly unreachable NIC).
+    bool explicit_config = false;
 };
 
 bool rasn_runtime_module_is_sharded(const std::string &module)
@@ -651,9 +702,13 @@ runtime_endpoint static_rasn_runtime_endpoint(const std::string &module, uint32_
     const bool sharded = partition_count > 1;
     const std::string shard_key = module_key + "_shard_" + std::to_string(partition_index);
     const std::string common_uri = config_service_string("rasn_runtime_uri", "", "rASN runtime module service URI");
-    const std::string module_uri = config_service_string(module_key + "_uri", common_uri, "rASN per-module service URI");
+    const std::string module_uri = config_service_override(
+        module_key + "_uri", common_uri, "rASN per-module service URI", nullptr);
     const std::string uri =
-        sharded ? config_service_string(shard_key + "_uri", module_uri, "rASN per-shard module service URI")
+        sharded ? config_service_override(shard_key + "_uri",
+                                          module_uri,
+                                          "rASN per-shard module service URI",
+                                          nullptr)
                 : module_uri;
     if (!uri.empty())
     {
@@ -662,22 +717,41 @@ runtime_endpoint static_rasn_runtime_endpoint(const std::string &module, uint32_
         endpoint.source = sharded ? "static:shard" : "static";
         endpoint.partition_index = partition_index;
         endpoint.partition_count = partition_count;
+        // A URI is only ever set by the operator, so it is always authoritative.
+        endpoint.explicit_config = true;
         return endpoint;
     }
     const std::string default_host = config_service_string("host", "localhost", "default rASN service RPC host");
-    const std::string common_host =
-        config_service_string("rasn_runtime_host", default_host, "rASN runtime module service host");
-    const std::string module_host = config_service_string(module_key + "_host", common_host, "rASN per-module service host");
+    bool common_host_configured = false;
+    const std::string common_host = config_service_override(
+        "rasn_runtime_host", default_host, "rASN runtime module service host", &common_host_configured);
+    bool module_host_configured = false;
+    const std::string module_host = config_service_override(
+        module_key + "_host", common_host, "rASN per-module service host", &module_host_configured);
+    bool shard_host_configured = false;
     std::string host =
-        sharded ? config_service_string(shard_key + "_host", module_host, "rASN per-shard module service host")
+        sharded ? config_service_override(shard_key + "_host",
+                                          module_host,
+                                          "rASN per-shard module service host",
+                                          &shard_host_configured)
                 : module_host;
+    const bool host_explicit = common_host_configured || module_host_configured ||
+                               (sharded && shard_host_configured);
     if (host.empty())
     {
         host = "localhost";
     }
-    const uint16_t common_port = config_service_port("rasn_runtime_port", 27107);
-    const uint16_t module_port = config_service_port(module_key + "_port", common_port);
-    const uint16_t port = sharded ? config_service_port(shard_key + "_port", module_port) : module_port;
+    bool common_port_configured = false;
+    const uint16_t common_port =
+        config_service_port_override("rasn_runtime_port", 27107, &common_port_configured);
+    bool module_port_configured = false;
+    const uint16_t module_port = config_service_port_override(
+        module_key + "_port", common_port, &module_port_configured);
+    bool shard_port_configured = false;
+    const uint16_t port =
+        sharded ? config_service_port_override(
+                      shard_key + "_port", module_port, &shard_port_configured)
+                : module_port;
     ::dsn::rpc_address address;
     address.assign_ipv4(host.c_str(), port);
     runtime_endpoint endpoint;
@@ -685,6 +759,9 @@ runtime_endpoint static_rasn_runtime_endpoint(const std::string &module, uint32_
     endpoint.source = sharded ? "static:shard" : "static";
     endpoint.partition_index = partition_index;
     endpoint.partition_count = partition_count;
+    endpoint.explicit_config = host_explicit || common_port_configured ||
+                               module_port_configured ||
+                               (sharded && shard_port_configured);
     return endpoint;
 }
 
@@ -797,12 +874,25 @@ bool lookup_rasn_runtime_endpoint_in_registry(const std::string &module, uint32_
 
 runtime_endpoint resolve_rasn_runtime_partition_endpoint(const std::string &module, uint32_t partition_index)
 {
+    // An operator-declared endpoint wins over registry discovery. When the app was
+    // configured with an explicit runtime address ([rasn.service] rasn_runtime_host
+    // / _uri, or the per-module / per-shard variants) it must be honored verbatim:
+    // the app is meant to reach the runtime at exactly that address and should not
+    // fall back to a discovered primary_address() that a co-located or
+    // differently-homed client may be unable to reach. Discovery remains the
+    // mechanism for modules whose placement is left unconfigured (dynamic/sharded
+    // fleets), and the same static endpoint is the final localhost fallback.
+    const runtime_endpoint static_endpoint = static_rasn_runtime_endpoint(module, partition_index);
+    if (static_endpoint.explicit_config)
+    {
+        return static_endpoint;
+    }
     runtime_endpoint endpoint;
     if (lookup_rasn_runtime_endpoint_in_registry(module, partition_index, &endpoint))
     {
         return endpoint;
     }
-    return static_rasn_runtime_endpoint(module, partition_index);
+    return static_endpoint;
 }
 
 runtime_endpoint resolve_rasn_runtime_endpoint(const std::string &module, const std::string &key = "")
@@ -3114,8 +3204,9 @@ bool rasn_runtime_rpc_context_available()
 std::string rasn_runtime_no_node_context_error(const std::string &module)
 {
     return std::string("distributed runtime module '") + module +
-           "' is only reachable over RPC from an rDSN service node context; run the app under --dsn "
-           "or embed it in a hosted runtime node";
+           "' is only reachable over RPC from an rDSN service node context; configure the app for "
+           "distributed/hybrid placement so its entry point attaches a client node, or embed it in "
+           "a hosted runtime node";
 }
 
 // Remote invocation with the runtime-owned resilience policy: a per-endpoint
@@ -5014,6 +5105,32 @@ std::vector<human_interaction_request> rasn_runtime_provider::pending_human() co
     return requests;
 }
 
+bool rasn_runtime_config_file_selects_remote(const std::string &config_path)
+{
+    // Parse placement with rDSN's configuration implementation BEFORE dsn_run(),
+    // so includes, inline comments, escaping, and last-write-wins semantics match
+    // the actual runtime config. A one-shot CLI needs this answer early to decide
+    // whether to launch a lightweight client service node for remote/hybrid RPC.
+    // Defaults to local (false) on any read or parse failure.
+    if (config_path.empty())
+    {
+        return false;
+    }
+    ::dsn::configuration config;
+    config.set_warning(false);
+    if (!config.load(config_path.c_str()))
+    {
+        return false;
+    }
+    const std::string provider = config.get_value<std::string>(
+        "rasn.runtime", "rasn_runtime_provider", "", "rASN runtime module provider");
+    const std::string mode = config.get_value<std::string>(
+        "rasn.runtime", "rasn_runtime_mode", "local", "rASN runtime module mode");
+    const std::string effective = provider.empty() ? mode : provider;
+    const std::string normalized = normalize_rasn_runtime_provider_name(effective);
+    return normalized == "distributed" || normalized == "hybrid";
+}
+
 rasn_runtime_config load_rasn_runtime_config()
 {
     rasn_runtime_config config;
@@ -5309,6 +5426,42 @@ agent_capability make_rasn_runtime_capability(const std::string &name)
     return capability;
 }
 
+// Resolve the address a runtime host publishes to the registry for a module. By
+// default this is the node's primary_address(), but rDSN derives that from the
+// first non-loopback NIC, which on multi-homed hosts (or hosts with virtual/bridge
+// interfaces) can be an address that clients cannot reach. Operators can override it
+// with [rasn.service] rasn_runtime_advertise_host (or a per-module
+// <module>_advertise_host): set 127.0.0.1 for a co-located runtime that only serves
+// same-host clients, or the routable IP / DNS name for a multi-machine deployment.
+// Only the host part is overridden; the advertised port stays the node's real listen
+// port. When unset, behavior is unchanged (primary_address()). An invalid or
+// unresolvable override returns an invalid address so it is never published as a
+// healthy registry endpoint.
+::dsn::rpc_address rasn_runtime_registry_advertise_address(const std::string &module,
+                                                           const ::dsn::rpc_address &primary)
+{
+    const std::string module_key = module_service_key(module);
+    const std::string common_host =
+        config_service_string("rasn_runtime_advertise_host", "", "rASN runtime registry advertise host");
+    const std::string host =
+        config_service_string(module_key + "_advertise_host", common_host, "rASN per-module registry advertise host");
+    if (host.empty())
+    {
+        return primary;
+    }
+    ::dsn::rpc_address address;
+    address.assign_ipv4(host.c_str(), primary.port());
+    if (address.is_invalid() || address.ip() == 0 || address.port() == 0)
+    {
+        derror("invalid registry advertise host '%s' for runtime module %s; "
+               "skipping registry publication",
+               host.c_str(),
+               module.c_str());
+        address.set_invalid();
+    }
+    return address;
+}
+
 agent_descriptor make_rasn_runtime_module_descriptor(const std::string &module,
                                                     const ::dsn::rpc_address &endpoint,
                                                     const std::string &app_name)
@@ -5570,7 +5723,12 @@ void rasn_runtime_app::register_modules_with_registry()
     bool registry_rpc_available = true;
     for (const std::string &module : _rpc.modules())
     {
-        agent_descriptor descriptor = make_rasn_runtime_module_descriptor(module, endpoint, name());
+        const ::dsn::rpc_address advertised = rasn_runtime_registry_advertise_address(module, endpoint);
+        if (advertised.is_invalid() || advertised.ip() == 0 || advertised.port() == 0)
+        {
+            continue;
+        }
+        agent_descriptor descriptor = make_rasn_runtime_module_descriptor(module, advertised, name());
         std::string error;
         if (!global_agent_registry().register_agent(descriptor, &error, true))
         {

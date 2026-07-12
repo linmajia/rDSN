@@ -186,17 +186,19 @@ Design notes:
 
 ## 6. Endpoints, placement, and topology
 
-- **Endpoint resolution** (`resolve_rasn_runtime_endpoint`): when
-  `rasn_runtime_registry_discovery_enabled` is true, the distributed path first
-  queries `rasn.registry` for a live descriptor. Sharded modules first query the
-  exact `rasn.runtime.<module>.shard.<n>` capability, then fall back to
+- **Endpoint resolution** (`resolve_rasn_runtime_endpoint`): an operator-declared
+  `<module>_uri`/`<module>_host`/`<module>_port` (or shared
+  `rasn_runtime_uri`/`rasn_runtime_host`/`rasn_runtime_port`) is authoritative
+  and is used without registry discovery.
+  This makes an app's configured runtime address deterministic. For modules left
+  unconfigured, the distributed path queries `rasn.registry` when
+  `rasn_runtime_registry_discovery_enabled` is true. Sharded modules first query
+  the exact `rasn.runtime.<module>.shard.<n>` capability, then fall back to
   `rasn.runtime.<module>`; non-sharded modules query only the module capability.
-  If discovery is empty or unavailable, it falls back to static config:
-  `<module>_uri` (or shared `rasn_runtime_uri`) if set; otherwise
-  `<module>_host`/`<module>_port` with shared fallbacks, default port `27107`
-  (the aggregate service). So a module can point at the registry-selected live
-  service, the aggregate service, a standalone role, or a URI-backed rDSN cluster
-  — independently per module.
+  If discovery is empty or unavailable, routing falls back to the static
+  localhost/default-port endpoint (`27107` for the aggregate service). A module
+  can therefore point at an explicitly configured service, a registry-selected
+  live service, a standalone role, or a URI-backed rDSN cluster independently.
 - **Shard-aware placement.** Modules whose descriptor is `sharded`
   (`agent_message_bus`, `resource_budget`, `blackboard`) can set
   `<module>_shard_count > 1`. Mutating and keyed read operations route by the
@@ -212,18 +214,20 @@ Design notes:
 - **Registry publication.** Runtime module service apps publish one lease-tracked
   descriptor per hosted module when
   `rasn_runtime_registry_registration_enabled` is true. The base descriptor
-  capability is `rasn.runtime.<module>` and the endpoint is the app's rDSN primary
-  address. When `<module>_hosted_shards` or `<module>_shard_index` is configured
-  for a sharded module, the same descriptor also advertises
+  capability is `rasn.runtime.<module>`. Its endpoint uses
+  `rasn_runtime_advertise_host` (or `<module>_advertise_host`) when configured and
+  otherwise retains the app's rDSN primary address; the real listen port is
+  preserved. When `<module>_hosted_shards` or `<module>_shard_index` is configured
+  for a sharded module, the descriptor also advertises
   `rasn.runtime.<module>.shard.<n>` for those partitions. A heartbeat keeps the
   lease live and stop unregisters it. Aggregate services therefore publish all
   eleven base capabilities, while standalone services publish only their module
   plus any explicitly hosted shard labels.
 - **Standalone roles.** Each module has a `rasn.runtime.<module>` role and a
   standalone app; launch it with a reachable state service for hydration (for
-  example `--dsn config.rasn.ini "rasn.state;resource_budget"`, or a remote
-  `[rasn.service] state_uri`). The app-list is normalized to the role. This is
-  what makes modules independently deployable.
+  example `codepilot serve config.rasn.ini "rasn.state;resource_budget"`, or a
+  remote `[rasn.service] state_uri`). The app-list is normalized to the role.
+  This is what makes modules independently deployable.
 - **Compatibility aliases.** App-list normalization and app registration still
   accept the earlier `rasn.common.*` roles, so existing distributed-runtime
   app-list scripts keep working while new deployments use the `rasn.runtime.*`
@@ -236,55 +240,77 @@ Design notes:
 
 ### 6.1 Configuration file layout
 
-A rASN application is a thin TUI/GUI; all agent logic and services live in the
-rASN **runtime**. Configuration splits into two files. The app's `config.ini` is
-**self-contained and never includes another file** — the rASN plugin does not
-modify rDSN's config parser, so it relies only on rDSN's stock, mandatory
-`@include`. Which file a binary loads is chosen **in the app** (`main.cpp`), not
-on the command line:
+Two things are fully **config-driven** and independent of the command line:
 
-- A plain `./app` always loads its own thin `config.ini` and boots on built-in
-  defaults.
-- `./app --dsn` auto-detects the shared `config.rasn.ini` next to the binary and
-  loads *that* instead; when the overlay is absent it falls back to the thin
-  `config.ini` and still runs on defaults.
+1. **Placement** — where an app's runtime modules run — comes from
+   `[rasn.runtime] rasn_runtime_provider` (`local` | `distributed` | `hybrid`) in
+   the app's own `config.ini`. There is **no `--dsn` mode switch**; the same
+   binary is a local app or a thin client of a remote runtime purely by config.
+2. **Deployment role** — whether a process is an *app* or a standalone *runtime
+   host* — is selected by the first CLI token: `./app <command>` runs the app;
+   `./app serve` launches the standalone runtime host. `serve` is a **role**, not
+   a placement selector (`--dsn` is kept only as a deprecated alias of `serve`).
 
-The shared runtime file composes *runtime → app*: `config.rasn.ini` **ends with a
-mandatory `@include config.ini`** that pulls in the co-hosted binary's own thin
-config so the app gateway is launched beside the services. The include is a stock
-rDSN relative include resolved against the working directory; the `--dsn` entry
-point switches into the runtime config's own directory before loading it
-(`align_working_directory_to_runtime_config`, finding 4 in §13.9) so it resolves
-beside `config.rasn.ini` regardless of the launch directory.
+Configuration is **three files**, composed with rDSN's stock, mandatory
+`@include` (the rASN plugin does **not** modify rDSN's config parser):
 
 | File | Audience | Contents |
 | --- | --- | --- |
-| `config.ini` | applications | **One per app** (`apps/<app>/config.ini`), thin, self-contained, always loaded by a plain `./app`. A minimal rDSN bootstrap (`[modules]` + `[core]`), the app's own `[apps.rasn.<app>]` section, and the two things an app cares about: the runtime **location** (`[rasn.runtime]`) and, optionally, the LLM serving endpoint (`[rasn.model]`). It carries **no** `[rasn.service]` endpoint map and **no** `[apps.rasn.*]` service-deployment sections of its own, and it does **not** `@include` anything. |
-| `config.rasn.ini` | runtime nodes | **Single shared runtime config** (`src/plugins/rasn/config.rasn.ini`). The **complete rASN runtime**: rDSN `[modules]`/`[core]`/thread pools, the `[rasn.service]` endpoint map + `[rasn.rpc]` timeouts, every `[apps.rasn.*]` service/module app, and all agent-logic tuning (`[rasn.model]`, `[rasn.tool]`, `[rasn.overload]`, `[rasn.policy]`, `[rasn.coordination]`, …). It carries **no** app-gateway section of its own — rDSN validates every `[apps.*]` type at load and each binary registers only its own gateway type — so it **ends with `@include config.ini`** to co-host exactly the loading binary's gateway. An operator drops it beside a binary (or onto a dedicated runtime node); it is **not** binplaced next to an app by default. Because the include runs last, the app's own sections override the overlay. |
+| `config.ini` | applications | **One per app** (`apps/<app>/config.ini`), thin and self-contained. rDSN bootstrap (`[modules]` + `[core]`), the app's own `[apps.rasn.<app>]` gateway, the runtime **placement** (`[rasn.runtime]`), and — commented by default — the LLM endpoint (`[rasn.model]`) and, for `distributed`, the remote runtime **address** (`[rasn.service] rasn_runtime_host`/`_port`). It carries no runtime-internal `[rasn.service]` endpoint map beyond that optional client address and no `[apps.rasn.*]` service apps. It **may** optionally `@include config.rasn.defaults.ini` near the top to tune an in-process (`local`) runtime; that line is commented out, so a plain app runs on built-in defaults. |
+| `config.rasn.ini` | runtime hosts | **The standalone runtime host config** (`src/plugins/rasn/config.rasn.ini`), loaded by `./app serve`. rDSN `[modules]`/`[core]`/thread pools, the `[rasn.service]` endpoint map + `[rasn.rpc]` timeouts, and every `[apps.rasn.*]` **service/module** app. It hosts **services only** and carries **no** app-gateway section — so it is self-contained and needs no reverse include of any app config. It **ends with `@include config.rasn.defaults.ini`** to pull in the shared module tuning. |
+| `config.rasn.defaults.ini` | shared | **Shared module tuning defaults** (`[rasn.model]`, `[rasn.tool]`, `[rasn.overload]`, `[rasn.policy]`, `[rasn.state]`, `[rasn.workflow]`, …) — identical whether a module runs in-process in an app or inside a runtime host. Included by `config.rasn.ini`, and optionally by a local app's `config.ini`. It holds **no** infra, `[rasn.service]`, or `[apps.*]` deployment sections, so it is safe for either side to include. |
+
+**Include semantics (stock rDSN, last-write-wins).** An `@include` is expanded
+*inline*: the included file's keys override same-named keys **before** the include,
+and keys **after** the include override the included file. This is why the
+inversion is clean — a runtime host includes the shared defaults last (defaults
+win over the host's own earlier scaffolding only where intended), while a local
+app can include the defaults near the top and still override any of them below.
 
 Who loads what:
 
-- **Default `<app>` (local, no args)** loads only its thin `config.ini`. No
-  `config.rasn.ini` is consulted, the runtime modules are built in-process on
-  built-in defaults, and the app sees no service/deployment config at all.
-- **All-in-one runtime host (`<app> --dsn`)** auto-loads the shared
-  `config.rasn.ini` when it is deployed next to the binary; its trailing
-  `@include config.ini` co-hosts the app gateway, so the service apps launch
-  alongside the app in one process (the app reaches them via LPC). With **no**
-  overlay present, `--dsn` falls back to the thin `config.ini` and runs on
-  defaults. **No config path is ever named on the command line.**
-- **Dedicated remote runtime node** runs an app binary with `--dsn` and a service
-  `-app_list`, with `config.rasn.ini` deployed beside it, to run the service stack
-  headless.
-- **Thin client → remote runtime.** The app keeps only its `config.ini`, sets
-  `[rasn.runtime] rasn_runtime_mode = distributed`, and gives the remote runtime
-  address in a small `[rasn.service]` block (`rasn_runtime_host`/`_port`). It
-  never deploys the runtime's service-deployment config.
+- **Local app (`./app <command>`, `rasn_runtime_provider = local`)** loads only
+  its thin `config.ini` and builds the runtime modules **in-process** on built-in
+  defaults (or on `config.rasn.defaults.ini` if the app opts into the include). It
+  runs the command on a node-less fast path and sees no service/deployment config.
+- **Thin client → remote runtime (`./app <command>`,
+  `rasn_runtime_provider = distributed`)** still loads only its `config.ini`, but
+  the entry point starts a lightweight rDSN client node (`mimic`) and attaches to
+  it so remote module RPC has a node context, then dials the runtime address from
+  `[rasn.service]`. It never deploys any service config.
+- **Standalone runtime host (`./app serve`)** loads `config.rasn.ini` beside the
+  binary and starts the services-only `-app_list`
+  (`rasn.registry;rasn.state;rasn.runtime;…`) headless — no app gateway. A
+  missing runtime-host config is a clear startup error; it never falls back to the
+  thin app config and sleeps with an empty service fleet. An explicit
+  `./app serve <config> [app_list]` selects another host config/role set.
 
-Only `config.ini` is binplaced next to each executable (each app ships its own).
-`config.rasn.ini` lives once in the source tree as the runtime config/template;
-copy it beside a binary — or onto a runtime node — to host the runtime, so there
-is exactly one runtime config to maintain.
+The runtime host is an ordinary rDSN service process: run it co-located on the
+same machine as the apps (clients dial `127.0.0.1`) or on a dedicated node
+(clients dial its routable address). Either way an app only ever needs the
+runtime's address — never its internal `[rasn.service]`/`[apps.*]` topology.
+
+**Endpoint resolution — explicit wins over discovery.** When an app configures an
+explicit runtime address (`[rasn.service] rasn_runtime_host`/`_uri`, or a
+`rasn_runtime_port` or per-module/per-shard variant), that endpoint is
+**authoritative**: the client
+dials exactly it and does **not** consult registry discovery, so it always reaches
+the runtime you pointed it at. Registry discovery
+(`rasn_runtime_registry_discovery_enabled`, default on) is used only for modules
+left unconfigured, with the static localhost endpoint as the final fallback.
+Symmetrically, a runtime host registers its modules under the address in
+`rasn_runtime_advertise_host` (per-module `<module>_advertise_host`) when set —
+`127.0.0.1` for co-located clients, a routable IP/DNS name for multi-machine — so
+discovery never hands back an unreachable auto-selected NIC address. Leaving it
+blank keeps the previous behavior (register the rDSN `primary_address()`). Invalid
+or unresolvable advertise hosts are rejected and the affected module is not
+published rather than registering `0.0.0.0` as healthy.
+
+CMake binplaces all three files beside each executable: the app always consumes
+only its own `config.ini`, while `serve` consumes `config.rasn.ini` plus
+`config.rasn.defaults.ini`. A dedicated runtime deployment copies the latter two
+with the binary. They remain one shared host config/defaults pair in the source
+tree, so app configs never duplicate runtime topology.
 
 ## 7. Resilience and idempotency (runtime-owned)
 
@@ -506,6 +532,8 @@ rasn_runtime_registry_discovery_enabled = true
 rasn_runtime_registry_registration_enabled = true
 registry_host = registry-node
 registry_port = 27100
+; Runtime-host config: publish the address clients can actually dial.
+rasn_runtime_advertise_host = modules-host
 ```
 
 Service-to-service auth for runtime RPC:
@@ -639,12 +667,12 @@ resource_budget_mode = remote
 resource_budget_host = budget-node
 ```
 
-Launch one standalone module service (deploy `config.rasn.ini` beside the binary
-— it carries the service sections and `@include`s the app's `config.ini`; the
-app-list selects which roles start):
+Launch one standalone module service (deploy both `config.rasn.ini` and
+`config.rasn.defaults.ini` beside the binary; the runtime config is self-contained
+and the app-list selects which service roles start):
 
 ```bat
-codepilot.exe --dsn config.rasn.ini "rasn.state;resource_budget"
+codepilot.exe serve config.rasn.ini "rasn.state;resource_budget"
 ```
 
 ## 11. Roadmap
@@ -677,6 +705,11 @@ codepilot.exe --dsn config.rasn.ini "rasn.state;resource_budget"
   storm is cleared in both modes, and LLM chat-completion parsing handles
   reasoning-only / error-envelope replies. Validated by unit tests, a single-box
   multi-process `--dsn` run, and a libfiu fault-injection campaign.
+- **Local/distributed mode & config-include redesign — DELIVERED (§13.12):**
+  placement is config-only via `rasn_runtime_provider`; `serve` is the independent
+  runtime-host role; `config.rasn.ini` is self-contained and includes only shared
+  `config.rasn.defaults.ini`; and distributed/hybrid app commands bootstrap a
+  lightweight client node instead of co-hosting the service fleet.
 
 See §13 for the full production-readiness audit that drives this roadmap, including
 which gaps are resolved in code, mitigated client-side, or tracked as framework work.
@@ -691,9 +724,9 @@ which gaps are resolved in code, mitigated client-side, or tracked as framework 
 | Distributed coordination facade (ownership election + cluster-shared state) reusing rDSN `distributed_lock_service` / `meta_state_service` | `coordination_service.h` / `coordination_service.cpp` |
 | RPC/LPC task codes | `rasn.code.definition.h` |
 | Reusable circuit breaker engine | `circuit_breaker.h` / `circuit_breaker.cpp` |
-| Provider/endpoint/resilience config | `[rasn.runtime]` in each app's `config.ini`; `[rasn.service]`/`[rasn.rpc]` in the shared `config.rasn.ini` |
-| Coordination config | `[rasn.coordination]` in the shared `config.rasn.ini` |
-| Config file layout (thin app `config.ini`; runtime `config.rasn.ini` `@include`s it) | `config.ini` + `config.rasn.ini` (see §6.1) |
+| Provider/endpoint/resilience config | `[rasn.runtime]` and the optional client endpoint in each app's `config.ini`; host `[rasn.service]`/`[rasn.rpc]` in `config.rasn.ini` |
+| Coordination config | `[rasn.coordination]` in `config.rasn.defaults.ini` |
+| Config file layout (thin app, standalone host, shared tuning defaults) | `config.ini` + `config.rasn.ini` + `config.rasn.defaults.ini` (see §6.1) |
 | Tests | `tests/rasn_unit_tests.cpp`, `tests/rasn_coordination_test.cpp`; opt-in libfiu fault-injection harness `tests/fault_injection/run_fault_injection.sh` (§13.8) |
 
 ## 13. Production-readiness audit — findings, remediation, and status
@@ -1054,14 +1087,14 @@ fixed within `src/plugins/rasn`:
   ride out a brief handover before failing closed.
 
 - **Runtime-config `@include` resolves beside the config (finding 4).**
-  `config.rasn.ini` ends with `@include config.ini`, but rDSN resolves includes
-  relative to the process working directory, so auto-detecting the runtime config next
-  to the binary while launching from another directory could miss the sibling app
-  config (or pull in an unrelated `config.ini`). The `--dsn` entry point now switches
-  into the selected runtime config's directory
-  (`align_working_directory_to_runtime_config`) and passes its absolute path to
-  `dsn_run`, so the include resolves beside the config regardless of launch directory.
-  No rDSN core change.
+  Before the §13.12 redesign, `config.rasn.ini` ended with
+  `@include config.ini`, while rDSN resolves includes relative to the process
+  working directory. Auto-detecting the runtime config next to the binary while
+  launching elsewhere could therefore miss the sibling app config (or pull in an
+  unrelated one). `align_working_directory_to_runtime_config` fixed that path
+  and remains in the `serve` entry point because the self-contained runtime config
+  now includes sibling `config.rasn.defaults.ini`. The runtime no longer includes
+  an app config. No rDSN core change.
 
 ### 13.10 Ownership-gate review follow-ups (round 2) — whole-module split brain, Windows `--dsn` chdir — RESOLVED (code)
 
@@ -1137,3 +1170,79 @@ different ports, both hosting `blackboard` shard 0 with the gate enabled.
   code via the `rasn_*` gtests) produced no `SIGSEGV/SIGBUS/SIGFPE/SIGILL` and no reproducible
   hang: `malloc` faults fail-stop via `std::bad_alloc` (`SIGABRT`); I/O and network faults
   propagate as graceful errors. Matches the reference result.
+
+### 13.12 Local/distributed mode & config-include redesign — RESOLVED (code)
+
+A design review of the app entry model and the then-two-file config layout (§6.1)
+validated a cleaner target, which has now been **implemented**. §6.1 has been
+rewritten to the as-built model; this section keeps the rationale and records the
+outcome. The redesign was sequenced deliberately because the config-include
+direction had already been flipped and reversed once (see §13.9 finding 4 and the
+`align_working_directory_to_runtime_config` shim).
+
+**Root observation — `--dsn` conflated two orthogonal axes.** Before this round,
+the flag selected *both* the process role *and* which config loaded, while runtime
+placement was separately config-driven. The redesign separates them cleanly:
+
+1. **Process role** — one-shot CLI (`app <cmd>`, runs and exits) vs. long-running
+   service host (boots an rDSN node, launches the `[apps.rasn.*]` fleet). This is an
+   argv concern, not a placement concern, and is now spelled `serve` (`--dsn`
+   remains only as a deprecated compatibility alias).
+2. **Runtime placement** — `local` / `distributed` / `hybrid`, already driven by
+   `[rasn.runtime] rasn_runtime_provider`. No flag should be required to pick it.
+
+**Decisions (validated).**
+
+1. **Placement is config-only.** An app does not pass a flag to "be distributed";
+   `rasn_runtime_provider` (+ the `[rasn.service]` endpoint map) fully determines
+   whether each module is invoked in-process or over RPC. `--dsn` is retired as the
+   mode selector.
+2. **The runtime is deployed independently of any app.** A standalone runtime node
+   is an ordinary rDSN service process whose config **is** `config.rasn.ini` (service
+   apps + tuning; **no** app-gateway section, **no** app include). An app in
+   `distributed` mode only holds client stubs and the runtime's `[rasn.service]`
+   address; it never sees how or where the runtime runs. All module internals stay
+   hidden behind the `rasn_runtime` facade.
+3. **An app may also be its own multi-node rDSN app** (its own `config.ini`,
+   `[apps.*]`, `[meta_server]`/`[replication]`, deployed per the app.kv / meta_server
+   pattern). That is orthogonal to the rASN runtime — so app-config and runtime-config
+   stay **separate deployment units** and are never force-merged.
+4. **Invert the include.** `config.rasn.ini` is now self-contained: the trailing
+   `@include config.ini` was replaced by
+   `@include config.rasn.defaults.ini`. The working-directory alignment helper is
+   retained so this sibling defaults include resolves correctly. For a **local**
+   in-process runtime, the app's own `config.ini` may include the same shared
+   defaults near the top and override specific keys below.
+5. **rDSN include semantics make the inversion clean — verified.** `@include` is
+   processed **inline at its textual position** and assignments are **last-write-wins**
+   (`src/dev/utility/configuration.cpp:216-263`; the `WARNING: overwrite option … (line
+   X => Y)` startup lines are this mechanism). So an included file overrides same-named
+   keys defined *before* it, and keys defined *after* the include override the included
+   file. Placing `@include config.rasn.defaults.ini` near the top, then app
+   overrides below, yields exactly the intended precedence with no parser change.
+
+**Implementation outcome.**
+
+- **A. Client-node bootstrap for CLI-side distributed mode.** A remote module call
+  requires an rDSN *service-node context*. App entry points now pre-read
+  `[rasn.runtime]`; `distributed`/`hybrid` commands start and attach to a
+  lightweight `mimic` client node, while `local` commands keep the node-less fast
+  path. No command-line placement flag is involved.
+- **B. Split `config.rasn.ini`.** Host deployment (`[apps.rasn.*]`, `[core]`,
+  `[modules]`, thread pools, `[rasn.service]`) remains in `config.rasn.ini`;
+  placement-independent behavior tuning moved to
+  `config.rasn.defaults.ini`. A local app can include only the latter without
+  inheriting service deployment sections.
+
+**Target topologies after the refactor.**
+
+| Topology | App process | Runtime |
+| --- | --- | --- |
+| Local app (dev) | `app` loads its `config.ini`; `rasn_runtime_provider = local`; optionally `@include`s runtime **defaults** | modules linked in-process, no RPC |
+| Thin client → remote runtime | `app` loads its `config.ini`; `rasn_runtime_provider = distributed`; `[rasn.service]` → remote; starts a lightweight client node | separate runtime node(s) started from `config.rasn.ini` |
+| App as its own distributed system | `app` deployed multi-node from its own `config.ini` (`[apps.*]`/`[meta_server]`) | independent; reached as a client |
+
+Build validation covered `codepilot`, `srepilot`, and `rasn.unit_tests`.
+Two-process smoke validation covered both explicit-address routing and
+registry-only discovery with `rasn_runtime_advertise_host`; a negative control
+without the advertise override reproduced the original unreachable-NIC timeout.

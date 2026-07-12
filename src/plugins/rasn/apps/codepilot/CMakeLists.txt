@@ -36,13 +36,16 @@ set(MY_PROJ_LIBS rasn)
 
 set(MY_PROJ_LIB_PATH "")
 
-# Binplace only this app's own thin config.ini. The shared rASN runtime config
-# (src/plugins/rasn/config.rasn.ini) is a RUNTIME artifact, not an app artifact:
-# a pure local app runs on built-in defaults from this self-contained config.ini.
-# When an operator drops config.rasn.ini next to the binary to host the runtime
-# (e.g. `<app> --dsn` all-in-one, or a dedicated runtime node), `--dsn` auto-loads
-# it and it `@include`s this config.ini to co-host the app gateway.
+# Binplace this app's own thin config.ini (the app always loads it) alongside the
+# runtime host config.rasn.ini and the shared tuning defaults config.rasn.defaults.ini.
+# A plain `./codepilot <cmd>` loads ONLY config.ini (thin, local placement -- no
+# service/deployment config is ever exposed to the app). `./codepilot serve` loads
+# the runtime host config.rasn.ini (full service fleet), which @includes
+# config.rasn.defaults.ini for shared module tuning. config.rasn.defaults.ini is
+# also what a local app may optionally @include to tune its in-process runtime.
 set(MY_BINPLACES
-    "${CMAKE_CURRENT_SOURCE_DIR}/config.ini")
+    "${CMAKE_CURRENT_SOURCE_DIR}/config.ini"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../config.rasn.ini"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../config.rasn.defaults.ini")
 
 dsn_add_executable()

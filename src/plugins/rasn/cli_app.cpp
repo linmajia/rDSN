@@ -21,7 +21,9 @@
 #if defined(_WIN32)
 #include <direct.h>
 #include <io.h>
+#include <windows.h>
 #else
+#include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
 #endif
@@ -59,6 +61,100 @@ std::string join_args(const std::vector<std::string> &args, size_t begin)
 bool starts_with(const std::string &value, const std::string &prefix)
 {
     return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
+}
+
+std::string resolve_cli_executable_path(const std::string &program)
+{
+    const auto resolve_existing = [](const std::string &candidate) {
+        std::string absolute;
+        if (candidate.empty() || !::dsn::utils::filesystem::file_exists(candidate))
+        {
+            return std::string();
+        }
+#if !defined(_WIN32)
+        struct stat file_status;
+        if (::stat(candidate.c_str(), &file_status) != 0 ||
+            !S_ISREG(file_status.st_mode) ||
+            ::access(candidate.c_str(), X_OK) != 0)
+        {
+            return std::string();
+        }
+#endif
+        if (::dsn::utils::filesystem::get_absolute_path(candidate, absolute))
+        {
+            return absolute;
+        }
+        return std::string();
+    };
+
+#if defined(_WIN32)
+    std::vector<char> module_path(32768);
+    const DWORD module_path_size = ::GetModuleFileNameA(
+        nullptr, module_path.data(), static_cast<DWORD>(module_path.size()));
+    if (module_path_size > 0 && module_path_size < module_path.size())
+    {
+        const std::string resolved =
+            resolve_existing(std::string(module_path.data(), module_path_size));
+        if (!resolved.empty())
+        {
+            return resolved;
+        }
+    }
+#endif
+
+    if (program.empty())
+    {
+        return "";
+    }
+
+    const bool has_directory =
+        program.find('/') != std::string::npos || program.find('\\') != std::string::npos
+#if defined(_WIN32)
+        || program.find(':') != std::string::npos
+#endif
+        ;
+    if (has_directory)
+    {
+        return resolve_existing(program);
+    }
+
+    const char *path_value = std::getenv("PATH");
+    if (path_value == nullptr)
+    {
+        return "";
+    }
+
+    std::istringstream paths(path_value);
+    std::string directory;
+#if defined(_WIN32)
+    constexpr char path_separator = ';';
+#else
+    constexpr char path_separator = ':';
+#endif
+    while (std::getline(paths, directory, path_separator))
+    {
+        if (directory.empty())
+        {
+            directory = ".";
+        }
+        const std::string candidate =
+            ::dsn::utils::filesystem::path_combine(directory, program);
+#if defined(_WIN32)
+        std::string resolved = resolve_existing(candidate + ".exe");
+        if (!resolved.empty())
+        {
+            return resolved;
+        }
+#else
+        std::string resolved;
+#endif
+        resolved = resolve_existing(candidate);
+        if (!resolved.empty())
+        {
+            return resolved;
+        }
+    }
+    return "";
 }
 
 std::string to_lower_ascii(std::string value)
@@ -616,6 +712,42 @@ std::vector<std::string> cli_args_from_argv(int argc, char **argv, int begin)
     return args;
 }
 
+std::string find_rasn_cli_config_file(const std::string &program, const std::string &filename)
+{
+    const std::string executable = resolve_cli_executable_path(program);
+    if (executable.empty() || filename.empty())
+    {
+        return "";
+    }
+
+    const std::string executable_dir =
+        ::dsn::utils::filesystem::remove_file_name(executable);
+    if (executable_dir.empty())
+    {
+        return "";
+    }
+
+    const std::string beside_executable =
+        ::dsn::utils::filesystem::path_combine(executable_dir, filename);
+    if (::dsn::utils::filesystem::file_exists(beside_executable))
+    {
+        return beside_executable;
+    }
+
+    const std::string parent_dir =
+        ::dsn::utils::filesystem::remove_file_name(executable_dir);
+    if (!parent_dir.empty())
+    {
+        const std::string beside_target =
+            ::dsn::utils::filesystem::path_combine(parent_dir, filename);
+        if (::dsn::utils::filesystem::file_exists(beside_target))
+        {
+            return beside_target;
+        }
+    }
+    return "";
+}
+
 void install_rasn_cli_out_of_memory_handler()
 {
     std::set_new_handler(exit_on_allocation_failure);
@@ -630,6 +762,26 @@ void run_dsn_with_cli_args(const std::vector<std::string> &args, bool sleep_afte
         dsn_args.push_back(const_cast<char *>(arg.c_str()));
     }
     ::dsn_run(static_cast<int>(dsn_args.size()), dsn_args.data(), sleep_after_init);
+}
+
+bool attach_cli_runtime_client_node()
+{
+    // A one-shot CLI thread has no rDSN service-node context, which remote/hybrid
+    // runtime module RPC requires. With [core] enable_default_app_mimic = true (set
+    // in every app config.ini) rDSN auto-registers a no-op [apps.mimic] node; when
+    // the CLI started it (-app_list mimic), attaching this thread to it gives the
+    // CLI a lightweight client node so calls to a remote runtime host resolve.
+    // Returns false (with a warning) if the mimic node is unavailable, in which case
+    // remote runtime calls will fail closed with a missing-node-context error.
+    if (::dsn_mimic_app("mimic", 1))
+    {
+        return true;
+    }
+    fprintf(stderr,
+            "rasn: warning: could not attach a client runtime node (no [apps.mimic] node "
+            "started); distributed/hybrid runtime calls may fail. Ensure [core] "
+            "enable_default_app_mimic = true.\n");
+    return false;
 }
 
 std::string align_working_directory_to_runtime_config(const std::string &config_path)
@@ -654,12 +806,13 @@ std::string align_working_directory_to_runtime_config(const std::string &config_
     // rDSN resolves a config file's `@include <relative>` against the process
     // working directory, so switch into the runtime config's own directory before
     // handing it to dsn_run. Passing the absolute config path keeps the main file
-    // openable after the chdir while its sibling `@include config.ini` now resolves
-    // beside it. Chdir'ing into the directory that already is the CWD is a harmless
-    // no-op, so this only changes behavior for launches from another directory.
+    // openable after the chdir while its sibling `@include config.rasn.defaults.ini`
+    // now resolves beside it. Chdir'ing into the directory that already is the CWD
+    // is a harmless no-op, so this only changes behavior for launches from another
+    // directory.
     // Windows resolves the include the same CWD-relative way, so chdir there too
-    // (via ::_chdir); guarding this block to POSIX made the Windows `--dsn` fix a
-    // no-op and left the include binding against the caller's directory.
+    // (via ::_chdir); guarding this block to POSIX previously made runtime-host
+    // config alignment a no-op and left the include bound to the caller's directory.
 #if defined(_WIN32)
     const int chdir_rc = ::_chdir(config_dir.c_str());
 #else

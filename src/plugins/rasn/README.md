@@ -90,9 +90,23 @@ When `<name>_uri` is present, rASN constructs the client address with rDSN's
 resolved by `dsn.dist.uri.resolver`; otherwise it falls back to `<name>_host` and
 `<name>_port`.
 
-Standalone one-shot CLI mode still initializes the rDSN runtime with the plugin `config.ini`, but starts no rDSN service apps. It lazily starts the shared graph for the duration of the command and uses the same service implementations inline for fast local commands, while service mode starts the full rDSN app graph and routes through RPC.
+Every app command loads the app's own `config.ini`. Runtime placement is selected
+only by `[rasn.runtime] rasn_runtime_provider`: `local` uses the same module
+implementations in-process, while `distributed`/`hybrid` starts a lightweight rDSN
+client node and communicates with a remote runtime. The command line does not
+select placement.
 
-Configuration is split into two files, but an **app never carries service config**. The rASN plugin does **not** modify rDSN's config parser; it uses only rDSN's stock mandatory `@include`, and *which* file a binary loads is chosen in the app (`main.cpp`), never on the command line. `config.ini` is the thin **application** config: a minimal rDSN bootstrap, the app's own `[apps.rasn.<app>]` section, and the two things an app cares about — the runtime location (`[rasn.runtime]`) and the LLM serving endpoint (`[rasn.model]`). It is **self-contained and `@include`s nothing**, and carries no `[rasn.service]` endpoint map and no `[apps.rasn.*]` service-deployment sections of its own. `config.rasn.ini` is the complete **runtime** (services, deployments, tuning), a **single shared** file (`src/plugins/rasn/config.rasn.ini`) that an operator drops beside a binary — or onto a runtime node — to host the runtime; it is not shipped next to an app by default, and it **ends with `@include config.ini`** to co-host the loading binary's own gateway (it carries no gateway section itself, since rDSN validates every `[apps.*]` type at load and each binary registers only its own). A default `codepilot` loads only its thin `config.ini` and runs the runtime in-process on defaults; drop `config.rasn.ini` beside the binary and `codepilot --dsn` auto-loads it to launch the whole stack in one process — **no config path on the command line** — and without it `--dsn` falls back to the thin config and still runs on defaults. Because the include runs last, app values override the overlay. Run a binary from its bin/install dir so the relative include resolves. See `docs/DISTRIBUTED_RUNTIME.md` §6.1.
+Configuration is split into three files, and an **app never carries runtime
+service deployment**. `config.ini` is the thin app config (rDSN bootstrap, app
+gateway, placement, and optional model/remote-runtime endpoint). A local app may
+optionally include `config.rasn.defaults.ini`, which contains only shared module
+tuning. `config.rasn.ini` is the self-contained, services-only runtime-host config;
+it includes `config.rasn.defaults.ini`, never an app config. CMake binplaces the
+host pair beside each executable; copy that pair with the binary on a dedicated
+node and run `codepilot serve`. `--dsn` remains
+only as a deprecated alias of `serve`. The rASN plugin uses stock rDSN inline,
+last-write-wins `@include` semantics and does not modify the parser. See
+`docs/DISTRIBUTED_RUNTIME.md` §6.1.
 
 Application CLIs share the same path-startup convention through the reusable
 `cli_support` helper: a single existing directory argument switches the process
@@ -1123,15 +1137,17 @@ codepilot.exe tool search C:\Users\haoxlin\source\repos\rdsn\rDSN.dist.service "
 codepilot.exe skill debug-build "Diagnose a build failure in rDSN.dist.service"
 ```
 
-## rDSN service mode
+## Standalone rDSN runtime host
 
-The executable can also run as an rDSN `service_app` using `config.ini`:
+The executable can launch the services-only runtime host using
+`config.rasn.ini` (which includes sibling `config.rasn.defaults.ini`):
 
 ```bat
-C:\Users\haoxlin\source\repos\rdsn\rb-rasn\bin\codepilot\Debug\codepilot.exe --dsn
+C:\Users\haoxlin\source\repos\rdsn\rb-rasn\bin\codepilot\Debug\codepilot.exe serve
 ```
 
-This registers and runs the app type:
+This registers and runs the runtime service types independently of the CodePilot
+gateway:
 
 ```text
 rasn.registry
@@ -1142,7 +1158,6 @@ rasn.state
 rasn.workflow
 rasn.observability
 rasn.runtime
-rasn.codepilot
 ```
 
 `rasn.runtime` hosts the shared rASN runtime modules (agent
@@ -1152,12 +1167,12 @@ human interaction, and sandbox runtime) behind one service. See
 [Distributed rASN runtime modules](#distributed-rasn-runtime-modules) for how
 to split these modules across processes or nodes.
 
-`rasn.llm.agent`, `rasn.tool.agent`, `rasn.coordinator`, `rasn.workflow`,
-`rasn.observability`, and `rasn.codepilot` all retain the shared
+`rasn.llm.agent`, `rasn.tool.agent`, `rasn.coordinator`, `rasn.workflow`, and
+`rasn.observability` all retain the shared
 `rasn_service_graph` while active; service shutdown releases those references in
 any order and only the final release stops the graph.
 
-Use `topology` in direct mode or `/topology` in service mode to inspect the
+Use `topology` (or `/topology` interactively) from a local or distributed app to inspect the
 registered graph, registry snapshot, state summary, observability counters, and
 the latest state-indexed observability snapshot:
 
@@ -1185,6 +1200,7 @@ tool_agent_port = 27103
 state_port = 27104
 workflow_port = 27105
 observability_port = 27106
+rasn_runtime_port = 27107
 ```
 
 Each service can also use a specific host or URI:
@@ -1213,13 +1229,14 @@ coordinator, model agent health, tool agent, workflow validation, and
 observability. Startup failures name the specific service boundary that did not
 become ready.
 
-For a repeatable service-mode RPC smoke, copy or point the built executable at
+For a repeatable service RPC smoke, point the built executable at
 `src\plugins\rasn\examples\service-rpc-smoke.ini`. The `rasn.codepilot` app runs
 `selftest` through the service graph, then the rDSN process remains alive until
-you stop it:
+you stop it. Because the normal host is services-only, explicitly include the
+test gateway in this custom app list:
 
 ```bat
-C:\Users\haoxlin\source\repos\rdsn\rb-rasn\bin\codepilot\Debug\codepilot.exe --dsn src\plugins\rasn\examples\service-rpc-smoke.ini
+C:\Users\haoxlin\source\repos\rdsn\rb-rasn\bin\codepilot\Debug\codepilot.exe serve src\plugins\rasn\examples\service-rpc-smoke.ini "rasn.registry;rasn.llm.agent;rasn.tool.agent;rasn.state;rasn.coordinator;rasn.workflow;rasn.observability;rasn.codepilot"
 ```
 
 The direct one-shot CLI mode is recommended for local prototyping and provider testing.
@@ -1247,7 +1264,7 @@ The provider is chosen like an rDSN environment/aspect provider: apps depend onl
 on the facade API, and swapping `local`/`distributed`/`hybrid` changes where the
 modules run without any app code change.
 
-In service mode the aggregate `rasn.runtime` app hosts all eleven modules
+A standalone host's aggregate `rasn.runtime` app hosts all eleven modules
 behind one endpoint (default port `27107`). Each module also has a standalone
 role so it can be deployed on its own process or node:
 
@@ -1267,12 +1284,11 @@ role so it can be deployed on its own process or node:
 
 Launch a single module service with a state authority available for hydration by
 passing the state service plus module name (module name or role) after the config;
-the app-list is normalized to the matching standalone role. Deploy `config.rasn.ini`
-beside the binary — it carries the service sections and `@include`s the app's
-`config.ini`:
+the app-list is normalized to the matching standalone role. Deploy
+`config.rasn.ini` and `config.rasn.defaults.ini` beside the binary:
 
 ```bat
-codepilot.exe --dsn config.rasn.ini "rasn.state;resource_budget"
+codepilot.exe serve config.rasn.ini "rasn.state;resource_budget"
 ```
 
 When `rasn_runtime_registry_registration_enabled` is true, each runtime module
@@ -1280,10 +1296,12 @@ service publishes a lease-tracked capability such as
 `rasn.runtime.resource_budget` to `rasn.registry`. Sharded services can also
 publish explicit partition capabilities such as
 `rasn.runtime.blackboard.shard.0` by setting `<module>_hosted_shards` or
-`<module>_shard_index` on the service process. Distributed and hybrid clients
-resolve those registry descriptors first when
-`rasn_runtime_registry_discovery_enabled` is true, then fall back to static
-endpoint config if discovery is empty or unavailable.
+`<module>_shard_index` on the service process. Set
+`rasn_runtime_advertise_host` (or `<module>_advertise_host`) on the host to the
+address clients can dial; otherwise rDSN's primary address is published.
+Distributed and hybrid clients use an explicitly configured module/runtime
+address authoritatively. Only modules left unconfigured use registry discovery,
+with the static localhost endpoint as the final fallback.
 
 Point clients at each module independently with `[rasn.service]` overrides. The
 key prefix is the module name, and any of `uri`, `host`, or `port` may be set:
@@ -1438,7 +1456,7 @@ hardening gaps remain:
 | Symptom | Check |
 | --- | --- |
 | `dsn.core.dll` or other runtime DLL cannot be found | Ensure `C:\Users\haoxlin\source\repos\rdsn\rb-rasn\bin\Debug` is first on `PATH` before running `codepilot.exe`. |
-| Service-mode RPC calls fail | Confirm no other process owns ports `27100`-`27106`, then rerun `codepilot.exe --dsn`. |
+| Runtime-host RPC calls fail | Confirm no other process owns ports `27100`-`27107`, then rerun `codepilot.exe serve`. |
 | Provider request fails | Run `codepilot.exe providers` and verify `[rasn.model]` or compatibility `[rasn.llm]` has the expected `provider`, `endpoint`, and `model`. |
 | Copilot/OpenAI-compatible authentication fails | Store credentials in `token_env` or trusted `token_command`; do not place token values in `config.ini` or trace files. |
 | Write or shell tools are denied | This is the safe default. Set `[rasn.policy] allow_write = true` or `allow_shell = true` only for trusted local tests. If approval is required, confirm the prompt or use `tool --yes ...` for direct scripted invocations. |

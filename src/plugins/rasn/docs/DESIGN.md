@@ -1268,25 +1268,23 @@ Responsibilities:
 
 rDSN design:
 
-- Packaging remains source-tree local: only each app's own thin `config.ini` is
-  copied beside the built executable by CMake, and examples are stored under
-  `examples/`. The rASN plugin does **not** modify rDSN's config parser; it uses
-  only rDSN's stock mandatory `@include`, and which file a binary loads is chosen
-  in the app (`main.cpp`), never on the command line. `config.ini` is
-  self-contained (it `@include`s nothing): a minimal rDSN bootstrap, the app's
-  `[apps.rasn.<app>]` section, and app-facing config (`[rasn.runtime]` location +
-  `[rasn.model]`), with no service/deployment sections of its own. The full
-  runtime — the `[apps.rasn.*]` service deployment sections, the `[rasn.service]`
-  endpoint map, and all tuning — lives once in the shared
-  `src/plugins/rasn/config.rasn.ini`, which is *not* binplaced by default; an
-  operator drops it beside a binary (or onto a runtime node) to host the runtime.
-  `config.rasn.ini` **ends with `@include config.ini`** to co-host the loading
-  binary's own gateway (it carries no gateway section itself, since rDSN validates
-  every `[apps.*]` type at load and each binary registers only its own). A plain
-  `./app` loads only `config.ini`; `<app> --dsn` auto-loads `config.rasn.ini` when
-  present and otherwise falls back to the thin config — so, absent the overlay,
-  apps (including `<app> --dsn`) run on built-in default configuration values. See
-  `docs/DISTRIBUTED_RUNTIME.md` §6.1.
+- Packaging remains source-tree local: CMake copies each app's thin `config.ini`
+  plus the shared `config.rasn.ini`/`config.rasn.defaults.ini` host pair beside
+  the built executable, and examples are stored under `examples/`. The app path
+  consumes only `config.ini`; `serve` consumes the host pair. The rASN plugin
+  does **not** modify rDSN's config parser; it uses
+  only rDSN's stock mandatory `@include`. `config.ini` is the thin app config: a
+  minimal rDSN bootstrap, the app's `[apps.rasn.<app>]` section, config-driven
+  runtime placement (`[rasn.runtime]`), and optional app-facing model/remote
+  endpoint settings. It contains no runtime service deployment. A local app may
+  optionally include `config.rasn.defaults.ini` near the top and override tuning
+  below. The standalone host config `config.rasn.ini` contains `[apps.rasn.*]`
+  service deployment, `[rasn.service]`, and rDSN infra; it includes only
+  `config.rasn.defaults.ini`, never an app config. `./app <command>` always loads
+  the app config, and placement (`local`/`distributed`/`hybrid`) comes exclusively
+  from it. `./app serve [config] [app_list]` is the independent services-only
+  runtime-host role (`--dsn` is a deprecated alias), not a placement selector.
+  See `docs/DISTRIBUTED_RUNTIME.md` §6.1.
 - rASN builds as a reusable `rasn` static library containing the engine, while
   CodePilot (`apps/codepilot/`), SREPilot (`apps/srepilot/`), and the
   `rasn.unit_tests` binary are thin consumers that link it. This keeps the

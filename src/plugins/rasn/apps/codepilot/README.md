@@ -92,24 +92,22 @@ CodePilot can run entirely offline with the simulator provider. It can also use
 Copilot-compatible, OpenAI-compatible, Ollama, llama.cpp, or LM Studio endpoints
 through the generic rASN provider layer.
 
-## Service mode
+## Runtime placement and standalone host
 
-Direct commands start an inline rASN service graph in-process. Service mode runs
-the rDSN app roles and the CodePilot gateway. You never name a config file on the
-command line — CodePilot loads its own thin `config.ini` by default, and in
-`--dsn` mode auto-loads the shared runtime `config.rasn.ini` when it is deployed
-next to the binary:
+CodePilot always loads its own thin `config.ini` for app commands. Runtime
+placement comes only from `[rasn.runtime] rasn_runtime_provider`: `local` runs the
+module graph in-process, while `distributed`/`hybrid` starts a lightweight rDSN
+client node and calls the configured remote runtime. No mode flag is required.
+
+To deploy the runtime independently, put `config.rasn.ini` and
+`config.rasn.defaults.ini` beside the executable and start the standalone,
+services-only host:
 
 ```bat
-codepilot.exe --dsn
+codepilot.exe serve
 ```
 
-To host the full service fleet in this one process, drop the shared
-`config.rasn.ini` (from `src/plugins/rasn/config.rasn.ini`) next to the executable;
-`--dsn` auto-loads it, and it `@include`s CodePilot's own `config.ini` to co-host
-the gateway. Without that overlay, `--dsn` falls back to the thin `config.ini` and
-still starts on built-in default configuration values. (Run the binary from the
-directory holding these files so the relative include resolves.) The `--dsn` path
-selects the CodePilot app list explicitly, so additional rASN applications can
-share the repository without requiring this executable to register their
-service-app types.
+The runtime host never includes CodePilot's app config or co-hosts its gateway;
+`config.rasn.ini` includes only the shared module tuning defaults. An explicit
+`codepilot.exe serve <config> [app_list]` selects another host config or a subset
+of runtime roles. `--dsn` remains only as a deprecated alias of `serve`.

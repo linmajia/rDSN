@@ -422,6 +422,12 @@ private:
 };
 
 rasn_runtime_config load_rasn_runtime_config();
+// Shallow-peek an app's config file for its [rasn.runtime] placement BEFORE rDSN
+// loads it, so a one-shot CLI can decide whether it needs a lightweight client
+// service node (required for remote/hybrid module RPC) before calling dsn_run().
+// Returns true for distributed/hybrid placement, false (local) otherwise or on
+// any read failure. Placement always lives in the app's own config.ini.
+bool rasn_runtime_config_file_selects_remote(const std::string &config_path);
 std::unique_ptr<rasn_runtime> create_rasn_runtime(rasn_service_graph &services, const rasn_runtime_config &config);
 rasn_runtime_response dispatch_rasn_runtime_request(const rasn_runtime_request &request);
 std::vector<std::string> rasn_runtime_module_names();

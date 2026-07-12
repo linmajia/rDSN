@@ -20,10 +20,11 @@ state checkpoint/recovery after a workflow run.
 metadata. The compiled plan reports stages, maximum parallelism, critical-path
 latency, cost units, and minimum reliability.
 
-For rDSN service-mode RPC validation, launch the example config:
+For rDSN service RPC validation, launch the example config and explicitly include
+its CodePilot test gateway in the otherwise services-only host app list:
 
 ```bat
-C:\Users\haoxlin\source\repos\rdsn\rb-rasn\bin\codepilot\Debug\codepilot.exe --dsn src\plugins\rasn\examples\service-rpc-smoke.ini
+C:\Users\haoxlin\source\repos\rdsn\rb-rasn\bin\codepilot\Debug\codepilot.exe serve src\plugins\rasn\examples\service-rpc-smoke.ini "rasn.registry;rasn.llm.agent;rasn.tool.agent;rasn.state;rasn.coordinator;rasn.workflow;rasn.observability;rasn.codepilot"
 ```
 
 The `rasn.codepilot` service app runs `selftest` through the rDSN service graph.
