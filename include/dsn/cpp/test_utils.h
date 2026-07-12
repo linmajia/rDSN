@@ -37,6 +37,7 @@
 # pragma once
 
 # include <dsn/service_api_cpp.h>
+# include <dsn/cpp/test_output_utils.h>
 # include <dsn/tool-api/task.h>
 # include <dsn/tool-api/task_worker.h>
 # include <gtest/gtest.h>

@@ -192,8 +192,23 @@ namespace dsn {
                 }
                 break;
             default:
-                dassert(false, "not implemented");
-                break;
+                // ERR_FORWARD_TO_OTHERS is only expected when we are a pure client
+                // sending to a group leader (see the assertion note above); the fake
+                // forwarding that follows redirects the request to the group's new
+                // leader. reply->error() is attacker-controlled, so an untrusted peer
+                // can also return ERR_FORWARD_TO_OTHERS for a request we sent directly
+                // to a named (non-group) server address. Honoring it would let the peer
+                // redirect the request to an arbitrary address, and the original
+                // "not implemented" assertion here aborted the whole process. Neither is
+                // acceptable: report a network failure to the caller instead of crashing.
+                derror("drop unexpected forward reply for non-group request %s, trace_id = %016" PRIx64,
+                    reply->header->rpc_name,
+                    reply->header->trace_id
+                    );
+                call->set_delay(delay_ms);
+                call->enqueue(ERR_NETWORK_FAILURE, reply);
+                call->release_ref(); // added in on_call
+                return true;
             }
 
             // do fake forwarding, reset request_id
@@ -226,7 +241,12 @@ namespace dsn {
                     }
                     break;
                 default:
-                    dassert(false, "not implemented");
+                    // A non-group request has no leader to update. context.u.is_forwarded
+                    // is attacker-controlled, so an untrusted peer can set it on a reply
+                    // to a direct (non-group) send; the original "not implemented"
+                    // assertion here aborted the whole process. There is simply no leader
+                    // side effect to apply, so ignore the bit and deliver the reply
+                    // normally below.
                     break;
                 }
             }
@@ -530,7 +550,18 @@ namespace dsn {
         }
         else
         {
-            dassert(false, "msg not handled at all");
+            // The rpc code / rpc_name of an inbound request is attacker-controlled: a peer can
+            // route an arbitrary request to a hosted app (e.g. by gpid on the layer2 replication
+            // path) whose code has no registered handler in this app. The original
+            // dassert(false, "msg not handled at all") turned that into a remote, unauthenticated
+            // whole-process abort. Mirror the non-inline sibling on_request(), which simply
+            // reports "no handler" without crashing. Ownership of msg is unchanged (the caller
+            // still owns it, exactly as when the assertion fired), so we must not free it here.
+            derror("no rpc handler for message with rpc name %s from %s, trace_id = %016" PRIx64,
+                msg->header->rpc_name,
+                msg->header->from_address.to_string(),
+                msg->header->trace_id
+                );
         }
     }
 
@@ -1147,8 +1178,24 @@ namespace dsn {
             // so use client session to send response.
             else
             {
-                dbg_dassert(response->to_address.port() > MAX_CLIENT_PORT, 
-                    "target address must have named port in this case");
+                // a forwarded request is answered by replying directly to the original
+                // client recorded in to_address, which must therefore be a reachable
+                // server address with a named port (legitimate forwarding only sets
+                // is_forwarded when from_address.port() > MAX_CLIENT_PORT, see forward()).
+                // a message from an untrusted peer may set is_forwarded while carrying a
+                // client-only address; we cannot route the reply in that case, so drop it
+                // gracefully instead of aborting the whole process.
+                if (response->to_address.port() <= MAX_CLIENT_PORT)
+                {
+                    derror("drop forwarded reply %s: target %s has no named port, trace_id = %016" PRIx64,
+                        response->header->rpc_name,
+                        response->to_address.to_string(),
+                        response->header->trace_id
+                        );
+                    response->add_ref();
+                    response->release_ref();
+                    return;
+                }
 
                 // use the header format recorded in the message
                 network* net = _client_nets[response->hdr_format][sp->rpc_call_channel];
@@ -1172,8 +1219,20 @@ namespace dsn {
         // not connection oriented network, we always use the named network to send msgs
         else
         {
-            dbg_dassert(response->to_address.port() > MAX_CLIENT_PORT,
-                "target address must have named port in this case");
+            // see the forwarded-reply note above: a connectionless reply is likewise
+            // routed to a named server address, so drop it gracefully if an untrusted
+            // peer supplied a client-only target instead of aborting the process.
+            if (response->to_address.port() <= MAX_CLIENT_PORT)
+            {
+                derror("drop reply %s: target %s has no named port, trace_id = %016" PRIx64,
+                    response->header->rpc_name,
+                    response->to_address.to_string(),
+                    response->header->trace_id
+                    );
+                response->add_ref();
+                response->release_ref();
+                return;
+            }
 
             network* net = _server_nets[response->header->from_address.port()][sp->rpc_call_channel];
 

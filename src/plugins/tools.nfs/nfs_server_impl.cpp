@@ -83,6 +83,17 @@ namespace dsn {
             std::string file_path = dsn::utils::filesystem::path_combine(request.source_dir, request.file_name);
             dsn_handle_t hfile;
 
+            // Reject a peer-supplied name that escapes the source directory before opening it.
+            if (nfs_path_has_parent_ref(file_path))
+            {
+                derror("nfs: rejecting copy request with parent-directory reference: source_dir=%s, file_name=%s",
+                    request.source_dir.c_str(), request.file_name.c_str());
+                ::dsn::service::copy_response resp;
+                resp.error = ERR_INVALID_PARAMETERS;
+                reply(resp);
+                return;
+            }
+
             {
                 zauto_lock l(_handles_map_lock);
                 auto it = _handles_map.find(file_path); // find file handle cache first
@@ -175,7 +186,19 @@ namespace dsn {
 
             ::dsn::service::copy_response resp;
             resp.error = err;
-            resp.file_content = cp.bb;
+            // cp.bb is a full nfs_copy_block_bytes block allocated with make_shared_array<char>,
+            // i.e. default-initialized (uninitialized) heap. Only the first cp.size bytes are
+            // filled by file::read, so shipping the whole buffer would disclose the uninitialized
+            // tail [cp.size, nfs_copy_block_bytes) to the (untrusted) client -- every file's last
+            // (partial) block, and any deliberately small copy request, would leak server heap
+            // memory into the reply. After the short-read check above, sz == cp.size on the ERR_OK
+            // path, so the first cp.size bytes are fully initialized; send exactly those. On an
+            // error the client ignores the content, so leave it empty rather than transmitting the
+            // uninitialized buffer.
+            if (err == ERR_OK)
+            {
+                resp.file_content = cp.bb.range(0, cp.size);
+            }
             resp.offset = cp.offset;
             resp.size = cp.size;
 
@@ -191,6 +214,19 @@ namespace dsn {
             error_code err = ERR_OK;
             std::vector<std::string> file_list;
             std::string folder = request.source_dir;
+
+            // The source directory (and, below, each requested file name) comes from an
+            // untrusted peer; reject any path that walks out of the source directory before
+            // touching the filesystem (see nfs_path_has_parent_ref).
+            if (nfs_path_has_parent_ref(folder))
+            {
+                derror("nfs: rejecting get_file_size request with parent-directory reference in source_dir=%s",
+                    request.source_dir.c_str());
+                resp.error = ERR_INVALID_PARAMETERS;
+                reply(resp);
+                return;
+            }
+
             if (request.file_list.size() == 0) // return all file size in the destination file folder
             {
                 if (!dsn::utils::filesystem::directory_exists(folder))
@@ -243,6 +279,15 @@ namespace dsn {
                 for (size_t i = 0; i < request.file_list.size(); i++)
                 {
                     std::string file_path = dsn::utils::filesystem::path_combine(folder, request.file_list[i]);
+
+                    // Reject a peer-supplied name that escapes the source directory.
+                    if (nfs_path_has_parent_ref(file_path))
+                    {
+                        derror("nfs: rejecting get_file_size request with parent-directory reference: source_dir=%s, file=%s",
+                            request.source_dir.c_str(), request.file_list[i].c_str());
+                        err = ERR_INVALID_PARAMETERS;
+                        break;
+                    }
 
                     struct stat st;
                     if (0 != ::stat(file_path.c_str(), &st))

@@ -285,7 +285,9 @@ namespace dsn {
         {
             //the protocol is json protocol
             std::string host;
-            int port;
+            // Default port to 0 so a malformed message that omits field 2 does not
+            // read uninitialized stack memory.
+            int port = 0;
 
             uint32_t xfer = 0;
             std::string fname;
@@ -330,9 +332,20 @@ namespace dsn {
 
             xfer += iprot->readStructEnd();
 
-            //currently only support ipv4 format
-            this->assign_ipv4(host.c_str(), port);
-            
+            // currently only support ipv4 format; parse the host as a numeric dotted-quad
+            // WITHOUT any DNS lookup. assign_ipv4(const char*, ...) would funnel this
+            // untrusted host string into gethostbyname(), letting a peer block the
+            // deserializing thread with a slow/hung DNS lookup (a denial of service). A
+            // legitimate peer always writes the numeric to_string() form (see write()).
+            uint32_t ip = 0;
+            if (!try_parse_ipv4(host.c_str(), ip))
+            {
+                throw ::apache::thrift::protocol::TProtocolException(
+                    ::apache::thrift::protocol::TProtocolException::INVALID_DATA,
+                    "rpc_address host must be a numeric ipv4 address");
+            }
+            this->assign_ipv4(ip, (uint16_t)port);
+
             return xfer;
         }
     }
@@ -825,6 +838,21 @@ namespace dsn {
         ::dsn::binary_reader_transport trans(reader);
         boost::shared_ptr< ::dsn::binary_reader_transport> transport(&trans, [](::dsn::binary_reader_transport*) {});
         ::apache::thrift::protocol::TBinaryProtocol proto(transport);
+
+        // Bound the decoder to the bytes actually available in the message body: no string,
+        // binary field, or container inside the body can legitimately be longer than the body
+        // that contains it. Thrift's string and container size limits default to 0 (unlimited),
+        // so without this a tiny body that claims a huge string/container length makes
+        // TBinaryProtocol resize()/allocate to that attacker-controlled size (up to ~2GB) up
+        // front, before the short read is detected -- a memory-amplification DoS on the RPC
+        // receive path (a 7-byte body can force a multi-GB allocation). A claimed size larger
+        // than the body now raises TProtocolException::SIZE_LIMIT immediately, before any
+        // allocation, and is caught by the caller (try_unmarshall) exactly as other corrupt
+        // input is.
+        int32_t read_limit = reader.get_remaining_size();
+        proto.setStringSizeLimit(read_limit);
+        proto.setContainerSizeLimit(read_limit);
+
         unmarshall_thrift_internal(val, &proto);
     }
 

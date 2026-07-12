@@ -43,6 +43,7 @@
 # include <dsn/utility/ports.h>
 # include <cstring>
 # include <utility>
+# include <limits>
 
 # ifdef __TITLE__
 # undef __TITLE__
@@ -239,27 +240,29 @@ namespace dsn
 
     void thrift_message_parser::read_thrift_header(const char* buffer, /*out*/ thrift_message_header& header)
     {
-        header.hdr_type = *(uint32_t*)(buffer);
-        buffer += sizeof(int32_t);
-        header.hdr_version = be32toh( *(int32_t*)(buffer) );
-        buffer += sizeof(int32_t);
-        header.hdr_length = be32toh( *(int32_t*)(buffer) );
-        buffer += sizeof(int32_t);
-        header.hdr_crc32 = be32toh( *(int32_t*)(buffer) );
-        buffer += sizeof(int32_t);
-        header.body_length = be32toh( *(int32_t*)(buffer) );
-        buffer += sizeof(int32_t);
-        header.body_crc32 = be32toh( *(int32_t*)(buffer) );
-        buffer += sizeof(int32_t);
-        header.app_id = be32toh( *(int32_t*)(buffer) );
-        buffer += sizeof(int32_t);
-        header.partition_index = be32toh( *(int32_t*)(buffer) );
-        buffer += sizeof(int32_t);
-        header.client_timeout = be32toh( *(int32_t*)(buffer) );
-        buffer += sizeof(int32_t);
-        header.client_thread_hash = be32toh( *(int32_t*)(buffer) );
-        buffer += sizeof(int32_t);
-        header.client_partition_hash = be64toh( *(int64_t*)(buffer) );
+        // The header sits at an arbitrary offset inside the shared receive buffer: after a
+        // message is consumed get_message_on_receive advances _buffer by msg_sz (an
+        // attacker-controlled amount, since it includes body_length), so the header of a
+        // following pipelined message generally starts at an unaligned address. Reading the
+        // multi-byte fields directly through `*(uint32_t*)buffer` / `*(int64_t*)buffer` is
+        // misaligned-access undefined behavior -- benign on x86 but a real hazard (SIGBUS) on
+        // stricter ISAs such as arm64, and flagged by UBSan. Copy the fixed-size header into a
+        // naturally aligned local first (the struct layout matches the on-wire layout and its
+        // size is validated in check_thrift_header), mirroring dsn_message_parser.
+        thrift_message_header raw;
+        memcpy(static_cast<void*>(&raw), buffer, sizeof(thrift_message_header));
+
+        header.hdr_type = raw.hdr_type;
+        header.hdr_version = be32toh(raw.hdr_version);
+        header.hdr_length = be32toh(raw.hdr_length);
+        header.hdr_crc32 = be32toh(raw.hdr_crc32);
+        header.body_length = be32toh(raw.body_length);
+        header.body_crc32 = be32toh(raw.body_crc32);
+        header.app_id = be32toh(raw.app_id);
+        header.partition_index = be32toh(raw.partition_index);
+        header.client_timeout = be32toh(raw.client_timeout);
+        header.client_thread_hash = be32toh(raw.client_thread_hash);
+        header.client_partition_hash = be64toh(raw.client_partition_hash);
     }
 
     bool thrift_message_parser::check_thrift_header(const thrift_message_header& header)
@@ -288,6 +291,18 @@ namespace dsn
     dsn::message_ex* thrift_message_parser::parse_message(const thrift_message_header& thrift_header, dsn::blob& message_data)
     {
         dsn::blob body_data = message_data.range(thrift_header.hdr_length);
+
+        // A thrift RPC request always carries a non-empty message-begin envelope. An empty body
+        // produces a receive message with no readable segment, which would make the read stream
+        // constructor (dsn_msg_read_next) below throw std::out_of_range. Reject it up front through
+        // the parser error channel so that exception can never escape and terminate the process on
+        // a 48-byte header-only message from the network.
+        if (body_data.length() == 0)
+        {
+            derror("thrift message body is empty");
+            return nullptr;
+        }
+
         dsn::message_ex* msg = message_ex::create_receive_message_with_standalone_header(body_data);
         if (msg == nullptr)
         {
@@ -302,18 +317,33 @@ namespace dsn
         int32_t seqid = 0;
         bool parsed = false;
 
-        // The thrift message-begin envelope is decoded from untrusted network bytes. A corrupt
-        // length/string can make readMessageBegin throw (TProtocolException / out_of_range from
-        // the underlying binary_reader). Keep the read stream in an inner scope so it (and its
-        // dsn_msg_read_commit) is destroyed before we may free msg on the failure path.
+        // The thrift message-begin envelope is decoded from untrusted network bytes. Constructing
+        // the read stream and decoding can throw (out_of_range / bad_alloc from the read stream,
+        // TProtocolException / out_of_range from the underlying binary_reader). Keep the entire
+        // decode -- including the read stream setup -- inside the try/inner scope so any exception
+        // is contained and the stream (and its dsn_msg_read_commit) is destroyed before we may free
+        // msg on the failure path.
         {
-            dsn::rpc_read_stream stream(msg);
-            ::dsn::binary_reader_transport binary_transport(stream);
-            boost::shared_ptr< ::dsn::binary_reader_transport > trans_ptr(&binary_transport, [](::dsn::binary_reader_transport*) {});
-            ::apache::thrift::protocol::TBinaryProtocol iprot(trans_ptr);
-
             try
             {
+                dsn::rpc_read_stream stream(msg);
+                ::dsn::binary_reader_transport binary_transport(stream);
+                boost::shared_ptr< ::dsn::binary_reader_transport > trans_ptr(&binary_transport, [](::dsn::binary_reader_transport*) {});
+                ::apache::thrift::protocol::TBinaryProtocol iprot(trans_ptr);
+
+                // Bound the decoder to the bytes actually received: no rpc name / container inside
+                // the body can legitimately be longer than the message body itself. Thrift's string
+                // and container size limits default to 0 (unlimited), so without this a tiny message
+                // that claims a huge length makes TBinaryProtocol::readStringBody resize() to that
+                // attacker-controlled size (up to ~2GB) up front, before the short read is detected
+                // -- a memory-amplification DoS (a 56-byte message can force a multi-GB allocation).
+                int32_t read_limit =
+                    body_data.length() > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())
+                        ? std::numeric_limits<int32_t>::max()
+                        : static_cast<int32_t>(body_data.length());
+                iprot.setStringSizeLimit(read_limit);
+                iprot.setContainerSizeLimit(read_limit);
+
                 iprot.readMessageBegin(fname, mtype, seqid);
                 parsed = true;
             }

@@ -111,6 +111,56 @@ namespace dsn {
                 return;
             }
 
+            // file_list comes from the (untrusted) remote server and is combined with the local
+            // dst_dir below to form the path this client creates and writes. Reject any name that
+            // escapes dst_dir (see nfs_path_has_parent_ref) up front -- before any file_context is
+            // allocated -- so a malicious server cannot make the client create or overwrite files
+            // outside the destination directory.
+            for (size_t i = 0; i < resp.file_list.size(); i++)
+            {
+                if (nfs_path_has_parent_ref(resp.file_list[i]))
+                {
+                    derror("nfs: rejecting get_file_size response with parent-directory reference in file name '%s'",
+                        resp.file_list[i].c_str());
+                    ureq->nfs_task->enqueue(ERR_INVALID_DATA, 0);
+                    delete ureq;
+                    return;
+                }
+
+                // size_list is a list<i64> filled in by the (untrusted) remote server. Below it is
+                // assigned to an unsigned counter (uint64_t size = resp.size_list[i]) that drives a
+                // loop pre-creating one copy_request_ex per nfs_copy_block_bytes block. A negative
+                // size wraps to a huge unsigned value, and an absurdly large positive size needs an
+                // enormous number of blocks, so either would make the client allocate an unbounded
+                // number of request objects (bad_alloc -> std::terminate) from a single small
+                // response. Reject a negative size, or one that would exceed the configured
+                // per-file block-count limit, through the existing nfs_task error channel.
+                int64_t fsize = resp.size_list[i];
+                if (fsize < 0)
+                {
+                    derror("nfs: rejecting get_file_size response with negative size %lld for file '%s'",
+                        (long long)fsize, resp.file_list[i].c_str());
+                    ureq->nfs_task->enqueue(ERR_INVALID_DATA, 0);
+                    delete ureq;
+                    return;
+                }
+                if (_opts.nfs_copy_block_bytes > 0)
+                {
+                    uint64_t block = _opts.nfs_copy_block_bytes;
+                    uint64_t req_count = (static_cast<uint64_t>(fsize) + block - 1) / block;
+                    if (req_count > static_cast<uint64_t>(_opts.max_copy_request_count_per_file))
+                    {
+                        derror("nfs: rejecting get_file_size response: file '%s' size %lld needs %llu "
+                               "copy blocks, exceeding the limit of %d",
+                            resp.file_list[i].c_str(), (long long)fsize, (unsigned long long)req_count,
+                            _opts.max_copy_request_count_per_file);
+                        ureq->nfs_task->enqueue(ERR_INVALID_DATA, 0);
+                        delete ureq;
+                        return;
+                    }
+                }
+            }
+
             for (size_t i = 0; i < resp.size_list.size(); i++) // file list
             {
                 file_context *filec;
@@ -270,6 +320,29 @@ namespace dsn {
                        reqc->file_ctx->file_name.c_str(),
                        resp.size,
                        (uint32_t)resp.file_content.length());
+                handle_completion(reqc->file_ctx->user_req, ERR_INVALID_DATA);
+                return;
+            }
+
+            // offset and size are echoed back by the (untrusted) remote server, but this client
+            // already knows exactly which block it asked for (reqc->copy_req): the honest server
+            // always echoes the request's offset/size unchanged. The local write in
+            // continue_write() uses response.offset as the destination file offset and
+            // response.size as the byte count, so a malicious or compromised server that returns
+            // a different offset could make the client write the block at an arbitrary position
+            // in the destination file -- e.g. a huge offset inflates it into a multi-terabyte
+            // sparse file (local disk-exhaustion DoS), and a wrong offset/size scrambles the file
+            // layout. Since the client controls the requested block, require the response to
+            // describe exactly that block and reject any mismatch.
+            if (resp.offset != reqc->copy_req.offset || resp.size != reqc->copy_req.size)
+            {
+                derror("nfs: copy response for file %s does not match the requested block: "
+                       "requested offset=%lld size=%d, got offset=%lld size=%d",
+                       reqc->file_ctx->file_name.c_str(),
+                       (long long)reqc->copy_req.offset,
+                       (int)reqc->copy_req.size,
+                       (long long)resp.offset,
+                       (int)resp.size);
                 handle_completion(reqc->file_ctx->user_req, ERR_INVALID_DATA);
                 return;
             }
