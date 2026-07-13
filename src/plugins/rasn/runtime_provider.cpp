@@ -6,6 +6,7 @@
 #include <rasn/rasn_core.h>
 #include <rasn/state_service.h>
 
+#include <dsn/cpp/utils.h>
 #include <dsn/cpp/zlocks.h>
 #include <dsn/tool-api/task.h>
 #include <dsn/utility/configuration.h>
@@ -5141,18 +5142,19 @@ bool rasn_runtime_config_file_selects_remote(const std::string &config_path)
     return normalized == "distributed" || normalized == "hybrid";
 }
 
-std::vector<std::string> rasn_runtime_unknown_host_apps(const std::vector<std::string> &defined_apps,
-                                                        const std::string &app_list,
-                                                        size_t *matched)
+std::vector<std::string>
+rasn_runtime_unstartable_host_apps(const std::vector<rasn_runtime_host_app_spec> &apps,
+                                   const std::string &app_list,
+                                   size_t *matched,
+                                   std::vector<std::string> *invalid)
 {
-    // Pure token-vs-defined-apps matcher (no file I/O) so the serve override
-    // validation is unit-testable. Mirrors rDSN's own -app_list parsing: split on
-    // ';' (',' also tolerated for parity with normalize_rasn_runtime_app_list),
-    // the app name is the part before '@', and a token is "known" iff its name
-    // exactly equals a defined [apps.*] section suffix. Returns the unknown tokens
-    // (which would start nothing); *matched receives how many tokens are known.
-    std::vector<std::string> unknown;
+    std::vector<std::string> unstartable;
+    if (invalid != nullptr)
+    {
+        invalid->clear();
+    }
     size_t matched_count = 0;
+    std::set<std::string> selected_apps;
     std::string token;
     for (size_t i = 0; i <= app_list.size(); ++i)
     {
@@ -5161,17 +5163,57 @@ std::vector<std::string> rasn_runtime_unknown_host_apps(const std::vector<std::s
             const std::string trimmed = trim(token);
             if (!trimmed.empty())
             {
-                const size_t at = trimmed.find('@');
-                const std::string name = at == std::string::npos ? trimmed : trimmed.substr(0, at);
-                const bool known =
-                    std::find(defined_apps.begin(), defined_apps.end(), name) != defined_apps.end();
-                if (known)
+                std::vector<std::string> selector;
+                ::dsn::utils::split_args(trimmed.c_str(), selector, '@');
+                if (selector.empty())
                 {
-                    ++matched_count;
+                    if (invalid != nullptr)
+                    {
+                        invalid->push_back(trimmed);
+                    }
                 }
                 else
                 {
-                    unknown.push_back(name);
+                    const std::vector<rasn_runtime_host_app_spec>::const_iterator app =
+                        std::find_if(apps.begin(),
+                                     apps.end(),
+                                     [&selector](const rasn_runtime_host_app_spec &candidate) {
+                                         return candidate.name == selector.front();
+                                     });
+                    if (app == apps.end() || !app->run || app->count <= 0)
+                    {
+                        unstartable.push_back(trimmed);
+                    }
+                    else if (!selected_apps.insert(app->name).second)
+                    {
+                        // rDSN scans app-list tokens for each app instance and
+                        // stops at the first token whose name matches. Any later
+                        // selector for the same app is therefore unreachable.
+                        unstartable.push_back(trimmed);
+                    }
+                    else if (selector.size() < 2)
+                    {
+                        matched_count += static_cast<size_t>(app->count);
+                    }
+                    else
+                    {
+                        int index = 0;
+                        if (!::dsn::utils::lexical_cast_integer<int>(selector.back(), index))
+                        {
+                            if (invalid != nullptr)
+                            {
+                                invalid->push_back(trimmed);
+                            }
+                        }
+                        else if (index >= 1 && index <= app->count)
+                        {
+                            ++matched_count;
+                        }
+                        else
+                        {
+                            unstartable.push_back(trimmed);
+                        }
+                    }
                 }
             }
             token.clear();
@@ -5185,7 +5227,7 @@ std::vector<std::string> rasn_runtime_unknown_host_apps(const std::vector<std::s
     {
         *matched = matched_count;
     }
-    return unknown;
+    return unstartable;
 }
 
 rasn_runtime_host_app_list_check
@@ -5215,6 +5257,11 @@ rasn_runtime_check_host_app_list(const std::string &config_path, const std::stri
     }
     result.config_loaded = true;
 
+    const bool default_run =
+        config.get_value<bool>("apps..default", "run", true, "whether to run the app instances or not");
+    const int default_count = static_cast<int>(config.get_value<unsigned long long>(
+        "apps..default", "count", 1, "count of app instances for this type"));
+
     std::vector<std::string> sections;
     config.get_all_sections(sections);
     const std::string prefix = "apps.";
@@ -5231,10 +5278,35 @@ rasn_runtime_check_host_app_list(const std::string &config_path, const std::stri
         {
             continue;
         }
-        result.defined_apps.push_back(name);
+        rasn_runtime_host_app_spec app;
+        app.name = name;
+        app.run = config.get_value<bool>(
+            section.c_str(), "run", default_run, "whether to run the app instances or not");
+        app.count = static_cast<int>(config.get_value<unsigned long long>(
+            section.c_str(), "count", static_cast<unsigned long long>(default_count), "count of app instances"));
+        result.apps.push_back(app);
     }
 
-    result.unknown = rasn_runtime_unknown_host_apps(result.defined_apps, app_list, &result.matched);
+    const bool mimic_enabled = config.get_value<bool>(
+        "core", "enable_default_app_mimic", false, "whether to start a default service app");
+    const bool mimic_defined =
+        std::find_if(result.apps.begin(),
+                     result.apps.end(),
+                     [](const rasn_runtime_host_app_spec &app) { return app.name == "mimic"; }) !=
+        result.apps.end();
+    if (mimic_enabled && !mimic_defined)
+    {
+        // service_spec::init_app_specs() synthesizes this section before it
+        // applies -app_list, inheriting the [apps..default] run/count values.
+        rasn_runtime_host_app_spec mimic;
+        mimic.name = "mimic";
+        mimic.run = default_run;
+        mimic.count = default_count;
+        result.apps.push_back(mimic);
+    }
+
+    result.unstartable =
+        rasn_runtime_unstartable_host_apps(result.apps, app_list, &result.matched, &result.invalid);
     return result;
 }
 

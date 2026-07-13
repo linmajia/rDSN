@@ -296,10 +296,12 @@ Who loads what:
   missing runtime-host config is a clear startup error; it never falls back to the
   thin app config and sleeps with an empty service fleet. An explicit
   `./app serve <config> [app_list]` selects another host config/role set; the
-  optional `app_list` is validated against the config's `[apps.*]` sections, so a
-  typo'd override that would match **no** app fails clearly instead of starting a
-  host that binds nothing and sleeps forever (partial-typo tokens are warned and
-  ignored, matching rDSN's own `-app_list` semantics).
+  optional `app_list` is validated against the config's effective `[apps.*]`
+  `run`/`count` settings and optional `@instance` selectors. An override that
+  would start **no runnable instance** (unknown/disabled app, zero count, or
+  out-of-range instance) fails clearly instead of starting a host that binds
+  nothing and sleeps forever. Ignored selectors in a partially valid list are
+  warned; malformed instance selectors are rejected.
 
 The runtime host is an ordinary rDSN service process: run it co-located on the
 same machine as the apps (clients dial `127.0.0.1`) or on a dedicated node

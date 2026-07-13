@@ -4234,7 +4234,7 @@ TEST(rasn_runtime, normalize_app_list_rewrites_modules_and_preserves_overrides)
     EXPECT_EQ("rasn.runtime.budget", normalize_rasn_runtime_app_list("resource_budget"));
     // Mixed known/unknown tokens: unknown passed through, separators normalized to ';'.
     EXPECT_EQ("rasn.runtime.budget;rasn.codepilot", normalize_rasn_runtime_app_list("budget, rasn.codepilot"));
-    // '@count' style suffixes are preserved on the rewritten role.
+    // '@instance' suffixes are preserved on the rewritten role.
     EXPECT_EQ("rasn.runtime.blackboard@3", normalize_rasn_runtime_app_list("blackboard@3"));
     // Multiple modules across ';' and ',' separators.
     EXPECT_EQ("rasn.runtime.budget;rasn.runtime.blackboard",
@@ -4246,40 +4246,105 @@ TEST(rasn_runtime, normalize_app_list_rewrites_modules_and_preserves_overrides)
     EXPECT_EQ("rasn.runtime.budget", normalize_rasn_runtime_app_list(";resource_budget;"));
 }
 
-TEST(rasn_runtime, unknown_host_apps_flags_typos_against_defined_sections)
+TEST(rasn_runtime, host_app_validation_rejects_nonstartable_selectors)
 {
-    // Mirrors the serve <config> <app_list> validation: tokens are matched (by the
-    // name part before '@') against the app names a runtime config actually defines.
-    const std::vector<std::string> defined = {
-        "rasn.registry", "rasn.state", "rasn.coordinator", "rasn.runtime", "rasn.runtime.blackboard"};
+    const auto app = [](const std::string &name, bool run, int count) {
+        rasn_runtime_host_app_spec spec;
+        spec.name = name;
+        spec.run = run;
+        spec.count = count;
+        return spec;
+    };
+    const std::vector<rasn_runtime_host_app_spec> apps = {
+        app("rasn.registry", true, 1),
+        app("rasn.state", false, 1),
+        app("rasn.coordinator", true, 0),
+        app("rasn.runtime", true, 1),
+        app("rasn.runtime.blackboard", true, 2)};
 
-    // A fully-typo'd override matches nothing (would start a no-op host).
     size_t matched = 42;
-    std::vector<std::string> unknown =
-        rasn_runtime_unknown_host_apps(defined, "rasn.nonexistant_app", &matched);
+    std::vector<std::string> invalid;
+    std::vector<std::string> unstartable =
+        rasn_runtime_unstartable_host_apps(apps, "rasn.nonexistant_app", &matched, &invalid);
     EXPECT_EQ(0u, matched);
-    ASSERT_EQ(1u, unknown.size());
-    EXPECT_EQ("rasn.nonexistant_app", unknown.front());
+    EXPECT_EQ((std::vector<std::string>{"rasn.nonexistant_app"}), unstartable);
+    EXPECT_TRUE(invalid.empty());
 
-    // A wholly valid override (with a '@count' suffix and ',' separator) matches all.
     matched = 0;
-    unknown = rasn_runtime_unknown_host_apps(defined, "rasn.registry;rasn.runtime.blackboard@2", &matched);
+    unstartable = rasn_runtime_unstartable_host_apps(
+        apps, "rasn.registry;rasn.runtime.blackboard@2", &matched, &invalid);
     EXPECT_EQ(2u, matched);
-    EXPECT_TRUE(unknown.empty());
+    EXPECT_TRUE(unstartable.empty());
+    EXPECT_TRUE(invalid.empty());
 
-    // A partial typo: the valid token still matches (matched>0 => host starts
-    // something), while the bad token is reported so the caller can warn.
     matched = 0;
-    unknown = rasn_runtime_unknown_host_apps(defined, "rasn.state, rasn.stat", &matched);
+    unstartable = rasn_runtime_unstartable_host_apps(
+        apps,
+        "rasn.runtime;rasn.state;rasn.coordinator;rasn.runtime.blackboard@3",
+        &matched,
+        &invalid);
     EXPECT_EQ(1u, matched);
-    ASSERT_EQ(1u, unknown.size());
-    EXPECT_EQ("rasn.stat", unknown.front());
+    EXPECT_EQ((std::vector<std::string>{
+                  "rasn.state", "rasn.coordinator", "rasn.runtime.blackboard@3"}),
+              unstartable);
+    EXPECT_TRUE(invalid.empty());
 
-    // Empty/whitespace tokens are ignored (no spurious unknowns, no matches).
-    matched = 7;
-    unknown = rasn_runtime_unknown_host_apps(defined, " ; , ", &matched);
+    matched = 0;
+    unstartable =
+        rasn_runtime_unstartable_host_apps(apps, "rasn.runtime@not-an-index", &matched, &invalid);
     EXPECT_EQ(0u, matched);
-    EXPECT_TRUE(unknown.empty());
+    EXPECT_TRUE(unstartable.empty());
+    EXPECT_EQ((std::vector<std::string>{"rasn.runtime@not-an-index"}), invalid);
+
+    matched = 0;
+    unstartable = rasn_runtime_unstartable_host_apps(
+        apps, "rasn.runtime@2;rasn.runtime@1", &matched, &invalid);
+    EXPECT_EQ(0u, matched);
+    EXPECT_EQ((std::vector<std::string>{"rasn.runtime@2", "rasn.runtime@1"}), unstartable);
+    EXPECT_TRUE(invalid.empty());
+
+    matched = 0;
+    unstartable =
+        rasn_runtime_unstartable_host_apps(apps, "rasn.runtime.blackboard", &matched, &invalid);
+    EXPECT_EQ(2u, matched);
+    EXPECT_TRUE(unstartable.empty());
+    EXPECT_TRUE(invalid.empty());
+}
+
+TEST(rasn_runtime, host_app_validation_uses_effective_run_and_count)
+{
+    const std::string config_path = temp_file_path("rasn-runtime-host-app-list.ini");
+    std::remove(config_path.c_str());
+    write_text_file(config_path,
+                    "[core]\n"
+                    "enable_default_app_mimic = true\n"
+                    "\n"
+                    "[apps..default]\n"
+                    "run = true\n"
+                    "count = 2\n"
+                    "\n"
+                    "[apps.enabled]\n"
+                    "\n"
+                    "[apps.disabled]\n"
+                    "run = false\n"
+                    "\n"
+                    "[apps.single]\n"
+                    "count = 1\n");
+
+    const rasn_runtime_host_app_list_check check =
+        rasn_runtime_check_host_app_list(config_path, "mimic@2;enabled@2;disabled;single@2");
+    EXPECT_TRUE(check.config_loaded);
+    EXPECT_EQ(2u, check.matched);
+    EXPECT_EQ((std::vector<std::string>{"disabled", "single@2"}), check.unstartable);
+    EXPECT_TRUE(check.invalid.empty());
+    EXPECT_NE(check.apps.end(),
+              std::find_if(check.apps.begin(),
+                           check.apps.end(),
+                           [](const rasn_runtime_host_app_spec &app) {
+                               return app.name == "mimic" && app.run && app.count == 2;
+                           }));
+
+    std::remove(config_path.c_str());
 }
 
 TEST(rasn_runtime, dispatch_requires_module_and_operation)

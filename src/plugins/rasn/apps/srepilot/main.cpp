@@ -106,37 +106,54 @@ int main(int argc, char **argv)
     // directory (rDSN resolves includes relative to the working directory).
     const std::string runtime_config_path =
         ::dsn::rasn::align_working_directory_to_runtime_config(config_path);
-    // Guard an explicit `serve <config> <app_list>` override: if it names no app
-    // defined in the runtime config, the host would bind nothing and then sleep
-    // forever, so fail clearly instead. The default app_list is always valid, so
-    // only validate an operator-supplied override.
+    // Guard an explicit override that would start no runnable app instance and
+    // leave the host sleeping without any bound services.
     if (!explicit_app_list.empty())
     {
         const ::dsn::rasn::rasn_runtime_host_app_list_check check =
             ::dsn::rasn::rasn_runtime_check_host_app_list(runtime_config_path, host_app_list);
+        if (check.config_loaded && !check.invalid.empty())
+        {
+            std::string invalid;
+            for (const std::string &selector : check.invalid)
+            {
+                invalid += " " + selector;
+            }
+            fprintf(stderr,
+                    "rasn: serve app_list contains invalid app instance selectors:%s\n",
+                    invalid.c_str());
+            return 1;
+        }
         if (check.config_loaded && check.matched == 0)
         {
             std::string available;
-            for (const std::string &name : check.defined_apps)
+            for (const ::dsn::rasn::rasn_runtime_host_app_spec &app : check.apps)
             {
-                available += " " + name;
+                if (app.run && app.count > 0)
+                {
+                    available += " " + app.name + "(count=" + std::to_string(app.count) + ")";
+                }
+            }
+            if (available.empty())
+            {
+                available = " <none>";
             }
             fprintf(stderr,
-                    "rasn: serve app_list '%s' matches no [apps.*] section in '%s'; the runtime "
-                    "host would start no services.\n      available apps:%s\n",
+                    "rasn: serve app_list '%s' selects no runnable [apps.*] instance in '%s'; the "
+                    "runtime host would start no services.\n      runnable apps:%s\n",
                     explicit_app_list.c_str(), runtime_config_path.c_str(), available.c_str());
             return 1;
         }
-        if (check.config_loaded && !check.unknown.empty())
+        if (check.config_loaded && !check.unstartable.empty())
         {
             std::string ignored;
-            for (const std::string &name : check.unknown)
+            for (const std::string &selector : check.unstartable)
             {
-                ignored += " " + name;
+                ignored += " " + selector;
             }
             fprintf(stderr,
-                    "rasn: warning: serve app_list entries match no [apps.*] section and will be "
-                    "ignored:%s\n",
+                    "rasn: warning: serve app_list entries select no runnable [apps.*] instance "
+                    "and will be ignored:%s\n",
                     ignored.c_str());
         }
     }
