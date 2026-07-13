@@ -1543,6 +1543,16 @@ std::string rasn_cli_app_base::runtime_modules_summary() const
     return output.str();
 }
 
+std::string rasn_cli_app_base::runtime_modules_topology() const
+{
+    configure_runtime_module_mode();
+    if (_rasn_runtime == nullptr)
+    {
+        return "runtime_topology: unavailable";
+    }
+    return _rasn_runtime->describe_topology();
+}
+
 bool rasn_cli_app_base::runtime_modules_ready(std::string *detail) const
 {
     // Ping every runtime module through the runtime facade. In local mode

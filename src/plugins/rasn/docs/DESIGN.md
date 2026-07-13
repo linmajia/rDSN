@@ -1366,9 +1366,10 @@ remaining limitations are:
   virtualize or seed them; it does not yet virtualize arbitrary external
   services, OS-level clocks, network state, process environments, or
   provider-side nondeterminism.
-- **Deployment validation:** service-mode RPC, URI/host endpoint configuration,
-  registry heartbeats, and active lease cleanup are implemented, but
-  multi-process and cluster deployment tests remain limited.
+- **Deployment validation:** the Linux multi-process harness covers explicit
+  runtime routing, registry-only discovery with a poisoned static fallback, and
+  optional ZooKeeper active/standby ownership handoff. Broader URI-backed,
+  replicated, and multi-host cluster coverage remains product work.
 - **Credential storage:** model credentials can be referenced with `env:`,
   `file:`, and `cmd:` handles and are protected by redaction, but vault-backed
   or OS-backed secret providers are not integrated.

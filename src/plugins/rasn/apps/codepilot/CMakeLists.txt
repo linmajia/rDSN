@@ -46,6 +46,8 @@ set(MY_PROJ_LIB_PATH "")
 set(MY_BINPLACES
     "${CMAKE_CURRENT_SOURCE_DIR}/config.ini"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../config.rasn.ini"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../config.rasn.defaults.ini")
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../config.rasn.defaults.ini"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/integration/run_multinode.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/integration/test.sh")
 
 dsn_add_executable()

@@ -208,8 +208,25 @@ int srepilot_cli::run_command(const std::vector<std::string> &args, bool interac
     }
     if (args[0] == "runtime")
     {
-        std::cout << runtime_modules_summary();
-        return 0;
+        if (args.size() == 1)
+        {
+            std::cout << runtime_modules_summary();
+            return 0;
+        }
+        if (args.size() == 2 && args[1] == "topology")
+        {
+            std::cout << runtime_modules_topology() << "\n";
+            return 0;
+        }
+        if (args.size() == 2 && args[1] == "health")
+        {
+            std::string detail;
+            const bool ready = runtime_modules_ready(&detail);
+            std::cout << (ready ? "[PASS] " : "[FAIL] ") << detail << "\n";
+            return ready ? 0 : 1;
+        }
+        std::cout << "usage: runtime [topology|health]\n";
+        return 1;
     }
     if (args[0] == "selftest")
     {
@@ -649,7 +666,7 @@ void srepilot_cli::print_help(bool interactive_mode) const
               << cli_help_item(interactive_mode, "observe failures [limit]", "show classified failures")
               << cli_help_item(interactive_mode, "observe metrics [format]", "dump runtime metrics (text|prometheus|json)")
               << cli_help_item(interactive_mode, "observe resilience", "dump overload/model/tool/remote-agent guards")
-              << cli_help_item(interactive_mode, "runtime", "show agent control, message bus, orchestration, replay, and sandbox state")
+              << cli_help_item(interactive_mode, "runtime [topology|health]", "show runtime state, resolved module routes, or reachability")
               << cli_help_item(interactive_mode, "provider [name]", "show or switch model provider")
               << cli_help_item(interactive_mode, "selftest", "run model/state/observability checks")
               << cli_help_item(interactive_mode, "interactive", "start REPL mode");

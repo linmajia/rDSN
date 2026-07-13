@@ -977,8 +977,25 @@ int codepilot_cli::run_command(const std::vector<std::string> &args, bool intera
 
     if (args[0] == "runtime")
     {
-        std::cout << runtime_modules_summary();
-        return 0;
+        if (args.size() == 1)
+        {
+            std::cout << runtime_modules_summary();
+            return 0;
+        }
+        if (args.size() == 2 && args[1] == "topology")
+        {
+            std::cout << runtime_modules_topology() << "\n";
+            return 0;
+        }
+        if (args.size() == 2 && args[1] == "health")
+        {
+            std::string detail;
+            const bool ready = runtime_modules_ready(&detail);
+            std::cout << (ready ? "[PASS] " : "[FAIL] ") << detail << "\n";
+            return ready ? 0 : 1;
+        }
+        std::cout << "usage: runtime [topology|health]\n";
+        return 1;
     }
 
     if (args[0] == "ask")
@@ -2309,6 +2326,7 @@ void codepilot_cli::print_help(bool interactive_mode) const
               << cli_help_item(interactive_mode, "skills", "list built-in skills")
               << cli_help_item(interactive_mode, "skill <name> [task]", "show or apply a skill prompt")
               << cli_help_item(interactive_mode, "topology", "show the rDSN service graph")
+              << cli_help_item(interactive_mode, "runtime [topology|health]", "show runtime state, resolved module routes, or reachability")
               << cli_help_item(interactive_mode, "provider [name]", "show or switch provider")
               << cli_help_item(interactive_mode, "trace [file]", "show or set JSONL runtime trace file")
               << cli_help_item(interactive_mode, "replay <trace-jsonl>", "replay captured nondeterministic choices")

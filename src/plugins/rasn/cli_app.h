@@ -156,6 +156,7 @@ protected:
                        const agent_plan_executor::approval_callback &approve,
                        const agent_plan_executor::tool_callback &tool);
     std::string runtime_modules_summary() const;
+    std::string runtime_modules_topology() const;
     bool runtime_modules_ready(std::string *detail = nullptr) const;
     deterministic_replay_result record_runtime_choice(const std::string &task_id,
                                                       const std::string &key,

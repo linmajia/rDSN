@@ -475,8 +475,9 @@ than reinventing consensus in rASN.
 > snapshot the active owner has since superseded — once it owns the resource no
 > other node writes, so its hydration observes the latest committed state. The gate
 > is wired into `rasn_runtime_app::start()` (acquire → hydrate → `open_service`) and
-> defaults **off**: the `inproc` backend only coordinates within one process, so
-> real cross-process single-writer enforcement needs `provider = simple|zookeeper`.
+> defaults **off**: the `inproc` and `simple` backends coordinate only within one
+> process/facade, so real cross-process single-writer enforcement needs
+> `provider = zookeeper`.
 > This lands the ownership half of finding 1.1 even before quorum replication of the
 > state itself.
 >
@@ -642,18 +643,25 @@ worker_count = 2
 partitioned = true
 ```
 
-> **Multi-process test procedure (needs a `--build_plugins` build + a ZooKeeper
-> ensemble; not runnable in a single-node local build).** (1) Start ZooKeeper. (2)
-> Launch two module services with the stanza above on different ports/hosts, both
-> `blackboard_hosted_shards = 0`, each under a supervisor that restarts it on exit.
-> (3) Assert exactly one logs a successful start and serves `put_blackboard` for a
-> shard-0 key, while the other exhausts its acquire attempts, logs `failed to acquire
-> ownership of rasn.runtime.blackboard.shard.0 ... refusing to open module APIs`, and
-> exits. (4) Stop the owner; the supervised standby restarts, acquires ownership on a
-> subsequent attempt, and begins serving. With `provider = inproc` this test
-> degenerates to a single process (the `inproc` backend does not coordinate across
-> processes), so it must run against `simple` (one process) or `zookeeper` (many
-> processes).
+> **Automated multi-process validation.** A Linux harness is binplaced beside
+> CodePilot as `run_multinode.py`, with `test.sh` as its standard rDSN test entry
+> point. It allocates loopback ports dynamically, gives every process separate
+> config/data/log directories, starts each child in its own process group, and
+> preserves the complete artifact tree on failure. The always-on scenarios prove:
+> (1) explicit endpoint routing reaches all 11 runtime modules in a separate process;
+> and (2) registry-only discovery resolves every module to a `registry:` endpoint
+> while port 27107 (the static fallback) is deliberately reserved by a non-runtime
+> listener, preventing a false pass. Run it from a Linux build with
+> `builder/bin/codepilot/test.sh`.
+>
+> The same harness runs the active/standby ownership handoff when
+> `RASN_MULTINODE_ZK_HOSTS=zk-1:2181,zk-2:2181,zk-3:2181` is set. It starts a shared
+> state service plus two full runtime hosts under one unique ZooKeeper lock
+> namespace, confirms the active serves all modules while the contending standby
+> fails `runtime health`, terminates the active by process group, and confirms the
+> still-retrying standby acquires ownership, hydrates, and begins serving. This
+> scenario requires a `--build_plugins` build and a reachable ZooKeeper ensemble.
+> `inproc` and `simple` cannot validate cross-process ownership.
 
 
 State mirror durability watermarks:
@@ -716,7 +724,8 @@ codepilot.exe serve config.rasn.ini "rasn.state;resource_budget"
   Migration can reuse the existing `query_state`/`put_state` ops to replay a local
   mirror onto a remote state service.
 - Real replicated storage and shard durability via rDSN-native replication/partitioning.
-- Deployment examples/tests for multi-node and URI-backed module clusters.
+- URI-backed multi-node cluster coverage beyond the automated explicit,
+  registry-discovery, and optional ZooKeeper ownership scenarios.
 - End-to-end trace propagation across core/module RPC envelopes — **DONE** (§13.4).
 - **Robustness hardening — DELIVERED (§13.8):** cold multi-process start no longer
   aborts on a state-hydration race (readiness retry), the `ERR_UNKNOWN` diagnostic-log
