@@ -46,8 +46,35 @@ set(MY_PROJ_LIB_PATH "")
 set(MY_BINPLACES
     "${CMAKE_CURRENT_SOURCE_DIR}/config.ini"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../config.rasn.ini"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../config.rasn.defaults.ini"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../config.rasn.defaults.ini")
+
+set(RASN_INTEGRATION_PROGRAMS
     "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/integration/run_multinode.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/integration/test.sh")
 
 dsn_add_executable()
+
+# MY_BINPLACES uses install(FILES), which removes execute permissions. Keep the
+# integration entry points executable in both build and install trees. A separate
+# dependency target also refreshes them when only a script changes and CodePilot
+# itself does not need relinking.
+add_custom_target(
+    ${MY_PROJ_NAME}_integration_programs
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:${MY_PROJ_NAME}>"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/integration/run_multinode.py"
+            "$<TARGET_FILE_DIR:${MY_PROJ_NAME}>/"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/integration/test.sh"
+            "$<TARGET_FILE_DIR:${MY_PROJ_NAME}>/"
+    DEPENDS ${RASN_INTEGRATION_PROGRAMS}
+    VERBATIM)
+add_dependencies(${MY_PROJ_NAME} ${MY_PROJ_NAME}_integration_programs)
+
+if(NOT DSN_BUILD_RUNTIME)
+    foreach(RASN_INTEGRATION_PROGRAM ${RASN_INTEGRATION_PROGRAMS})
+        install(PROGRAMS "${RASN_INTEGRATION_PROGRAM}"
+                DESTINATION "bin/${MY_PROJ_NAME}")
+    endforeach()
+endif()

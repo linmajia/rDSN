@@ -42,6 +42,22 @@ SERVICE_SPECS = [
 ]
 
 STATIC_FALLBACK_PORT = 27107
+OWNERSHIP_HANDOFF_TIMEOUT_SECONDS = 60.0
+OWNERSHIP_PRE_HANDOFF_PROBE_TIMEOUT_SECONDS = 20.0
+OWNERSHIP_RETRY_BACKOFF_MS = 250
+OWNERSHIP_RETRY_MARGIN_SECONDS = 15.0
+OWNERSHIP_ACQUIRE_MAX_ATTEMPTS = (
+    int(
+        (
+            OWNERSHIP_HANDOFF_TIMEOUT_SECONDS
+            + OWNERSHIP_PRE_HANDOFF_PROBE_TIMEOUT_SECONDS
+            + OWNERSHIP_RETRY_MARGIN_SECONDS
+        )
+        * 1000
+        / OWNERSHIP_RETRY_BACKOFF_MS
+    )
+    + 1
+)
 
 
 class HarnessError(RuntimeError):
@@ -322,11 +338,15 @@ class Harness(object):
         )
         timed_out = False
         try:
-            output, _ = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            terminate_process_group(process, grace_seconds=1.0)
-            output, _ = process.communicate()
+            try:
+                output, _ = process.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                terminate_process_group(process, grace_seconds=1.0)
+                output, _ = process.communicate()
+        finally:
+            if process.poll() is None:
+                terminate_process_group(process, grace_seconds=1.0)
         output = (output or b"").decode("utf-8", "replace")
         write_text(log_path, output)
         return (124 if timed_out else process.returncode), output
@@ -366,11 +386,13 @@ class Harness(object):
             )
         )
 
-    def wait_for_health(self, directory, binary, timeout=40.0):
+    def wait_for_health(self, directory, binary, timeout=40.0, host=None):
         deadline = time.monotonic() + timeout
         last_status = None
         last_output = ""
         while time.monotonic() < deadline:
+            if host is not None:
+                self.assert_running(host)
             last_status, last_output = self.run_client(
                 directory,
                 binary,
@@ -378,6 +400,8 @@ class Harness(object):
                 "health",
                 timeout=25.0,
             )
+            if host is not None:
+                self.assert_running(host)
             if (
                 last_status == 0
                 and "[PASS] all 11 rASN runtime modules reachable" in last_output
@@ -446,7 +470,7 @@ def explicit_scenario(harness):
         "static",
         ports["rasn_runtime"],
     )
-    harness.wait_for_health(client_dir, client_binary)
+    harness.wait_for_health(client_dir, client_binary, host=host)
     harness.assert_selftest(client_dir, client_binary)
     harness.stop_child(host)
     print("[PASS] explicit endpoint routing: all 11 runtime modules")
@@ -508,7 +532,7 @@ def registry_scenario(harness):
             ports["rasn_runtime"],
             timeout=60.0,
         )
-        harness.wait_for_health(client_dir, client_binary)
+        harness.wait_for_health(client_dir, client_binary, host=host)
         harness.assert_selftest(client_dir, client_binary)
         harness.stop_child(host)
     finally:
@@ -545,8 +569,16 @@ def ownership_host_updates(state_port, runtime_port):
         ("rasn.service", "rasn_runtime_registry_discovery_enabled", "false"),
         ("rasn.service", "rasn_runtime_registry_registration_enabled", "false"),
         ("rasn.service", "rasn_runtime_ownership_gate_enabled", "true"),
-        ("rasn.service", "rasn_runtime_ownership_acquire_max_attempts", "120"),
-        ("rasn.service", "rasn_runtime_ownership_acquire_retry_backoff_ms", "250"),
+        (
+            "rasn.service",
+            "rasn_runtime_ownership_acquire_max_attempts",
+            OWNERSHIP_ACQUIRE_MAX_ATTEMPTS,
+        ),
+        (
+            "rasn.service",
+            "rasn_runtime_ownership_acquire_retry_backoff_ms",
+            OWNERSHIP_RETRY_BACKOFF_MS,
+        ),
         ("threadpool.THREAD_POOL_META_SERVER", "partitioned", "false"),
         ("threadpool.THREAD_POOL_META_SERVER", "worker_count", "2"),
         ("threadpool.THREAD_POOL_DLOCK", "partitioned", "true"),
@@ -600,7 +632,12 @@ def ownership_scenario(harness, zk_hosts):
         "active-client",
         ownership_client_updates(active_ports["rasn_runtime"]),
     )
-    harness.wait_for_health(active_client_dir, active_client_binary, timeout=60.0)
+    harness.wait_for_health(
+        active_client_dir,
+        active_client_binary,
+        timeout=OWNERSHIP_HANDOFF_TIMEOUT_SECONDS,
+        host=active,
+    )
 
     standby_ports = allocate_service_ports()
     standby_dir, standby_binary = prepare_host(
@@ -628,7 +665,7 @@ def ownership_scenario(harness, zk_hosts):
         standby_client_binary,
         ["runtime", "health"],
         "health-before-handoff",
-        timeout=20.0,
+        timeout=OWNERSHIP_PRE_HANDOFF_PROBE_TIMEOUT_SECONDS,
     )
     if status == 0:
         raise HarnessError(
@@ -647,7 +684,8 @@ def ownership_scenario(harness, zk_hosts):
     harness.wait_for_health(
         standby_client_dir,
         standby_client_binary,
-        timeout=60.0,
+        timeout=OWNERSHIP_HANDOFF_TIMEOUT_SECONDS,
+        host=standby,
     )
     harness.stop_child(standby)
     harness.stop_child(state)
@@ -701,6 +739,9 @@ def main(argv):
     except HarnessError as error:
         print("rASN multi-process integration checks failed: {0}".format(error), file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        print("rASN multi-process integration checks interrupted", file=sys.stderr)
+        return 130
 
     artifact_parent = os.environ.get("RASN_MULTINODE_ARTIFACT_ROOT") or os.environ.get(
         "DSN_TEST_TMP_DIR"
