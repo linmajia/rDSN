@@ -457,6 +457,41 @@ bool rasn_runtime_service_hosts_request(const rasn_runtime_request &request,
 std::vector<rasn_runtime_descriptor> rasn_runtime_module_descriptors();
 std::string rasn_runtime_module_app_role(const std::string &module_or_role);
 std::string normalize_rasn_runtime_app_list(const std::string &app_list);
+struct rasn_runtime_host_app_spec
+{
+    std::string name;
+    bool run = true;
+    int count = 1;
+};
+
+// Result of validating an explicit `serve <config> <app_list>` override against
+// the effective app specs in the runtime host config. `config_loaded` is false
+// when the config could not be parsed (callers must not reject on validation
+// then). `matched` counts app instances rDSN would actually start;
+// `unstartable` contains unknown, disabled, zero-count, and out-of-range
+// selectors, including later selectors shadowed by an earlier selector for the
+// same app; `invalid` contains malformed instance selectors that rDSN rejects.
+struct rasn_runtime_host_app_list_check
+{
+    bool config_loaded = false;
+    size_t matched = 0;
+    std::vector<std::string> unstartable;
+    std::vector<std::string> invalid;
+    std::vector<rasn_runtime_host_app_spec> apps;
+};
+// Validate an explicit runtime-host app_list (as passed to -app_list) so an
+// override that selects zero runnable instances can be rejected before dsn_run()
+// instead of bringing up a host that binds nothing and then sleeps forever.
+rasn_runtime_host_app_list_check
+rasn_runtime_check_host_app_list(const std::string &config_path, const std::string &app_list);
+// Pure matcher underlying the config-file check. Returns selectors that start no
+// instance; malformed instance selectors are returned separately through
+// `invalid`.
+std::vector<std::string>
+rasn_runtime_unstartable_host_apps(const std::vector<rasn_runtime_host_app_spec> &apps,
+                                   const std::string &app_list,
+                                   size_t *matched = nullptr,
+                                   std::vector<std::string> *invalid = nullptr);
 rasn_runtime_state_compaction_report compact_rasn_runtime_state_mirror(rasn_service_graph &services,
                                                                        const std::string &checkpoint_path = "",
                                                                        const std::string &state_prefix = "");

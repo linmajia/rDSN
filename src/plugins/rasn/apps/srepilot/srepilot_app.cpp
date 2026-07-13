@@ -451,7 +451,23 @@ int srepilot_cli::observe(const std::vector<std::string> &args)
 int srepilot_cli::selftest()
 {
     bool ok = true;
-    std::cout << "SREPilot self-test\n";
+    // Report the two independent placement axes (see codepilot run_selftest for
+    // the rationale): the core service graph runs in-process (inline) unless RPC
+    // clients are enabled, while the runtime-module provider is configured
+    // separately. Only the runtime-module check below issues real cross-node RPC
+    // when the provider is distributed; a passing inline result does not prove
+    // connectivity to a deployed rASN service fleet.
+    const bool core_rpc = _services.rpc_clients_enabled();
+    const std::string runtime_provider = load_rasn_runtime_config().provider;
+    std::cout << "SREPilot self-test\n"
+              << "  core service graph: "
+              << (core_rpc ? "rDSN RPC (remote services)" : "in-process (inline)") << "\n"
+              << "  runtime modules:    " << runtime_provider << "\n";
+    if (!core_rpc)
+    {
+        std::cout << "  note: core service checks (model/state/observability) run in-process; only the "
+                     "runtime-module check exercises RPC when the provider is distributed.\n";
+    }
 
     const model_gateway_response health = _services.model_health();
     print_check(health.ok,

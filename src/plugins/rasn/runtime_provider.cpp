@@ -6,6 +6,7 @@
 #include <rasn/rasn_core.h>
 #include <rasn/state_service.h>
 
+#include <dsn/cpp/utils.h>
 #include <dsn/cpp/zlocks.h>
 #include <dsn/tool-api/task.h>
 #include <dsn/utility/configuration.h>
@@ -2657,7 +2658,17 @@ private:
             _dedup_cv.notify_all();
             return;
         }
-        dedup_entry &entry = _dedup_index[key];
+        std::map<std::string, dedup_entry>::iterator it = _dedup_index.find(key);
+        if (it == _dedup_index.end())
+        {
+            // The in-flight entry was already removed (aborted/evicted) before
+            // completion. Do NOT recreate it via operator[]: that would insert a
+            // key absent from _dedup_order, leaving an orphan that capacity
+            // enforcement can never evict (a slow memory leak when ttl==0).
+            _dedup_cv.notify_all();
+            return;
+        }
+        dedup_entry &entry = it->second;
         entry.in_flight = false;
         entry.response = response;
         entry.expires_at_ms =
@@ -5129,6 +5140,174 @@ bool rasn_runtime_config_file_selects_remote(const std::string &config_path)
     const std::string effective = provider.empty() ? mode : provider;
     const std::string normalized = normalize_rasn_runtime_provider_name(effective);
     return normalized == "distributed" || normalized == "hybrid";
+}
+
+std::vector<std::string>
+rasn_runtime_unstartable_host_apps(const std::vector<rasn_runtime_host_app_spec> &apps,
+                                   const std::string &app_list,
+                                   size_t *matched,
+                                   std::vector<std::string> *invalid)
+{
+    std::vector<std::string> unstartable;
+    if (invalid != nullptr)
+    {
+        invalid->clear();
+    }
+    size_t matched_count = 0;
+    std::set<std::string> selected_apps;
+    std::string token;
+    for (size_t i = 0; i <= app_list.size(); ++i)
+    {
+        if (i == app_list.size() || app_list[i] == ';' || app_list[i] == ',')
+        {
+            const std::string trimmed = trim(token);
+            if (!trimmed.empty())
+            {
+                std::vector<std::string> selector;
+                ::dsn::utils::split_args(trimmed.c_str(), selector, '@');
+                if (selector.empty())
+                {
+                    if (invalid != nullptr)
+                    {
+                        invalid->push_back(trimmed);
+                    }
+                }
+                else
+                {
+                    const std::vector<rasn_runtime_host_app_spec>::const_iterator app =
+                        std::find_if(apps.begin(),
+                                     apps.end(),
+                                     [&selector](const rasn_runtime_host_app_spec &candidate) {
+                                         return candidate.name == selector.front();
+                                     });
+                    if (app == apps.end() || !app->run || app->count <= 0)
+                    {
+                        unstartable.push_back(trimmed);
+                    }
+                    else if (!selected_apps.insert(app->name).second)
+                    {
+                        // rDSN scans app-list tokens for each app instance and
+                        // stops at the first token whose name matches. Any later
+                        // selector for the same app is therefore unreachable.
+                        unstartable.push_back(trimmed);
+                    }
+                    else if (selector.size() < 2)
+                    {
+                        matched_count += static_cast<size_t>(app->count);
+                    }
+                    else
+                    {
+                        int index = 0;
+                        if (!::dsn::utils::lexical_cast_integer<int>(selector.back(), index))
+                        {
+                            if (invalid != nullptr)
+                            {
+                                invalid->push_back(trimmed);
+                            }
+                        }
+                        else if (index >= 1 && index <= app->count)
+                        {
+                            ++matched_count;
+                        }
+                        else
+                        {
+                            unstartable.push_back(trimmed);
+                        }
+                    }
+                }
+            }
+            token.clear();
+        }
+        else
+        {
+            token.push_back(app_list[i]);
+        }
+    }
+    if (matched != nullptr)
+    {
+        *matched = matched_count;
+    }
+    return unstartable;
+}
+
+rasn_runtime_host_app_list_check
+rasn_runtime_check_host_app_list(const std::string &config_path, const std::string &app_list)
+{
+    // A `serve <config> <app_list>` override selects which [apps.*] sections the
+    // runtime host starts. rDSN matches each token (its name part before '@')
+    // against a config section by exact equality ("apps." + token == section), so
+    // a token that names no section starts nothing; a fully-typo'd override brings
+    // up a host that binds no services and then sleeps forever -- contrary to the
+    // command's fail-clearly contract. Surface that here BEFORE dsn_run(), using
+    // the same rDSN configuration parser (so @includes/comments/last-write-wins
+    // match the real runtime), and let the caller reject a zero-match override.
+    rasn_runtime_host_app_list_check result;
+    if (config_path.empty())
+    {
+        return result;
+    }
+
+    ::dsn::configuration config;
+    config.set_warning(false);
+    if (!config.load(config_path.c_str()))
+    {
+        // Config unreadable/unparsable: leave config_loaded=false so the caller
+        // does not reject on an unknown section set (rDSN surfaces the load error).
+        return result;
+    }
+    result.config_loaded = true;
+
+    const bool default_run =
+        config.get_value<bool>("apps..default", "run", true, "whether to run the app instances or not");
+    const int default_count = static_cast<int>(config.get_value<unsigned long long>(
+        "apps..default", "count", 1, "count of app instances for this type"));
+
+    std::vector<std::string> sections;
+    config.get_all_sections(sections);
+    const std::string prefix = "apps.";
+    for (const std::string &section : sections)
+    {
+        if (section.size() <= prefix.size() || section.compare(0, prefix.size(), prefix) != 0)
+        {
+            continue;
+        }
+        const std::string name = section.substr(prefix.size());
+        // Skip the "[apps..default]" inheritance template (its name part is empty
+        // or begins with '.'); it is never a startable app.
+        if (name.empty() || name[0] == '.')
+        {
+            continue;
+        }
+        rasn_runtime_host_app_spec app;
+        app.name = name;
+        app.run = config.get_value<bool>(
+            section.c_str(), "run", default_run, "whether to run the app instances or not");
+        app.count = static_cast<int>(config.get_value<unsigned long long>(
+            section.c_str(), "count", static_cast<unsigned long long>(default_count), "count of app instances"));
+        result.apps.push_back(app);
+    }
+
+    const bool mimic_enabled = config.get_value<bool>(
+        "core", "enable_default_app_mimic", false, "whether to start a default service app");
+    const bool mimic_defined =
+        std::find_if(result.apps.begin(),
+                     result.apps.end(),
+                     [](const rasn_runtime_host_app_spec &app) { return app.name == "mimic"; }) !=
+        result.apps.end();
+    if (mimic_enabled && !mimic_defined)
+    {
+        // service_spec::init_app_specs() synthesizes this section before it
+        // applies -app_list, inheriting the [apps..default] run/count values.
+        rasn_runtime_host_app_spec mimic;
+        mimic.name = "mimic";
+        mimic.run = default_run;
+        mimic.count = default_count;
+        result.apps.push_back(mimic);
+    }
+
+    result.unstartable =
+        rasn_runtime_unstartable_host_apps(result.apps, app_list, &result.matched, &result.invalid);
+    return result;
 }
 
 rasn_runtime_config load_rasn_runtime_config()

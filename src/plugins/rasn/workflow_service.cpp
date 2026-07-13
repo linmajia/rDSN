@@ -1742,6 +1742,20 @@ bool workflow_store::owns_execution_lease(const workflow_run_record &record, std
         }
         return false;
     }
+
+    // Reject ownership once the lease has expired, mirroring the takeover path
+    // (acquire_execution_lease treats status=="running" && expires_ms>now as owned).
+    // Without this a holder whose renewals stalled could keep persisting records
+    // after another node has legitimately taken over the expired lease.
+    if (lease.expires_ms <= ::dsn_now_ms())
+    {
+        if (error != nullptr)
+        {
+            *error = "workflow lease expired for run " + record.run_id + " owner=" + record.execution_owner +
+                     " lease_expires_ms=" + std::to_string(lease.expires_ms);
+        }
+        return false;
+    }
     return true;
 }
 
