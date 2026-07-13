@@ -250,6 +250,18 @@ bool rasn_session_store::begin_session(const std::string &app_name,
         return false;
     }
     output << session_event_json(event) << "\n";
+    output.flush();
+    if (!output)
+    {
+        // A failed write (disk full, quota, I/O error) must not be reported as
+        // success: doing so would drop the event yet still advance the cached
+        // sequence, opening a silent gap in the session log.
+        if (error != nullptr)
+        {
+            *error = "failed to write session log: " + session_file_path(session_id);
+        }
+        return false;
+    }
 
     if (summary != nullptr)
     {
@@ -299,6 +311,17 @@ bool rasn_session_store::append_event(const std::string &session_id,
         return false;
     }
     output << session_event_json(event) << "\n";
+    output.flush();
+    if (!output)
+    {
+        // Surface write failures instead of advancing the cached sequence past a
+        // dropped event (which would leave a silent hole in the session log).
+        if (error != nullptr)
+        {
+            *error = "failed to write session log: " + path;
+        }
+        return false;
+    }
     update_cached_session_sequence(path, event.sequence);
     return true;
 }

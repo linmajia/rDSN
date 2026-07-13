@@ -2657,7 +2657,17 @@ private:
             _dedup_cv.notify_all();
             return;
         }
-        dedup_entry &entry = _dedup_index[key];
+        std::map<std::string, dedup_entry>::iterator it = _dedup_index.find(key);
+        if (it == _dedup_index.end())
+        {
+            // The in-flight entry was already removed (aborted/evicted) before
+            // completion. Do NOT recreate it via operator[]: that would insert a
+            // key absent from _dedup_order, leaving an orphan that capacity
+            // enforcement can never evict (a slow memory leak when ttl==0).
+            _dedup_cv.notify_all();
+            return;
+        }
+        dedup_entry &entry = it->second;
         entry.in_flight = false;
         entry.response = response;
         entry.expires_at_ms =
