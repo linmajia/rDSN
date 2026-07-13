@@ -4246,6 +4246,42 @@ TEST(rasn_runtime, normalize_app_list_rewrites_modules_and_preserves_overrides)
     EXPECT_EQ("rasn.runtime.budget", normalize_rasn_runtime_app_list(";resource_budget;"));
 }
 
+TEST(rasn_runtime, unknown_host_apps_flags_typos_against_defined_sections)
+{
+    // Mirrors the serve <config> <app_list> validation: tokens are matched (by the
+    // name part before '@') against the app names a runtime config actually defines.
+    const std::vector<std::string> defined = {
+        "rasn.registry", "rasn.state", "rasn.coordinator", "rasn.runtime", "rasn.runtime.blackboard"};
+
+    // A fully-typo'd override matches nothing (would start a no-op host).
+    size_t matched = 42;
+    std::vector<std::string> unknown =
+        rasn_runtime_unknown_host_apps(defined, "rasn.nonexistant_app", &matched);
+    EXPECT_EQ(0u, matched);
+    ASSERT_EQ(1u, unknown.size());
+    EXPECT_EQ("rasn.nonexistant_app", unknown.front());
+
+    // A wholly valid override (with a '@count' suffix and ',' separator) matches all.
+    matched = 0;
+    unknown = rasn_runtime_unknown_host_apps(defined, "rasn.registry;rasn.runtime.blackboard@2", &matched);
+    EXPECT_EQ(2u, matched);
+    EXPECT_TRUE(unknown.empty());
+
+    // A partial typo: the valid token still matches (matched>0 => host starts
+    // something), while the bad token is reported so the caller can warn.
+    matched = 0;
+    unknown = rasn_runtime_unknown_host_apps(defined, "rasn.state, rasn.stat", &matched);
+    EXPECT_EQ(1u, matched);
+    ASSERT_EQ(1u, unknown.size());
+    EXPECT_EQ("rasn.stat", unknown.front());
+
+    // Empty/whitespace tokens are ignored (no spurious unknowns, no matches).
+    matched = 7;
+    unknown = rasn_runtime_unknown_host_apps(defined, " ; , ", &matched);
+    EXPECT_EQ(0u, matched);
+    EXPECT_TRUE(unknown.empty());
+}
+
 TEST(rasn_runtime, dispatch_requires_module_and_operation)
 {
     rasn_runtime_request missing_module;

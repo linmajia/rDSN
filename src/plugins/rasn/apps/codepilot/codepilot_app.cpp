@@ -1899,9 +1899,28 @@ int codepilot_cli::run_selftest(const std::vector<std::string> &args)
         return 1;
     }
 
-    const std::string mode = _services.rpc_clients_enabled() ? "rDSN RPC" : "inline";
+    // The self-test exercises two INDEPENDENT placement axes; report them
+    // separately so a distributed thin client is not misread as validating a
+    // remote service fleet. rpc_clients_enabled() governs ONLY the core service
+    // graph (model/state/tool/workflow adapters): when it is false those checks
+    // run in-process against this node's local services regardless of the runtime
+    // provider, so a passing result does not prove connectivity to any deployed
+    // rasn.state/registry/coordinator service. The runtime-module provider
+    // (local/distributed/hybrid) is a separate knob, and only the runtime-module
+    // reachability check below issues real cross-node RPC when it is distributed.
+    const bool core_rpc = _services.rpc_clients_enabled();
+    const std::string mode = core_rpc ? "rDSN RPC" : "inline";
+    const std::string runtime_provider = load_rasn_runtime_config().provider;
     const std::string checkpoint_path = args.empty() ? "" : args[0];
-    std::cout << "rASN self-test mode=" << mode << "\n";
+    std::cout << "rASN self-test\n"
+              << "  core service graph: "
+              << (core_rpc ? "rDSN RPC (remote services)" : "in-process (inline)") << "\n"
+              << "  runtime modules:    " << runtime_provider << "\n";
+    if (!core_rpc)
+    {
+        std::cout << "  note: core service checks (model/state/tool/workflow) run in-process; only the "
+                     "runtime-module check exercises RPC when the provider is distributed.\n";
+    }
 
     bool ok = true;
     const auto check = [&ok](bool condition, const std::string &label, const std::string &detail) {

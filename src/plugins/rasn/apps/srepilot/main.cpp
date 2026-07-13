@@ -106,6 +106,40 @@ int main(int argc, char **argv)
     // directory (rDSN resolves includes relative to the working directory).
     const std::string runtime_config_path =
         ::dsn::rasn::align_working_directory_to_runtime_config(config_path);
+    // Guard an explicit `serve <config> <app_list>` override: if it names no app
+    // defined in the runtime config, the host would bind nothing and then sleep
+    // forever, so fail clearly instead. The default app_list is always valid, so
+    // only validate an operator-supplied override.
+    if (!explicit_app_list.empty())
+    {
+        const ::dsn::rasn::rasn_runtime_host_app_list_check check =
+            ::dsn::rasn::rasn_runtime_check_host_app_list(runtime_config_path, host_app_list);
+        if (check.config_loaded && check.matched == 0)
+        {
+            std::string available;
+            for (const std::string &name : check.defined_apps)
+            {
+                available += " " + name;
+            }
+            fprintf(stderr,
+                    "rasn: serve app_list '%s' matches no [apps.*] section in '%s'; the runtime "
+                    "host would start no services.\n      available apps:%s\n",
+                    explicit_app_list.c_str(), runtime_config_path.c_str(), available.c_str());
+            return 1;
+        }
+        if (check.config_loaded && !check.unknown.empty())
+        {
+            std::string ignored;
+            for (const std::string &name : check.unknown)
+            {
+                ignored += " " + name;
+            }
+            fprintf(stderr,
+                    "rasn: warning: serve app_list entries match no [apps.*] section and will be "
+                    "ignored:%s\n",
+                    ignored.c_str());
+        }
+    }
     ::dsn::rasn::run_dsn_with_cli_args(
         std::vector<std::string>{program, runtime_config_path, "-app_list", host_app_list}, true);
     return 0;

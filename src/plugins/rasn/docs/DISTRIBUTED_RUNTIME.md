@@ -277,13 +277,29 @@ Who loads what:
   `rasn_runtime_provider = distributed`)** still loads only its `config.ini`, but
   the entry point starts a lightweight rDSN client node (`mimic`) and attaches to
   it so remote module RPC has a node context, then dials the runtime address from
-  `[rasn.service]`. It never deploys any service config.
+  `[rasn.service]`. It never deploys any service config. Note the two placement
+  axes are **independent**: the thin client enables the runtime-module provider
+  (the 11 nucleus modules over RPC) but **not** the core service-graph RPC clients
+  (`rpc_clients_enabled()` stays false — only `serve`/`--dsn` hosts enable those),
+  so the client's own `model`/`state`/`tool`/`workflow` adapters run **in-process**
+  against its local config, not against the deployed `rasn.state`/`rasn.registry`
+  services. Consequently a distributed-client **`selftest` validates runtime-module
+  reachability over RPC but not deployed-core connectivity** — its output now labels
+  the two axes separately (`core service graph: in-process (inline)` vs
+  `rDSN RPC`, and `runtime modules: local|distributed|hybrid`) so a passing inline
+  result is not misread as end-to-end fleet validation. (Making the thin client a
+  full core-service RPC client is deferred to the planned distributed-mode redesign;
+  see §13.3.)
 - **Standalone runtime host (`./app serve`)** loads `config.rasn.ini` beside the
   binary and starts the services-only `-app_list`
   (`rasn.registry;rasn.state;rasn.runtime;…`) headless — no app gateway. A
   missing runtime-host config is a clear startup error; it never falls back to the
   thin app config and sleeps with an empty service fleet. An explicit
-  `./app serve <config> [app_list]` selects another host config/role set.
+  `./app serve <config> [app_list]` selects another host config/role set; the
+  optional `app_list` is validated against the config's `[apps.*]` sections, so a
+  typo'd override that would match **no** app fails clearly instead of starting a
+  host that binds nothing and sleeps forever (partial-typo tokens are warned and
+  ignored, matching rDSN's own `-app_list` semantics).
 
 The runtime host is an ordinary rDSN service process: run it co-located on the
 same machine as the apps (clients dial `127.0.0.1`) or on a dedicated node

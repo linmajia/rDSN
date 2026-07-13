@@ -457,6 +457,33 @@ bool rasn_runtime_service_hosts_request(const rasn_runtime_request &request,
 std::vector<rasn_runtime_descriptor> rasn_runtime_module_descriptors();
 std::string rasn_runtime_module_app_role(const std::string &module_or_role);
 std::string normalize_rasn_runtime_app_list(const std::string &app_list);
+// Result of validating an explicit `serve <config> <app_list>` override against
+// the app sections defined in the runtime host config. `config_loaded` is false
+// when the config could not be parsed (callers must NOT reject on validation
+// then, since the section set is unknown). `matched` counts override tokens that
+// name a defined [apps.*] section; `unknown` lists tokens that name none (they
+// start nothing); `defined_apps` lists the app names the config does define, for
+// a helpful error hint.
+struct rasn_runtime_host_app_list_check
+{
+    bool config_loaded = false;
+    size_t matched = 0;
+    std::vector<std::string> unknown;
+    std::vector<std::string> defined_apps;
+};
+// Validate an explicit runtime-host app_list (as passed to -app_list) so a typo'd
+// override that matches zero [apps.*] sections can be rejected before dsn_run()
+// instead of bringing up a host that binds nothing and then sleeps forever.
+// Mirrors rDSN's own token matching (name part before '@', exact section match).
+rasn_runtime_host_app_list_check
+rasn_runtime_check_host_app_list(const std::string &config_path, const std::string &app_list);
+// Pure app_list-vs-defined-apps matcher (no file I/O) underlying the check above,
+// exported so the serve-override validation can be unit-tested without a config
+// file on disk. Returns the app_list tokens (name part before '@') that match no
+// entry in `defined_apps`; *matched (optional) receives how many tokens do match.
+std::vector<std::string> rasn_runtime_unknown_host_apps(const std::vector<std::string> &defined_apps,
+                                                        const std::string &app_list,
+                                                        size_t *matched = nullptr);
 rasn_runtime_state_compaction_report compact_rasn_runtime_state_mirror(rasn_service_graph &services,
                                                                        const std::string &checkpoint_path = "",
                                                                        const std::string &state_prefix = "");

@@ -5131,6 +5131,103 @@ bool rasn_runtime_config_file_selects_remote(const std::string &config_path)
     return normalized == "distributed" || normalized == "hybrid";
 }
 
+std::vector<std::string> rasn_runtime_unknown_host_apps(const std::vector<std::string> &defined_apps,
+                                                        const std::string &app_list,
+                                                        size_t *matched)
+{
+    // Pure token-vs-defined-apps matcher (no file I/O) so the serve override
+    // validation is unit-testable. Mirrors rDSN's own -app_list parsing: split on
+    // ';' (',' also tolerated for parity with normalize_rasn_runtime_app_list),
+    // the app name is the part before '@', and a token is "known" iff its name
+    // exactly equals a defined [apps.*] section suffix. Returns the unknown tokens
+    // (which would start nothing); *matched receives how many tokens are known.
+    std::vector<std::string> unknown;
+    size_t matched_count = 0;
+    std::string token;
+    for (size_t i = 0; i <= app_list.size(); ++i)
+    {
+        if (i == app_list.size() || app_list[i] == ';' || app_list[i] == ',')
+        {
+            const std::string trimmed = trim(token);
+            if (!trimmed.empty())
+            {
+                const size_t at = trimmed.find('@');
+                const std::string name = at == std::string::npos ? trimmed : trimmed.substr(0, at);
+                const bool known =
+                    std::find(defined_apps.begin(), defined_apps.end(), name) != defined_apps.end();
+                if (known)
+                {
+                    ++matched_count;
+                }
+                else
+                {
+                    unknown.push_back(name);
+                }
+            }
+            token.clear();
+        }
+        else
+        {
+            token.push_back(app_list[i]);
+        }
+    }
+    if (matched != nullptr)
+    {
+        *matched = matched_count;
+    }
+    return unknown;
+}
+
+rasn_runtime_host_app_list_check
+rasn_runtime_check_host_app_list(const std::string &config_path, const std::string &app_list)
+{
+    // A `serve <config> <app_list>` override selects which [apps.*] sections the
+    // runtime host starts. rDSN matches each token (its name part before '@')
+    // against a config section by exact equality ("apps." + token == section), so
+    // a token that names no section starts nothing; a fully-typo'd override brings
+    // up a host that binds no services and then sleeps forever -- contrary to the
+    // command's fail-clearly contract. Surface that here BEFORE dsn_run(), using
+    // the same rDSN configuration parser (so @includes/comments/last-write-wins
+    // match the real runtime), and let the caller reject a zero-match override.
+    rasn_runtime_host_app_list_check result;
+    if (config_path.empty())
+    {
+        return result;
+    }
+
+    ::dsn::configuration config;
+    config.set_warning(false);
+    if (!config.load(config_path.c_str()))
+    {
+        // Config unreadable/unparsable: leave config_loaded=false so the caller
+        // does not reject on an unknown section set (rDSN surfaces the load error).
+        return result;
+    }
+    result.config_loaded = true;
+
+    std::vector<std::string> sections;
+    config.get_all_sections(sections);
+    const std::string prefix = "apps.";
+    for (const std::string &section : sections)
+    {
+        if (section.size() <= prefix.size() || section.compare(0, prefix.size(), prefix) != 0)
+        {
+            continue;
+        }
+        const std::string name = section.substr(prefix.size());
+        // Skip the "[apps..default]" inheritance template (its name part is empty
+        // or begins with '.'); it is never a startable app.
+        if (name.empty() || name[0] == '.')
+        {
+            continue;
+        }
+        result.defined_apps.push_back(name);
+    }
+
+    result.unknown = rasn_runtime_unknown_host_apps(result.defined_apps, app_list, &result.matched);
+    return result;
+}
+
 rasn_runtime_config load_rasn_runtime_config()
 {
     rasn_runtime_config config;
