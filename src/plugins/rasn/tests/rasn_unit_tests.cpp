@@ -5093,6 +5093,21 @@ TEST(rasn_runtime, ownership_resources_whole_sharded_module_locks_every_shard)
                   "blackboard", {}, /*sharded=*/true, /*partition_count=*/3));
 }
 
+TEST(rasn_runtime, partition_hash_preserves_keys_and_explicit_shard_routes)
+{
+    rasn_runtime_request keyed;
+    keyed.module = "blackboard";
+    keyed.key = "topic";
+    EXPECT_EQ(5912253781582851172ULL, rasn_runtime_partition_hash(keyed));
+
+    keyed.route_partition = 7;
+    EXPECT_EQ(7u, rasn_runtime_partition_hash(keyed));
+
+    rasn_runtime_request unkeyed;
+    unkeyed.module = "blackboard";
+    EXPECT_EQ(0u, rasn_runtime_partition_hash(unkeyed));
+}
+
 TEST(rasn_runtime, ingress_guard_admits_hosted_shards_and_rejects_others)
 {
     rasn_runtime_request request;

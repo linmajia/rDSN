@@ -267,6 +267,15 @@ uint64_t fnv1a64(const std::string &value)
     return hash;
 }
 
+uint64_t rasn_runtime_partition_hash_impl(const rasn_runtime_request &request)
+{
+    if (request.route_partition != (std::numeric_limits<uint32_t>::max)())
+    {
+        return request.route_partition;
+    }
+    return request.key.empty() ? 0 : fnv1a64(request.key);
+}
+
 uint32_t rasn_runtime_partition_count(const std::string &module)
 {
     if (!rasn_runtime_module_is_sharded(module))
@@ -396,7 +405,10 @@ uint32_t rasn_runtime_partition_for_key(const std::string &module, const std::st
     {
         return 0;
     }
-    return static_cast<uint32_t>(fnv1a64(key) % count);
+    rasn_runtime_request request;
+    request.module = module;
+    request.key = key;
+    return static_cast<uint32_t>(rasn_runtime_partition_hash_impl(request) % count);
 }
 
 uint32_t rasn_runtime_partition_for_request(const rasn_runtime_request &request)
@@ -733,7 +745,10 @@ runtime_endpoint static_rasn_runtime_endpoint(const std::string &module, uint32_
     {
         runtime_endpoint endpoint;
         endpoint.address = ::dsn::url_host_address(uri.c_str());
-        endpoint.source = sharded ? "static:shard" : "static";
+        endpoint.source =
+            endpoint.address.type() == HOST_TYPE_URI
+                ? (sharded ? "resolver:shard" : "resolver")
+                : (sharded ? "static:shard" : "static");
         endpoint.partition_index = partition_index;
         endpoint.partition_count = partition_count;
         // A URI is only ever set by the operator, so it is always authoritative.
@@ -3256,10 +3271,19 @@ rasn_runtime_response invoke_remote_module(const rasn_runtime_request &request)
     }
     const runtime_endpoint resolved_endpoint = resolve_rasn_runtime_endpoint(request);
     const ::dsn::rpc_address address = resolved_endpoint.address;
+    const uint64_t partition_hash = rasn_runtime_partition_hash(request);
     const std::string endpoint = std::string(address.to_string());
     const std::string breaker_key =
         module + "#" + std::to_string(resolved_endpoint.partition_index) + "@" + endpoint;
     rasn_runtime_request sending = request;
+    if (rasn_runtime_module_is_sharded(module) &&
+        resolved_endpoint.partition_count > 1)
+    {
+        // Keep the wire-level ingress hint aligned with the partition selected
+        // from the stable key hash. The RPC header still carries the full hash so
+        // URI addresses let rDSN resolve the authoritative replica-group endpoint.
+        sending.route_partition = resolved_endpoint.partition_index;
+    }
     if (sending.request_id.empty() && rasn_runtime_idempotency_enabled())
     {
         sending.request_id = generate_rasn_runtime_request_id();
@@ -3303,7 +3327,8 @@ rasn_runtime_response invoke_remote_module(const rasn_runtime_request &request)
     for (uint32_t attempt = 1; attempt <= max_attempts; ++attempt)
     {
         rasn_runtime_client client(address);
-        const std::pair< ::dsn::error_code, rasn_runtime_response> result = client.call_sync(sending, timeout);
+        const std::pair< ::dsn::error_code, rasn_runtime_response> result =
+            client.call_sync(sending, timeout, 0, partition_hash);
         if (result.first == ::dsn::ERR_OK)
         {
             if (breaker_enabled)
@@ -3387,6 +3412,7 @@ bool ping_remote_module(const std::string &module, std::string *error)
         const bool breaker_enabled = rasn_runtime_breaker_enabled();
         const std::chrono::milliseconds ping_timeout = rasn_runtime_ping_timeout(module);
         rasn_runtime_request ping = make_module_request(module, "ping");
+        ping.route_partition = resolved_endpoint.partition_index;
         std::string auth_error;
         if (!prepare_rasn_runtime_rpc_request(&ping, &auth_error))
         {
@@ -3418,7 +3444,8 @@ bool ping_remote_module(const std::string &module, std::string *error)
         }
         rasn_runtime_client client(address);
         const std::pair< ::dsn::error_code, rasn_runtime_response> result =
-            client.call_sync(ping, ping_timeout);
+            client.call_sync(
+                ping, ping_timeout, 0, rasn_runtime_partition_hash(ping));
         if (result.first != ::dsn::ERR_OK)
         {
             if (breaker_enabled)
@@ -3696,6 +3723,11 @@ private:
 };
 
 } // namespace
+
+uint64_t rasn_runtime_partition_hash(const rasn_runtime_request &request)
+{
+    return rasn_runtime_partition_hash_impl(request);
+}
 
 std::vector<std::string> rasn_runtime_module_names()
 {
@@ -4375,7 +4407,8 @@ rasn_runtime_provider::call_module_api_shards(const rasn_runtime_request &reques
     for (uint32_t i = 0; i < partition_count; ++i)
     {
         const runtime_endpoint endpoint = resolve_rasn_runtime_partition_endpoint(request.module, i);
-        if (!queried_endpoints.insert(std::string(endpoint.address.to_string())).second)
+        if (endpoint.address.type() != HOST_TYPE_URI &&
+            !queried_endpoints.insert(std::string(endpoint.address.to_string())).second)
         {
             continue;
         }

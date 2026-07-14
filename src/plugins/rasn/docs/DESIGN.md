@@ -1475,8 +1475,9 @@ remaining limitations are:
   exact rDSN facility that should back them:
   `replicated_service_app_type_1` (now used by `rasn.state.replicated`; direct
   module groups remain) for quorum-replicated storage,
-  `dist::partition_resolver` for shard routing, and Thrift IDL for typed RPC
-  schemas. Remaining missing-module gaps (durable/vector agent memory, a
+  `dist::partition_resolver` (now used by URI-backed runtime-module clients;
+  meta-managed module tables remain) for shard routing, and Thrift IDL for typed
+  RPC schemas. Remaining missing-module gaps (durable/vector agent memory, a
   **global** quota/rate authority consuming the new shared store, secrets vault,
   multi-tenancy, distributed scheduler/placement) are tracked there as roadmap
   items.

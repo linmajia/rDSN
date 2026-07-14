@@ -450,6 +450,10 @@ std::vector<std::string> rasn_runtime_module_ownership_resources_for(const std::
                                                                      const std::vector<uint32_t> &hosted_shards,
                                                                      bool sharded,
                                                                      uint32_t partition_count);
+// Stable application partition hash passed to rDSN RPC. URI addresses feed this
+// value into dist::partition_resolver; an explicit route_partition is already a
+// partition selector and therefore takes precedence over the natural key hash.
+uint64_t rasn_runtime_partition_hash(const rasn_runtime_request &request);
 // Ingress shard-ownership guard: true when a runtime service that hosts
 // `hosted_shards` of a module should serve `request`. An empty hosted set means
 // the service owns the whole module (or the module is unsharded) and serves every

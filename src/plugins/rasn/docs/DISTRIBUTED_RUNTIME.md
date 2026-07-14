@@ -202,11 +202,23 @@ Design notes:
 - **Shard-aware placement.** Modules whose descriptor is `sharded`
   (`agent_message_bus`, `resource_budget`, `blackboard`) can set
   `<module>_shard_count > 1`. Mutating and keyed read operations route by the
-  module's natural key (`message_id`, budget `scope`, blackboard `key`) using a
-  deterministic FNV-1a hash; fan-out reads such as snapshots query each distinct
-  shard endpoint and merge the typed results. Static per-shard endpoint knobs are
+  module's natural key (`message_id`, budget `scope`, blackboard `key`) using the
+  existing stable FNV-1a hash. That full hash is now carried in the rDSN RPC
+  `partition_hash`: when the endpoint is a module-level `dsn://` URI, the core
+  invokes `dist::partition_resolver` to map it to the current partition replica
+  group and invalidates the resolver cache after access failure. Static and
+  registry endpoints retain deterministic hash/modulo selection as compatibility
+  fallbacks because they are not meta-server tables. Fan-out reads such as
+  snapshots query every URI-backed partition even though all share one logical
+  URI, or each distinct static endpoint, then merge the typed results. Static
+  per-shard endpoint knobs are
   `<module>_shard_<n>_{uri,host,port}` with the normal per-module endpoint as the
-  fallback. For registry-routed shards, a module service can set
+  fallback and remain authoritative per-shard overrides. Resolver-backed clients
+  must configure `<module>_shard_count` equal to the meta-server table's partition
+  count; the public resolver API does not expose that count for startup
+  cross-validation. Explicit hosted-shard ingress checks can reject some mismatched
+  routes, but operators must treat any count mismatch as invalid configuration. For
+  registry-routed shards, a module service can set
   `<module>_hosted_shards = 0,2` (or `all`) so it publishes explicit
   `rasn.runtime.<module>.shard.<n>` capabilities. If no shard-specific descriptor
   is live, clients retain the older module-level fallback that maps sorted live
@@ -233,10 +245,10 @@ Design notes:
   app-list scripts keep working while new deployments use the `rasn.runtime.*`
   names.
 - **Topology reporting.** `describe_topology()` renders, per module, its routing
-  (local/remote), resolved endpoint source (`registry:` or `static:`; sharded
-  modules list `shardN=...#shard=N/count`), standalone role, intended consistency
-  model, and statefulness — the operator's view for validating a multi-node
-  layout.
+  (local/remote), resolved endpoint source (`registry:`, `static:`, or
+  resolver-backed `resolver:`; sharded modules list
+  `shardN=...#shard=N/count`), standalone role, intended consistency model, and
+  statefulness — the operator's view for validating a multi-node layout.
 
 ### 6.1 Configuration file layout
 
@@ -463,8 +475,10 @@ quorum-replicated `rasn.state` backend described in §13.13.
 
 The current prototype implements deterministic partition routing for the sharded
 modules above, so a configured shard count can spread different keys across
-independent module service stores. The intent is still to back
-`replicated`/`sharded` modules with rDSN's native replication/partitioning rather
+independent module service stores. A module-level `dsn://` endpoint now delegates
+the key-hash-to-replica-group step to rDSN's native `partition_resolver` (§6);
+static and registry placement retain the standalone-store path. The intent is
+still to make each `replicated`/`sharded` module a real rDSN replicated app rather
 than reinventing consensus in rASN.
 
 > **Until then — one active writer per shard.** Because each store is a
@@ -665,6 +679,35 @@ resource_budget_shard_count = 2
 resource_budget_shard_0_uri = dsn://meta-server:34601/rasn-budget-a
 resource_budget_shard_1_uri = dsn://meta-server:34601/rasn-budget-b
 ```
+
+Meta-server partition resolution (client path; the referenced runtime module must
+be deployed as a compatible rDSN table):
+
+```ini
+[modules]
+dsn.dist.uri.resolver
+
+[rasn.runtime]
+rasn_runtime_provider = distributed
+
+[rasn.service]
+blackboard_shard_count = 4
+blackboard_uri = dsn://rasn-cluster/rasn-blackboard
+
+[uri-resolver.dsn://rasn-cluster]
+factory = partition_resolver_simple
+arguments = meta-1:27601,meta-2:27601
+```
+
+The module URI is one authoritative logical endpoint. rASN supplies the stable key
+hash (or exact `route_partition` for fan-out/ping) to the RPC header; rDSN resolves
+and refreshes the physical replica-group endpoint. Resolver failure is returned
+rather than silently falling through to registry/static routing. Circuit breakers
+remain keyed by logical module URI plus partition because the public call surface
+does not expose the resolved physical replica. Current checked-in runtime module
+roles are not yet replicated tables, so this client integration does not claim
+module durability, primary failover, or rebalancing; those require direct module
+replication (§13.5).
 
 Registry-discovered shard ownership on a standalone module service:
 
@@ -892,7 +935,7 @@ where rASN grew a parallel mechanism that an existing rDSN facility should own:
 | Concern | rASN today | rDSN facility to reuse | Status |
 | --- | --- | --- | --- |
 | State replication / HA | standalone journaled store by default; optional `rasn.state.replicated` authority | `replicated_service_app_type_1` (layer-2 replication SM: `checkpoint`/`learn`/`apply`) | **DELIVERED for `rasn.state` (§13.13); direct module groups remain** |
-| Partition routing | hand-rolled `fnv1a64(key) % shard_count` in the module bus/budget/blackboard | `dist::partition_resolver` (partition→endpoint resolution with config/meta integration) | DOCUMENTED |
+| Partition routing | stable application key hash with static/registry shard fallbacks; URI-backed calls now carry the hash through rDSN RPC | `dist::partition_resolver` (partition→endpoint resolution with config/meta integration) | **DELIVERED for URI-backed client routing (§6); direct meta-managed module tables remain** |
 | Discovery + failure detection | local map by default; opt-in shared descriptor/lease records with fenced primary and frontend group | `meta_state_service` + `distributed_lock_service` on `ext/zookeeper`; rDSN group address for client failover | **DELIVERED (§13.14)** |
 | Wire schema / IDL | generic envelope with a field-map payload + `schema_manifest` codegen | Thrift IDL + `dsn.tools` codegen (typed, versioned RPC structs) | DOCUMENTED |
 
@@ -979,8 +1022,11 @@ contract (§4) exactly as they are, and swaps the *backing* of stateful modules:
   Only then should `describe_topology()` report `actual=replicated` instead of
   `single_writer_in_memory`; the shared durable mirror does not change the module's
   execution consistency.
-- Resolve `sharded` modules through `dist::partition_resolver` instead of
-  `fnv1a64 % count`, so partitions map to replica groups managed by the meta-server.
+- URI-backed sharded clients now pass the stable application key hash to rDSN RPC,
+  so `dist::partition_resolver` maps partitions to replica groups and refreshes
+  failed access (§6). The static/registry fallback remains for standalone
+  single-writer shards. Direct runtime-module replica groups still require each
+  module to become a replicated app rather than the current in-memory service role.
 - Membership/discovery HA is now delivered (§13.14) using the generic rDSN
   facilities that actually match descriptor storage: ZooKeeper-backed
   `meta_state_service` for records, `distributed_lock_service` for a fenced writer,
@@ -1017,10 +1063,10 @@ Resolved/mitigated **in code and validated** (committed as
   dispatch echo.
 
 Everything else above is either landed in the coordination (§13.7), replicated
-state (§13.13), and HA discovery (§13.14) rounds or DOCUMENTED with its rDSN-native
-target because it depends on larger data-plane migrations (direct module
-replication, partition resolution, or IDL codegen). These sections are the source
-of truth for §11.
+state (§13.13), HA discovery (§13.14), and resolver-aware client-routing (§6)
+rounds or DOCUMENTED with its rDSN-native target because it depends on larger
+data-plane migrations (direct module replication or IDL codegen). These sections
+are the source of truth for §11.
 
 ### 13.7 Distributed coordination module (findings 1.1 ownership, 1.5 shared state) — RESOLVED (code)
 

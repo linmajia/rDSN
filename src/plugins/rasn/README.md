@@ -1325,8 +1325,8 @@ support deterministic key-based partition routing. Set `<module>_shard_count`,
 then optionally override each shard with
 `<module>_shard_<n>_uri` or `<module>_shard_<n>_{host,port}`. Writes and keyed
 reads route by the module's natural key (`message_id`, budget `scope`, or
-blackboard `key`); snapshot-style reads fan out to each distinct shard endpoint
-and merge typed results.
+blackboard `key`); snapshot-style reads fan out to every configured partition and
+merge typed results.
 
 ```ini
 blackboard_shard_count = 2
@@ -1335,6 +1335,29 @@ blackboard_shard_0_port = 27117
 blackboard_shard_1_host = blackboard-b
 blackboard_shard_1_port = 27127
 ```
+
+For a module-level `dsn://` URI, rASN passes the stable key hash as the rDSN RPC
+partition hash. The core `dist::partition_resolver` then owns
+partition-to-replica-group resolution, cache invalidation, and retry after access
+failure. Set `<module>_shard_count` to the meta-server table's partition count;
+explicit per-shard endpoints remain authoritative overrides. Existing FNV-1a key
+hashing is preserved so enabling resolver-backed routing does not silently remap
+already-sharded state.
+
+```ini
+[rasn.service]
+blackboard_shard_count = 4
+blackboard_uri = dsn://rasn-cluster/rasn-blackboard
+
+[uri-resolver.dsn://rasn-cluster]
+factory = partition_resolver_simple
+arguments = meta-1:27601,meta-2:27601
+```
+
+The client path is resolver-aware, but current runtime module app roles are still
+single-writer in-memory services rather than rDSN replicated tables. Meta-managed
+module replica groups require the direct module-replication work described in
+`docs/DISTRIBUTED_RUNTIME.md`.
 
 For registry-routed sharded deployments, set the same shard count on clients and
 configure each standalone module service with the shard labels it owns:
@@ -1404,8 +1427,9 @@ of being masked by a static summary. In distributed mode the ping uses the
 dedicated `*_ping_timeout_ms` budget and a single attempt so an unreachable
 endpoint surfaces quickly; sharded modules probe every configured shard.
 `rasn_runtime::describe_topology()` renders where each module is routed (local
-vs. remote), whether the endpoint came from `registry:` or `static:` config,
-per-shard endpoint labels when applicable, its standalone role, and both its
+vs. remote), whether the endpoint came from `registry:`, `static:`, or
+resolver-backed `resolver:` config, per-shard endpoint labels when applicable,
+its standalone role, and both its
 intended consistency model and its `actual=single_writer_in_memory` runtime
 backing, which is useful for verifying a hybrid or multi-node layout.
 
