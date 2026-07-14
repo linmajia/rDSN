@@ -1912,23 +1912,37 @@ TEST(rasn_human_interaction, tracks_answers_cancellation_and_expiry)
     request.choices.push_back("no");
     request.deadline_ms = 200;
 
-    human_interaction_result opened = queue.open(request);
+    human_interaction_result opened = queue.open(request, 100);
     ASSERT_TRUE(opened.ok) << opened.error;
+    EXPECT_EQ(100u, opened.request.created_at_ms);
+    EXPECT_EQ(100u, opened.request.updated_at_ms);
     EXPECT_EQ(1u, queue.pending("agent").size());
 
-    human_interaction_result rejected = queue.answer("approval-1", "maybe");
+    human_interaction_result rejected = queue.answer("approval-1", "maybe", 120);
     EXPECT_FALSE(rejected.ok);
-    human_interaction_result answered = queue.answer("approval-1", "yes");
+    human_interaction_result answered = queue.answer("approval-1", "yes", 130);
     ASSERT_TRUE(answered.ok) << answered.error;
     EXPECT_EQ("answered", answered.request.state);
+    EXPECT_EQ(130u, answered.request.updated_at_ms);
 
     request.request_id = "approval-2";
-    opened = queue.open(request);
+    opened = queue.open(request, 140);
     ASSERT_TRUE(opened.ok) << opened.error;
     EXPECT_EQ(1u, queue.expire(250));
     human_interaction_request expired;
     ASSERT_TRUE(queue.find("approval-2", &expired));
     EXPECT_EQ("expired", expired.state);
+    EXPECT_EQ(250u, expired.updated_at_ms);
+
+    request.request_id = "approval-3";
+    request.deadline_ms = 0;
+    opened = queue.open(request, 260);
+    ASSERT_TRUE(opened.ok) << opened.error;
+    const human_interaction_result cancelled = queue.cancel("approval-3", "superseded", 270);
+    ASSERT_TRUE(cancelled.ok) << cancelled.error;
+    EXPECT_EQ("cancelled", cancelled.request.state);
+    EXPECT_EQ("superseded", cancelled.request.answer);
+    EXPECT_EQ(270u, cancelled.request.updated_at_ms);
 }
 
 TEST(rasn_tool_catalog, describes_aliases_and_normalizes_invocations)
@@ -5176,6 +5190,114 @@ TEST(rasn_runtime, replica_rejects_nondeterministic_mutations)
     const rasn_runtime_response mismatched = store.dispatch(request);
     EXPECT_FALSE(mismatched.ok);
     EXPECT_NE(std::string::npos, mismatched.error.find("request key"));
+
+    rasn_runtime_replica_store human_store("human_interaction");
+    rasn_runtime_request expire;
+    expire.module = "human_interaction";
+    expire.operation = "expire";
+    expire.key = "*";
+    expire.request_id = "replica-missing-expiry-time";
+    expire.payload = "now_ms=1:0\n";
+    const rasn_runtime_response missing_expiry_time = human_store.dispatch(expire);
+    EXPECT_FALSE(missing_expiry_time.ok);
+    EXPECT_NE(std::string::npos, missing_expiry_time.error.find("timestamp"));
+}
+
+TEST(rasn_runtime, replica_human_interaction_accepts_live_mutations_and_restores)
+{
+    const auto encode_field = [](const std::string &key, const std::string &value) {
+        return key + "=" + std::to_string(value.size()) + ":" + value + "\n";
+    };
+    const auto open_request = [&encode_field](const std::string &human_id,
+                                              const std::string &command_id,
+                                              uint64_t deadline_ms) {
+        rasn_runtime_request request;
+        request.module = "human_interaction";
+        request.operation = "open";
+        request.key = human_id;
+        request.request_id = command_id;
+        request.payload = encode_field("request_id", human_id) +
+                          encode_field("requester", "reviewer") +
+                          encode_field("prompt", "Approve deployment?") +
+                          encode_field("choice", "yes") +
+                          encode_field("choice", "no") +
+                          encode_field("state", "pending") +
+                          encode_field("created_at_ms", "100") +
+                          encode_field("updated_at_ms", "100") +
+                          encode_field("deadline_ms", std::to_string(deadline_ms));
+        return request;
+    };
+    const auto transition_request = [&encode_field](const std::string &human_id,
+                                                    const std::string &operation,
+                                                    const std::string &value_field,
+                                                    const std::string &value,
+                                                    const std::string &command_id,
+                                                    uint64_t updated_at_ms) {
+        rasn_runtime_request request;
+        request.module = "human_interaction";
+        request.operation = operation;
+        request.key = human_id;
+        request.request_id = command_id;
+        request.payload = encode_field("request_id", human_id) +
+                          encode_field(value_field, value) +
+                          encode_field("updated_at_ms", std::to_string(updated_at_ms));
+        return request;
+    };
+    const auto find_request = [](const std::string &human_id) {
+        rasn_runtime_request request;
+        request.module = "human_interaction";
+        request.operation = "find";
+        request.key = human_id;
+        return request;
+    };
+
+    rasn_runtime_replica_store source("human_interaction");
+    ASSERT_TRUE(source.dispatch(open_request("human-answer", "open-answer", 500)).ok);
+    const rasn_runtime_request answer =
+        transition_request("human-answer", "answer", "answer", "yes", "answer-command", 120);
+    ASSERT_TRUE(source.dispatch(answer).ok);
+    EXPECT_NE(std::string::npos,
+              source.dispatch(find_request("human-answer")).payload.find("answered"));
+
+    ASSERT_TRUE(source.dispatch(open_request("human-cancel", "open-cancel", 500)).ok);
+    ASSERT_TRUE(source.dispatch(transition_request("human-cancel",
+                                                   "cancel",
+                                                   "reason",
+                                                   "superseded",
+                                                   "cancel-command",
+                                                   130))
+                    .ok);
+    EXPECT_NE(std::string::npos,
+              source.dispatch(find_request("human-cancel")).payload.find("cancelled"));
+
+    ASSERT_TRUE(source.dispatch(open_request("human-expire", "open-expire", 150)).ok);
+    rasn_runtime_request expire;
+    expire.module = "human_interaction";
+    expire.operation = "expire";
+    expire.key = "*";
+    expire.request_id = "expire-command";
+    expire.payload = encode_field("now_ms", "200");
+    ASSERT_TRUE(source.dispatch(expire).ok);
+    EXPECT_NE(std::string::npos,
+              source.dispatch(find_request("human-expire")).payload.find("expired"));
+
+    ::dsn_gpid gpid = {};
+    gpid.u.app_id = 11;
+    gpid.u.partition_index = 0;
+    const int64_t decree = 17;
+    std::vector<state_record> records;
+    std::string error;
+    ASSERT_TRUE(source.checkpoint_records(gpid, decree, &records, &error)) << error;
+
+    rasn_runtime_replica_store restored("human_interaction");
+    ASSERT_TRUE(restored.replace_checkpoint_records(records, gpid, decree, &error)) << error;
+    EXPECT_NE(std::string::npos,
+              restored.dispatch(find_request("human-answer")).payload.find("answered"));
+    EXPECT_NE(std::string::npos,
+              restored.dispatch(find_request("human-cancel")).payload.find("cancelled"));
+    EXPECT_NE(std::string::npos,
+              restored.dispatch(find_request("human-expire")).payload.find("expired"));
+    EXPECT_EQ(source.dispatch(answer).payload, restored.dispatch(answer).payload);
 }
 
 TEST(rasn_runtime, replica_dedup_preserves_failed_mutation_outcome)

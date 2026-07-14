@@ -1763,6 +1763,14 @@ the original result instead of applying twice. Native eviction uses a
 protocol-fixed capacity of 8192; app startup fails unless the visible config
 matches that constant, so node-local tuning cannot make replicas diverge.
 
+The `human_interaction` singleton is a live replicated queue rather than a
+checkpoint-only mirror. The runtime facade routes open, answer, cancel, and
+deadline-expiry mutations through its write code, and routes find, requester-
+filtered pending, snapshot, and describe operations through its read code.
+Request IDs and transition timestamps are materialized by the client facade
+before replication; checkpoint hydration remains an internal recovery-only
+operation.
+
 Checkpoint files are named `rasn-runtime-checkpoint.<decree>` in each partition
 data directory and reuse the validated `state_store` snapshot format without
 enabling its standalone journal. Every image carries a required module/schema/

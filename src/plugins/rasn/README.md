@@ -1185,7 +1185,9 @@ co-hosts one meta server and three replica servers for development only;
 production must place and supervise those roles on separate failure domains.
 Pass `"meta;replica"` as the optional `serve` app-list argument, as shown in the
 profile header, so the generic standalone-role list does not filter those two
-cluster roles.
+cluster roles. The `human_interaction` table accepts live open, answer, cancel,
+and expiry mutations through the same runtime facade; it is not limited to
+checkpoint import.
 
 `rasn.llm.agent`, `rasn.tool.agent`, `rasn.coordinator`, `rasn.workflow`, and
 `rasn.observability` all retain the shared
@@ -1463,7 +1465,9 @@ example `agent_control_plane`, `determinism_ledger`), and control-surface module
 are `singleton` (for example `human_interaction`, `sandbox_runtime`). Standalone
 roles realize these as single-writer stores; the native replicated profile gives
 each module an independent table, mutation log, checkpoint stream, and failover
-boundary.
+boundary. The facade exposes the human-interaction queue's open, answer, cancel,
+find, filtered-pending, and expiry operations for both standalone and native
+replicated placement.
 
 > **Operational warning for standalone roles — one active writer per shard.**
 > Key-based sharding alone is placement, not replication. Do **not** run multiple

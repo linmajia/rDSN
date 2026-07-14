@@ -35,10 +35,14 @@ struct human_interaction_result
 class human_interaction_queue
 {
 public:
-    human_interaction_result open(human_interaction_request request);
+    human_interaction_result open(human_interaction_request request, uint64_t now_ms = 0);
     bool hydrate_request(const human_interaction_request &request, std::string *error);
-    human_interaction_result answer(const std::string &request_id, const std::string &answer);
-    human_interaction_result cancel(const std::string &request_id, const std::string &reason);
+    human_interaction_result answer(const std::string &request_id,
+                                    const std::string &answer,
+                                    uint64_t updated_at_ms = 0);
+    human_interaction_result cancel(const std::string &request_id,
+                                    const std::string &reason,
+                                    uint64_t updated_at_ms = 0);
     size_t expire(uint64_t now_ms);
     bool find(const std::string &request_id, human_interaction_request *request) const;
     std::vector<human_interaction_request> pending(const std::string &requester = "") const;

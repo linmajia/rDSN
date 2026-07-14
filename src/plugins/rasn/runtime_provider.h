@@ -325,8 +325,15 @@ public:
                                         const std::string &output,
                                         const std::vector<std::string> &policy_labels) const;
     std::string describe_contracts() const;
+    human_interaction_result open_human_interaction(const human_interaction_request &request);
+    human_interaction_result answer_human_interaction(const std::string &request_id,
+                                                      const std::string &answer);
+    human_interaction_result cancel_human_interaction(const std::string &request_id,
+                                                      const std::string &reason);
+    bool find_human_interaction(const std::string &request_id, human_interaction_request *request) const;
+    size_t expire_human_interactions(uint64_t now_ms);
     std::vector<human_interaction_request> human_snapshot() const;
-    std::vector<human_interaction_request> pending_human() const;
+    std::vector<human_interaction_request> pending_human(const std::string &requester = "") const;
     void set_sandbox_profile(const sandbox_profile &profile);
     sandbox_decision evaluate_sandbox(const sandbox_request &request) const;
     sandbox_profile sandbox() const;
@@ -415,8 +422,15 @@ public:
                                         const std::string &output,
                                         const std::vector<std::string> &policy_labels) const;
     std::string describe_contracts() const;
+    human_interaction_result open_human_interaction(const human_interaction_request &request);
+    human_interaction_result answer_human_interaction(const std::string &request_id,
+                                                      const std::string &answer);
+    human_interaction_result cancel_human_interaction(const std::string &request_id,
+                                                      const std::string &reason);
+    bool find_human_interaction(const std::string &request_id, human_interaction_request *request) const;
+    size_t expire_human_interactions(uint64_t now_ms);
     std::vector<human_interaction_request> human_snapshot() const;
-    std::vector<human_interaction_request> pending_human() const;
+    std::vector<human_interaction_request> pending_human(const std::string &requester = "") const;
 
     bool mirror_state(const std::string &module,
                       const std::string &kind,

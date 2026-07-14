@@ -10,7 +10,7 @@
 namespace dsn {
 namespace rasn {
 
-human_interaction_result human_interaction_queue::open(human_interaction_request request)
+human_interaction_result human_interaction_queue::open(human_interaction_request request, uint64_t now_ms)
 {
     human_interaction_result result;
     if (request.prompt.empty())
@@ -26,7 +26,10 @@ human_interaction_result human_interaction_queue::open(human_interaction_request
     {
         request.state = "pending";
     }
-    const uint64_t now_ms = ::dsn_now_ms();
+    if (now_ms == 0)
+    {
+        now_ms = ::dsn_now_ms();
+    }
     if (request.created_at_ms == 0)
     {
         request.created_at_ms = now_ms;
@@ -69,7 +72,9 @@ bool human_interaction_queue::hydrate_request(const human_interaction_request &r
     return true;
 }
 
-human_interaction_result human_interaction_queue::answer(const std::string &request_id, const std::string &answer)
+human_interaction_result human_interaction_queue::answer(const std::string &request_id,
+                                                          const std::string &answer,
+                                                          uint64_t updated_at_ms)
 {
     human_interaction_result result;
     ::dsn::service::zauto_lock guard(_lock);
@@ -91,13 +96,15 @@ human_interaction_result human_interaction_queue::answer(const std::string &requ
     }
     it->second.answer = answer;
     it->second.state = "answered";
-    it->second.updated_at_ms = ::dsn_now_ms();
+    it->second.updated_at_ms = updated_at_ms == 0 ? ::dsn_now_ms() : updated_at_ms;
     result.ok = true;
     result.request = it->second;
     return result;
 }
 
-human_interaction_result human_interaction_queue::cancel(const std::string &request_id, const std::string &reason)
+human_interaction_result human_interaction_queue::cancel(const std::string &request_id,
+                                                          const std::string &reason,
+                                                          uint64_t updated_at_ms)
 {
     human_interaction_result result;
     ::dsn::service::zauto_lock guard(_lock);
@@ -114,7 +121,7 @@ human_interaction_result human_interaction_queue::cancel(const std::string &requ
     }
     it->second.state = "cancelled";
     it->second.answer = reason;
-    it->second.updated_at_ms = ::dsn_now_ms();
+    it->second.updated_at_ms = updated_at_ms == 0 ? ::dsn_now_ms() : updated_at_ms;
     result.ok = true;
     result.request = it->second;
     return result;

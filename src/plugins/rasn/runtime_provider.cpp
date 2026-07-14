@@ -3248,6 +3248,61 @@ private:
             if (!decode_human_payload(request.payload, &human_request, &error)) return make_rasn_runtime_error(request, error);
             return bool_response(request, _human.hydrate_request(human_request, &error), error);
         }
+        if (request.operation == "open")
+        {
+            human_interaction_request human_request;
+            if (!decode_human_payload(request.payload, &human_request, &error))
+            {
+                return make_rasn_runtime_error(request, error);
+            }
+            if (human_request.request_id.empty() || human_request.request_id != request.key)
+            {
+                return make_rasn_runtime_error(request, "human interaction id must match the request key");
+            }
+            const human_interaction_result result =
+                _human.open(human_request, human_request.updated_at_ms);
+            return result.ok ? success_response(request, encode_human_payload(result.request))
+                             : make_rasn_runtime_error(request, result.error);
+        }
+        if (request.operation == "answer" || request.operation == "cancel")
+        {
+            field_map fields;
+            if (!parse_payload(request.payload, &fields, &error))
+            {
+                return make_rasn_runtime_error(request, error);
+            }
+            if (field_string(fields, "request_id") != request.key)
+            {
+                return make_rasn_runtime_error(request, "human interaction id must match the request key");
+            }
+            const uint64_t updated_at_ms = field_uint64(fields, "updated_at_ms");
+            const human_interaction_result result =
+                request.operation == "answer"
+                    ? _human.answer(request.key, field_string(fields, "answer"), updated_at_ms)
+                    : _human.cancel(request.key, field_string(fields, "reason"), updated_at_ms);
+            return result.ok ? success_response(request, encode_human_payload(result.request))
+                             : make_rasn_runtime_error(request, result.error);
+        }
+        if (request.operation == "find")
+        {
+            human_interaction_request human_request;
+            if (!_human.find(request.key, &human_request))
+            {
+                return make_rasn_runtime_error(request, "human interaction request not found: " + request.key);
+            }
+            return success_response(request, encode_human_payload(human_request));
+        }
+        if (request.operation == "expire")
+        {
+            field_map fields;
+            if (!parse_payload(request.payload, &fields, &error))
+            {
+                return make_rasn_runtime_error(request, error);
+            }
+            return success_response(
+                request,
+                encode_fields({{"count", std::to_string(_human.expire(field_uint64(fields, "now_ms")))}}));
+        }
         if (request.operation == "snapshot") return success_response(request, encode_items(_human.snapshot(), encode_human_payload));
         if (request.operation == "pending") return success_response(request, encode_items(_human.pending(request.key), encode_human_payload));
         if (request.operation == "describe") return success_response(request, _human.describe());
@@ -3351,6 +3406,22 @@ bool response_bool(const rasn_runtime_response &response, std::string *error)
     }
     clear_error(error);
     return true;
+}
+
+human_interaction_result human_result_from_response(const rasn_runtime_response &response)
+{
+    human_interaction_result result;
+    if (!response.ok)
+    {
+        result.error = response.error.empty() ? "runtime module API request failed" : response.error;
+        return result;
+    }
+    if (!decode_human_payload(response.payload, &result.request, &result.error))
+    {
+        return result;
+    }
+    result.ok = true;
+    return result;
 }
 
 contract_evaluation failed_contract_evaluation(const std::string &contract_id, const std::string &error)
@@ -4307,6 +4378,54 @@ bool replicated_runtime_request_is_deterministic(const rasn_runtime_request &req
             return false;
         }
     }
+    else if (request.module == "human_interaction" && request.operation == "open")
+    {
+        human_interaction_request human_request;
+        if (!decode_human_payload(request.payload, &human_request, &decode_error) ||
+            human_request.request_id.empty() || human_request.request_id != request.key ||
+            human_request.created_at_ms == 0 || human_request.updated_at_ms == 0)
+        {
+            if (error != nullptr)
+            {
+                *error = decode_error.empty()
+                             ? "replicated human interaction open requires a matching id and explicit timestamps"
+                             : decode_error;
+            }
+            return false;
+        }
+    }
+    else if (request.module == "human_interaction" &&
+             (request.operation == "answer" || request.operation == "cancel"))
+    {
+        field_map fields;
+        if (request.key.empty() || !parse_payload(request.payload, &fields, &decode_error) ||
+            field_string(fields, "request_id") != request.key ||
+            field_uint64(fields, "updated_at_ms") == 0)
+        {
+            if (error != nullptr)
+            {
+                *error = decode_error.empty()
+                             ? "replicated human interaction transition requires a matching id and explicit timestamp"
+                             : decode_error;
+            }
+            return false;
+        }
+    }
+    else if (request.module == "human_interaction" && request.operation == "expire")
+    {
+        field_map fields;
+        if (!parse_payload(request.payload, &fields, &decode_error) ||
+            field_uint64(fields, "now_ms") == 0)
+        {
+            if (error != nullptr)
+            {
+                *error = decode_error.empty()
+                             ? "replicated human interaction expiry requires an explicit timestamp"
+                             : decode_error;
+            }
+            return false;
+        }
+    }
     return true;
 }
 
@@ -5142,14 +5261,44 @@ std::string rasn_runtime::describe_contracts() const
     return _provider->describe_contracts();
 }
 
+human_interaction_result
+rasn_runtime::open_human_interaction(const human_interaction_request &request)
+{
+    return _provider->open_human_interaction(request);
+}
+
+human_interaction_result rasn_runtime::answer_human_interaction(const std::string &request_id,
+                                                                const std::string &answer)
+{
+    return _provider->answer_human_interaction(request_id, answer);
+}
+
+human_interaction_result rasn_runtime::cancel_human_interaction(const std::string &request_id,
+                                                                const std::string &reason)
+{
+    return _provider->cancel_human_interaction(request_id, reason);
+}
+
+bool rasn_runtime::find_human_interaction(const std::string &request_id,
+                                          human_interaction_request *request) const
+{
+    return _provider->find_human_interaction(request_id, request);
+}
+
+size_t rasn_runtime::expire_human_interactions(uint64_t now_ms)
+{
+    return _provider->expire_human_interactions(now_ms);
+}
+
 std::vector<human_interaction_request> rasn_runtime::human_snapshot() const
 {
     return _provider->human_snapshot();
 }
 
-std::vector<human_interaction_request> rasn_runtime::pending_human() const
+std::vector<human_interaction_request>
+rasn_runtime::pending_human(const std::string &requester) const
 {
-    return _provider->pending_human();
+    return _provider->pending_human(requester);
 }
 
 void rasn_runtime::set_sandbox_profile(const sandbox_profile &profile)
@@ -6141,6 +6290,139 @@ std::string rasn_runtime_provider::describe_contracts() const
     return response.ok ? response.payload : response.error;
 }
 
+human_interaction_result
+rasn_runtime_provider::open_human_interaction(const human_interaction_request &request)
+{
+    human_interaction_request submitted = request;
+    if (submitted.request_id.empty())
+    {
+        submitted.request_id = make_trace_id();
+    }
+    if (submitted.state.empty())
+    {
+        submitted.state = "pending";
+    }
+    const uint64_t now_ms = ::dsn_now_ms();
+    if (submitted.created_at_ms == 0)
+    {
+        submitted.created_at_ms = now_ms;
+    }
+    submitted.updated_at_ms = now_ms;
+
+    human_interaction_result result = human_result_from_response(
+        call_module_api(make_module_request("human_interaction",
+                                            "open",
+                                            submitted.request_id,
+                                            encode_human_payload(submitted))));
+    if (result.ok)
+    {
+        std::string mirror_error;
+        if (!mirror_state_after_success("human_interaction",
+                                        "request",
+                                        result.request.request_id,
+                                        encode_human_payload(result.request),
+                                        &mirror_error))
+        {
+            result.ok = false;
+            result.error = mirror_error;
+        }
+    }
+    return result;
+}
+
+human_interaction_result
+rasn_runtime_provider::answer_human_interaction(const std::string &request_id,
+                                                const std::string &answer)
+{
+    human_interaction_result result = human_result_from_response(call_module_api(make_module_request(
+        "human_interaction",
+        "answer",
+        request_id,
+        encode_fields({{"request_id", request_id},
+                       {"answer", answer},
+                       {"updated_at_ms", std::to_string(::dsn_now_ms())}}))));
+    if (result.ok)
+    {
+        std::string mirror_error;
+        if (!mirror_state_after_success("human_interaction",
+                                        "request",
+                                        result.request.request_id,
+                                        encode_human_payload(result.request),
+                                        &mirror_error))
+        {
+            result.ok = false;
+            result.error = mirror_error;
+        }
+    }
+    return result;
+}
+
+human_interaction_result
+rasn_runtime_provider::cancel_human_interaction(const std::string &request_id,
+                                                const std::string &reason)
+{
+    human_interaction_result result = human_result_from_response(call_module_api(make_module_request(
+        "human_interaction",
+        "cancel",
+        request_id,
+        encode_fields({{"request_id", request_id},
+                       {"reason", reason},
+                       {"updated_at_ms", std::to_string(::dsn_now_ms())}}))));
+    if (result.ok)
+    {
+        std::string mirror_error;
+        if (!mirror_state_after_success("human_interaction",
+                                        "request",
+                                        result.request.request_id,
+                                        encode_human_payload(result.request),
+                                        &mirror_error))
+        {
+            result.ok = false;
+            result.error = mirror_error;
+        }
+    }
+    return result;
+}
+
+bool rasn_runtime_provider::find_human_interaction(const std::string &request_id,
+                                                   human_interaction_request *request) const
+{
+    const rasn_runtime_response response =
+        call_module_api(make_module_request("human_interaction", "find", request_id));
+    if (!response.ok)
+    {
+        return false;
+    }
+    std::string error;
+    return decode_human_payload(response.payload, request, &error);
+}
+
+size_t rasn_runtime_provider::expire_human_interactions(uint64_t now_ms)
+{
+    const rasn_runtime_response response = call_module_api(make_module_request(
+        "human_interaction", "expire", "*", encode_fields({{"now_ms", std::to_string(now_ms)}})));
+    if (!response.ok)
+    {
+        return 0;
+    }
+    field_map fields;
+    std::string error;
+    const size_t expired = decode_fields(response.payload, &fields, &error)
+                               ? field_size(fields, "count")
+                               : 0;
+    if (expired > 0)
+    {
+        for (const human_interaction_request &request : human_snapshot())
+        {
+            mirror_state_after_success("human_interaction",
+                                       "request",
+                                       request.request_id,
+                                       encode_human_payload(request));
+        }
+    }
+    return expired;
+}
+
 std::vector<human_interaction_request> rasn_runtime_provider::human_snapshot() const
 {
     const rasn_runtime_response response = call_module_api(make_module_request("human_interaction", "snapshot"));
@@ -6153,9 +6435,11 @@ std::vector<human_interaction_request> rasn_runtime_provider::human_snapshot() c
     return requests;
 }
 
-std::vector<human_interaction_request> rasn_runtime_provider::pending_human() const
+std::vector<human_interaction_request>
+rasn_runtime_provider::pending_human(const std::string &requester) const
 {
-    const rasn_runtime_response response = call_module_api(make_module_request("human_interaction", "pending"));
+    const rasn_runtime_response response =
+        call_module_api(make_module_request("human_interaction", "pending", requester));
     std::vector<human_interaction_request> requests;
     std::string error;
     if (response.ok)
