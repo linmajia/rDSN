@@ -415,6 +415,10 @@ uint32_t rasn_runtime_partition_for_request(const rasn_runtime_request &request)
 
 ::dsn::rpc_address rasn_service_address(const std::string &service_name, uint16_t default_port)
 {
+    if (service_name == "registry")
+    {
+        return configured_rasn_registry_address();
+    }
     const std::string uri = config_service_string(service_name + "_uri", "", "rASN service URI");
     if (!uri.empty())
     {
@@ -6131,7 +6135,7 @@ void rasn_runtime_app::heartbeat_modules_to_registry()
                   err.to_string());
             registry_rpc_available = false;
         }
-        else if (!response.ok)
+        else if (registry_response_is_agent_not_found(response))
         {
             std::tie(err, response) = registry.register_sync(descriptor, timeout);
             if (err != ::dsn::ERR_OK)
@@ -6146,6 +6150,13 @@ void rasn_runtime_app::heartbeat_modules_to_registry()
                       descriptor.agent_id.c_str(),
                       response.error.message.c_str());
             }
+        }
+        else if (!response.ok)
+        {
+            dwarn("registry heartbeat rejected runtime module %s without a safe "
+                  "re-registration: %s",
+                  descriptor.agent_id.c_str(),
+                  response.error.message.c_str());
         }
     }
 }

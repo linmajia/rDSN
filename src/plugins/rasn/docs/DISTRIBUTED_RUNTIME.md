@@ -425,15 +425,16 @@ engine rather than introducing another bespoke mechanism:
   backend described in §13.7, so every participating process observes one breaker
   state. While an endpoint is unhealthy, calls short-circuit with `ERR_BUSY`
   without touching the dependency, exactly as the module path does.
-- **Idempotency-aware retries.** Errors that prove the request never applied
-  (`ERR_NETWORK_FAILURE`, `ERR_NETWORK_INIT_FAILED`, `ERR_BUSY`,
-  `ERR_CAPACITY_EXCEEDED`, `ERR_TRY_AGAIN`) are retried for *any* operation. The
-  ambiguous `ERR_TIMEOUT` — where the server may already have applied the write —
-  is retried **only** for operations the caller declares idempotent. Reads and
-  key-overwrite writes are idempotent; compare-and-swap (`put_conditional`) and
-  starting a workflow run are not, so a lost reply on those fails fast instead of
-  risking a double-apply. Linear backoff (`backoff_ms * attempt`) separates
-  retries; total attempts are `rasn_core_rpc_retries + 1`.
+- **Idempotency-aware retries.** Errors that prove the request never reached
+  application dispatch (`ERR_NETWORK_INIT_FAILED`, `ERR_BUSY`,
+  `ERR_CAPACITY_EXCEEDED`, `ERR_TRY_AGAIN`) are retried for *any* operation.
+  `ERR_NETWORK_FAILURE` can be synthesized when an in-flight connection drops
+  after the server applied the request, so it is ambiguous like `ERR_TIMEOUT`;
+  both are retried **only** for operations the caller declares idempotent. Reads
+  and key-overwrite writes are idempotent; compare-and-swap (`put_conditional`)
+  and starting a workflow run are not, so a lost reply on those fails fast
+  instead of risking a double-apply. Linear backoff (`backoff_ms * attempt`)
+  separates retries; total attempts are `rasn_core_rpc_retries + 1`.
 - **Config.** `[rasn.service] rasn_core_rpc_retries`, `rasn_core_rpc_backoff_ms`,
   `rasn_core_rpc_breaker_enabled`, `rasn_core_rpc_breaker_failures`, and
   `rasn_core_rpc_breaker_open_ms`. The RPC timeout reuses `[rasn.rpc] timeout_ms`.
@@ -516,6 +517,26 @@ than reinventing consensus in rASN.
   therefore fail over to a different registered endpoint after the registry stops
   returning the unhealthy descriptor, while static config remains the deterministic
   fallback when registry is unavailable.
+- **HA registry authority (opt in).** `[rasn.registry] shared_state_enabled = true`
+  replaces a registry frontend's private map with the existing rDSN
+  `meta_state_service` through the coordination facade. Every frontend can serve
+  reads; one frontend owns `rasn.registry.primary` through
+  `distributed_lock_service` and performs registration, heartbeat, unregister,
+  full-record epoch promotion, static-descriptor reconciliation, and lease expiry.
+  Each new writer copies the previous committed snapshot below its grant-version
+  children, reconciles static records, and only then publishes a schema-versioned
+  epoch marker. Readers consume one exact committed epoch and validate its owner
+  against an authoritative ZooKeeper lock-tree read before and after the snapshot,
+  so a delayed former leader cannot overwrite or introduce visible records.
+  Shared-mode backend/record failures are returned as errors, never converted into
+  a successful empty roster.
+- **HA frontend routing.** `[rasn.service] registry_addresses` builds an rDSN group
+  address after `registry_uri` precedence and before legacy host/port fallback.
+  Registration, heartbeat, unregister, query, list, CLI diagnostics, readiness, and
+  runtime-module discovery all use the same helper and bounded retry policy. rDSN
+  advances a failed group leader on transport failure; a standby's typed
+  `registry_not_primary` response explicitly advances it before retry. Configure
+  `client_max_attempts` at least as high as the frontend count.
 - **Cross-node module auth.** Distributed runtime module RPC can require a shared
   service token with `[rasn.service] rasn_runtime_auth_enabled = true` and
   a deployment-supplied `rasn_runtime_auth_token`. Remote providers stamp the token onto the
@@ -565,6 +586,51 @@ registry_port = 27100
 ; Runtime-host config: publish the address clients can actually dial.
 rasn_runtime_advertise_host = modules-host
 ```
+
+HA registry frontends (one registry process per endpoint, all sharing ZooKeeper):
+
+```ini
+; config.rasn.ini (host topology)
+[rasn.service]
+registry_addresses = registry-a:27100,registry-b:27100,registry-c:27100
+
+; config.rasn.defaults.ini (loaded last by every registry frontend)
+[rasn.registry]
+shared_state_enabled = true
+shared_state_prefix = registry/v1
+leader_resource = rasn.registry.primary
+client_max_attempts = 3
+
+[rasn.coordination]
+provider = zookeeper
+lock_namespace = /rasn/locks
+state_namespace = /rasn/state
+
+[zookeeper]
+hosts_list = zk-1:2181,zk-2:2181,zk-3:2181
+
+[apps.rasn.registry]
+; Use the matching port on each process and select only rasn.registry in its
+; app-list. Do not use count>1 as a substitute for process/node redundancy.
+ports = 27100
+pools = THREAD_POOL_DEFAULT,THREAD_POOL_META_SERVER,THREAD_POOL_DLOCK
+
+[threadpool.THREAD_POOL_META_SERVER]
+partitioned = false
+worker_count = 2
+
+[threadpool.THREAD_POOL_DLOCK]
+partitioned = true
+```
+
+All frontend processes open the existing registry RPC contract. Standbys serve
+shared reads and reject mutations with `registry_not_primary`; clients rotate to
+the elected writer. A writer crash is detected by the ZooKeeper-backed lock lease,
+one standby acquires a greater fencing token, reconciles `[rasn.agent.*]`, and
+continues from the shared descriptor/heartbeat records. A ZooKeeper build is
+mandatory: requesting shared registry state while the resolved coordination
+provider is not `zookeeper` aborts registry startup instead of silently falling
+back to process memory.
 
 Service-to-service auth for runtime RPC:
 
@@ -726,6 +792,12 @@ codepilot.exe serve config.rasn.ini "rasn.state;resource_budget"
   versions. Remaining: move admission/rate/cost/overload/dedup authorities onto
   safe leased or transactional primitives, and validate cross-process ownership
   and breaker propagation on ZooKeeper under multi-node.
+- **HA discovery — DELIVERED (§13.14):** registry descriptors/leases can live in
+  ZooKeeper-backed `meta_state_service`; a fenced
+  `distributed_lock_service` primary serializes mutations while every frontend
+  serves shared reads; and `registry_addresses` uses an rDSN group with bounded
+  failover for every registry call family. Remaining deployment evidence is a
+  multi-process ZooKeeper frontend-failover scenario in the Linux harness.
 - Multi-process integration tests for the distributed/hybrid RPC paths.
 - Generated typed RPC schemas per module (replace the generic envelope payload).
 - State-mirror compaction/watermarks promotion is partially complete: watermarks
@@ -763,6 +835,7 @@ which gaps are resolved in code, mitigated client-side, or tracked as framework 
 | Providers (`local`/`distributed`/`hybrid`), transport helpers, breaker, dedup, service store, apps | `runtime_provider.cpp` |
 | Core-service client RPC resilience (breaker + idempotency-aware retries) | `rpc_resilience.h` / `rpc_resilience.cpp` |
 | Distributed coordination facade (ownership election + cluster-shared state) reusing rDSN `distributed_lock_service` / `meta_state_service` | `coordination_service.h` / `coordination_service.cpp` |
+| Local + HA registry facade, fenced shared records, frontend group/retries | `agent_registry.h` / `agent_registry.cpp`; `[rasn.registry]` + `[rasn.service] registry_addresses` |
 | RPC/LPC task codes | `rasn.code.definition.h` |
 | Reusable circuit breaker engine | `circuit_breaker.h` / `circuit_breaker.cpp` |
 | Provider/endpoint/resilience config | `[rasn.runtime]` and the optional client endpoint in each app's `config.ini`; host `[rasn.service]`/`[rasn.rpc]` in `config.rasn.ini` |
@@ -794,10 +867,10 @@ bespoke mechanism, the audit names the rDSN facility that should back it.
 | --- | --- | --- | --- |
 | 1.1 | P0 | **Stateful modules execute in single-writer memory.** Running >1 active writer for the same module/shard is split-brain; durable failover also requires an authoritative mirror. | **PARTIALLY RESOLVED (code)** — the ownership gate (§13.7) enforces one active module/shard owner, and `rasn.state.replicated` (§13.13) now uses rDSN `replicated_service_app_type_1` for quorum-committed mirror mutations, checkpoints, and learning. A successor can hydrate from that authority. Direct active-active replicated module state machines and multi-partition state queries remain future work |
 | 1.2 | P0 | **Core services had no RPC resilience.** `rasn.state` / `rasn.workflow` / `rasn.observability` clients made one-shot RPCs — no breaker, no retry — while the module path was fully hardened. A single transient blip failed the call. | **RESOLVED (code)** — §7.1, `rpc_resilience.h`, wrapped in `agent_services.cpp` |
-| 1.3 | P0 | **Registry discovery is an in-memory SPOF on the request path.** Routing resolves live endpoints through a single `rasn.registry`; if that lookup blips the request fails, and the registry itself is not replicated. | **MITIGATED (code)** — the routing-critical discovery query in `coordinator_service.cpp` now goes through `resilient_rpc_call` (breaker + idempotent retry). Registry **HA** still DOCUMENTED → §13.5 (meta-server / ZooKeeper) |
+| 1.3 | P0 | **Registry discovery was an in-memory SPOF on the request path.** Routing resolved live endpoints through one process-local `rasn.registry`; restart lost dynamic membership and one frontend failure interrupted discovery. | **RESOLVED (code/config)** — §9/§13.14: opt-in ZooKeeper-backed `meta_state_service` records, fenced active-writer election over `distributed_lock_service`, shared reads on every frontend, strict backend errors, and rDSN group-address failover/retry across `registry_addresses`. Local map + legacy one-address behavior remain the default |
 | 1.4 | P1 | **RPC envelopes carry no end-to-end trace id.** `agent_request`/`response` carry `trace_id`, but the runtime-module envelope (`make_module_request`) didn't propagate it, so a call couldn't be followed across nodes in logs. | **RESOLVED (code)** — §13.4; `trace_id` added to the runtime-module envelope (EOF-safe), stamped from an ambient scope on egress, restored/echoed on ingress |
 | 1.5 | P1 | **Resilience/quota/dedup state is per serving process.** Breaker, dedup, admission, and rate state live on whichever node serves the RPC; there is no shared view, so protection is per-replica, not cluster-global. | **PARTIALLY RESOLVED (code)** — all four circuit-breaker families can now use a fenced, versioned authoritative adapter over the coordination module (§13.7), including one leased half-open probe cluster-wide. Grant-version children prevent an expired holder from overwriting a newer owner; a post-release lock barrier plus authoritative-record recheck prevents that stale holder from exposing a probe transition during an interleaving handoff. Admission, rate/cost, overload, and dedup state remain process-local because they need leased capacity, transactions/CAS, or a replicated state machine. |
-| 1.6 | P2 | **Core service endpoints are bound at construction.** Some core clients resolve their peer once; combined with 1.3 this limits failover for non-discovery paths. | MITIGATED by 1.2/1.3 breaker keying; full dynamic rebind DOCUMENTED |
+| 1.6 | P2 | **Core service endpoints are bound at construction.** Some core clients resolve their peer once, limiting failover for non-registry paths. | **PARTIALLY RESOLVED** — registry clients now bind one durable rDSN group whose leader changes in place; other core-service addresses still need resolver/group-based rebinding |
 
 ### 13.2 Lens 2 — Reinvention vs. reuse of rDSN
 
@@ -812,7 +885,7 @@ where rASN grew a parallel mechanism that an existing rDSN facility should own:
 | --- | --- | --- | --- |
 | State replication / HA | standalone journaled store by default; optional `rasn.state.replicated` authority | `replicated_service_app_type_1` (layer-2 replication SM: `checkpoint`/`learn`/`apply`) | **DELIVERED for `rasn.state` (§13.13); direct module groups remain** |
 | Partition routing | hand-rolled `fnv1a64(key) % shard_count` in the module bus/budget/blackboard | `dist::partition_resolver` (partition→endpoint resolution with config/meta integration) | DOCUMENTED |
-| Discovery + failure detection | `rasn.registry` heartbeat/lease table (single instance) | meta-server + `failure_detector` + `ext/zookeeper` for HA membership | DOCUMENTED |
+| Discovery + failure detection | local map by default; opt-in shared descriptor/lease records with fenced primary and frontend group | `meta_state_service` + `distributed_lock_service` on `ext/zookeeper`; rDSN group address for client failover | **DELIVERED (§13.14)** |
 | Wire schema / IDL | generic envelope with a field-map payload + `schema_manifest` codegen | Thrift IDL + `dsn.tools` codegen (typed, versioned RPC structs) | DOCUMENTED |
 
 The coordination module (§13.7) and replicated state backend (§13.13) prove this
@@ -821,7 +894,7 @@ reuse pattern is viable end-to-end: the
 `--build_plugins` checkout, and its `distributed_lock_service`/`meta_state_service`
 providers and type-1 replication application are consumed directly. The remaining
 migrations still replace core data-plane mechanisms (module state machines,
-partition resolution, HA membership, or the wire schema), so they stay explicitly
+partition resolution, or the wire schema), so they stay explicitly
 sequenced rather than being approximated with rASN-local substitutes.
 
 ### 13.3 Lens 3 — Missing critical modules
@@ -900,9 +973,13 @@ contract (§4) exactly as they are, and swaps the *backing* of stateful modules:
   execution consistency.
 - Resolve `sharded` modules through `dist::partition_resolver` instead of
   `fnv1a64 % count`, so partitions map to replica groups managed by the meta-server.
-- Make membership/discovery HA via the meta-server + `failure_detector` +
-  `ext/zookeeper`, removing the single-registry SPOF (1.3) and giving 1.5 a shared,
-  authoritative view for cluster-global quotas and coordination.
+- Membership/discovery HA is now delivered (§13.14) using the generic rDSN
+  facilities that actually match descriptor storage: ZooKeeper-backed
+  `meta_state_service` for records, `distributed_lock_service` for a fenced writer,
+  and an rDSN group address for frontend failover. The replication meta-server and
+  `failure_detector` remain table/replica and node-liveness facilities; forcing
+  arbitrary capability descriptors into their partition protocol would create a
+  second, mismatched registry rather than reuse an API designed for this data.
 
 Until direct module replication lands, the operational contract in §8 remains:
 **exactly one active writer per shard**, enforced through the coordination module's
@@ -931,10 +1008,11 @@ Resolved/mitigated **in code and validated** (committed as
   four focused tests for wire round-trip, legacy back-compat, scope nesting, and
   dispatch echo.
 
-Everything else above is either landed in the coordination (§13.7) and replicated
-state (§13.13) rounds or DOCUMENTED with its rDSN-native target because it depends
-on larger data-plane migrations (direct module replication, partition resolution,
-HA discovery, or IDL codegen). These sections are the source of truth for §11.
+Everything else above is either landed in the coordination (§13.7), replicated
+state (§13.13), and HA discovery (§13.14) rounds or DOCUMENTED with its rDSN-native
+target because it depends on larger data-plane migrations (direct module
+replication, partition resolution, or IDL codegen). These sections are the source
+of truth for §11.
 
 ### 13.7 Distributed coordination module (findings 1.1 ownership, 1.5 shared state) — RESOLVED (code)
 
@@ -1467,3 +1545,96 @@ store semantics. Automated tests do not yet drive a real type-1 replica group
 through checkpoint transfer, learning, and primary failover; operators can exercise
 that path with `config.rasn.state.ini`, and cluster automation remains a tracked
 deployment-validation gap.
+
+### 13.14 HA registry membership/discovery — RESOLVED (code/config)
+
+The default remains the lightweight process-local `agent_registry`, preserving
+single-node behavior and builds without `plugins_ext`. Enabling
+`[rasn.registry] shared_state_enabled = true` changes only the registry app's
+backing authority:
+
+1. `rasn_registry_app` creates its own registry instance and starts the current
+   app's `rasn_coordination_context`.
+2. Startup requires the resolved provider to be exactly `zookeeper`. A missing
+   dist plugin or accidental `inproc`/`simple` setting is a startup error rather
+   than an HA-shaped local fallback.
+3. Every frontend opens the existing register/unregister/query/list/heartbeat task
+   codes and reads the common `meta_state_service` tree.
+4. Frontends contend for the preserved `rasn.registry.primary` lock. The winner
+   installs its monotonically increasing grant version as the mutation fence,
+   copies every record/tombstone from the previous committed global epoch,
+   rebases live dynamic leases into its own clock domain, reconciles
+   `[rasn.agent.*]`, writes a schema-validated epoch marker, and only then exposes
+   the new epoch. It owns dynamic writes plus lease sweeping; standby reads rely
+   on the writer's expiry tombstones rather than comparing persisted timestamps
+   with a different node's clock. After commit, the successor suppresses expiry
+   for one complete lease so a long promotion cannot immediately tombstone the
+   rebased records. HA startup therefore rejects
+   `lease_ms != 0` together with `sweep_interval_ms = 0`.
+   Standbys remain live read replicas and periodically retry election; reads fail
+   closed while a newly acquired writer is still promoting its snapshot.
+5. Loss callbacks revoke the local writer fence. A mutation that was already in
+   flight writes only beneath its old epoch child, then rechecks the exact current
+   lock owner/version and returns `registry_mutation_outcome_unknown` if leadership
+   changed or the submitted write failed, so callers never replay a possibly
+   committed mutation. Readers select
+   the greatest valid **committed epoch**, read every agent from that exact epoch,
+   and validate the marker's owner/fence against the authoritative ZooKeeper lock
+   tree both before and after the read. A delayed old writer therefore cannot
+   overwrite a successor or introduce an id that the successor never copied.
+   Because ordinary ZooKeeper reads may come from a lagging follower,
+   `query_owner()` first completes a leader-ordered shared-state write barrier, then
+   lists the lock children, reads the minimum-sequence owner's payload, and lists
+   again to reject a concurrent handoff.
+   If a timed-out acquisition or failed promotion cannot prove that its ZooKeeper
+   node was released, the process fail-stops so the app-shared session cannot
+   strand a ghost registry owner.
+
+The persisted record has an explicit magic/schema, descriptor, heartbeat time,
+lease flag, tombstone, and writer fence. Agent ids (including URI-bearing runtime
+ids with `/`) are hex encoded as path components. Decoding is bounded by the
+existing agent wire-vector limits and rejects malformed, trailing, mismatched-id,
+or mismatched-fence data. The committed marker separately records its schema,
+fence, and writer identity. Backend/list/decode/ownership errors fail the typed
+RPC; a missing agent child means absence only after a current committed epoch has
+been validated.
+
+`configured_rasn_registry_address()` is now the one address path used by the core
+service graph, coordinator, runtime module discovery/registration/heartbeat, CLI,
+and readiness logic. Its precedence is:
+
+1. `registry_uri`;
+2. comma-separated `registry_addresses` (a process-lifetime rDSN group);
+3. legacy `registry_host`/`registry_port`, falling back to `host`.
+
+All five registry client methods apply bounded linear-backoff failover. Transport
+failure uses rDSN's automatic group-leader advancement; a standby mutation reply
+uses the explicit `registry_not_primary` code to advance before retry. Query/list
+also retry ambiguous `ERR_TIMEOUT` and rotate after a typed
+`registry_backend_unavailable` read failure. Register/unregister/heartbeat retry
+only typed pre-apply `registry_not_primary`/`registry_backend_unavailable` errors;
+ambiguous timeouts/in-flight network failures and post-submission
+`registry_mutation_outcome_unknown` responses rotate the group for the next call
+but are returned to the caller because replay can overwrite a newer registration
+or heartbeat (an ABA race). Heartbeat callers re-register only after the typed
+`registry_agent_not_found` response, not after a generic rejection or uncertain
+outcome. Existing outer
+circuit-breaker protection in coordinator discovery remains useful but is no
+longer the only failover layer.
+
+This deliberately does **not** force descriptors into the replication
+meta-server's table/partition protocol: `failure_detector` exposes node beacons
+but not arbitrary capability records, while `partition_resolver` resolves
+replicated tables. The generic facilities already supplied by rDSN for this shape
+are `meta_state_service`, `distributed_lock_service`, and the RPC group address;
+the ZooKeeper provider supplies cross-process session/lease failure detection.
+
+Focused unit source covers persisted-record round trip/corruption including fence
+zero, bounded frontend-list parsing/deduplication, and absent-unregister semantics. The
+remaining evidence gap is an automated Linux scenario that launches multiple
+registry-only frontend processes against ZooKeeper, proves shared reads and
+standby mutation forwarding, kills the writer, and observes a committed
+greater-epoch takeover. Old per-agent and marker children grow with leadership
+epochs (not heartbeats). The exact-epoch pre/post validation makes safe pruning
+possible, but bounded retention and retry behavior still need implementation and
+multi-process validation before old epochs are deleted online.

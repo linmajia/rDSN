@@ -137,8 +137,9 @@ public:
     virtual ::dsn::error_code verify_ownership_fence(const std::string &resource_id,
                                                      uint64_t fencing_token) = 0;
 
-    // Non-blocking best-effort query of the current owner. Returns true and sets
-    // owner_id if an owner is known, false otherwise.
+    // Query the current owner. The ZooKeeper backend validates the authoritative
+    // lock-node view because its public query_cache API may be stale after a
+    // waiter cancels; local/simple providers use their in-memory owner view.
     virtual bool query_owner(const std::string &resource_id,
                              /*out*/ std::string &owner_id,
                              /*out*/ uint64_t *fencing_token) = 0;

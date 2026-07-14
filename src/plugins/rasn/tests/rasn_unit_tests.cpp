@@ -859,6 +859,71 @@ TEST(rasn_registry, shard_capabilities_select_exact_partition_owners)
     EXPECT_EQ(27127u, shard1_owners[0].port);
 }
 
+TEST(rasn_registry, shared_state_record_round_trips_and_rejects_corruption)
+{
+    registry_state_record record;
+    record.writer_fence = 0;
+    record.descriptor.agent_id = "rasn.runtime.blackboard@dsn://node-a:27117/path";
+    record.descriptor.role = "rasn.runtime.blackboard";
+    record.descriptor.app_name = "rasn.runtime";
+    record.descriptor.endpoint_uri = "dsn://node-a:27117/blackboard";
+    record.descriptor.health = "healthy";
+    record.descriptor.capabilities.push_back(
+        make_capability("rasn.runtime.blackboard", "request\nbytes", "response", "stateful"));
+    record.last_heartbeat_ms = 123456;
+    record.lease_tracked = true;
+
+    std::string encoded;
+    std::string error;
+    ASSERT_TRUE(encode_registry_state_record(record, &encoded, &error)) << error;
+
+    registry_state_record decoded;
+    ASSERT_TRUE(decode_registry_state_record(encoded, &decoded, &error)) << error;
+    EXPECT_EQ(record.writer_fence, decoded.writer_fence);
+    EXPECT_EQ(record.descriptor.agent_id, decoded.descriptor.agent_id);
+    EXPECT_EQ(record.descriptor.endpoint_uri, decoded.descriptor.endpoint_uri);
+    ASSERT_EQ(1u, decoded.descriptor.capabilities.size());
+    EXPECT_EQ("request\nbytes", decoded.descriptor.capabilities[0].input_type);
+    EXPECT_EQ(record.last_heartbeat_ms, decoded.last_heartbeat_ms);
+    EXPECT_TRUE(decoded.lease_tracked);
+
+    encoded.push_back('\0');
+    EXPECT_FALSE(decode_registry_state_record(encoded, &decoded, &error));
+    EXPECT_FALSE(error.empty());
+}
+
+TEST(rasn_registry, parses_bounded_unique_frontend_group)
+{
+    std::vector< ::dsn::rpc_address> addresses;
+    std::string error;
+    ASSERT_TRUE(parse_rasn_registry_addresses(
+        "127.0.0.1:27100, 127.0.0.1:27101,127.0.0.1:27100",
+        &addresses,
+        &error))
+        << error;
+    ASSERT_EQ(2u, addresses.size());
+    EXPECT_EQ(27100u, addresses[0].port());
+    EXPECT_EQ(27101u, addresses[1].port());
+
+    EXPECT_FALSE(parse_rasn_registry_addresses("dsn://cluster/registry", &addresses, &error));
+    EXPECT_TRUE(addresses.empty());
+    EXPECT_FALSE(error.empty());
+}
+
+TEST(rasn_registry, unregistering_an_absent_agent_is_successful)
+{
+    agent_registry registry;
+    std::string error;
+    EXPECT_TRUE(registry.unregister_agent("already-absent", &error)) << error;
+
+    agent_descriptor descriptor;
+    descriptor.agent_id = "unit.unregister";
+    descriptor.role = "tool";
+    ASSERT_TRUE(registry.register_agent(descriptor, &error, true)) << error;
+    EXPECT_TRUE(registry.unregister_agent(descriptor.agent_id, &error)) << error;
+    EXPECT_TRUE(registry.unregister_agent(descriptor.agent_id, &error)) << error;
+}
+
 TEST(rasn_coordinator, retries_retryable_model_invocations_with_trace)
 {
     agent_request request;
@@ -3473,7 +3538,8 @@ TEST(rasn_rpc_resilience, retries_are_idempotency_aware_and_breaker_short_circui
                     ++attempts;
                     if (attempts < 2)
                     {
-                        return std::make_pair(::dsn::ERR_NETWORK_FAILURE, fake_response());
+                        return std::make_pair(
+                            ::dsn::ERR_NETWORK_INIT_FAILED, fake_response());
                     }
                     fake_response ok;
                     ok.value = "ok";
@@ -3501,7 +3567,27 @@ TEST(rasn_rpc_resilience, retries_are_idempotency_aware_and_breaker_short_circui
         EXPECT_EQ(1, attempts);
     }
 
-    // 3. The same ERR_TIMEOUT IS retried up to max_attempts for an idempotent op.
+    // 3. ERR_NETWORK_FAILURE can represent a lost reply after application. It is
+    //    therefore not retried for a non-idempotent operation.
+    {
+        int attempts = 0;
+        const std::pair< ::dsn::error_code, fake_response> result =
+            resilient_rpc_call<fake_response>(
+                breakers,
+                "case.network_failure_non_idempotent",
+                options,
+                /*idempotent=*/false,
+                std::chrono::milliseconds(10),
+                [&](std::chrono::milliseconds) {
+                    ++attempts;
+                    return std::make_pair(
+                        ::dsn::ERR_NETWORK_FAILURE, fake_response());
+                });
+        EXPECT_EQ(::dsn::ERR_NETWORK_FAILURE, result.first);
+        EXPECT_EQ(1, attempts);
+    }
+
+    // 4. The same ERR_TIMEOUT IS retried up to max_attempts for an idempotent op.
     {
         int attempts = 0;
         const std::pair< ::dsn::error_code, fake_response> result =
@@ -3516,7 +3602,7 @@ TEST(rasn_rpc_resilience, retries_are_idempotency_aware_and_breaker_short_circui
         EXPECT_EQ(3, attempts);
     }
 
-    // 4. After enough hard failures the per-endpoint breaker opens and the next
+    // 5. After enough hard failures the per-endpoint breaker opens and the next
     //    call short-circuits with ERR_BUSY WITHOUT invoking the dependency.
     {
         const auto always_fail = [](std::chrono::milliseconds) {

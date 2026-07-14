@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -501,6 +502,7 @@ public:
                                         uint64_t *fencing_token,
                                         const ownership_lost_callback &on_lost) override
     {
+        auto attempt = std::make_shared<ownership_attempt>();
         {
             std::lock_guard<std::mutex> guard(_ownership->mu);
             auto it = _ownership->holds.find(resource_id);
@@ -513,50 +515,70 @@ public:
                     *fencing_token = it->second.version;
                 return ::dsn::ERR_OK; // idempotent re-acquire
             }
+            hold reservation;
+            reservation.owner = owner_id;
+            reservation.attempt = attempt;
+            reservation.usable = false;
+            _ownership->holds.emplace(resource_id, std::move(reservation));
         }
 
         ::dsn::dist::distributed_lock_service::lock_options opt = {true, true};
         auto granted = std::make_shared<std::atomic<int>>(static_cast<int>(::dsn::ERR_TIMEOUT.get()));
         auto granted_version = std::make_shared<std::atomic<uint64_t>>(0);
         std::shared_ptr<ownership_registry> ownership = _ownership;
-        auto cleanup_requested = std::make_shared<std::atomic<bool>>(false);
-        auto cleanup_started = std::make_shared<std::atomic<bool>>(false);
-        ::dsn::dist::distributed_lock_service *lock_provider = _lock;
+        const bool fail_stop_on_loss = _cfg.provider == "zookeeper";
 
         std::pair< ::dsn::task_ptr, ::dsn::task_ptr> tasks = _lock->lock(
             resource_id, owner_id, LPC_RASN_COORDINATION,
-            [granted,
-             granted_version,
-             cleanup_requested,
-             cleanup_started,
-             lock_provider,
-             ownership,
-             resource_id,
-             owner_id](::dsn::error_code ec,
-                       const std::string &,
-                       uint64_t version) {
+            [granted, granted_version](::dsn::error_code ec,
+                                       const std::string &,
+                                       uint64_t version) {
                 granted_version->store(version);
                 granted->store(static_cast<int>(ec.get()));
-                if (ec == ::dsn::ERR_OK && cleanup_requested->load())
-                {
-                    schedule_uncertain_grant_cleanup(lock_provider,
-                                                     ownership,
-                                                     resource_id,
-                                                     owner_id,
-                                                     cleanup_started);
-                }
             },
             LPC_RASN_COORDINATION,
-            [ownership, resource_id, owner_id, on_lost](::dsn::error_code ec,
-                                                        const std::string &,
-                                                        uint64_t version) {
+            [ownership,
+             attempt,
+             resource_id,
+             owner_id,
+             on_lost,
+             fail_stop_on_loss](::dsn::error_code ec,
+                                const std::string &,
+                                uint64_t version) {
                 ec.end_tracking();
-                on_lease_lost(ownership, resource_id, owner_id, version, on_lost);
+                on_lease_lost(
+                    ownership, attempt, resource_id, owner_id, version, on_lost);
+                if (fail_stop_on_loss)
+                {
+                    derror("rasn.coordination lost ZooKeeper ownership of lock '%s' "
+                           "for owner '%s' at fence %llu; fail-stopping because the "
+                           "provider cannot distinguish session expiry from a "
+                           "transient disconnect",
+                           resource_id.c_str(),
+                           owner_id.c_str(),
+                           static_cast<unsigned long long>(version));
+                    ::dsn_exit(1);
+                }
             },
             opt);
 
+        {
+            std::lock_guard<std::mutex> guard(_ownership->mu);
+            auto it = _ownership->holds.find(resource_id);
+            if (it != _ownership->holds.end() &&
+                it->second.owner == owner_id &&
+                it->second.attempt == attempt)
+            {
+                it->second.lease_task = tasks.second;
+            }
+        }
+
         const bool completed = tasks.first->wait((std::max)(1, timeout_ms));
-        if (!completed) {
+        const ::dsn::error_code grant_error(
+            static_cast<dsn_error_t>(granted->load()));
+        if (!completed ||
+            (_cfg.provider == "zookeeper" &&
+             grant_error == ::dsn::ERR_TIMEOUT)) {
             // Timed out while (apparently) still pending. Cancel the attempt, but
             // the grant may have won the race between our wait() deadline and the
             // cancel: rDSN's cancel_pending_lock reports ERR_OBJECT_NOT_FOUND and
@@ -565,82 +587,120 @@ public:
             // If that owner is us -- or the grant callback already stored ERR_OK --
             // we actually hold the lock and must not leak it: record the hold (with
             // its live lease task) and return success, matching the documented
-            // contract (ERR_OK == granted). Only a genuine timeout unwinds the lease.
-            auto cancel = std::make_shared<coordination_async_result>();
-            ::dsn::task_ptr cancel_task = _lock->cancel_pending_lock(
-                resource_id,
-                owner_id,
-                LPC_RASN_COORDINATION,
-                [cancel](::dsn::error_code ec,
-                         const std::string &owner,
-                         uint64_t version) {
-                    cancel->error.store(static_cast<int>(ec.get()));
-                    cancel->value = owner;
-                    cancel->version = version;
-                });
-            if (!wait_for_operation(cancel_task)) {
+            // contract (ERR_OK == granted). Only a cancellation verified against
+            // the authoritative lock tree unwinds the lease.
+            static const int kMaxCancelAttempts = 3;
+            std::shared_ptr<coordination_async_result> cancel;
+            ::dsn::error_code cancel_error = ::dsn::ERR_TIMEOUT;
+            bool cancel_saw_us = false;
+            for (int cancel_attempt = 0;
+                 cancel_attempt < kMaxCancelAttempts;
+                 ++cancel_attempt)
+            {
+                cancel = std::make_shared<coordination_async_result>();
+                ::dsn::task_ptr cancel_task = _lock->cancel_pending_lock(
+                    resource_id,
+                    owner_id,
+                    LPC_RASN_COORDINATION,
+                    [cancel](::dsn::error_code ec,
+                             const std::string &owner,
+                             uint64_t version) {
+                        cancel->error.store(static_cast<int>(ec.get()));
+                        cancel->value = owner;
+                        cancel->version = version;
+                    });
+                if (!wait_for_operation(cancel_task))
                 {
-                    std::lock_guard<std::mutex> guard(_ownership->mu);
-                    hold h;
-                    h.owner = owner_id;
-                    h.lease_task = tasks.second;
-                    h.version = granted_version->load();
-                    h.usable = false;
-                    _ownership->holds[resource_id] = h;
+                    derror("rasn.coordination could not determine whether pending "
+                           "lock '%s' for owner '%s' was cancelled; fail-stopping "
+                           "so the shared session cannot retain a ghost owner",
+                           resource_id.c_str(),
+                           owner_id.c_str());
+                    ::dsn_exit(1);
                 }
-                cleanup_requested->store(true);
-                if (::dsn::error_code(static_cast<dsn_error_t>(granted->load())) ==
-                    ::dsn::ERR_OK)
+
+                cancel_error = async_error(cancel);
+                cancel_saw_us =
+                    cancel_error == ::dsn::ERR_OBJECT_NOT_FOUND &&
+                    cancel->value == owner_id;
+                if (cancel_error != ::dsn::ERR_TIMEOUT)
                 {
-                    schedule_uncertain_grant_cleanup(_lock,
-                                                     _ownership,
-                                                     resource_id,
-                                                     owner_id,
-                                                     cleanup_started);
+                    break;
                 }
-                return ::dsn::ERR_TIMEOUT;
             }
 
             const bool grant_won =
-                ::dsn::error_code(static_cast<dsn_error_t>(granted->load())) == ::dsn::ERR_OK;
-            const bool cancel_saw_us =
-                async_error(cancel) == ::dsn::ERR_OBJECT_NOT_FOUND &&
-                cancel->value == owner_id;
+                ::dsn::error_code(static_cast<dsn_error_t>(granted->load())) ==
+                ::dsn::ERR_OK;
+            if (!grant_won && !cancel_saw_us &&
+                _cfg.provider == "zookeeper" &&
+                cancel_error == ::dsn::ERR_INVALID_PARAMETERS)
+            {
+                // The ZooKeeper provider sets its handle to `locked` before
+                // enqueueing the grant callback. cancel_pending_lock then returns
+                // ERR_INVALID_PARAMETERS rather than the interface's documented
+                // ERR_OBJECT_NOT_FOUND race result. Resolve that window against
+                // the authoritative lock tree before discarding either task.
+                std::string current_owner;
+                uint64_t current_version = 0;
+                if (query_owner(resource_id, current_owner, &current_version) &&
+                    current_owner == owner_id)
+                {
+                    cancel_saw_us = true;
+                    cancel->version = current_version;
+                }
+            }
             if (grant_won || cancel_saw_us) {
-                std::lock_guard<std::mutex> guard(_ownership->mu);
-                hold h;
-                h.owner = owner_id;
-                h.lease_task = tasks.second;
-                h.version =
+                const uint64_t version =
                     grant_won ? granted_version->load() : cancel->version;
-                _ownership->holds[resource_id] = h;
-                remember_latest_version(resource_id, h.version);
-                if (fencing_token != nullptr)
-                    *fencing_token = h.version;
-                return ::dsn::ERR_OK;
+                return publish_grant(
+                    resource_id, owner_id, attempt, version, fencing_token);
             }
 
+            const bool definitively_cancelled =
+                cancel_error == ::dsn::ERR_OK ||
+                cancel_error == ::dsn::ERR_OBJECT_NOT_FOUND;
+            bool owner_node_present = false;
+            const ::dsn::error_code owner_check =
+                _cfg.provider == "zookeeper"
+                    ? zookeeper_owner_node_present(
+                          resource_id, owner_id, &owner_node_present)
+                    : ::dsn::ERR_OK;
+            if (!definitively_cancelled || owner_check != ::dsn::ERR_OK ||
+                owner_node_present)
+            {
+                derror("rasn.coordination could not prove cancellation of lock '%s' "
+                       "for owner '%s' (cancel=%s, owner_check=%s, present=%s); "
+                       "fail-stopping so the shared session cannot retain a ghost owner",
+                       resource_id.c_str(),
+                       owner_id.c_str(),
+                       cancel_error.to_string(),
+                       owner_check.to_string(),
+                       owner_node_present ? "true" : "false");
+                ::dsn_exit(1);
+            }
+            discard_attempt(resource_id, owner_id, attempt);
             if (tasks.second != nullptr)
                 cancel_and_wait(tasks.second);
             cancel_and_wait(tasks.first);
             return ::dsn::ERR_TIMEOUT;
         }
 
-        ::dsn::error_code ec(static_cast<dsn_error_t>(granted->load()));
-        if (ec == ::dsn::ERR_OK) {
-            std::lock_guard<std::mutex> guard(_ownership->mu);
-            hold h;
-            h.owner = owner_id;
-            h.lease_task = tasks.second;
-            h.version = granted_version->load();
-            _ownership->holds[resource_id] = h;
-            remember_latest_version(resource_id, h.version);
-            if (fencing_token != nullptr)
-                *fencing_token = h.version;
-        } else if (tasks.second != nullptr) {
+        if (grant_error == ::dsn::ERR_OK)
+        {
+            return publish_grant(resource_id,
+                                 owner_id,
+                                 attempt,
+                                 granted_version->load(),
+                                 fencing_token);
+        }
+
+        discard_attempt(resource_id, owner_id, attempt);
+        if (tasks.second != nullptr)
+        {
             cancel_and_wait(tasks.second);
         }
-        return ec;
+        return grant_error;
     }
 
     ::dsn::error_code release_ownership(const std::string &resource_id,
@@ -765,6 +825,91 @@ public:
                      std::string &owner_id,
                      uint64_t *fencing_token) override
     {
+        if (_cfg.provider == "zookeeper")
+        {
+            // rDSN's ZooKeeper meta-state reads may be served from a lagging
+            // follower. Both providers for this app share one ZooKeeper session;
+            // completing a write on it is a leader-ordered barrier for the lock
+            // reads that follow.
+            std::ostringstream barrier_key;
+            barrier_key << "_coordination/owner_read_barriers/" << std::hex
+                        << reinterpret_cast<uintptr_t>(this);
+            const ::dsn::error_code barrier = put_state(
+                barrier_key.str(), std::to_string(::dsn_now_ns()));
+            if (barrier != ::dsn::ERR_OK)
+            {
+                return false;
+            }
+
+            const std::string lock_path =
+                join_path(_cfg.lock_namespace, resource_id);
+            const auto read_owner = [this, &lock_path](
+                                        std::string *node,
+                                        uint64_t *version) {
+                std::vector<std::string> children;
+                const ::dsn::error_code listed =
+                    list_children_sync(lock_path, children);
+                if (listed != ::dsn::ERR_OK || children.empty())
+                {
+                    return false;
+                }
+
+                bool found = false;
+                uint64_t minimum = 0;
+                std::string minimum_node;
+                for (const std::string &child : children)
+                {
+                    uint64_t candidate = 0;
+                    if (!parse_lock_version(child, &candidate))
+                    {
+                        derror("rasn.coordination cannot query owner for '%s': "
+                               "unexpected ZooKeeper lock child '%s'",
+                               lock_path.c_str(),
+                               child.c_str());
+                        return false;
+                    }
+                    if (!found || candidate < minimum)
+                    {
+                        found = true;
+                        minimum = candidate;
+                        minimum_node = child;
+                    }
+                }
+                if (!found)
+                {
+                    return false;
+                }
+                *node = minimum_node;
+                *version = minimum;
+                return true;
+            };
+
+            std::string owner_node;
+            uint64_t version = 0;
+            if (!read_owner(&owner_node, &version) ||
+                get_data_sync(lock_path + "/" + owner_node, owner_id) !=
+                    ::dsn::ERR_OK ||
+                owner_id.empty())
+            {
+                return false;
+            }
+
+            // Re-read after fetching the node payload so an owner handoff cannot
+            // pair one grant's owner id with another grant's sequence.
+            std::string verified_node;
+            uint64_t verified_version = 0;
+            if (!read_owner(&verified_node, &verified_version) ||
+                verified_node != owner_node || verified_version != version)
+            {
+                return false;
+            }
+            if (fencing_token != nullptr)
+            {
+                *fencing_token = version;
+            }
+            return true;
+        }
+
         uint64_t version = 0;
         ::dsn::error_code ec = _lock->query_cache(resource_id, owner_id, version);
         if (ec == ::dsn::ERR_OK && fencing_token != nullptr)
@@ -831,10 +976,16 @@ public:
     }
 
 private:
+    struct ownership_attempt
+    {
+        std::atomic<bool> lost{false};
+    };
+
     struct hold
     {
         std::string owner;
         ::dsn::task_ptr lease_task;
+        std::shared_ptr<ownership_attempt> attempt;
         uint64_t version = 0;
         bool usable = true;
         bool destroy_on_stop = true;
@@ -849,6 +1000,49 @@ private:
         // verifies live sequential children instead and never populates this map.
         std::map<std::string, uint64_t> latest_versions;
     };
+
+    ::dsn::error_code publish_grant(
+        const std::string &resource_id,
+        const std::string &owner_id,
+        const std::shared_ptr<ownership_attempt> &attempt,
+        uint64_t version,
+        uint64_t *fencing_token)
+    {
+        std::lock_guard<std::mutex> guard(_ownership->mu);
+        auto it = _ownership->holds.find(resource_id);
+        if (attempt->lost.load() || it == _ownership->holds.end() ||
+            it->second.owner != owner_id || it->second.attempt != attempt)
+        {
+            if (it != _ownership->holds.end() &&
+                it->second.owner == owner_id &&
+                it->second.attempt == attempt)
+            {
+                _ownership->holds.erase(it);
+            }
+            return ::ERR_EXPIRED;
+        }
+        it->second.version = version;
+        it->second.usable = true;
+        remember_latest_version(resource_id, version);
+        if (fencing_token != nullptr)
+        {
+            *fencing_token = version;
+        }
+        return ::dsn::ERR_OK;
+    }
+
+    void discard_attempt(const std::string &resource_id,
+                         const std::string &owner_id,
+                         const std::shared_ptr<ownership_attempt> &attempt)
+    {
+        std::lock_guard<std::mutex> guard(_ownership->mu);
+        auto it = _ownership->holds.find(resource_id);
+        if (it != _ownership->holds.end() && it->second.owner == owner_id &&
+            it->second.attempt == attempt)
+        {
+            _ownership->holds.erase(it);
+        }
+    }
 
     void remember_latest_version(const std::string &resource_id, uint64_t version)
     {
@@ -879,45 +1073,6 @@ private:
         wait_for_operation(task);
     }
 
-    static void schedule_uncertain_grant_cleanup(
-        ::dsn::dist::distributed_lock_service *lock_provider,
-        const std::shared_ptr<ownership_registry> &ownership,
-        const std::string &resource_id,
-        const std::string &owner_id,
-        const std::shared_ptr<std::atomic<bool>> &cleanup_started)
-    {
-        if (cleanup_started->exchange(true))
-            return;
-        lock_provider->unlock(
-            resource_id,
-            owner_id,
-            false,
-            LPC_RASN_COORDINATION,
-            [ownership, resource_id, owner_id](::dsn::error_code ec) {
-                const bool released =
-                    ec == ::dsn::ERR_OK || ec == ::ERR_HOLD_BY_OTHERS ||
-                    ec == ::dsn::ERR_OBJECT_NOT_FOUND || ec == ::ERR_NO_OWNER;
-                if (!released)
-                {
-                    dwarn("rasn.coordination could not clean up an ambiguously granted "
-                          "lock '%s' for owner '%s': %s",
-                          resource_id.c_str(),
-                          owner_id.c_str(),
-                          ec.to_string());
-                    return;
-                }
-                std::lock_guard<std::mutex> guard(ownership->mu);
-                auto it = ownership->holds.find(resource_id);
-                if (it != ownership->holds.end() &&
-                    it->second.owner == owner_id && !it->second.usable)
-                {
-                    if (it->second.lease_task != nullptr)
-                        it->second.lease_task->cancel(false);
-                    ownership->holds.erase(it);
-                }
-            });
-    }
-
     ::dsn::error_code list_children_sync(
         const std::string &node, std::vector<std::string> &children)
     {
@@ -938,24 +1093,86 @@ private:
     }
 
     static void on_lease_lost(const std::shared_ptr<ownership_registry> &ownership,
+                              const std::shared_ptr<ownership_attempt> &attempt,
                               const std::string &resource_id,
                               const std::string &owner_id,
                               uint64_t version,
                               const ownership_lost_callback &callback)
     {
-        bool removed = false;
+        attempt->lost.store(true);
+        bool notify = false;
         {
             std::lock_guard<std::mutex> guard(ownership->mu);
             auto it = ownership->holds.find(resource_id);
             if (it != ownership->holds.end() && it->second.owner == owner_id &&
-                it->second.version == version)
+                it->second.attempt == attempt)
             {
+                notify = it->second.usable;
                 ownership->holds.erase(it);
-                removed = true;
             }
         }
-        if (removed && callback)
+        if (notify && callback)
             callback(resource_id, version);
+    }
+
+    ::dsn::error_code zookeeper_owner_node_present(
+        const std::string &resource_id,
+        const std::string &owner_id,
+        bool *present)
+    {
+        *present = false;
+        if (_cfg.provider != "zookeeper")
+        {
+            return ::dsn::ERR_OK;
+        }
+
+        std::ostringstream barrier_key;
+        barrier_key << "_coordination/cancel_barriers/" << std::hex
+                    << reinterpret_cast<uintptr_t>(this);
+        const ::dsn::error_code barrier =
+            put_state(barrier_key.str(), std::to_string(::dsn_now_ns()));
+        if (barrier != ::dsn::ERR_OK)
+        {
+            return barrier;
+        }
+
+        const std::string lock_path =
+            join_path(_cfg.lock_namespace, resource_id);
+        std::vector<std::string> before;
+        ::dsn::error_code listed = list_children_sync(lock_path, before);
+        if (listed != ::dsn::ERR_OK)
+        {
+            return listed;
+        }
+        std::sort(before.begin(), before.end());
+        for (const std::string &child : before)
+        {
+            uint64_t ignored_version = 0;
+            if (!parse_lock_version(child, &ignored_version))
+            {
+                return ::dsn::ERR_INVALID_STATE;
+            }
+            std::string candidate_owner;
+            const ::dsn::error_code read =
+                get_data_sync(lock_path + "/" + child, candidate_owner);
+            if (read != ::dsn::ERR_OK)
+            {
+                return read;
+            }
+            if (candidate_owner == owner_id)
+            {
+                *present = true;
+            }
+        }
+
+        std::vector<std::string> after;
+        listed = list_children_sync(lock_path, after);
+        if (listed != ::dsn::ERR_OK)
+        {
+            return listed;
+        }
+        std::sort(after.begin(), after.end());
+        return before == after ? ::dsn::ERR_OK : ::dsn::ERR_INVALID_STATE;
     }
 
     static std::string parent_path(const std::string &node)

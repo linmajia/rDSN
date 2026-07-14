@@ -197,6 +197,10 @@ std::chrono::milliseconds registry_registration_timeout()
 
 ::dsn::rpc_address config_service_address(const std::string &service_name, uint16_t default_port)
 {
+    if (service_name == "registry")
+    {
+        return configured_rasn_registry_address();
+    }
     const service_endpoint_config endpoint = config_service_endpoint(service_name, default_port);
     if (!endpoint.endpoint_uri.empty())
     {
@@ -2674,9 +2678,9 @@ void rasn_service_graph::heartbeat_agents_to_registry()
                   err.to_string());
             continue;
         }
-        if (!response.ok)
+        if (registry_response_is_agent_not_found(response))
         {
-            dwarn("registry heartbeat rejected rASN agent %s: %s; retrying register",
+            dwarn("registry no longer knows rASN agent %s: %s; registering again",
                   descriptor.agent_id.c_str(),
                   response.error.message.c_str());
             std::tie(err, response) = registry.register_sync(descriptor, timeout);
@@ -2692,6 +2696,13 @@ void rasn_service_graph::heartbeat_agents_to_registry()
                       descriptor.agent_id.c_str(),
                       response.error.message.c_str());
             }
+        }
+        else if (!response.ok)
+        {
+            dwarn("registry heartbeat rejected rASN agent %s without a safe "
+                  "re-registration: %s",
+                  descriptor.agent_id.c_str(),
+                  response.error.message.c_str());
         }
     }
 }

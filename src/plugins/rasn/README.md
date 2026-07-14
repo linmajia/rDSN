@@ -32,7 +32,7 @@ The prototype is intentionally small and is organized around four building block
 rASN models an agent system like a distributed service system. The current prototype registers these rDSN app roles:
 
 ```text
-rasn.registry       stores agent descriptors and capability metadata
+rasn.registry       stores agent descriptors/capabilities (local map or opt-in HA authority)
 rasn.coordinator    orchestrates task graph execution and routes service calls
 rasn.llm.agent      isolates nondeterministic LLM completion behind the model gateway
 rasn.tool.agent     isolates local tool side effects behind explicit opt-in policies
@@ -1450,6 +1450,7 @@ hardening gaps remain:
 | Area | Current capability | Remaining limitation |
 | --- | --- | --- |
 | State availability | Standalone checkpoints/journal/NFS/local mirror, plus optional one-partition `rasn.state.replicated` quorum writes and checkpoint learning over rDSN type-1 replication. | Runtime modules still execute as elected single-writer in-memory stores; multi-partition query fan-out, safe online checkpoint GC, and an HA meta-server deployment remain. |
+| Discovery availability | Local registry by default; optional ZooKeeper-backed shared descriptors/leases, committed-epoch active-writer failover, read-capable standby frontends, and rDSN group-address client failover across `registry_addresses`. | Automated multi-process registry-writer failover evidence and bounded old-epoch pruning remain. |
 | Tool isolation | Default-deny side effects, workspace scoping, approvals, command allowlists, timeout/job containment, and a configurable container command wrapper. | No hardened container orchestrator with image, mount, network, and lifecycle policy. |
 | Replay fidelity | Replay for model responses, tool results, workflow scheduling, filesystem snapshots, and an `external.effect` ledger for side-effect intents. | No full virtualization of arbitrary external services, clocks, network state, or process environments. |
 | Deployment validation | Inline mode, typed service-mode RPC, URI/host endpoint configuration, registry heartbeats, active lease cleanup, distributed runtime modules, state-mirror hydration/watermarks, and a deployable rDSN type-1 replicated-state profile. | Full replicated-state cluster automation, direct quorum replication/sharding of module state, explicit watermark pruning, and local-to-remote migration tooling are not yet implemented. |

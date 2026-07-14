@@ -44,21 +44,20 @@ struct rpc_resilience_options
     uint64_t backoff_ms = 50;
 };
 
-// Transport errors where the server almost certainly did NOT apply the request
-// (connection failed, or the request was rejected before dispatch). Safe to
-// retry even for non-idempotent operations.
+// Errors that reject the request before application dispatch. Safe to retry
+// even for non-idempotent operations.
 inline bool rpc_error_is_pre_apply(::dsn::error_code code)
 {
-    return code == ::dsn::ERR_NETWORK_FAILURE || code == ::dsn::ERR_NETWORK_INIT_FAILED ||
-           code == ::dsn::ERR_BUSY || code == ::dsn::ERR_CAPACITY_EXCEEDED ||
-           code == ::dsn::ERR_TRY_AGAIN;
+    return code == ::dsn::ERR_NETWORK_INIT_FAILED || code == ::dsn::ERR_BUSY ||
+           code == ::dsn::ERR_CAPACITY_EXCEEDED || code == ::dsn::ERR_TRY_AGAIN;
 }
 
-// Ambiguous transient errors: the request may or may not have been applied. Only
-// safe to retry when the operation is idempotent.
+// rDSN may synthesize ERR_NETWORK_FAILURE for an in-flight request after the
+// server applied it, just like an ordinary lost-reply timeout. Both are safe to
+// retry only when the operation is idempotent.
 inline bool rpc_error_is_ambiguous_transient(::dsn::error_code code)
 {
-    return code == ::dsn::ERR_TIMEOUT;
+    return code == ::dsn::ERR_NETWORK_FAILURE || code == ::dsn::ERR_TIMEOUT;
 }
 
 inline bool rpc_should_retry(::dsn::error_code code, bool idempotent)

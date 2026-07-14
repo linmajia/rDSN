@@ -134,19 +134,41 @@ Responsibilities:
 rDSN design:
 
 - `rasn.registry` is a `service_app` with a `serverlet`.
-- Registry state is protected by `zlock`.
+- The default registry is a process-local map protected by `zlock`.
+- Optional HA mode (`[rasn.registry] shared_state_enabled = true`) gives each
+  registry app its own facade over the existing ZooKeeper-backed rDSN
+  `meta_state_service`. Every frontend serves shared reads; one frontend owns a
+  preserved `distributed_lock_service` resource and performs mutations/expiry.
+- HA records are schema-versioned and isolated below lock-grant epochs. A new
+  writer copies the complete prior snapshot, reconciles static descriptors, and
+  only then publishes its committed epoch marker. Readers use that one exact epoch
+  and validate its owner/fence against the authoritative ZooKeeper lock tree before
+  and after the read, so an expired/delayed leader cannot expose stale or newly
+  introduced records.
+- `[rasn.service] registry_addresses` creates one rDSN group used by all registry
+  call families. Bounded client retries use rDSN transport-failure leader rotation
+  and explicitly rotate after a standby returns `registry_not_primary`. Query/list
+  may retry ambiguous timeouts and read-backend failures; mutations retry only
+  typed pre-apply backend/standby rejection. Post-submission failures return
+  `registry_mutation_outcome_unknown`; ambiguous timeouts/in-flight network
+  failures rotate the group for the next call but are not replayed. Heartbeat
+  callers re-register only after `registry_agent_not_found`.
 - Initial entries come from `dsn_config_get_all_sections` over
   `[rasn.agent.*]`.
-- Static entries are loaded from `[rasn.agent.*]` sections at registry startup.
+- Static entries are loaded from `[rasn.agent.*]` sections at registry startup;
+  each new HA writer reconciles removed and changed static entries.
 - Agent descriptors carry either host/port or `endpoint_uri`; the coordinator
   prefers URI routing and falls back to IPv4 host/port routing.
 - Built-in agents register with `rasn.registry` through typed RPCs when service
   clients are enabled. `LPC_RASN_REGISTRY_HEARTBEAT_TIMER` sends periodic
-  heartbeats, and lease-tracked entries are filtered from healthy queries once
-  their heartbeat age exceeds `[rasn.registry] lease_ms`.
+  heartbeats. The local registry filters lease-tracked entries by heartbeat age;
+  in HA mode only the elected writer compares timestamps and emits expiry
+  tombstones, so standby reads never compare another process's clock. Promotion
+  rebases live leases into the successor's clock domain.
 - `LPC_RASN_REGISTRY_LEASE_SWEEP_TIMER` runs inside the registry service app and
-  actively removes expired lease-tracked entries. Static descriptors are not
-  lease-tracked and are not removed by sweeps.
+  actively removes expired lease-tracked entries. In HA mode the same maintenance
+  timer retries standby election and only the fenced writer emits expiry
+  tombstones. Static descriptors are not lease-tracked.
 - Dynamic updates use typed register/unregister/heartbeat RPCs.
 - Direct CLI mode also loads static entries before built-in agents register, so
   `registry` and `agentctl` see the same configured agents without requiring the
@@ -154,11 +176,15 @@ rDSN design:
 
 Correctness and robustness requirements:
 
-- Duplicate agent ids are rejected unless the descriptor version is newer and
-  the update is explicit.
+- Re-registering an agent id updates its descriptor and refreshes its lease;
+  unregistering an absent id succeeds. Clients do not replay a mutation after an
+  ambiguous timeout because a later registration of the same id makes that ABA
+  unsafe.
 - Expired or unhealthy entries are not returned for routing unless requested for
   diagnosis.
 - Capability matching is exact by default; fuzzy matching is an explicit policy.
+- Shared backend, schema, and identity/fence errors fail the typed query/list RPC
+  rather than appearing as a successful empty roster.
 
 ### 3. Task and message model
 
@@ -1438,16 +1464,15 @@ remaining limitations are:
 - **Full-distribution audit:** a severity-ranked production-readiness audit across
   three lenses — is rASN fully distributed, does it reuse rDSN instead of
   reinventing, and are critical modules missing — is recorded in
-  DISTRIBUTED_RUNTIME.md §13. It marks each finding RESOLVED (core-service and
-  registry-discovery resilience, and distributed coordination via reused rDSN
-  `distributed_lock_service`/`meta_state_service` primitives — §13.7), MITIGATED
-  (single-writer ownership 1.1 and cluster-shared state 1.5, now backed by that
-  coordination module), or DOCUMENTED, and maps the documented gaps to the exact
-  rDSN facility that should back them:
+  DISTRIBUTED_RUNTIME.md §13. It marks each finding RESOLVED (core-service
+  resilience; HA registry discovery through fenced ZooKeeper-backed
+  `meta_state_service`, `distributed_lock_service`, and rDSN groups — §13.14; and
+  distributed coordination — §13.7), MITIGATED (single-writer ownership 1.1 and
+  cluster-shared state 1.5), or DOCUMENTED, and maps the documented gaps to the
+  exact rDSN facility that should back them:
   `replicated_service_app_type_1` (now used by `rasn.state.replicated`; direct
   module groups remain) for quorum-replicated storage,
-  `dist::partition_resolver` for shard routing, meta-server / `failure_detector` /
-  `ext/zookeeper` for HA discovery, and Thrift IDL for typed RPC
+  `dist::partition_resolver` for shard routing, and Thrift IDL for typed RPC
   schemas. Remaining missing-module gaps (durable/vector agent memory, a
   **global** quota/rate authority consuming the new shared store, secrets vault,
   multi-tenancy, distributed scheduler/placement) are tracked there as roadmap
