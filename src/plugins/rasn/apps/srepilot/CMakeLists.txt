@@ -36,6 +36,7 @@ set(MY_PROJ_LIB_PATH "")
 set(MY_BINPLACES
     "${CMAKE_CURRENT_SOURCE_DIR}/config.ini"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../config.rasn.ini"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../config.rasn.state.ini"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../config.rasn.defaults.ini")
 
 dsn_add_executable()

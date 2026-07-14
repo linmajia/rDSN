@@ -423,7 +423,11 @@ rDSN design:
   source, is treated as a blocking error rather than a reason to checkpoint an
   empty in-memory store over durable state.
 - Files and directories use `dsn::utils::filesystem`.
-- Future replicated mode can follow `replicated_service_app_type_1`.
+- The optional `rasn.state.replicated` app follows
+  `replicated_service_app_type_1` directly: PUT/conditional PUT are quorum writes,
+  each replica applies the ordered mutation to a journal-free store, and rDSN owns
+  checkpoint transfer, learning, and mutation-log durability. It currently uses
+  one partition because prefix queries do not yet fan out.
 
 Correctness and robustness requirements:
 
@@ -1167,7 +1171,9 @@ Correctness and robustness requirements:
 
 ### 15. Durable state journal
 
-The state subsystem is a memory store plus append-only durability layer.
+The standalone state subsystem is a memory store plus append-only durability
+layer. The replicated state application deliberately disables this journal and
+uses rDSN's quorum mutation log plus framework checkpoints instead.
 
 Responsibilities:
 
@@ -1269,7 +1275,8 @@ Responsibilities:
 rDSN design:
 
 - Packaging remains source-tree local: CMake copies each app's thin `config.ini`
-  plus the shared `config.rasn.ini`/`config.rasn.defaults.ini` host pair beside
+  plus the shared `config.rasn.ini`/`config.rasn.defaults.ini` host pair and
+  `config.rasn.state.ini` replicated-state profile beside
   the built executable, and examples are stored under `examples/`. The app path
   consumes only `config.ini`; `serve` consumes the host pair. The rASN plugin
   does **not** modify rDSN's config parser; it uses
@@ -1346,14 +1353,13 @@ rASN is now usable as a prototype nucleus for building and testing robust agent
 systems, but it should not be described as a production-complete platform. The
 remaining limitations are:
 
-- **State availability:** the state service has checkpoints, journals,
-  conditional writes, workflow leases, optional local replica mirroring, and
-  optional rDSN NFS import, but it is not quorum-replicated and does not yet use
-  an external HA database or replicated SKV backend. The single-writer constraint
-  is now *enforceable* rather than operator-discipline-only: the coordination
-  module (below) elects exactly one owner per shard via rDSN
-  `distributed_lock_service`, so a module can acquire ownership before serving
-  writes even before quorum replication lands.
+- **State availability:** standalone state retains checkpoints, journals,
+  conditional writes, workflow leases, optional local mirroring, and rDSN NFS
+  import. The optional `rasn.state.replicated` backend now commits state mutations
+  through rDSN `replicated_service_app_type_1` and supports framework checkpoint
+  learning. Runtime module stores themselves remain elected single-writer memory:
+  the replicated state authority makes their mirrors durable and hydratable, not
+  active-active. Multi-partition query fan-out and HA meta-server deployment remain.
 - **Tool isolation:** local tools are default-deny, policy-gated,
   approval-gated, allowlist-aware, workspace-rooted, timeout-bound, and can be
   routed through a configured container command wrapper. rASN still lacks a
@@ -1427,7 +1433,8 @@ remaining limitations are:
   fail-stop instead of risking split brain. All four breaker families can use
   fenced grant-version records plus one leased cluster-wide probe
   (DISTRIBUTED_RUNTIME.md §13.7). Admission/rate/cost/overload/dedup authorities
-  and quorum-replicated module state remain future work.
+  and directly quorum-replicated module state remain future work; the shared
+  `rasn.state` authority itself is now quorum-replicated.
 - **Full-distribution audit:** a severity-ranked production-readiness audit across
   three lenses — is rASN fully distributed, does it reuse rDSN instead of
   reinventing, and are critical modules missing — is recorded in
@@ -1437,7 +1444,8 @@ remaining limitations are:
   (single-writer ownership 1.1 and cluster-shared state 1.5, now backed by that
   coordination module), or DOCUMENTED, and maps the documented gaps to the exact
   rDSN facility that should back them:
-  `replicated_service_app_type_1` for quorum-replicated module/state storage,
+  `replicated_service_app_type_1` (now used by `rasn.state.replicated`; direct
+  module groups remain) for quorum-replicated storage,
   `dist::partition_resolver` for shard routing, meta-server / `failure_detector` /
   `ext/zookeeper` for HA discovery, and Thrift IDL for typed RPC
   schemas. Remaining missing-module gaps (durable/vector agent memory, a

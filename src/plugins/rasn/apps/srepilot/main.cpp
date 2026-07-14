@@ -17,8 +17,7 @@ void register_rasn_apps()
 {
     dassert(::dsn::register_app< ::dsn::rasn::rasn_registry_app>("rasn.registry"),
             "register rasn.registry app failed");
-    dassert(::dsn::register_app< ::dsn::rasn::rasn_state_app>("rasn.state"),
-            "register rasn.state app failed");
+    ::dsn::rasn::register_rasn_state_apps();
     dassert(::dsn::register_app< ::dsn::rasn::rasn_workflow_app>("rasn.workflow"),
             "register rasn.workflow app failed");
     dassert(::dsn::register_app< ::dsn::rasn::rasn_observability_app>("rasn.observability"),

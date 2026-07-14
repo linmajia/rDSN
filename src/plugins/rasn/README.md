@@ -102,8 +102,9 @@ gateway, placement, and optional model/remote-runtime endpoint). A local app may
 optionally include `config.rasn.defaults.ini`, which contains only shared module
 tuning. `config.rasn.ini` is the self-contained, services-only runtime-host config;
 it includes `config.rasn.defaults.ini`, never an app config. CMake binplaces the
-host pair beside each executable; copy that pair with the binary on a dedicated
-node and run `codepilot serve`. `--dsn` remains
+host pair and optional `config.rasn.state.ini` quorum-state profile beside each
+executable; copy the required files with the binary on a dedicated node and run
+`codepilot serve`. `--dsn` remains
 only as a deprecated alias of `serve`. The rASN plugin uses stock rDSN inline,
 last-write-wins `@include` semantics and does not modify the parser. See
 `docs/DISTRIBUTED_RUNTIME.md` §6.1.
@@ -1167,6 +1168,13 @@ human interaction, and sandbox runtime) behind one service. See
 [Distributed rASN runtime modules](#distributed-rasn-runtime-modules) for how
 to split these modules across processes or nodes.
 
+For a quorum-backed state authority, build with `--build_plugins` and launch
+`config.rasn.state.ini` in a separate service process. It starts a one-partition,
+three-replica `rasn.state.replicated` development cluster. Point runtime hosts at
+`state_uri = dsn://rasn-cluster/rasn-state`; applications and runtime modules keep
+the same state API. The single-machine profile validates quorum behavior but must
+be split into independently supervised replica nodes for host-failure tolerance.
+
 `rasn.llm.agent`, `rasn.tool.agent`, `rasn.coordinator`, `rasn.workflow`, and
 `rasn.observability` all retain the shared
 `rasn_service_graph` while active; service shutdown releases those references in
@@ -1441,10 +1449,10 @@ hardening gaps remain:
 
 | Area | Current capability | Remaining limitation |
 | --- | --- | --- |
-| State availability | Checkpoints, append-only journals, conditional writes, workflow leases, optional local replica mirroring, and optional rDSN NFS import. | No quorum-replicated or externally managed HA state backend yet. |
+| State availability | Standalone checkpoints/journal/NFS/local mirror, plus optional one-partition `rasn.state.replicated` quorum writes and checkpoint learning over rDSN type-1 replication. | Runtime modules still execute as elected single-writer in-memory stores; multi-partition query fan-out, safe online checkpoint GC, and an HA meta-server deployment remain. |
 | Tool isolation | Default-deny side effects, workspace scoping, approvals, command allowlists, timeout/job containment, and a configurable container command wrapper. | No hardened container orchestrator with image, mount, network, and lifecycle policy. |
 | Replay fidelity | Replay for model responses, tool results, workflow scheduling, filesystem snapshots, and an `external.effect` ledger for side-effect intents. | No full virtualization of arbitrary external services, clocks, network state, or process environments. |
-| Deployment validation | Inline mode, typed service-mode RPC, URI/host endpoint configuration, registry heartbeats, active lease cleanup, and distributed rASN runtime modules with an aggregate service, standalone per-module roles, per-module/shard endpoint overrides, `local`/`distributed`/`hybrid` providers, per-module circuit breaker, idempotent retries, RPC retry/backoff, optional shared-token runtime RPC auth, state-mirror hydration with verified watermarks, watermark-verified checkpoint compaction, and health-ping readiness/topology reporting. | Multi-process and cluster deployment tests are still limited; quorum replication/sharding of module state, explicit watermark pruning, and local-to-remote migration tooling are not yet implemented. |
+| Deployment validation | Inline mode, typed service-mode RPC, URI/host endpoint configuration, registry heartbeats, active lease cleanup, distributed runtime modules, state-mirror hydration/watermarks, and a deployable rDSN type-1 replicated-state profile. | Full replicated-state cluster automation, direct quorum replication/sharding of module state, explicit watermark pruning, and local-to-remote migration tooling are not yet implemented. |
 | Credentials | `token_ref` handles for environment variables, files, and commands, plus deterministic redaction. | No vault-backed or OS-backed credential provider integration. |
 | SDK packaging | Generated C++/TypeScript/Python contracts and RPC-client source. | Packaged SDKs and concrete TypeScript/Python transports are not shipped. |
 | Evaluation evidence | Unit tests, self-tests, service smokes, schema smokes, report build, and a small eval harness. | Large benchmarks and user studies for debugging effectiveness remain future work. |

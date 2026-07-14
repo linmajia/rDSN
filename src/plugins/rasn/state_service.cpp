@@ -930,6 +930,169 @@ bool decode_state_record_fields(const std::vector<std::string> &fields,
     return true;
 }
 
+bool load_state_checkpoint_file(const std::string &path,
+                                std::map<std::string, state_record> *records,
+                                uint64_t *last_sequence,
+                                std::string *error)
+{
+    std::ifstream input(path.c_str(), std::ios::binary);
+    if (!input)
+    {
+        if (error != nullptr)
+        {
+            *error = "failed to open checkpoint for recovery: " + path;
+        }
+        return false;
+    }
+
+    std::string header;
+    if (!std::getline(input, header))
+    {
+        if (error != nullptr)
+        {
+            *error = "empty checkpoint: " + path;
+        }
+        return false;
+    }
+    const std::vector<std::string> header_fields = split_tab_fields(header);
+    uint64_t loaded_last_sequence = 0;
+    if (header_fields.size() != 2 || header_fields[0] != "rasn-state-v1")
+    {
+        if (error != nullptr)
+        {
+            *error = "invalid checkpoint header: " + path;
+        }
+        return false;
+    }
+    if (!parse_uint64(header_fields[1], &loaded_last_sequence))
+    {
+        if (error != nullptr)
+        {
+            *error = "invalid checkpoint sequence: " + path;
+        }
+        return false;
+    }
+
+    std::map<std::string, state_record> loaded;
+    std::string line;
+    while (std::getline(input, line))
+    {
+        if (line.empty())
+        {
+            continue;
+        }
+
+        state_record record;
+        if (!decode_state_record_fields(split_tab_fields(line), path, &record, error))
+        {
+            return false;
+        }
+        loaded[record.key] = record;
+        loaded_last_sequence = (std::max)(loaded_last_sequence, record.sequence);
+    }
+    if (input.bad())
+    {
+        if (error != nullptr)
+        {
+            *error = "failed to read checkpoint: " + path;
+        }
+        return false;
+    }
+
+    if (records != nullptr)
+    {
+        records->swap(loaded);
+    }
+    if (last_sequence != nullptr)
+    {
+        *last_sequence = loaded_last_sequence;
+    }
+    return true;
+}
+
+bool write_state_checkpoint_file(const std::string &path,
+                                 const std::map<std::string, state_record> &records,
+                                 uint64_t last_sequence,
+                                 std::string *error)
+{
+    if (!ensure_parent_directory(path, error))
+    {
+        return false;
+    }
+
+    const std::string temp_path = path + ".tmp";
+    std::ofstream output(temp_path.c_str(), std::ios::binary | std::ios::trunc);
+    if (!output)
+    {
+        if (error != nullptr)
+        {
+            *error = "failed to open checkpoint for write: " + temp_path;
+        }
+        return false;
+    }
+
+    output << "rasn-state-v1\t" << last_sequence << "\n";
+    for (const std::map<std::string, state_record>::value_type &entry : records)
+    {
+        write_state_record_line(output, entry.second);
+    }
+    output.close();
+    if (!output)
+    {
+        ::dsn::utils::filesystem::remove_path(temp_path);
+        if (error != nullptr)
+        {
+            *error = "failed to flush checkpoint: " + temp_path;
+        }
+        return false;
+    }
+
+    const std::string backup_path = path + ".bak";
+    bool has_backup = false;
+    if (::dsn::utils::filesystem::file_exists(path))
+    {
+        if (::dsn::utils::filesystem::file_exists(backup_path) &&
+            !::dsn::utils::filesystem::remove_path(backup_path))
+        {
+            ::dsn::utils::filesystem::remove_path(temp_path);
+            if (error != nullptr)
+            {
+                *error = "failed to remove stale checkpoint backup: " + backup_path;
+            }
+            return false;
+        }
+        if (!::dsn::utils::filesystem::rename_path(path, backup_path))
+        {
+            ::dsn::utils::filesystem::remove_path(temp_path);
+            if (error != nullptr)
+            {
+                *error = "failed to preserve existing checkpoint: " + path;
+            }
+            return false;
+        }
+        has_backup = true;
+    }
+
+    if (!::dsn::utils::filesystem::rename_path(temp_path, path))
+    {
+        if (has_backup)
+        {
+            ::dsn::utils::filesystem::rename_path(backup_path, path);
+        }
+        ::dsn::utils::filesystem::remove_path(temp_path);
+        if (error != nullptr)
+        {
+            *error = "failed to move checkpoint into place: " + path;
+        }
+        return false;
+    }
+    if (has_backup)
+    {
+        ::dsn::utils::filesystem::remove_path(backup_path);
+    }
+    return true;
+}
+
 bool ensure_parent_directory(const std::string &path, std::string *error)
 {
     const std::string directory = ::dsn::utils::filesystem::remove_file_name(path);
@@ -978,6 +1141,30 @@ bool state_key_matches_prefix(const std::string &key, const std::string &prefix)
         return true;
     }
     return key[prefix.size()] == '/';
+}
+
+const char kReplicatedStateCheckpointPrefix[] = "rasn-state-checkpoint.";
+
+bool parse_replicated_checkpoint_decree(const std::string &file_name, int64_t *decree)
+{
+    const size_t prefix_length = sizeof(kReplicatedStateCheckpointPrefix) - 1;
+    if (file_name.size() <= prefix_length ||
+        file_name.compare(0, prefix_length, kReplicatedStateCheckpointPrefix) != 0)
+    {
+        return false;
+    }
+
+    uint64_t parsed = 0;
+    if (!parse_uint64(file_name.substr(prefix_length), &parsed) ||
+        parsed > static_cast<uint64_t>((std::numeric_limits<int64_t>::max)()))
+    {
+        return false;
+    }
+    if (decree != nullptr)
+    {
+        *decree = static_cast<int64_t>(parsed);
+    }
+    return true;
 }
 
 } // namespace
@@ -1128,7 +1315,7 @@ state_response state_store::put(const state_put_request &request)
         }
 
         std::string journal_error;
-        if (!append_journal_record(stored, &journal_error))
+        if (_journal_enabled && !append_journal_record(stored, &journal_error))
         {
             return error_response(journal_error);
         }
@@ -1206,12 +1393,6 @@ state_response state_store::checkpoint(const state_checkpoint_request &request) 
     }
 
     const std::string path = request.path.empty() ? default_checkpoint_path() : request.path;
-    std::string directory_error;
-    if (!ensure_parent_directory(path, &directory_error))
-    {
-        return error_response(directory_error);
-    }
-
     std::map<std::string, state_record> snapshot;
     uint64_t last_sequence = 0;
     uint64_t snapshot_epoch = 0;
@@ -1222,97 +1403,55 @@ state_response state_store::checkpoint(const state_checkpoint_request &request) 
         snapshot_epoch = _write_epoch;
     }
 
-    const std::string temp_path = path + ".tmp";
-    std::ofstream output(temp_path.c_str(), std::ios::binary | std::ios::trunc);
-    if (!output)
+    std::string checkpoint_error;
+    if (!write_state_checkpoint_file(path, snapshot, last_sequence, &checkpoint_error))
     {
-        return error_response("failed to open checkpoint for write: " + temp_path);
+        return error_response(checkpoint_error);
     }
 
-    output << "rasn-state-v1\t" << last_sequence << "\n";
-    for (const std::map<std::string, state_record>::value_type &entry : snapshot)
+    if (_journal_enabled)
     {
-        write_state_record_line(output, entry.second);
-    }
-    output.close();
-    if (!output)
-    {
-        ::dsn::utils::filesystem::remove_path(temp_path);
-        return error_response("failed to flush checkpoint: " + temp_path);
-    }
+        const std::string journal_path = default_journal_path();
 
-    const std::string backup_path = path + ".bak";
-    bool has_backup = false;
-    if (::dsn::utils::filesystem::file_exists(path))
-    {
-        if (::dsn::utils::filesystem::file_exists(backup_path) &&
-            !::dsn::utils::filesystem::remove_path(backup_path))
+        // Mirror the checkpoint file to the replica first. This is the slow I/O and
+        // must stay outside _lock; copying a checkpoint that is current-or-superseded
+        // is always safe because the journal (kept or compacted below) determines
+        // which post-snapshot writes recovery must replay.
+        std::string replica_error;
+        if (!copy_checkpoint_to_replica(path, &replica_error))
         {
-            ::dsn::utils::filesystem::remove_path(temp_path);
-            return error_response("failed to remove stale checkpoint backup: " + backup_path);
+            return error_response(replica_error);
         }
-        if (!::dsn::utils::filesystem::rename_path(path, backup_path))
+
+        // Only compact (delete) the journals if no write landed since we snapshotted
+        // _records. A put that appended to the journal after the snapshot is not in
+        // this checkpoint file, so removing the journal would lose it from durable
+        // storage. In that case leave both journals for the next checkpoint to fold
+        // in (recovery replays checkpoint + journal, so keeping them is safe).
+        //
+        // The epoch re-check and the removals must happen under a single lock
+        // acquisition. A concurrent put() serializes on _lock to append its durable
+        // journal record (to both the primary and, via append_journal_record, the
+        // mirrored replica journal) and bump _write_epoch atomically; checking the
+        // epoch under the lock but unlinking after releasing it would let such a put
+        // slip in between and have its just-acknowledged record deleted from either
+        // journal. The primary and replica journals are compacted together so the
+        // replica can never lose an acked write the primary keeps (and vice versa).
+        // remove_path is a fast unlink, so holding _lock across both matches the
+        // pre-refactor design where the whole checkpoint ran locked.
         {
-            ::dsn::utils::filesystem::remove_path(temp_path);
-            return error_response("failed to preserve existing checkpoint: " + path);
-        }
-        has_backup = true;
-    }
-
-    if (!::dsn::utils::filesystem::rename_path(temp_path, path))
-    {
-        if (has_backup)
-        {
-            ::dsn::utils::filesystem::rename_path(backup_path, path);
-        }
-        ::dsn::utils::filesystem::remove_path(temp_path);
-        return error_response("failed to move checkpoint into place: " + path);
-    }
-    if (has_backup)
-    {
-        ::dsn::utils::filesystem::remove_path(backup_path);
-    }
-
-    const std::string journal_path = default_journal_path();
-
-    // Mirror the checkpoint file to the replica first. This is the slow I/O and
-    // must stay outside _lock; copying a checkpoint that is current-or-superseded
-    // is always safe because the journal (kept or compacted below) determines
-    // which post-snapshot writes recovery must replay.
-    std::string replica_error;
-    if (!copy_checkpoint_to_replica(path, &replica_error))
-    {
-        return error_response(replica_error);
-    }
-
-    // Only compact (delete) the journals if no write landed since we snapshotted
-    // _records. A put that appended to the journal after the snapshot is not in
-    // this checkpoint file, so removing the journal would lose it from durable
-    // storage. In that case leave both journals for the next checkpoint to fold
-    // in (recovery replays checkpoint + journal, so keeping them is safe).
-    //
-    // The epoch re-check and the removals must happen under a single lock
-    // acquisition. A concurrent put() serializes on _lock to append its durable
-    // journal record (to both the primary and, via append_journal_record, the
-    // mirrored replica journal) and bump _write_epoch atomically; checking the
-    // epoch under the lock but unlinking after releasing it would let such a put
-    // slip in between and have its just-acknowledged record deleted from either
-    // journal. The primary and replica journals are compacted together so the
-    // replica can never lose an acked write the primary keeps (and vice versa).
-    // remove_path is a fast unlink, so holding _lock across both matches the
-    // pre-refactor design where the whole checkpoint ran locked.
-    {
-        ::dsn::service::zauto_lock guard(_lock);
-        if (_write_epoch == snapshot_epoch)
-        {
-            if (::dsn::utils::filesystem::file_exists(journal_path) &&
-                !::dsn::utils::filesystem::remove_path(journal_path))
+            ::dsn::service::zauto_lock guard(_lock);
+            if (_write_epoch == snapshot_epoch)
             {
-                return error_response("failed to compact state journal: " + journal_path);
-            }
-            if (!remove_replica_journal(journal_path, &replica_error))
-            {
-                return error_response(replica_error);
+                if (::dsn::utils::filesystem::file_exists(journal_path) &&
+                    !::dsn::utils::filesystem::remove_path(journal_path))
+                {
+                    return error_response("failed to compact state journal: " + journal_path);
+                }
+                if (!remove_replica_journal(journal_path, &replica_error))
+                {
+                    return error_response(replica_error);
+                }
             }
         }
     }
@@ -1327,6 +1466,69 @@ state_response state_store::checkpoint(const state_checkpoint_request &request) 
     dinfo("checkpointed rASN state records=%llu path=%s",
           static_cast<unsigned long long>(response.records.size()),
           path.c_str());
+    return response;
+}
+
+state_response state_store::copy_checkpoint(const state_checkpoint_request &request,
+                                            const std::string &durable_path)
+{
+    return import_checkpoint(request, durable_path, false);
+}
+
+state_response state_store::replace_from_checkpoint(const state_checkpoint_request &request,
+                                                    const std::string &durable_path)
+{
+    return import_checkpoint(request, durable_path, true);
+}
+
+state_response state_store::import_checkpoint(const state_checkpoint_request &request,
+                                              const std::string &durable_path,
+                                              bool replace)
+{
+    if (!valid_schema(request.schema_version))
+    {
+        return error_response("state checkpoint import request has unsupported schema version");
+    }
+    if (request.path.empty())
+    {
+        return error_response("state checkpoint import requires a source path");
+    }
+
+    std::map<std::string, state_record> imported;
+    uint64_t last_sequence = 0;
+    std::string import_error;
+    if (!load_state_checkpoint_file(request.path, &imported, &last_sequence, &import_error))
+    {
+        return error_response(import_error);
+    }
+    if (!durable_path.empty() && durable_path != request.path &&
+        !write_state_checkpoint_file(durable_path, imported, last_sequence, &import_error))
+    {
+        return error_response(import_error);
+    }
+
+    if (replace)
+    {
+        {
+            ::dsn::service::zauto_lock guard(_lock);
+            _records.swap(imported);
+            _last_sequence = last_sequence;
+            ++_write_epoch;
+        }
+        state_response response = query(state_query_request());
+        dinfo("replaced rASN state records=%llu checkpoint=%s",
+              static_cast<unsigned long long>(response.records.size()),
+              request.path.c_str());
+        return response;
+    }
+
+    state_response response;
+    response.last_sequence = last_sequence;
+    response.records.reserve(imported.size());
+    for (const std::map<std::string, state_record>::value_type &entry : imported)
+    {
+        response.records.push_back(entry.second);
+    }
     return response;
 }
 
@@ -1362,44 +1564,10 @@ state_response state_store::recover(const state_checkpoint_request &request)
 
     if (::dsn::utils::filesystem::file_exists(path))
     {
-        std::ifstream input(path.c_str(), std::ios::binary);
-        if (!input)
+        std::string checkpoint_error;
+        if (!load_state_checkpoint_file(path, &recovered, &last_sequence, &checkpoint_error))
         {
-            return error_response("failed to open checkpoint for recovery: " + path);
-        }
-
-        std::string header;
-        if (!std::getline(input, header))
-        {
-            return error_response("empty checkpoint: " + path);
-        }
-        const std::vector<std::string> header_fields = split_tab_fields(header);
-        if (header_fields.size() != 2 || header_fields[0] != "rasn-state-v1")
-        {
-            return error_response("invalid checkpoint header: " + path);
-        }
-
-        if (!parse_uint64(header_fields[1], &last_sequence))
-        {
-            return error_response("invalid checkpoint sequence: " + path);
-        }
-
-        std::string line;
-        while (std::getline(input, line))
-        {
-            if (line.empty())
-            {
-                continue;
-            }
-
-            state_record record;
-            std::string decode_error;
-            if (!decode_state_record_fields(split_tab_fields(line), path, &record, &decode_error))
-            {
-                return error_response(decode_error);
-            }
-            recovered[record.key] = record;
-            last_sequence = (std::max)(last_sequence, record.sequence);
+            return error_response(checkpoint_error);
         }
     }
     else if (!::dsn::utils::filesystem::file_exists(journal_path))
@@ -1566,58 +1734,87 @@ state_store &global_state_store()
     return store;
 }
 
-void rasn_state_rpc_service::open_service()
+void rasn_state_rpc_service::open_service(::dsn_gpid gpid)
 {
     dinfo("opening rasn.state serverlet");
-    this->register_async_rpc_handler(RPC_RASN_STATE_PUT, "put", &rasn_state_rpc_service::on_put);
     this->register_async_rpc_handler(
-        RPC_RASN_STATE_PUT_CONDITIONAL, "put_conditional", &rasn_state_rpc_service::on_put_conditional);
-    this->register_async_rpc_handler(RPC_RASN_STATE_GET, "get", &rasn_state_rpc_service::on_get);
-    this->register_async_rpc_handler(RPC_RASN_STATE_QUERY, "query", &rasn_state_rpc_service::on_query);
-    this->register_async_rpc_handler(RPC_RASN_STATE_CHECKPOINT, "checkpoint", &rasn_state_rpc_service::on_checkpoint);
-    this->register_async_rpc_handler(RPC_RASN_STATE_RECOVER, "recover", &rasn_state_rpc_service::on_recover);
+        RPC_RASN_STATE_PUT, "put", &rasn_state_rpc_service::on_put, gpid);
+    this->register_async_rpc_handler(
+        RPC_RASN_STATE_PUT_CONDITIONAL,
+        "put_conditional",
+        &rasn_state_rpc_service::on_put_conditional,
+        gpid);
+    this->register_async_rpc_handler(
+        RPC_RASN_STATE_GET, "get", &rasn_state_rpc_service::on_get, gpid);
+    this->register_async_rpc_handler(
+        RPC_RASN_STATE_QUERY, "query", &rasn_state_rpc_service::on_query, gpid);
+    this->register_async_rpc_handler(
+        RPC_RASN_STATE_CHECKPOINT,
+        "checkpoint",
+        &rasn_state_rpc_service::on_checkpoint,
+        gpid);
+    this->register_async_rpc_handler(
+        RPC_RASN_STATE_RECOVER, "recover", &rasn_state_rpc_service::on_recover, gpid);
 }
 
-void rasn_state_rpc_service::close_service()
+void rasn_state_rpc_service::close_service(::dsn_gpid gpid)
 {
     dinfo("closing rasn.state serverlet");
-    this->unregister_rpc_handler(RPC_RASN_STATE_PUT);
-    this->unregister_rpc_handler(RPC_RASN_STATE_PUT_CONDITIONAL);
-    this->unregister_rpc_handler(RPC_RASN_STATE_GET);
-    this->unregister_rpc_handler(RPC_RASN_STATE_QUERY);
-    this->unregister_rpc_handler(RPC_RASN_STATE_CHECKPOINT);
-    this->unregister_rpc_handler(RPC_RASN_STATE_RECOVER);
+    this->unregister_rpc_handler(RPC_RASN_STATE_PUT, gpid);
+    this->unregister_rpc_handler(RPC_RASN_STATE_PUT_CONDITIONAL, gpid);
+    this->unregister_rpc_handler(RPC_RASN_STATE_GET, gpid);
+    this->unregister_rpc_handler(RPC_RASN_STATE_QUERY, gpid);
+    this->unregister_rpc_handler(RPC_RASN_STATE_CHECKPOINT, gpid);
+    this->unregister_rpc_handler(RPC_RASN_STATE_RECOVER, gpid);
 }
 
 void rasn_state_rpc_service::on_put(const state_record &request, ::dsn::rpc_replier<state_response> &reply)
 {
-    reply(global_state_store().put(request));
+    reply(_store->put(request));
 }
 
 void rasn_state_rpc_service::on_put_conditional(const state_put_request &request,
                                                 ::dsn::rpc_replier<state_response> &reply)
 {
-    reply(global_state_store().put(request));
+    reply(_store->put(request));
 }
 
 void rasn_state_rpc_service::on_get(const state_key_request &request, ::dsn::rpc_replier<state_response> &reply)
 {
-    reply(global_state_store().get(request));
+    reply(_store->get(request));
 }
 
 void rasn_state_rpc_service::on_query(const state_query_request &request, ::dsn::rpc_replier<state_response> &reply)
 {
-    reply(global_state_store().query(request));
+    reply(_store->query(request));
 }
 
 void rasn_state_rpc_service::on_checkpoint(const state_checkpoint_request &request, ::dsn::rpc_replier<state_response> &reply)
 {
-    reply(global_state_store().checkpoint(request));
+    if (_replicated)
+    {
+        state_response response;
+        response.ok = false;
+        response.error =
+            "state checkpoints are managed by rDSN replication in replicated mode";
+        reply(response);
+        return;
+    }
+    reply(_store->checkpoint(request));
 }
 
 void rasn_state_rpc_service::on_recover(const state_checkpoint_request &request, ::dsn::rpc_replier<state_response> &reply)
 {
-    reply(global_state_store().recover(request));
+    if (_replicated)
+    {
+        state_response response;
+        response.ok = false;
+        response.error =
+            "state recovery is managed by rDSN checkpoint learning in replicated mode";
+        reply(response);
+        return;
+    }
+    reply(_store->recover(request));
 }
 
 std::pair< ::dsn::error_code, state_response>
@@ -1728,6 +1925,237 @@ rasn_state_client::recover_sync(const state_checkpoint_request &request,
 {
     _rpc.close_service();
     return ::dsn::ERR_OK;
+}
+
+rasn_replicated_state_app::rasn_replicated_state_app(::dsn_gpid gpid)
+    : ::dsn::replicated_service_app_type_1(gpid),
+      _checkpoint_lock(true),
+      _store(false),
+      _rpc(&_store, true),
+      _last_durable_decree(0)
+{
+}
+
+::dsn::error_code rasn_replicated_state_app::start(int argc, char **argv)
+{
+    const char *data_dir = ::dsn_get_app_data_dir(get_gpid());
+    if (data_dir == nullptr || data_dir[0] == '\0')
+    {
+        derror("replicated rasn.state partition has no app data directory");
+        return ::dsn::ERR_INVALID_PARAMETERS;
+    }
+    _data_dir = data_dir;
+
+    const ::dsn::error_code recovered = recover_latest_checkpoint();
+    if (recovered != ::dsn::ERR_OK)
+    {
+        return recovered;
+    }
+
+    _rpc.open_service(get_gpid());
+    dinfo("opened quorum-replicated rasn.state partition=%d checkpoint_decree=%lld",
+          get_gpid().u.partition_index,
+          static_cast<long long>(_last_durable_decree.load()));
+    return ::dsn::ERR_OK;
+}
+
+::dsn::error_code rasn_replicated_state_app::stop(bool cleanup)
+{
+    _rpc.close_service(get_gpid());
+    if (cleanup && !_data_dir.empty())
+    {
+        ::dsn::service::zauto_lock guard(_checkpoint_lock);
+        if (::dsn::utils::filesystem::path_exists(_data_dir) &&
+            !::dsn::utils::filesystem::remove_path(_data_dir))
+        {
+            derror("failed to remove replicated rasn.state data directory: %s",
+                   _data_dir.c_str());
+            return ::dsn::ERR_FILE_OPERATION_FAILED;
+        }
+    }
+    return ::dsn::ERR_OK;
+}
+
+::dsn::error_code rasn_replicated_state_app::sync_checkpoint(int64_t last_commit)
+{
+    if (last_commit < 0)
+    {
+        return ::dsn::ERR_INVALID_PARAMETERS;
+    }
+
+    ::dsn::service::zauto_lock guard(_checkpoint_lock);
+    const int64_t current = _last_durable_decree.load();
+    if (last_commit < current)
+    {
+        return ::dsn::ERR_INVALID_STATE;
+    }
+
+    const std::string path = checkpoint_path(last_commit);
+    if (last_commit == current && ::dsn::utils::filesystem::file_exists(path))
+    {
+        return ::dsn::ERR_OK;
+    }
+
+    // This must remain a synchronous framework checkpoint. The type-1 layer blocks
+    // later committed writes while this callback runs, so the store snapshot is
+    // exactly the state at last_commit even though checkpoint() releases its lock
+    // during file I/O. An asynchronous callback would need an app-level
+    // decree/snapshot barrier before it could safely reuse state_store::checkpoint.
+    state_checkpoint_request request;
+    request.path = path;
+    const state_response checkpointed = _store.checkpoint(request);
+    if (!checkpointed.ok)
+    {
+        derror("failed to checkpoint replicated rasn.state decree=%lld: %s",
+               static_cast<long long>(last_commit),
+               checkpointed.error.c_str());
+        return ::dsn::ERR_CHECKPOINT_FAILED;
+    }
+
+    _last_durable_decree.store(last_commit);
+    return ::dsn::ERR_OK;
+}
+
+::dsn::error_code rasn_replicated_state_app::async_checkpoint(int64_t last_commit)
+{
+    (void)last_commit;
+    // Keep the replication framework on its synchronous path; see sync_checkpoint.
+    return ::dsn::ERR_NOT_IMPLEMENTED;
+}
+
+int64_t rasn_replicated_state_app::get_last_checkpoint_decree()
+{
+    return _last_durable_decree.load();
+}
+
+::dsn::error_code rasn_replicated_state_app::get_checkpoint(int64_t learn_start,
+                                                            int64_t local_commit,
+                                                            void *learn_request,
+                                                            int learn_request_size,
+                                                            app_learn_state &state)
+{
+    const int64_t decree = _last_durable_decree.load();
+    if (decree <= 0)
+    {
+        return ::dsn::ERR_OBJECT_NOT_FOUND;
+    }
+
+    const std::string path = checkpoint_path(decree);
+    if (!::dsn::utils::filesystem::file_exists(path))
+    {
+        derror("replicated rasn.state checkpoint is missing: %s", path.c_str());
+        return ::dsn::ERR_OBJECT_NOT_FOUND;
+    }
+
+    state.from_decree_excluded = 0;
+    state.to_decree_included = decree;
+    state.files.push_back(path);
+    return ::dsn::ERR_OK;
+}
+
+::dsn::error_code rasn_replicated_state_app::apply_checkpoint(
+    ::dsn_chkpt_apply_mode mode,
+    int64_t local_commit,
+    const ::dsn_app_learn_state &state)
+{
+    if ((mode != ::DSN_CHKPT_LEARN && mode != ::DSN_CHKPT_COPY) ||
+        state.to_decree_included < 0 || state.file_state_count != 1 ||
+        state.files == nullptr || state.files[0] == nullptr || state.files[0][0] == '\0')
+    {
+        return ::dsn::ERR_INVALID_PARAMETERS;
+    }
+
+    ::dsn::service::zauto_lock guard(_checkpoint_lock);
+    const int64_t current = _last_durable_decree.load();
+    if (mode == ::DSN_CHKPT_COPY && state.to_decree_included < current)
+    {
+        derror("refusing stale replicated rasn.state checkpoint copy decree=%lld current=%lld",
+               static_cast<long long>(state.to_decree_included),
+               static_cast<long long>(current));
+        return ::dsn::ERR_INVALID_STATE;
+    }
+
+    state_checkpoint_request request;
+    request.path = state.files[0];
+    const std::string durable_path = checkpoint_path(state.to_decree_included);
+    const state_response imported =
+        mode == ::DSN_CHKPT_LEARN
+            ? _store.replace_from_checkpoint(request, durable_path)
+            : _store.copy_checkpoint(request, durable_path);
+    if (!imported.ok)
+    {
+        derror("failed to apply replicated rasn.state checkpoint decree=%lld mode=%d: %s",
+               static_cast<long long>(state.to_decree_included),
+               static_cast<int>(mode),
+               imported.error.c_str());
+        return ::dsn::ERR_CHECKPOINT_FAILED;
+    }
+
+    _last_durable_decree.store(state.to_decree_included);
+    return ::dsn::ERR_OK;
+}
+
+::dsn::error_code rasn_replicated_state_app::recover_latest_checkpoint()
+{
+    std::vector<std::string> files;
+    if (!::dsn::utils::filesystem::get_subfiles(_data_dir, files, false))
+    {
+        derror("failed to enumerate replicated rasn.state data directory: %s",
+               _data_dir.c_str());
+        return ::dsn::ERR_FILE_OPERATION_FAILED;
+    }
+
+    std::vector<std::pair<int64_t, std::string>> checkpoints;
+    for (const std::string &path : files)
+    {
+        int64_t decree = 0;
+        if (parse_replicated_checkpoint_decree(
+                ::dsn::utils::filesystem::get_file_name(path), &decree))
+        {
+            checkpoints.emplace_back(decree, path);
+        }
+    }
+    if (checkpoints.empty())
+    {
+        return ::dsn::ERR_OK;
+    }
+
+    std::sort(checkpoints.rbegin(), checkpoints.rend());
+    for (const std::pair<int64_t, std::string> &checkpoint : checkpoints)
+    {
+        state_checkpoint_request request;
+        request.path = checkpoint.second;
+        const state_response recovered = _store.replace_from_checkpoint(request);
+        if (recovered.ok)
+        {
+            _last_durable_decree.store(checkpoint.first);
+            return ::dsn::ERR_OK;
+        }
+
+        dwarn("ignoring invalid replicated rasn.state checkpoint path=%s error=%s",
+              checkpoint.second.c_str(),
+              recovered.error.c_str());
+    }
+
+    derror("all replicated rasn.state checkpoints are invalid in %s", _data_dir.c_str());
+    return ::dsn::ERR_CHECKPOINT_FAILED;
+}
+
+std::string rasn_replicated_state_app::checkpoint_path(int64_t decree) const
+{
+    return ::dsn::utils::filesystem::path_combine(
+        _data_dir,
+        std::string(kReplicatedStateCheckpointPrefix) + std::to_string(decree));
+}
+
+void register_rasn_state_apps()
+{
+    dassert(::dsn::register_app<rasn_state_app>("rasn.state"),
+            "register rasn.state app failed");
+    dassert(
+        ::dsn::register_app_with_type_1_replication_support<rasn_replicated_state_app>(
+            "rasn.state.replicated"),
+        "register rasn.state.replicated type-1 app failed");
 }
 
 } // namespace rasn
