@@ -1435,6 +1435,24 @@ data directory. `sync_checkpoint()` snapshots the committed store,
 the learned checkpoint without replacing live memory (so copying a newer snapshot
 cannot roll a serving primary backward); `DSN_CHKPT_LEARN` persists and atomically
 replaces the in-memory store, after which rDSN replays later mutations.
+The app explicitly returns `ERR_NOT_IMPLEMENTED` from `async_checkpoint()`:
+`state_store::checkpoint()` releases its store lock during file I/O, and the
+synchronous type-1 callback guarantees that decree `N+1` cannot apply before the
+snapshot for decree `N` is captured. Any future asynchronous implementation first
+needs an app-level decree/snapshot barrier rather than reusing this path directly.
+Operator `RPC_RASN_STATE_CHECKPOINT` and `RPC_RASN_STATE_RECOVER` requests are
+rejected in replicated mode so files outside the framework lifecycle cannot be
+mistaken for durable replica checkpoints.
+
+Checkpoint files are currently retained without automatic garbage collection.
+rDSN may still be transferring a path returned by `get_checkpoint()` after that
+method returns, and this application has no transfer-release callback with which
+to prove an older file is unused. Operators must monitor partition data-directory
+growth and prune obsolete files only while the affected replica is stopped,
+retaining its newest valid checkpoint. Failed conditional writes and rejected
+RECOVER requests still consume a committed decree because classification precedes
+application dispatch; they are deterministic no-ops, trading small log overhead
+for identical replay on every replica.
 
 The current profile intentionally has **one partition**. Existing `GET`/`QUERY`
 semantics address one state authority and prefix queries do not fan out or merge
@@ -1443,3 +1461,9 @@ work in §13.2. Likewise, the 11 runtime modules remain elected single-writer
 processes with in-memory stores; their acknowledged mirrors are now quorum durable,
 and a standby hydrates from that authority, but direct active-active module state
 machines remain §13.5 work.
+
+Focused unit source covers deterministic sequence allocation and COPY-versus-LEARN
+store semantics. Automated tests do not yet drive a real type-1 replica group
+through checkpoint transfer, learning, and primary failover; operators can exercise
+that path with `config.rasn.state.ini`, and cluster automation remains a tracked
+deployment-validation gap.

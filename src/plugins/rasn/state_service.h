@@ -319,6 +319,7 @@ public:
     ::dsn::error_code start(int argc, char **argv) override;
     ::dsn::error_code stop(bool cleanup = false) override;
     ::dsn::error_code sync_checkpoint(int64_t last_commit) override;
+    ::dsn::error_code async_checkpoint(int64_t last_commit) override;
     int64_t get_last_checkpoint_decree() override;
     ::dsn::error_code get_checkpoint(int64_t learn_start,
                                      int64_t local_commit,

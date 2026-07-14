@@ -1791,6 +1791,15 @@ void rasn_state_rpc_service::on_query(const state_query_request &request, ::dsn:
 
 void rasn_state_rpc_service::on_checkpoint(const state_checkpoint_request &request, ::dsn::rpc_replier<state_response> &reply)
 {
+    if (_replicated)
+    {
+        state_response response;
+        response.ok = false;
+        response.error =
+            "state checkpoints are managed by rDSN replication in replicated mode";
+        reply(response);
+        return;
+    }
     reply(_store->checkpoint(request));
 }
 
@@ -1987,6 +1996,11 @@ rasn_replicated_state_app::rasn_replicated_state_app(::dsn_gpid gpid)
         return ::dsn::ERR_OK;
     }
 
+    // This must remain a synchronous framework checkpoint. The type-1 layer blocks
+    // later committed writes while this callback runs, so the store snapshot is
+    // exactly the state at last_commit even though checkpoint() releases its lock
+    // during file I/O. An asynchronous callback would need an app-level
+    // decree/snapshot barrier before it could safely reuse state_store::checkpoint.
     state_checkpoint_request request;
     request.path = path;
     const state_response checkpointed = _store.checkpoint(request);
@@ -2000,6 +2014,13 @@ rasn_replicated_state_app::rasn_replicated_state_app(::dsn_gpid gpid)
 
     _last_durable_decree.store(last_commit);
     return ::dsn::ERR_OK;
+}
+
+::dsn::error_code rasn_replicated_state_app::async_checkpoint(int64_t last_commit)
+{
+    (void)last_commit;
+    // Keep the replication framework on its synchronous path; see sync_checkpoint.
+    return ::dsn::ERR_NOT_IMPLEMENTED;
 }
 
 int64_t rasn_replicated_state_app::get_last_checkpoint_decree()
