@@ -5103,9 +5103,14 @@ TEST(rasn_runtime, partition_hash_preserves_keys_and_explicit_shard_routes)
     keyed.route_partition = 7;
     EXPECT_EQ(7u, rasn_runtime_partition_hash(keyed));
 
-    rasn_runtime_request unkeyed;
-    unkeyed.module = "blackboard";
-    EXPECT_EQ(0u, rasn_runtime_partition_hash(unkeyed));
+    rasn_runtime_request empty_shard_key;
+    empty_shard_key.module = "blackboard";
+    EXPECT_EQ(14695981039346656037ULL,
+              rasn_runtime_partition_hash(empty_shard_key));
+
+    rasn_runtime_request unkeyed_control;
+    unkeyed_control.module = "agent_control_plane";
+    EXPECT_EQ(0u, rasn_runtime_partition_hash(unkeyed_control));
 }
 
 TEST(rasn_runtime, ingress_guard_admits_hosted_shards_and_rejects_others)

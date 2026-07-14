@@ -203,7 +203,8 @@ Design notes:
   (`agent_message_bus`, `resource_budget`, `blackboard`) can set
   `<module>_shard_count > 1`. Mutating and keyed read operations route by the
   module's natural key (`message_id`, budget `scope`, blackboard `key`) using the
-  existing stable FNV-1a hash. That full hash is now carried in the rDSN RPC
+  existing stable FNV-1a hash, including the empty string so its historical
+  hash/modulo placement is unchanged. That full hash is now carried in the rDSN RPC
   `partition_hash`: when the endpoint is a module-level `dsn://` URI, the core
   invokes `dist::partition_resolver` to map it to the current partition replica
   group and invalidates the resolver cache after access failure. Static and
@@ -216,8 +217,10 @@ Design notes:
   fallback and remain authoritative per-shard overrides. Resolver-backed clients
   must configure `<module>_shard_count` equal to the meta-server table's partition
   count; the public resolver API does not expose that count for startup
-  cross-validation. Explicit hosted-shard ingress checks can reject some mismatched
-  routes, but operators must treat any count mismatch as invalid configuration. For
+  cross-validation. rASN therefore emits a once-per-process warning when a sharded
+  module shares one resolver URI across partitions. Explicit hosted-shard ingress
+  checks can reject some mismatched routes, but operators must treat any count
+  mismatch as invalid configuration. For
   registry-routed shards, a module service can set
   `<module>_hosted_shards = 0,2` (or `all`) so it publishes explicit
   `rasn.runtime.<module>.shard.<n>` capabilities. If no shard-specific descriptor
@@ -384,7 +387,10 @@ sequenceDiagram
   `ERR_CAPACITY_EXCEEDED`, `ERR_TRY_AGAIN`), and linear backoff. Non-transient
   errors fail fast.
 - **Per-endpoint circuit breaker.** A process-global `circuit_breaker_registry`
-  keyed by `module + shard + resolved endpoint`. On repeated transport failures
+  keyed by `module + shard + resolved endpoint`. For a URI this is intentionally
+  the logical URI/partition: rDSN first invalidates and retries a failed physical
+  replica internally, and rASN records a failure only if that resolver path returns
+  a terminal error. On repeated transport failures
   the breaker opens and calls short-circuit for a cooldown before a single
   half-open probe is admitted, so one dead module endpoint cannot stall every
   request or amplify load. Health pings check every configured shard, consult
@@ -700,11 +706,14 @@ arguments = meta-1:27601,meta-2:27601
 ```
 
 The module URI is one authoritative logical endpoint. rASN supplies the stable key
-hash (or exact `route_partition` for fan-out/ping) to the RPC header; rDSN resolves
+hash (or the small exact `route_partition` for fan-out/ping) to the RPC header;
+modulo the same partition count both forms select the same partition. rDSN resolves
 and refreshes the physical replica-group endpoint. Resolver failure is returned
 rather than silently falling through to registry/static routing. Circuit breakers
 remain keyed by logical module URI plus partition because the public call surface
-does not expose the resolved physical replica. Current checked-in runtime module
+does not expose the resolved physical replica; this is deliberate because rDSN
+already invalidates and retries physical replicas before returning failure. Current
+checked-in runtime module
 roles are not yet replicated tables, so this client integration does not claim
 module durability, primary failover, or rebalancing; those require direct module
 replication (§13.5).

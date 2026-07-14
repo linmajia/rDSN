@@ -1342,7 +1342,10 @@ partition-to-replica-group resolution, cache invalidation, and retry after acces
 failure. Set `<module>_shard_count` to the meta-server table's partition count;
 explicit per-shard endpoints remain authoritative overrides. Existing FNV-1a key
 hashing is preserved so enabling resolver-backed routing does not silently remap
-already-sharded state.
+already-sharded state, including the historical hash/modulo placement of an empty
+natural key. Since rDSN's public resolver API does not expose the table partition
+count, rASN emits a once-per-process warning for each shared module URI and
+operators must verify the counts match.
 
 ```ini
 [rasn.service]

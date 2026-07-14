@@ -251,6 +251,39 @@ struct runtime_endpoint
     bool explicit_config = false;
 };
 
+void warn_resolver_partition_contract_once(const std::string &module,
+                                           const std::string &uri,
+                                           uint32_t partition_count)
+{
+    static std::mutex lock;
+    static std::set<std::string> warned;
+    const std::string warning_key =
+        module + "\x1f" + uri + "\x1f" + std::to_string(partition_count);
+    {
+        std::lock_guard<std::mutex> guard(lock);
+        if (!warned.insert(warning_key).second)
+        {
+            return;
+        }
+    }
+    dwarn("runtime module '%s' uses shared resolver URI '%s' across %u configured "
+          "shards; rDSN does not expose the table partition count for startup "
+          "validation, so operators must ensure the counts match",
+          module.c_str(),
+          uri.c_str(),
+          static_cast<unsigned int>(partition_count));
+}
+
+std::string rasn_runtime_breaker_key(const std::string &module,
+                                     const runtime_endpoint &endpoint)
+{
+    // URI calls expose only the logical table URI. rDSN invalidates and retries a
+    // failed physical replica internally, so rASN deliberately keys the breaker
+    // to the logical partition after that resolver path returns a terminal failure.
+    return module + "#" + std::to_string(endpoint.partition_index) + "@" +
+           std::string(endpoint.address.to_string());
+}
+
 bool rasn_runtime_module_is_sharded(const std::string &module)
 {
     return module == "agent_message_bus" || module == "resource_budget" || module == "blackboard";
@@ -273,7 +306,11 @@ uint64_t rasn_runtime_partition_hash_impl(const rasn_runtime_request &request)
     {
         return request.route_partition;
     }
-    return request.key.empty() ? 0 : fnv1a64(request.key);
+    // Sharded modules historically hashed even the empty natural key. Preserve
+    // that corner-case mapping; unsharded keyless control calls keep hash zero.
+    return request.key.empty() && !rasn_runtime_module_is_sharded(request.module)
+               ? 0
+               : fnv1a64(request.key);
 }
 
 uint32_t rasn_runtime_partition_count(const std::string &module)
@@ -401,7 +438,7 @@ std::vector<uint32_t> rasn_runtime_hosted_shards(const std::string &module)
 uint32_t rasn_runtime_partition_for_key(const std::string &module, const std::string &key)
 {
     const uint32_t count = rasn_runtime_partition_count(module);
-    if (count <= 1 || key.empty())
+    if (count <= 1)
     {
         return 0;
     }
@@ -735,11 +772,12 @@ runtime_endpoint static_rasn_runtime_endpoint(const std::string &module, uint32_
     const std::string common_uri = config_service_string("rasn_runtime_uri", "", "rASN runtime module service URI");
     const std::string module_uri = config_service_override(
         module_key + "_uri", common_uri, "rASN per-module service URI", nullptr);
+    bool shard_uri_configured = false;
     const std::string uri =
         sharded ? config_service_override(shard_key + "_uri",
                                           module_uri,
                                           "rASN per-shard module service URI",
-                                          nullptr)
+                                          &shard_uri_configured)
                 : module_uri;
     if (!uri.empty())
     {
@@ -749,6 +787,11 @@ runtime_endpoint static_rasn_runtime_endpoint(const std::string &module, uint32_
             endpoint.address.type() == HOST_TYPE_URI
                 ? (sharded ? "resolver:shard" : "resolver")
                 : (sharded ? "static:shard" : "static");
+        if (endpoint.address.type() == HOST_TYPE_URI && sharded &&
+            !shard_uri_configured)
+        {
+            warn_resolver_partition_contract_once(module, uri, partition_count);
+        }
         endpoint.partition_index = partition_index;
         endpoint.partition_count = partition_count;
         // A URI is only ever set by the operator, so it is always authoritative.
@@ -3274,7 +3317,7 @@ rasn_runtime_response invoke_remote_module(const rasn_runtime_request &request)
     const uint64_t partition_hash = rasn_runtime_partition_hash(request);
     const std::string endpoint = std::string(address.to_string());
     const std::string breaker_key =
-        module + "#" + std::to_string(resolved_endpoint.partition_index) + "@" + endpoint;
+        rasn_runtime_breaker_key(module, resolved_endpoint);
     rasn_runtime_request sending = request;
     if (rasn_runtime_module_is_sharded(module) &&
         resolved_endpoint.partition_count > 1)
@@ -3408,11 +3451,15 @@ bool ping_remote_module(const std::string &module, std::string *error)
         const ::dsn::rpc_address address = resolved_endpoint.address;
         const std::string endpoint = std::string(address.to_string());
         const std::string breaker_key =
-            module + "#" + std::to_string(resolved_endpoint.partition_index) + "@" + endpoint;
+            rasn_runtime_breaker_key(module, resolved_endpoint);
         const bool breaker_enabled = rasn_runtime_breaker_enabled();
         const std::chrono::milliseconds ping_timeout = rasn_runtime_ping_timeout(module);
         rasn_runtime_request ping = make_module_request(module, "ping");
         ping.route_partition = resolved_endpoint.partition_index;
+        // Explicit fan-out/probe routes use the partition index itself as the
+        // canonical hash. Keyed calls retain the full FNV hash; modulo the same
+        // configured/meta partition count, both select this partition.
+        const uint64_t partition_hash = rasn_runtime_partition_hash(ping);
         std::string auth_error;
         if (!prepare_rasn_runtime_rpc_request(&ping, &auth_error))
         {
@@ -3444,8 +3491,7 @@ bool ping_remote_module(const std::string &module, std::string *error)
         }
         rasn_runtime_client client(address);
         const std::pair< ::dsn::error_code, rasn_runtime_response> result =
-            client.call_sync(
-                ping, ping_timeout, 0, rasn_runtime_partition_hash(ping));
+            client.call_sync(ping, ping_timeout, 0, partition_hash);
         if (result.first != ::dsn::ERR_OK)
         {
             if (breaker_enabled)
