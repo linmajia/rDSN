@@ -55,6 +55,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -908,6 +909,103 @@ TEST(rasn_registry, parses_bounded_unique_frontend_group)
     EXPECT_FALSE(parse_rasn_registry_addresses("dsn://cluster/registry", &addresses, &error));
     EXPECT_TRUE(addresses.empty());
     EXPECT_FALSE(error.empty());
+}
+
+TEST(rasn_registry, validates_ha_thread_pool_wiring)
+{
+    std::string error;
+    EXPECT_FALSE(validate_rasn_registry_ha_pools(
+        "THREAD_POOL_DEFAULT,THREAD_POOL_META_SERVER", true, &error));
+    EXPECT_NE(std::string::npos, error.find("THREAD_POOL_DLOCK"));
+
+    error.clear();
+    EXPECT_FALSE(validate_rasn_registry_ha_pools(
+        "THREAD_POOL_DEFAULT,THREAD_POOL_META_SERVER,THREAD_POOL_DLOCK",
+        false,
+        &error));
+    EXPECT_NE(std::string::npos, error.find("partitioned=true"));
+
+    error.clear();
+    EXPECT_TRUE(validate_rasn_registry_ha_pools(
+        "THREAD_POOL_DLOCK, THREAD_POOL_DEFAULT,THREAD_POOL_META_SERVER",
+        true,
+        &error))
+        << error;
+}
+
+TEST(rasn_registry, prunes_old_epochs_without_copying_tombstones)
+{
+    rasn_coordination_config config;
+    config.provider = "inproc";
+    config.state_namespace =
+        "/rasn-registry-prune-" + std::to_string(::dsn_now_ns());
+    const std::shared_ptr<rasn_coordination_context> coordination =
+        std::make_shared<rasn_coordination_context>(config);
+    ASSERT_EQ(::dsn::ERR_OK, coordination->start());
+
+    const std::string state_prefix = "registry/unit";
+    const std::string resource = "rasn.registry.unit";
+    const std::string owner = "unit-owner";
+    agent_registry registry;
+    std::string error;
+    ASSERT_TRUE(registry.configure_shared_backend(
+        coordination, state_prefix, resource, owner, &error))
+        << error;
+
+    std::string agent_key;
+    for (uint64_t generation = 1; generation <= 5; ++generation)
+    {
+        uint64_t fence = 0;
+        ASSERT_EQ(::dsn::ERR_OK,
+                  coordination->service()->acquire_ownership(
+                      resource, owner, 1000, &fence));
+        ASSERT_EQ(generation, fence);
+        const std::shared_ptr<std::atomic<bool>> leadership_lost =
+            std::make_shared<std::atomic<bool>>(false);
+        ASSERT_TRUE(registry.activate_shared_writer(
+            fence, std::vector<agent_descriptor>(), leadership_lost, &error))
+            << error;
+
+        if (generation == 1)
+        {
+            agent_descriptor descriptor;
+            descriptor.agent_id = "unit.pruned-agent";
+            descriptor.role = "tool";
+            descriptor.health = "healthy";
+            ASSERT_TRUE(registry.register_agent(descriptor, &error, true)) << error;
+            ASSERT_TRUE(registry.unregister_agent(descriptor.agent_id, &error)) << error;
+
+            std::vector<std::string> agent_keys;
+            ASSERT_EQ(::dsn::ERR_OK,
+                      coordination->service()->list_state(
+                          state_prefix + "/agents", agent_keys));
+            ASSERT_EQ(1u, agent_keys.size());
+            agent_key = agent_keys[0];
+        }
+        else if (generation == 2)
+        {
+            std::vector<std::string> versions;
+            ASSERT_EQ(::dsn::ERR_OK,
+                      coordination->service()->list_state(
+                          state_prefix + "/agents/" + agent_key, versions));
+            ASSERT_EQ(1u, versions.size());
+            EXPECT_EQ("1", versions[0]);
+        }
+
+        size_t pruned = 0;
+        ASSERT_TRUE(registry.prune_shared_history(3, &pruned, &error)) << error;
+        registry.clear_shared_writer();
+        ASSERT_EQ(::dsn::ERR_OK,
+                  coordination->service()->release_ownership(
+                      resource, owner, false));
+    }
+
+    std::vector<std::string> epochs;
+    ASSERT_EQ(::dsn::ERR_OK,
+              coordination->service()->list_state(
+                  state_prefix + "/epochs", epochs));
+    const std::set<std::string> retained(epochs.begin(), epochs.end());
+    EXPECT_EQ((std::set<std::string>{"3", "4", "5"}), retained);
 }
 
 TEST(rasn_registry, unregistering_an_absent_agent_is_successful)

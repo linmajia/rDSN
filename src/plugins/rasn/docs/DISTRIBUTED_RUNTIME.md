@@ -522,12 +522,18 @@ than reinventing consensus in rASN.
   `meta_state_service` through the coordination facade. Every frontend can serve
   reads; one frontend owns `rasn.registry.primary` through
   `distributed_lock_service` and performs registration, heartbeat, unregister,
-  full-record epoch promotion, static-descriptor reconciliation, and lease expiry.
-  Each new writer copies the previous committed snapshot below its grant-version
-  children, reconciles static records, and only then publishes a schema-versioned
-  epoch marker. Readers consume one exact committed epoch and validate its owner
-  against an authoritative ZooKeeper lock-tree read before and after the snapshot,
-  so a delayed former leader cannot overwrite or introduce visible records.
+  live-record epoch promotion, static-descriptor reconciliation, and lease expiry.
+  Each new writer copies the previous committed live snapshot below its
+  grant-version children, omits tombstones, reconciles static records, and only
+  then publishes a schema-versioned epoch marker. Readers consume one exact
+  committed epoch and perform one authoritative ZooKeeper lock-tree validation
+  after the read; that final check proves the selected epoch remained authoritative
+  through the operation, so a delayed former leader cannot overwrite or introduce
+  visible records. This is epoch fencing rather than a transactionally consistent
+  snapshot: the active writer can update individual records concurrently within
+  its current epoch.
+  The active writer also keeps a bounded epoch window, deleting old per-agent
+  children before their commit markers and retrying transient cleanup failures.
   Shared-mode backend/record failures are returned as errors, never converted into
   a successful empty roster.
 - **HA frontend routing.** `[rasn.service] registry_addresses` builds an rDSN group
@@ -712,8 +718,10 @@ timeout_ms = 8000
 ; app's `pools` (e.g. pools = THREAD_POOL_DEFAULT,THREAD_POOL_META_SERVER,THREAD_POOL_DLOCK).
 ; THREAD_POOL_META_SERVER carries the rASN facade's grant/lease callbacks;
 ; THREAD_POOL_DLOCK carries the zookeeper lock provider's own lock tasks and MUST be
-; partitioned (the provider asserts single-thread access per lock). Omitting
-; THREAD_POOL_DLOCK core-dumps at startup ("pool THREAD_POOL_DLOCK not ready").
+; partitioned (the provider asserts single-thread access per lock). The HA registry
+; checks this wiring before provider initialization; other ZooKeeper-backed app
+; roles that omit THREAD_POOL_DLOCK can still abort at provider startup with
+; "pool THREAD_POOL_DLOCK not ready".
 [threadpool.THREAD_POOL_META_SERVER]
 partitioned = false
 worker_count = 2
@@ -1555,15 +1563,19 @@ backing authority:
 
 1. `rasn_registry_app` creates its own registry instance and starts the current
    app's `rasn_coordination_context`.
-2. Startup requires the resolved provider to be exactly `zookeeper`. A missing
-   dist plugin or accidental `inproc`/`simple` setting is a startup error rather
-   than an HA-shaped local fallback.
+2. Startup requires the resolved provider to be exactly `zookeeper`, the hosting
+   app to list `THREAD_POOL_META_SERVER` and `THREAD_POOL_DLOCK`, and DLOCK to be
+   partitioned. Pool wiring is validated before coordination initialization, so
+   an incomplete deployment fails immediately rather than timing out. A missing
+   dist plugin or accidental `inproc`/`simple` setting is likewise a startup error
+   rather than an HA-shaped local fallback.
 3. Every frontend opens the existing register/unregister/query/list/heartbeat task
    codes and reads the common `meta_state_service` tree.
 4. Frontends contend for the preserved `rasn.registry.primary` lock. The winner
    installs its monotonically increasing grant version as the mutation fence,
-   copies every record/tombstone from the previous committed global epoch,
-   rebases live dynamic leases into its own clock domain, reconciles
+   copies every live record from the previous committed global epoch while
+   treating tombstones as absence, rebases dynamic leases into its own clock
+   domain, reconciles
    `[rasn.agent.*]`, writes a schema-validated epoch marker, and only then exposes
    the new epoch. It owns dynamic writes plus lease sweeping; standby reads rely
    on the writer's expiry tombstones rather than comparing persisted timestamps
@@ -1580,15 +1592,25 @@ backing authority:
    committed mutation. Readers select
    the greatest valid **committed epoch**, read every agent from that exact epoch,
    and validate the marker's owner/fence against the authoritative ZooKeeper lock
-   tree both before and after the read. A delayed old writer therefore cannot
+   tree afterward. This final validation proves the selected epoch remained
+   authoritative through the operation; a delayed old writer therefore cannot
    overwrite a successor or introduce an id that the successor never copied.
+   Individual record updates within the active epoch are not a transactional
+   snapshot. Shared reads do not hold the registry's local-map/writer mutex across
+   backend I/O, so one frontend can execute independent reads concurrently.
    Because ordinary ZooKeeper reads may come from a lagging follower,
-   `query_owner()` first completes a leader-ordered shared-state write barrier, then
+   that final `query_owner()` first completes a leader-ordered shared-state write
+   barrier, then
    lists the lock children, reads the minimum-sequence owner's payload, and lists
-   again to reject a concurrent handoff.
+   again to reject a concurrent handoff. The public rDSN `meta_state_service`
+   interface exposes no native ZooKeeper `sync()`, so the same-session write is the
+   one remaining barrier per registry read rather than two.
    If a timed-out acquisition or failed promotion cannot prove that its ZooKeeper
    node was released, the process fail-stops so the app-shared session cannot
-   strand a ghost registry owner.
+   strand a ghost registry owner. The current rDSN provider also maps transient
+   disconnect and true session expiry to the same loss callback; consequently an
+   active registry process fail-stops on either event. Supervisors must restart it,
+   and operators should treat ZooKeeper stability as an availability dependency.
 
 The persisted record has an explicit magic/schema, descriptor, heartbeat time,
 lease flag, tombstone, and writer fence. Agent ids (including URI-bearing runtime
@@ -1630,11 +1652,16 @@ are `meta_state_service`, `distributed_lock_service`, and the RPC group address;
 the ZooKeeper provider supplies cross-process session/lease failure detection.
 
 Focused unit source covers persisted-record round trip/corruption including fence
-zero, bounded frontend-list parsing/deduplication, and absent-unregister semantics. The
-remaining evidence gap is an automated Linux scenario that launches multiple
-registry-only frontend processes against ZooKeeper, proves shared reads and
-standby mutation forwarding, kills the writer, and observes a committed
-greater-epoch takeover. Old per-agent and marker children grow with leadership
-epochs (not heartbeats). The exact-epoch pre/post validation makes safe pruning
-possible, but bounded retention and retry behavior still need implementation and
-multi-process validation before old epochs are deleted online.
+zero, bounded frontend-list parsing/deduplication, absent-unregister semantics,
+HA pool preconditions, tombstone-free promotion, and bounded epoch pruning. The
+active writer retains `history_retained_epochs` (minimum 2, default 3), deletes
+each old epoch's per-agent children before its marker, leaves shared agent parent
+paths intact to avoid racing a successor, and retries every
+`history_prune_interval_ms` (0 means promotion-only). Cleanup is best effort:
+failure never revokes a valid writer or blocks service, and all deletes are
+idempotent and restricted to epochs older than its fence.
+
+The remaining evidence gap is an automated Linux scenario that launches multiple
+registry-only frontend processes against ZooKeeper, proves concurrent shared
+reads and standby mutation forwarding, kills the writer, observes a committed
+greater-epoch takeover, and validates online retention against the real provider.

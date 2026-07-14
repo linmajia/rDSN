@@ -140,11 +140,14 @@ rDSN design:
   `meta_state_service`. Every frontend serves shared reads; one frontend owns a
   preserved `distributed_lock_service` resource and performs mutations/expiry.
 - HA records are schema-versioned and isolated below lock-grant epochs. A new
-  writer copies the complete prior snapshot, reconciles static descriptors, and
-  only then publishes its committed epoch marker. Readers use that one exact epoch
-  and validate its owner/fence against the authoritative ZooKeeper lock tree before
-  and after the read, so an expired/delayed leader cannot expose stale or newly
-  introduced records.
+  writer copies the live prior snapshot (tombstones become absence), reconciles
+  static descriptors, and only then publishes its committed epoch marker. Readers
+  use that one exact epoch and validate its owner/fence against the authoritative
+  ZooKeeper lock tree after the read; this final validation proves the epoch
+  remained authoritative through the read, so an expired/delayed leader cannot
+  expose stale or newly introduced records. Individual records can still change
+  concurrently within the current epoch. The active writer retains a bounded
+  committed-epoch window and deletes old per-agent children before their markers.
 - `[rasn.service] registry_addresses` creates one rDSN group used by all registry
   call families. Bounded client retries use rDSN transport-failure leader rotation
   and explicitly rotate after a standby returns `registry_not_primary`. Query/list

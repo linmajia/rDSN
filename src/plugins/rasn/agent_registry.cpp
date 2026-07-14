@@ -123,6 +123,27 @@ uint64_t registry_leader_retry_ms()
             "rasn.registry", "leader_retry_interval_ms", 1000, "HA registry standby election retry interval"));
 }
 
+size_t registry_retained_epochs()
+{
+    const uint64_t configured = ::dsn_config_get_value_uint64(
+        "rasn.registry",
+        "history_retained_epochs",
+        3,
+        "Committed HA registry epochs retained after fenced pruning");
+    return static_cast<size_t>((std::min)(
+        configured,
+        static_cast<uint64_t>((std::numeric_limits<size_t>::max)())));
+}
+
+uint64_t registry_history_prune_interval_ms()
+{
+    return ::dsn_config_get_value_uint64(
+        "rasn.registry",
+        "history_prune_interval_ms",
+        60000,
+        "HA registry history-pruning retry interval; 0 prunes only after promotion");
+}
+
 uint32_t registry_client_max_attempts()
 {
     const uint64_t configured = ::dsn_config_get_value_uint64(
@@ -550,8 +571,58 @@ bool decode_registry_state_record(const std::string &encoded,
     }
 }
 
+bool validate_rasn_registry_ha_pools(const std::string &pools,
+                                     bool dlock_partitioned,
+                                     std::string *error)
+{
+    const std::vector<std::string> configured = split_config_csv(pools);
+    const std::set<std::string> available(configured.begin(), configured.end());
+    std::vector<std::string> missing;
+    if (available.find("THREAD_POOL_META_SERVER") == available.end())
+    {
+        missing.push_back("THREAD_POOL_META_SERVER");
+    }
+    if (available.find("THREAD_POOL_DLOCK") == available.end())
+    {
+        missing.push_back("THREAD_POOL_DLOCK");
+    }
+    if (!missing.empty())
+    {
+        if (error != nullptr)
+        {
+            std::ostringstream message;
+            message << "HA registry app pools are missing ";
+            for (size_t i = 0; i < missing.size(); ++i)
+            {
+                if (i != 0)
+                {
+                    message << ",";
+                }
+                message << missing[i];
+            }
+            message << "; configure pools=THREAD_POOL_DEFAULT,"
+                       "THREAD_POOL_META_SERVER,THREAD_POOL_DLOCK";
+            *error = message.str();
+        }
+        return false;
+    }
+    if (!dlock_partitioned)
+    {
+        if (error != nullptr)
+        {
+            *error = "HA registry requires "
+                     "[threadpool.THREAD_POOL_DLOCK] partitioned=true";
+        }
+        return false;
+    }
+    return true;
+}
+
 agent_registry::agent_registry()
-    : _writer_active(false), _writer_promoting(false), _writer_fence(0)
+    : _shared_backend_configured(false),
+      _writer_active(false),
+      _writer_promoting(false),
+      _writer_fence(0)
 {
 }
 
@@ -585,6 +656,14 @@ bool agent_registry::configure_shared_backend(
     }
 
     ::dsn::service::zauto_lock guard(_lock);
+    if (_shared_backend_configured.load(std::memory_order_relaxed))
+    {
+        if (error != nullptr)
+        {
+            *error = "HA registry shared backend is already configured";
+        }
+        return false;
+    }
     _coordination = coordination;
     _shared_state_prefix = normalized;
     _shared_agents_prefix = normalized + "/agents";
@@ -596,6 +675,7 @@ bool agent_registry::configure_shared_backend(
     _writer_promoting = false;
     _writer_fence = 0;
     _agents.clear();
+    _shared_backend_configured.store(true, std::memory_order_release);
     return true;
 }
 
@@ -667,14 +747,21 @@ bool agent_registry::activate_shared_writer(
 
 bool agent_registry::shared_backend_enabled() const
 {
-    ::dsn::service::zauto_lock guard(_lock);
-    return _coordination != nullptr;
+    return _shared_backend_configured.load(std::memory_order_acquire);
 }
 
 bool agent_registry::shared_writer_active() const
 {
     ::dsn::service::zauto_lock guard(_lock);
     return _writer_active;
+}
+
+bool agent_registry::prune_shared_history(size_t retained_epochs,
+                                          size_t *pruned_epochs,
+                                          std::string *error)
+{
+    ::dsn::service::zauto_lock guard(_lock);
+    return prune_shared_history_locked(retained_epochs, pruned_epochs, error);
 }
 
 uint64_t agent_registry::shared_writer_fence() const
@@ -850,46 +937,54 @@ bool agent_registry::list_agents(bool healthy_only,
         return false;
     }
 
-    ::dsn::service::zauto_lock guard(_lock);
     agents->clear();
-    const uint64_t now_ms = ::dsn_now_ms();
-    const uint64_t lease_ms = registry_lease_ms();
-    if (_coordination != nullptr)
+    if (!_shared_backend_configured.load(std::memory_order_acquire))
     {
-        std::vector<registry_state_record> records;
-        if (!read_all_shared_records(&records, error))
+        ::dsn::service::zauto_lock guard(_lock);
+        if (!_shared_backend_configured.load(std::memory_order_relaxed))
         {
-            return false;
-        }
-        agents->reserve(records.size());
-        for (const registry_state_record &record : records)
-        {
-            if (record.tombstone)
+            const uint64_t now_ms = ::dsn_now_ms();
+            const uint64_t lease_ms = registry_lease_ms();
+            agents->reserve(_agents.size());
+            for (const std::map<std::string, registry_entry>::value_type &entry :
+                 _agents)
             {
-                continue;
+                if (healthy_only &&
+                    (!is_healthy_descriptor(entry.second.descriptor) ||
+                     !is_live_entry(entry.second, now_ms, lease_ms)))
+                {
+                    continue;
+                }
+                agents->push_back(entry.second.descriptor);
             }
-            // The elected writer is the sole HA lease-clock authority and turns
-            // expired records into tombstones. Comparing its persisted timestamp
-            // with a standby's local clock would make reads depend on node skew.
-            if (healthy_only && !is_healthy_descriptor(record.descriptor))
-            {
-                continue;
-            }
-            agents->push_back(record.descriptor);
+            return true;
         }
-        return true;
     }
 
-    agents->reserve(_agents.size());
-    for (const std::map<std::string, registry_entry>::value_type &entry : _agents)
+    // Shared-backend configuration is published before handlers open and never
+    // replaced. Do not hold the local-map/writer mutex across synchronous
+    // ZooKeeper I/O: immutable epoch records plus final owner validation let
+    // independent reads execute concurrently on one frontend.
+    std::vector<registry_state_record> records;
+    if (!read_all_shared_records(&records, error))
     {
-        if (healthy_only &&
-            (!is_healthy_descriptor(entry.second.descriptor) ||
-             !is_live_entry(entry.second, now_ms, lease_ms)))
+        return false;
+    }
+    agents->reserve(records.size());
+    for (const registry_state_record &record : records)
+    {
+        if (record.tombstone)
         {
             continue;
         }
-        agents->push_back(entry.second.descriptor);
+        // The elected writer is the sole HA lease-clock authority and turns
+        // expired records into tombstones. Comparing its persisted timestamp
+        // with a standby's local clock would make reads depend on node skew.
+        if (healthy_only && !is_healthy_descriptor(record.descriptor))
+        {
+            continue;
+        }
+        agents->push_back(record.descriptor);
     }
     return true;
 }
@@ -948,34 +1043,38 @@ bool agent_registry::find_agent(const std::string &agent_id,
                                 agent_descriptor *descriptor,
                                 std::string *error) const
 {
-    ::dsn::service::zauto_lock guard(_lock);
-    if (_coordination != nullptr)
+    if (!_shared_backend_configured.load(std::memory_order_acquire))
     {
-        registry_state_record record;
-        bool found = false;
-        if (!read_shared_record(agent_id, &record, &found, error))
+        ::dsn::service::zauto_lock guard(_lock);
+        if (!_shared_backend_configured.load(std::memory_order_relaxed))
         {
-            return false;
+            const std::map<std::string, registry_entry>::const_iterator it =
+                _agents.find(agent_id);
+            if (it == _agents.end())
+            {
+                return false;
+            }
+            if (descriptor != nullptr)
+            {
+                *descriptor = it->second.descriptor;
+            }
+            return true;
         }
-        if (!found || record.tombstone)
-        {
-            return false;
-        }
-        if (descriptor != nullptr)
-        {
-            *descriptor = record.descriptor;
-        }
-        return true;
     }
 
-    const std::map<std::string, registry_entry>::const_iterator it = _agents.find(agent_id);
-    if (it == _agents.end())
+    registry_state_record record;
+    bool found = false;
+    if (!read_shared_record(agent_id, &record, &found, error))
+    {
+        return false;
+    }
+    if (!found || record.tombstone)
     {
         return false;
     }
     if (descriptor != nullptr)
     {
-        *descriptor = it->second.descriptor;
+        *descriptor = record.descriptor;
     }
     return true;
 }
@@ -1207,16 +1306,22 @@ bool agent_registry::replace_static_agents_locked(
         return false;
     }
 
-    // Promote every current record into the new leader epoch before exposing
+    // Promote every live current record into the new leader epoch before exposing
     // mutations. Without this barrier, a delayed old leader could still overwrite
     // its own lower-fence child for an agent the successor had not touched yet.
+    // Tombstones encode absence only inside their source epoch; omitting them from
+    // the successor snapshot reclaims them without permitting resurrection.
     // Lease timestamps are process-clock values, so grant every live dynamic
     // registration a fresh lease in the new writer's clock domain.
     const uint64_t promotion_now_ms = ::dsn_now_ms();
     for (registry_state_record &record : current)
     {
+        if (record.tombstone)
+        {
+            continue;
+        }
         record.writer_fence = _writer_fence;
-        if (!record.tombstone && record.lease_tracked)
+        if (record.lease_tracked)
         {
             record.last_heartbeat_ms = promotion_now_ms;
         }
@@ -1490,7 +1595,7 @@ bool agent_registry::read_all_shared_records(
                committed_fence, committed_owner, error);
 }
 
-bool agent_registry::read_committed_epoch(bool require_current_owner,
+bool agent_registry::read_committed_epoch(bool require_committed_epoch,
                                           uint64_t *fencing_token,
                                           std::string *writer_owner,
                                           bool *found,
@@ -1513,12 +1618,12 @@ bool agent_registry::read_committed_epoch(bool require_current_owner,
         _coordination->service()->list_state(_shared_epochs_prefix, epochs);
     if (error_is_not_found(listed))
     {
-        if (require_current_owner && error != nullptr)
+        if (require_committed_epoch && error != nullptr)
         {
             *error = std::string(k_registry_backend_unavailable) +
                      ": shared registry has no committed leadership epoch";
         }
-        return !require_current_owner;
+        return !require_committed_epoch;
     }
     if (listed != ::dsn::ERR_OK)
     {
@@ -1548,12 +1653,12 @@ bool agent_registry::read_committed_epoch(bool require_current_owner,
     }
     if (!parsed_any)
     {
-        if (require_current_owner && error != nullptr)
+        if (require_committed_epoch && error != nullptr)
         {
             *error = std::string(k_registry_backend_unavailable) +
                      ": shared registry epoch directory is empty";
         }
-        return !require_current_owner;
+        return !require_committed_epoch;
     }
 
     std::string encoded;
@@ -1574,13 +1679,6 @@ bool agent_registry::read_committed_epoch(bool require_current_owner,
             *error = std::string(k_registry_backend_unavailable) +
                      ": corrupt shared registry epoch: " + decode_error;
         }
-        return false;
-    }
-
-    if (require_current_owner &&
-        !verify_committed_epoch_owner(
-            committed_fence, epoch.writer_owner, error))
-    {
         return false;
     }
 
@@ -1643,6 +1741,129 @@ bool agent_registry::commit_shared_epoch(std::string *error)
     {
         set_backend_error("committing shared registry epoch", put, error);
         return false;
+    }
+    return verify_shared_writer(error);
+}
+
+bool agent_registry::prune_shared_history_locked(size_t retained_epochs,
+                                                 size_t *pruned_epochs,
+                                                 std::string *error)
+{
+    if (pruned_epochs == nullptr || retained_epochs < 2)
+    {
+        if (error != nullptr)
+        {
+            *error = "registry history pruning requires an output and at least "
+                     "two retained epochs";
+        }
+        return false;
+    }
+    *pruned_epochs = 0;
+    if (!_writer_active)
+    {
+        if (error != nullptr)
+        {
+            *error = std::string(k_registry_not_primary) +
+                     ": only the active registry writer may prune history";
+        }
+        return false;
+    }
+    if (!verify_shared_writer(error))
+    {
+        return false;
+    }
+
+    std::vector<std::string> epoch_children;
+    const ::dsn::error_code listed =
+        _coordination->service()->list_state(_shared_epochs_prefix, epoch_children);
+    if (error_is_not_found(listed))
+    {
+        return true;
+    }
+    if (listed != ::dsn::ERR_OK)
+    {
+        set_backend_error("listing registry epochs for pruning", listed, error);
+        return false;
+    }
+
+    std::vector<uint64_t> epochs;
+    epochs.reserve(epoch_children.size());
+    for (const std::string &child : epoch_children)
+    {
+        uint64_t epoch = 0;
+        if (!parse_fence(child, &epoch))
+        {
+            if (error != nullptr)
+            {
+                *error = std::string(k_registry_backend_unavailable) +
+                         ": invalid registry epoch during pruning: " + child;
+            }
+            return false;
+        }
+        if (child != std::to_string(epoch))
+        {
+            if (error != nullptr)
+            {
+                *error = std::string(k_registry_backend_unavailable) +
+                         ": non-canonical registry epoch during pruning: " + child;
+            }
+            return false;
+        }
+        epochs.push_back(epoch);
+    }
+    std::sort(epochs.begin(), epochs.end());
+    if (epochs.size() <= retained_epochs)
+    {
+        return true;
+    }
+
+    const size_t prune_count = epochs.size() - retained_epochs;
+    std::vector<std::string> agent_keys;
+    const ::dsn::error_code agents_listed =
+        _coordination->service()->list_state(_shared_agents_prefix, agent_keys);
+    if (agents_listed != ::dsn::ERR_OK && !error_is_not_found(agents_listed))
+    {
+        set_backend_error("listing registry agents for pruning", agents_listed, error);
+        return false;
+    }
+
+    for (size_t i = 0; i < prune_count; ++i)
+    {
+        const uint64_t epoch = epochs[i];
+        if (epoch >= _writer_fence)
+        {
+            if (error != nullptr)
+            {
+                *error = std::string(k_registry_not_primary) +
+                         ": refusing to prune the current or a newer registry epoch";
+            }
+            return false;
+        }
+        for (const std::string &agent_key : agent_keys)
+        {
+            const ::dsn::error_code removed =
+                _coordination->service()->delete_state(
+                    _shared_agents_prefix + "/" + agent_key + "/" +
+                    std::to_string(epoch));
+            if (removed != ::dsn::ERR_OK)
+            {
+                set_backend_error("pruning registry agent history", removed, error);
+                return false;
+            }
+        }
+
+        // Delete the commit marker last. A reader that already selected this old
+        // epoch may fail closed while cleanup races it, but no incomplete epoch
+        // can become discoverable.
+        const ::dsn::error_code marker_removed =
+            _coordination->service()->delete_state(
+                _shared_epochs_prefix + "/" + std::to_string(epoch));
+        if (marker_removed != ::dsn::ERR_OK)
+        {
+            set_backend_error("pruning registry epoch marker", marker_removed, error);
+            return false;
+        }
+        ++(*pruned_epochs);
     }
     return verify_shared_writer(error);
 }
@@ -2185,7 +2406,8 @@ rasn_registry_app::rasn_registry_app(::dsn_gpid gpid)
       _leader_active(false),
       _shared_enabled(false),
       _last_sweep_ms(0),
-      _lease_sweep_not_before_ms(0)
+      _lease_sweep_not_before_ms(0),
+      _last_history_prune_ms(0)
 {
 }
 
@@ -2200,6 +2422,47 @@ rasn_registry_app::rasn_registry_app(::dsn_gpid gpid)
             derror("cannot start HA rASN registry with leases enabled and "
                    "sweep_interval_ms=0: only the elected writer may evaluate "
                    "cross-process lease timestamps");
+            return ::dsn::ERR_INVALID_PARAMETERS;
+        }
+        if (registry_retained_epochs() < 2)
+        {
+            derror("cannot start HA rASN registry with history_retained_epochs < 2");
+            return ::dsn::ERR_INVALID_PARAMETERS;
+        }
+        dsn_app_info app_info;
+        if (!::dsn_get_current_app_info(&app_info))
+        {
+            derror("cannot start HA rASN registry: current app identity is unavailable");
+            return ::dsn::ERR_INVALID_STATE;
+        }
+        const std::string app_section = std::string("apps.") + app_info.role;
+        const std::string default_pools = ::dsn_config_get_value_string(
+            "apps..default", "pools", "", "rDSN default app thread pools");
+        std::string pools = ::dsn_config_get_value_string(
+            app_section.c_str(),
+            "pools",
+            default_pools.c_str(),
+            "rDSN app thread pools");
+        if (split_config_csv(pools).empty())
+        {
+            // Match rDSN's app-spec parser: an omitted or empty role-level list
+            // inherits [apps..default] rather than meaning no pools.
+            pools = default_pools;
+        }
+        const bool default_partitioned = ::dsn_config_get_value_bool(
+            "threadpool..default",
+            "partitioned",
+            false,
+            "rDSN default thread-pool partitioning");
+        const bool dlock_partitioned = ::dsn_config_get_value_bool(
+            "threadpool.THREAD_POOL_DLOCK",
+            "partitioned",
+            default_partitioned,
+            "ZooKeeper distributed-lock pool must be partitioned");
+        if (!validate_rasn_registry_ha_pools(
+                pools, dlock_partitioned, &error))
+        {
+            derror("cannot start HA rASN registry: %s", error.c_str());
             return ::dsn::ERR_INVALID_PARAMETERS;
         }
         if (!configure_ha_registry(&error))
@@ -2237,6 +2500,7 @@ rasn_registry_app::rasn_registry_app(::dsn_gpid gpid)
             _leader_fence = 0;
         }
         _lease_sweep_not_before_ms = 0;
+        _last_history_prune_ms = 0;
         return ::dsn::ERR_INVALID_STATE;
     }
     return ::dsn::ERR_OK;
@@ -2261,6 +2525,7 @@ rasn_registry_app::rasn_registry_app(::dsn_gpid gpid)
         _leader_fence = 0;
         _leadership_lost.reset();
         _lease_sweep_not_before_ms = 0;
+        _last_history_prune_ms = 0;
     }
     return release;
 }
@@ -2361,6 +2626,8 @@ bool rasn_registry_app::configure_ha_registry(std::string *error)
         lease_ms > (std::numeric_limits<uint64_t>::max)() - _last_sweep_ms
             ? (std::numeric_limits<uint64_t>::max)()
             : _last_sweep_ms + lease_ms;
+    _last_history_prune_ms = _last_sweep_ms;
+    prune_history();
     dinfo("rASN registry frontend became active writer owner=%s fence=%llu",
           _leader_owner.c_str(),
           static_cast<unsigned long long>(_leader_fence));
@@ -2381,6 +2648,7 @@ void rasn_registry_app::lose_leadership()
     _leader_fence = 0;
     _leadership_lost.reset();
     _lease_sweep_not_before_ms = 0;
+    _last_history_prune_ms = 0;
 }
 
 bool rasn_registry_app::start_maintenance_timer()
@@ -2452,6 +2720,14 @@ void rasn_registry_app::maintain_registry()
 
     const uint64_t sweep_ms = registry_lease_sweep_ms();
     const uint64_t now_ms = ::dsn_now_ms();
+    const uint64_t prune_ms = registry_history_prune_interval_ms();
+    if (_shared_enabled && prune_ms != 0 &&
+        (_last_history_prune_ms == 0 || now_ms <= _last_history_prune_ms ||
+         now_ms - _last_history_prune_ms >= prune_ms))
+    {
+        _last_history_prune_ms = now_ms;
+        prune_history();
+    }
     if (_lease_sweep_not_before_ms != 0 &&
         now_ms < _lease_sweep_not_before_ms)
     {
@@ -2464,6 +2740,23 @@ void rasn_registry_app::maintain_registry()
     {
         _last_sweep_ms = now_ms;
         sweep_leases();
+    }
+}
+
+void rasn_registry_app::prune_history()
+{
+    size_t pruned = 0;
+    std::string error;
+    if (!_registry.prune_shared_history(
+            registry_retained_epochs(), &pruned, &error))
+    {
+        dwarn("failed to prune HA rASN registry history: %s", error.c_str());
+        return;
+    }
+    if (pruned != 0)
+    {
+        dinfo("pruned %llu old HA rASN registry epochs",
+              static_cast<unsigned long long>(pruned));
     }
 }
 

@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -63,6 +64,9 @@ public:
     bool shared_backend_enabled() const;
     bool shared_writer_active() const;
     uint64_t shared_writer_fence() const;
+    bool prune_shared_history(size_t retained_epochs,
+                              size_t *pruned_epochs,
+                              std::string *error);
 
     bool register_agent(const agent_descriptor &descriptor, std::string *error);
     bool register_agent(const agent_descriptor &descriptor, std::string *error, bool lease_tracked);
@@ -115,7 +119,7 @@ private:
     bool read_all_shared_records(bool require_current_owner,
                                  std::vector<registry_state_record> *records,
                                  std::string *error) const;
-    bool read_committed_epoch(bool require_current_owner,
+    bool read_committed_epoch(bool require_committed_epoch,
                               uint64_t *fencing_token,
                               std::string *writer_owner,
                               bool *found,
@@ -127,6 +131,9 @@ private:
         const std::map<std::string, agent_descriptor> &desired,
         std::string *error);
     bool commit_shared_epoch(std::string *error);
+    bool prune_shared_history_locked(size_t retained_epochs,
+                                     size_t *pruned_epochs,
+                                     std::string *error);
     bool write_shared_record(const registry_state_record &record, std::string *error);
     bool verify_shared_writer(std::string *error) const;
     bool is_live_entry(const registry_entry &entry, uint64_t now_ms, uint64_t lease_ms) const;
@@ -137,6 +144,7 @@ private:
 
     mutable ::dsn::service::zlock _lock;
     std::map<std::string, registry_entry> _agents;
+    std::atomic<bool> _shared_backend_configured;
     std::shared_ptr<rasn_coordination_context> _coordination;
     std::string _shared_state_prefix;
     std::string _shared_agents_prefix;
@@ -229,6 +237,9 @@ std::vector<agent_descriptor> configured_static_agents();
 bool parse_rasn_registry_addresses(const std::string &value,
                                    std::vector< ::dsn::rpc_address> *addresses,
                                    std::string *error);
+bool validate_rasn_registry_ha_pools(const std::string &pools,
+                                     bool dlock_partitioned,
+                                     std::string *error);
 ::dsn::rpc_address configured_rasn_registry_address();
 bool registry_response_is_agent_not_found(const agent_response &response);
 
@@ -303,6 +314,7 @@ private:
     bool start_maintenance_timer();
     void cancel_maintenance_timer();
     void maintain_registry();
+    void prune_history();
     void sweep_leases();
 
     agent_registry _registry;
@@ -316,6 +328,7 @@ private:
     bool _shared_enabled;
     uint64_t _last_sweep_ms;
     uint64_t _lease_sweep_not_before_ms;
+    uint64_t _last_history_prune_ms;
     ::dsn::task_ptr _maintenance_timer;
 };
 
