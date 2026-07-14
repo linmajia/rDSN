@@ -2,7 +2,9 @@
 
 #include <rasn/agent_clients.h>
 #include <rasn/agent_registry.h>
+#include <rasn/coordination_breaker.h>
 #include <rasn/coordinator_service.h>
+#include <rasn/llm_provider.h>
 #include <rasn/metrics.h>
 #include <rasn/policy_manager.h>
 #include <rasn/redaction.h>
@@ -31,6 +33,32 @@ namespace rasn {
 namespace {
 
 bool g_rdsn_rpc_enabled = false;
+
+uint64_t agent_breaker_probe_lease_hint(uint32_t timeout_ms, uint32_t retry_budget)
+{
+    rpc_resilience_options options;
+    options.max_attempts =
+        retry_budget == (std::numeric_limits<uint32_t>::max)() ? retry_budget : retry_budget + 1;
+    options.backoff_ms = 0;
+    const uint64_t effective_timeout = timeout_ms == 0 ? 20000 : timeout_ms;
+    return rpc_breaker_probe_lease_hint(
+        options, std::chrono::milliseconds(effective_timeout));
+}
+
+uint64_t model_breaker_probe_lease_hint(uint32_t timeout_ms, uint32_t retry_budget)
+{
+    rpc_resilience_options options;
+    options.max_attempts =
+        retry_budget == (std::numeric_limits<uint32_t>::max)() ? retry_budget : retry_budget + 1;
+    options.backoff_ms = 0;
+    const uint64_t effective_timeout = effective_llm_request_timeout_ms(timeout_ms);
+    const uint64_t chrono_max =
+        static_cast<uint64_t>((std::numeric_limits<int64_t>::max)());
+    return rpc_breaker_probe_lease_hint(
+        options,
+        std::chrono::milliseconds(
+            static_cast<int64_t>((std::min)(effective_timeout, chrono_max))));
+}
 
 struct service_endpoint_config
 {
@@ -250,8 +278,19 @@ std::string format_model_breaker_states(const std::vector<circuit_breaker_regist
     for (size_t i = 0; i < states.size(); ++i)
     {
         const circuit_breaker_registry::entry &entry = states[i];
-        oss << "\n- provider=" << entry.key << " state=" << to_string(entry.state)
+        oss << "\n- provider=" << entry.key << " source="
+            << (entry.shared ? "coordination" : "local");
+        if (!entry.available)
+        {
+            oss << " unavailable=" << entry.error;
+            continue;
+        }
+        oss << " state=" << to_string(entry.state)
             << " consecutive_failures=" << entry.consecutive_failures;
+        if (entry.shared)
+        {
+            oss << " revision=" << entry.revision;
+        }
     }
     return oss.str();
 }
@@ -436,8 +475,19 @@ std::string format_remote_agent_breaker_states(const std::vector<circuit_breaker
     for (size_t i = 0; i < states.size(); ++i)
     {
         const circuit_breaker_registry::entry &entry = states[i];
-        oss << "\n- agent=" << entry.key << " state=" << to_string(entry.state)
+        oss << "\n- agent=" << entry.key << " source="
+            << (entry.shared ? "coordination" : "local");
+        if (!entry.available)
+        {
+            oss << " unavailable=" << entry.error;
+            continue;
+        }
+        oss << " state=" << to_string(entry.state)
             << " consecutive_failures=" << entry.consecutive_failures;
+        if (entry.shared)
+        {
+            oss << " revision=" << entry.revision;
+        }
     }
     return oss.str();
 }
@@ -934,8 +984,10 @@ model_gateway_response rasn_llm_agent_service::model_health() const
 
 void rasn_llm_agent_service::ensure_model_breaker_config()
 {
-    std::call_once(_model_breaker_config_once,
-                   [this] { _model_breakers.set_config(read_model_breaker_config()); });
+    std::call_once(_model_breaker_config_once, [this] {
+        _model_breakers.set_config(read_model_breaker_config());
+        configure_rasn_shared_breaker_registry(_model_breakers, "model_provider");
+    });
 }
 
 void rasn_llm_agent_service::ensure_model_admission_config()
@@ -977,8 +1029,8 @@ bool rasn_llm_agent_service::model_breaker_is_open(const std::string &provider,
                                                    llm_response *fast_fail)
 {
     ensure_model_breaker_config();
-    circuit_breaker &breaker = _model_breakers.get(provider);
-    if (!breaker.is_open(::dsn_now_ms()))
+    const breaker_status status = _model_breakers.inspect(provider, ::dsn_now_ms());
+    if (!status.open)
     {
         return false;
     }
@@ -989,57 +1041,76 @@ bool rasn_llm_agent_service::model_breaker_is_open(const std::string &provider,
     // admission slot or rate token. This precheck is non-mutating and leaves the
     // one-shot half-open probe intact for the authoritative model_breaker_admit()
     // once the cooldown elapses and the request has passed the other gates.
-    dwarn("rASN model circuit breaker open for provider=%s; short-circuiting request before admission",
-          provider.c_str());
+    dwarn("rASN model circuit breaker open for provider=%s; short-circuiting request before admission%s%s",
+          provider.c_str(),
+          status.error.empty() ? "" : ": ",
+          status.error.c_str());
     runtime.record_model_breaker_short_circuit(task, provider, to_string(breaker_state::open));
     if (fast_fail != nullptr)
     {
-        *fast_fail = rpc_error_response("model circuit breaker " + std::string(to_string(breaker_state::open)) +
-                                        " for provider " + provider + "; request short-circuited");
+        *fast_fail = rpc_error_response(
+            "model circuit breaker " + std::string(to_string(breaker_state::open)) +
+            " for provider " + provider + "; request short-circuited" +
+            (status.error.empty() ? "" : ": " + status.error));
     }
     return true;
 }
 
-bool rasn_llm_agent_service::model_breaker_admit(const std::string &provider,
-                                                 const agent_task &task,
-                                                 nucleus_runtime &runtime,
-                                                 llm_response *fast_fail)
+breaker_decision
+rasn_llm_agent_service::model_breaker_admit(const std::string &provider,
+                                            const agent_task &task,
+                                            nucleus_runtime &runtime,
+                                            uint64_t probe_lease_hint_ms,
+                                            llm_response *fast_fail)
 {
     ensure_model_breaker_config();
-    circuit_breaker &breaker = _model_breakers.get(provider);
-    const breaker_decision decision = breaker.allow(::dsn_now_ms());
+    const breaker_decision decision =
+        _model_breakers.allow(provider, ::dsn_now_ms(), probe_lease_hint_ms);
     if (decision.half_open_probe)
     {
         dinfo("rASN model circuit breaker half-open: admitting probe for provider=%s", provider.c_str());
     }
     if (decision.allowed)
     {
-        return true;
+        return decision;
     }
-    dwarn("rASN model circuit breaker %s for provider=%s; short-circuiting request",
+    dwarn("rASN model circuit breaker %s for provider=%s; short-circuiting request%s%s",
           to_string(decision.state),
-          provider.c_str());
+          provider.c_str(),
+          decision.error.empty() ? "" : ": ",
+          decision.error.c_str());
     runtime.record_model_breaker_short_circuit(task, provider, to_string(decision.state));
     if (fast_fail != nullptr)
     {
-        *fast_fail = rpc_error_response("model circuit breaker " + std::string(to_string(decision.state)) +
-                                        " for provider " + provider + "; request short-circuited");
+        *fast_fail = rpc_error_response(
+            "model circuit breaker " + std::string(to_string(decision.state)) +
+            " for provider " + provider + "; request short-circuited" +
+            (decision.error.empty() ? "" : ": " + decision.error));
     }
-    return false;
+    return decision;
 }
 
 void rasn_llm_agent_service::model_breaker_report(const std::string &provider,
                                                   const agent_task &task,
                                                   nucleus_runtime &runtime,
+                                                  const breaker_decision &admission,
                                                   bool ok)
 {
-    circuit_breaker &breaker = _model_breakers.get(provider);
-    if (breaker.report(ok, ::dsn_now_ms()))
+    const breaker_report reported =
+        _model_breakers.report(provider, admission, ok, ::dsn_now_ms());
+    if (!reported.available)
+    {
+        dwarn("rASN model circuit breaker report failed for provider=%s: %s",
+              provider.c_str(),
+              reported.error.c_str());
+        return;
+    }
+    if (reported.opened)
     {
         dwarn("rASN model circuit breaker opened for provider=%s after %u consecutive failures",
               provider.c_str(),
-              static_cast<unsigned int>(breaker.consecutive_failures()));
-        runtime.record_model_breaker_open(task, provider, breaker.consecutive_failures());
+              static_cast<unsigned int>(reported.consecutive_failures));
+        runtime.record_model_breaker_open(task, provider, reported.consecutive_failures);
     }
 }
 
@@ -1244,6 +1315,7 @@ llm_response rasn_llm_agent_service::complete(const agent_completion_request &re
     admission_slot admission;
     rate_decision rate;
     rate_decision cost;
+    breaker_decision breaker_admission;
     if (guarded)
     {
         llm_response fast_fail;
@@ -1273,7 +1345,13 @@ llm_response rasn_llm_agent_service::complete(const agent_completion_request &re
             model_rate_refund(provider_name);
             return fast_fail;
         }
-        if (!model_breaker_admit(provider_name, request.task, runtime, &fast_fail))
+        breaker_admission = model_breaker_admit(
+            provider_name,
+            request.task,
+            runtime,
+            model_breaker_probe_lease_hint(request.timeout_ms, request.retry_budget),
+            &fast_fail);
+        if (!breaker_admission.allowed)
         {
             // The breaker short-circuited this request after the rate token and the
             // cost charge were taken, so it will not reach the provider; refund both
@@ -1290,7 +1368,8 @@ llm_response rasn_llm_agent_service::complete(const agent_completion_request &re
     const llm_response response = redact_llm_response(_provider->complete(redact_llm_request(llm), runtime));
     if (guarded)
     {
-        model_breaker_report(provider_name, request.task, runtime, response.ok);
+        model_breaker_report(
+            provider_name, request.task, runtime, breaker_admission, response.ok);
     }
     const agent_response generic_response = make_agent_response_from_llm(generic_request, response);
     if (!validate_agent_response(generic_response, &validation_error))
@@ -1334,6 +1413,7 @@ llm_response rasn_llm_agent_service::complete_streaming(const agent_completion_r
     admission_slot admission;
     rate_decision rate;
     rate_decision cost;
+    breaker_decision breaker_admission;
     if (guarded)
     {
         llm_response fast_fail;
@@ -1362,7 +1442,13 @@ llm_response rasn_llm_agent_service::complete_streaming(const agent_completion_r
             model_rate_refund(provider_name);
             return fast_fail;
         }
-        if (!model_breaker_admit(provider_name, request.task, runtime, &fast_fail))
+        breaker_admission = model_breaker_admit(
+            provider_name,
+            request.task,
+            runtime,
+            model_breaker_probe_lease_hint(request.timeout_ms, request.retry_budget),
+            &fast_fail);
+        if (!breaker_admission.allowed)
         {
             // See complete(): refund both the rate token and the cost charge taken
             // above when the breaker short-circuits, so a fast-failed request does
@@ -1378,7 +1464,8 @@ llm_response rasn_llm_agent_service::complete_streaming(const agent_completion_r
         redact_llm_response(_provider->complete_streaming(redact_llm_request(llm), runtime, on_chunk));
     if (guarded)
     {
-        model_breaker_report(provider_name, request.task, runtime, response.ok);
+        model_breaker_report(
+            provider_name, request.task, runtime, breaker_admission, response.ok);
     }
     const agent_response generic_response = make_agent_response_from_llm(generic_request, response);
     if (!validate_agent_response(generic_response, &validation_error))
@@ -1733,8 +1820,10 @@ void rasn_coordinator_service::stop()
 
 void rasn_coordinator_service::ensure_remote_agent_breaker_config()
 {
-    std::call_once(_remote_agent_breaker_config_once,
-                   [this] { _remote_agent_breakers.set_config(read_remote_agent_breaker_config()); });
+    std::call_once(_remote_agent_breaker_config_once, [this] {
+        _remote_agent_breakers.set_config(read_remote_agent_breaker_config());
+        configure_rasn_shared_breaker_registry(_remote_agent_breakers, "remote_agent");
+    });
 }
 
 void rasn_coordinator_service::ensure_remote_agent_admission_config()
@@ -1756,13 +1845,15 @@ bool rasn_coordinator_service::remote_agent_breaker_is_open(const agent_descript
 {
     ensure_remote_agent_breaker_config();
     const std::string key = remote_agent_key(agent);
-    circuit_breaker &breaker = _remote_agent_breakers.get(key);
-    if (!breaker.is_open(::dsn_now_ms()))
+    const breaker_status status = _remote_agent_breakers.inspect(key, ::dsn_now_ms());
+    if (!status.open)
     {
         return false;
     }
-    dwarn("rASN remote-agent circuit breaker open for agent=%s; short-circuiting dispatch before admission",
-          key.c_str());
+    dwarn("rASN remote-agent circuit breaker open for agent=%s; short-circuiting dispatch before admission%s%s",
+          key.c_str(),
+          status.error.empty() ? "" : ": ",
+          status.error.c_str());
     runtime.record_remote_agent_breaker_short_circuit(request.task, key, to_string(breaker_state::open));
     if (fast_fail != nullptr)
     {
@@ -1770,33 +1861,40 @@ bool rasn_coordinator_service::remote_agent_breaker_is_open(const agent_descript
             request,
             "remote_agent",
             "remote_agent_breaker_open",
-            "remote-agent circuit breaker open for agent " + key + "; request short-circuited",
+            "remote-agent circuit breaker open for agent " + key +
+                "; request short-circuited" +
+                (status.error.empty() ? "" : ": " + status.error),
             false,
             descriptor().agent_id);
     }
     return true;
 }
 
-bool rasn_coordinator_service::remote_agent_breaker_admit(const agent_descriptor &agent,
-                                                         const agent_request &request,
-                                                         nucleus_runtime &runtime,
-                                                         agent_response *fast_fail)
+breaker_decision
+rasn_coordinator_service::remote_agent_breaker_admit(const agent_descriptor &agent,
+                                                     const agent_request &request,
+                                                     nucleus_runtime &runtime,
+                                                     agent_response *fast_fail)
 {
     ensure_remote_agent_breaker_config();
     const std::string key = remote_agent_key(agent);
-    circuit_breaker &breaker = _remote_agent_breakers.get(key);
-    const breaker_decision decision = breaker.allow(::dsn_now_ms());
+    const breaker_decision decision = _remote_agent_breakers.allow(
+        key,
+        ::dsn_now_ms(),
+        agent_breaker_probe_lease_hint(request.timeout_ms, request.retry_budget));
     if (decision.half_open_probe)
     {
         dinfo("rASN remote-agent circuit breaker half-open: admitting probe for agent=%s", key.c_str());
     }
     if (decision.allowed)
     {
-        return true;
+        return decision;
     }
-    dwarn("rASN remote-agent circuit breaker %s for agent=%s; short-circuiting dispatch",
+    dwarn("rASN remote-agent circuit breaker %s for agent=%s; short-circuiting dispatch%s%s",
           to_string(decision.state),
-          key.c_str());
+          key.c_str(),
+          decision.error.empty() ? "" : ": ",
+          decision.error.c_str());
     runtime.record_remote_agent_breaker_short_circuit(request.task, key, to_string(decision.state));
     if (fast_fail != nullptr)
     {
@@ -1805,26 +1903,37 @@ bool rasn_coordinator_service::remote_agent_breaker_admit(const agent_descriptor
             "remote_agent",
             "remote_agent_breaker_open",
             "remote-agent circuit breaker " + std::string(to_string(decision.state)) +
-                " for agent " + key + "; request short-circuited",
+                " for agent " + key + "; request short-circuited" +
+                (decision.error.empty() ? "" : ": " + decision.error),
             false,
             descriptor().agent_id);
     }
-    return false;
+    return decision;
 }
 
 void rasn_coordinator_service::remote_agent_breaker_report(const agent_descriptor &agent,
                                                           const agent_task &task,
                                                           nucleus_runtime &runtime,
+                                                          const breaker_decision &admission,
                                                           bool ok)
 {
     const std::string key = remote_agent_key(agent);
-    circuit_breaker &breaker = _remote_agent_breakers.get(key);
-    if (breaker.report(ok, ::dsn_now_ms()))
+    const breaker_report reported =
+        _remote_agent_breakers.report(key, admission, ok, ::dsn_now_ms());
+    if (!reported.available)
+    {
+        dwarn("rASN remote-agent circuit breaker report failed for agent=%s: %s",
+              key.c_str(),
+              reported.error.c_str());
+        return;
+    }
+    if (reported.opened)
     {
         dwarn("rASN remote-agent circuit breaker opened for agent=%s after %u consecutive retryable failures",
               key.c_str(),
-              static_cast<unsigned int>(breaker.consecutive_failures()));
-        runtime.record_remote_agent_breaker_open(task, key, breaker.consecutive_failures());
+              static_cast<unsigned int>(reported.consecutive_failures));
+        runtime.record_remote_agent_breaker_open(
+            task, key, reported.consecutive_failures);
     }
 }
 
@@ -1945,7 +2054,9 @@ agent_response rasn_coordinator_service::invoke_remote_agent(const agent_request
     {
         return fast_fail;
     }
-    if (!remote_agent_breaker_admit(agent, request, runtime, &fast_fail))
+    const breaker_decision breaker_admission =
+        remote_agent_breaker_admit(agent, request, runtime, &fast_fail);
+    if (!breaker_admission.allowed)
     {
         remote_agent_rate_refund(agent);
         return fast_fail;
@@ -1953,7 +2064,11 @@ agent_response rasn_coordinator_service::invoke_remote_agent(const agent_request
     apply_remote_agent_backpressure(agent, request.task, runtime, admission, rate);
 
     const agent_response response = coordinator_router::invoke_remote(request, agent, address, descriptor().agent_id);
-    remote_agent_breaker_report(agent, request.task, runtime, remote_agent_response_is_dependency_success(response));
+    remote_agent_breaker_report(agent,
+                                request.task,
+                                runtime,
+                                breaker_admission,
+                                remote_agent_response_is_dependency_success(response));
     return response;
 }
 

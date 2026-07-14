@@ -377,7 +377,10 @@ sequenceDiagram
   half-open probe is admitted, so one dead module endpoint cannot stall every
   request or amplify load. Health pings check every configured shard, consult
   `is_open`, and skip a probing round trip while open. Reuses the same
-  `circuit_breaker` engine as the model gateway and remote-agent dispatch.
+  `circuit_breaker` engine as the model gateway and remote-agent dispatch. With
+  `[rasn.coordination] shared_breaker_enabled = true`, the registry resolves a
+  coordination context for the current rDSN app and delegates to the fenced
+  cluster-global backend in §13.7.
 - **Idempotent retries.** A retry after a *lost reply* is dangerous: the server may
   have already applied the write. So `invoke_remote_module` stamps each logical
   call with a unique `request_id` that is **stable across its own retries**. For
@@ -415,10 +418,13 @@ by the shared `resilient_rpc_call` helper in `rpc_resilience.h`, which gives eve
 cross-node core dependency the *same* policy, reusing the shared `circuit_breaker`
 engine rather than introducing another bespoke mechanism:
 
-- **Per-endpoint circuit breaker.** A process-global `circuit_breaker_registry`
-  (`global_rasn_core_breakers()`) keyed by service + resolved endpoint. While an
-  endpoint is unhealthy, calls short-circuit with `ERR_BUSY` without touching the
-  dependency, exactly as the module path does.
+- **Per-endpoint circuit breaker.** A `circuit_breaker_registry`
+  (`global_rasn_core_breakers()`) keyed by service + resolved endpoint. It is
+  process-local by default. When `[rasn.coordination] shared_breaker_enabled =
+  true`, the same registry API delegates to the lock-serialized authoritative
+  backend described in §13.7, so every participating process observes one breaker
+  state. While an endpoint is unhealthy, calls short-circuit with `ERR_BUSY`
+  without touching the dependency, exactly as the module path does.
 - **Idempotency-aware retries.** Errors that prove the request never applied
   (`ERR_NETWORK_FAILURE`, `ERR_NETWORK_INIT_FAILED`, `ERR_BUSY`,
   `ERR_CAPACITY_EXCEEDED`, `ERR_TRY_AGAIN`) are retried for *any* operation. The
@@ -434,9 +440,11 @@ engine rather than introducing another bespoke mechanism:
   The in-process (non-distributed) path is unchanged: resilience wraps only the
   RPC-client branch, so single-process runs pay nothing.
 
-Like module dedup, this is per-service-process resilience; it suppresses transient
-transport failures and fast-fails dead endpoints, but it is not cross-process
-exactly-once and does not replace the replicated backends discussed in §8 and §13.
+With shared breakers disabled, this remains per-service-process resilience. With
+them enabled on the ZooKeeper coordination backend, breaker transitions and the
+single half-open probe are cluster-global. Retry idempotency and module dedup are
+separate contracts: this does not make mutations cross-process exactly-once and
+does not replace the replicated backends discussed in §8 and §13.
 
 ## 8. Consistency models
 
@@ -616,6 +624,7 @@ rasn_runtime_ownership_gate_enabled = true
 ; before failing closed, so a brief handover does not force a supervised restart.
 rasn_runtime_ownership_acquire_max_attempts = 5
 rasn_runtime_ownership_acquire_retry_backoff_ms = 1000
+rasn_runtime_request_drain_timeout_ms = 30000
 
 [rasn.coordination]
 ; inproc coordinates only within one process; use zookeeper for real cross-node
@@ -624,6 +633,7 @@ rasn_runtime_ownership_acquire_retry_backoff_ms = 1000
 provider = zookeeper
 lock_namespace = /rasn/locks
 acquire_timeout_ms = 5000
+operation_timeout_ms = 5000
 
 [zookeeper]
 hosts_list = zk-1:2181,zk-2:2181,zk-3:2181
@@ -709,9 +719,10 @@ codepilot.exe serve config.rasn.ini "rasn.state;resource_budget"
   backends. Ownership wiring is now landed: `rasn_runtime_app::start()` acquires
   ownership of each hosted module/shard before opening its RPC API when
   `rasn_runtime_ownership_gate_enabled = true` (default off; fail-closed on
-  contention). Remaining: move breaker/dedup/quota counters onto the shared store
-  (finding 1.5), and validate cross-process single-writer on a `simple`/`zookeeper`
-  backend under multi-node.
+  contention). Cluster-global breakers are also delivered with fenced state
+  versions. Remaining: move admission/rate/cost/overload/dedup authorities onto
+  safe leased or transactional primitives, and validate cross-process ownership
+  and breaker propagation on ZooKeeper under multi-node.
 - Multi-process integration tests for the distributed/hybrid RPC paths.
 - Generated typed RPC schemas per module (replace the generic envelope payload).
 - State-mirror compaction/watermarks promotion is partially complete: watermarks
@@ -778,11 +789,11 @@ bespoke mechanism, the audit names the rDSN facility that should back it.
 
 | # | Sev | Finding | Status |
 | --- | --- | --- | --- |
-| 1.1 | P0 | **Stateful modules are single-writer in-memory, not quorum-replicated.** The 11 runtime modules and the state service realize `replicated`/`sharded` intent (§8) as single-writer singletons mirrored to `rasn.state`; running >1 active writer per shard is split-brain, not HA. | **MITIGATED (code)** — the coordination module (§13.7) reuses rDSN `distributed_lock_service`, and `rasn_runtime_app::start()` now **acquires ownership of each hosted module/shard before opening its RPC API** (`rasn_runtime_ownership_gate_enabled`, default off, fail-closed on contention), enforcing exactly one active owner per shard. Quorum **replication** of the state itself still DOCUMENTED → §13.5 (`replicated_service_app_type_1`); cross-process enforcement needs `simple`/`zookeeper` + multi-node validation |
+| 1.1 | P0 | **Stateful modules are single-writer in-memory, not quorum-replicated.** The 11 runtime modules and the state service realize `replicated`/`sharded` intent (§8) as single-writer singletons mirrored to `rasn.state`; running >1 active writer per shard is split-brain, not HA. | **MITIGATED (code)** — the coordination module (§13.7) reuses rDSN `distributed_lock_service`, and `rasn_runtime_app::start()` now **acquires ownership of each hosted module/shard before opening its RPC API** (`rasn_runtime_ownership_gate_enabled`, default off, fail-closed on contention), enforcing exactly one active owner per shard. Lease loss, an ambiguous release, or an undrained handler deadline fail-stops the runtime. Quorum **replication** of the state itself still DOCUMENTED → §13.5 (`replicated_service_app_type_1`); cross-process enforcement requires `zookeeper` + multi-node validation |
 | 1.2 | P0 | **Core services had no RPC resilience.** `rasn.state` / `rasn.workflow` / `rasn.observability` clients made one-shot RPCs — no breaker, no retry — while the module path was fully hardened. A single transient blip failed the call. | **RESOLVED (code)** — §7.1, `rpc_resilience.h`, wrapped in `agent_services.cpp` |
 | 1.3 | P0 | **Registry discovery is an in-memory SPOF on the request path.** Routing resolves live endpoints through a single `rasn.registry`; if that lookup blips the request fails, and the registry itself is not replicated. | **MITIGATED (code)** — the routing-critical discovery query in `coordinator_service.cpp` now goes through `resilient_rpc_call` (breaker + idempotent retry). Registry **HA** still DOCUMENTED → §13.5 (meta-server / ZooKeeper) |
 | 1.4 | P1 | **RPC envelopes carry no end-to-end trace id.** `agent_request`/`response` carry `trace_id`, but the runtime-module envelope (`make_module_request`) didn't propagate it, so a call couldn't be followed across nodes in logs. | **RESOLVED (code)** — §13.4; `trace_id` added to the runtime-module envelope (EOF-safe), stamped from an ambient scope on egress, restored/echoed on ingress |
-| 1.5 | P1 | **Resilience/quota/dedup state is per serving process.** Breaker, dedup, admission, and rate state live on whichever node serves the RPC; there is no shared view, so protection is per-replica, not cluster-global. | **MITIGATED (code)** — the coordination module (§13.7) reuses rDSN `meta_state_service` to provide a cluster-shared, authoritative state store (`put/get/list/delete_state`); wiring each breaker/dedup/quota counter onto it is the remaining per-module integration. |
+| 1.5 | P1 | **Resilience/quota/dedup state is per serving process.** Breaker, dedup, admission, and rate state live on whichever node serves the RPC; there is no shared view, so protection is per-replica, not cluster-global. | **PARTIALLY RESOLVED (code)** — all four circuit-breaker families can now use a fenced, versioned authoritative adapter over the coordination module (§13.7), including one leased half-open probe cluster-wide. Grant-version children prevent an expired holder from overwriting a newer owner; a post-release lock barrier plus authoritative-record recheck prevents that stale holder from exposing a probe transition during an interleaving handoff. Admission, rate/cost, overload, and dedup state remain process-local because they need leased capacity, transactions/CAS, or a replicated state machine. |
 | 1.6 | P2 | **Core service endpoints are bound at construction.** Some core clients resolve their peer once; combined with 1.3 this limits failover for non-discovery paths. | MITIGATED by 1.2/1.3 breaker keying; full dynamic rebind DOCUMENTED |
 
 ### 13.2 Lens 2 — Reinvention vs. reuse of rDSN
@@ -935,7 +946,9 @@ provider-agnostic interface with two concerns:
 
 - *Ownership / leader election* — `acquire_ownership(resource, owner_id[, timeout])`,
   `release_ownership`, `query_owner`. Exactly one caller holds a resource at a time;
-  re-acquire by the same owner is idempotent; a lease is handed off after release.
+  re-acquire by the same owner is idempotent; every grant exposes a fencing version,
+  and callers that need monotonic fencing can release without destroying the lock
+  object.
 - *Cluster-shared state* — `put_state` / `get_state` / `delete_state` / `list_state`
   over a hierarchical, znode-style key space rooted at a configured namespace.
 
@@ -957,13 +970,14 @@ provider-agnostic interface with two concerns:
 
 The `simple`/`zookeeper` backends come from the `rDSN.dist.service` ext plugin
 (`src/plugins_ext/`). The facade wraps their async, `error_code`-returning task API
-behind blocking helpers. Those helpers `wait()` for completion callbacks delivered on
+behind blocking helpers. Those helpers wait no longer than the configured
+`operation_timeout_ms` for completion callbacks delivered on
 **`THREAD_POOL_META_SERVER`** — the pool the reused rDSN dist providers themselves
 depend on: `distributed_lock_service_simple`/`_zookeeper` enqueue their own internal
 work there (notably the `LPC_DIST_LOCK_SVC_RANDOM_EXPIRE` lease timer), so any app
 running the `simple`/`zookeeper` backend must declare that pool regardless of where
 callbacks land. It is distinct from `THREAD_POOL_DEFAULT` / `THREAD_POOL_RASN_WORKFLOW`
-(which run rASN request handlers), so a caller blocked in `wait()` can never starve
+(which run rASN request handlers), so a blocked caller cannot starve
 the worker that runs its own callback.
 
 Because the shipped configs default to `provider = inproc`, they deliberately do
@@ -987,7 +1001,12 @@ abandoned lock; (b) `put_state` treats a lost `node_exist`→`create_node` race
 (`ERR_NODE_ALREADY_EXIST`) as last-writer-wins by falling back to `set_data`, so
 concurrent first-writers all succeed; (c) namespace/parent-znode creation tolerates
 only `ERR_NODE_ALREADY_EXIST` and surfaces every other error — `start()` aborts if the
-state namespace cannot be materialized rather than limping on against a missing root.
+state namespace cannot be materialized rather than limping on against a missing root;
+(d) cancellation, unlock, state I/O, and cleanup are all bounded, callbacks retain
+heap-owned result state, and a provider with an unresolved operation is quarantined
+rather than finalized under a late callback; (e) once unlock begins, the cached hold
+is unusable, so an ambiguous unlock can never be mistaken for an idempotent re-acquire.
+If a timed-out cancel later grants the lock, a completion-side cleanup releases it.
 
 **Build wiring (reuse, not reinvent).** `src/CMakeLists.txt` now configures
 `plugins_ext` before `plugins` so rASN can see the dist targets. The rASN library,
@@ -997,10 +1016,11 @@ state namespace cannot be materialized rather than limping on against a missing 
 A plain build without the ext plugin still compiles rASN with just the `inproc`
 fallback, so nothing regresses for lightweight checkouts.
 
-**Config.** `[rasn.coordination]` in the shared `config.rasn.ini`:
+**Config.** `[rasn.coordination]` in the shared defaults:
 `provider` (`inproc`|`simple`|`zookeeper`), `lock_namespace`, `state_namespace`,
-`acquire_timeout_ms`, and `state_work_dir` (durable-log directory for the `simple`
-backend; ignored by the others).
+`acquire_timeout_ms`, `operation_timeout_ms`, and `state_work_dir` (durable-log
+directory for the `simple` backend; ignored by the others), plus the shared-breaker
+controls below.
 
 **Tests.** `tests/rasn_coordination_test.cpp` asserts the ownership contract
 (acquire / idempotent re-acquire / mutual exclusion / hand-off / query) and the
@@ -1009,6 +1029,9 @@ delete) against the facade. The `inproc` path and config defaults always run; th
 `simple`-provider cases run under `RASN_HAS_DIST_COORDINATION` and exercise the real
 rDSN lock + meta-state providers, including a concurrent-`put_state` case that races
 eight writers on one fresh key and asserts they all succeed (last-writer-wins).
+Focused cases also cover preserved monotonic grant versions, post-release fence
+barriers, shared-breaker propagation, exclusive/recoverable probes, stale reports,
+lease caps, snapshots, and configuration mismatch.
 
 **Wired into the runtime (as-built).** Consuming the facility inside the module
 services is now landed for the ownership half: `rasn_runtime_app::start()` calls
@@ -1018,26 +1041,119 @@ services is now landed for the ownership half: `rasn_runtime_app::start()` calls
 service serves — resources named `rasn.runtime.<module>` for an unsharded module or
 `rasn.runtime.<module>.shard.<n>` per served shard (a host of the whole sharded module
 locks *every* shard resource, so it still contends with any shard-specific peer), owner
-id = the node's primary address — and **fails closed** (refuses to open the RPC API, releasing
-anything it took) if a resource is already owned. Ownership is acquired before
+id = the node's primary address plus a per-runtime session nonce — and **fails
+closed** (refuses to open the RPC API, releasing anything it took) if a resource is
+already owned. Ownership is acquired before
 hydration so a standby that waits for the active owner to release then hydrates the
 *latest* committed snapshot rather than a stale one (review finding 1); a contended
 acquire is retried up to `rasn_runtime_ownership_acquire_max_attempts` (default 1)
 before failing closed, and an always-on standby relies on a supervisor restart to
-retry past that (§10). `stop()` releases all held ownership. Independently of the
+retry past that (§10). Lease-loss callbacks use lifetime-safe shared state and
+fail-stop if ownership disappears while the service can accept requests. On normal
+stop, the server first rejects new RPCs and drains admitted handlers for at most
+`rasn_runtime_request_drain_timeout_ms`; it then releases ownership. A drain timeout
+or ambiguous unlock fail-stops the process, because rDSN shares the underlying
+ZooKeeper session by app name and finalizing this facade alone cannot prove that an
+ephemeral ghost owner disappeared. Independently of the
 gate, the RPC ingress path (`reply_module_request`) rejects any request routed to a
 shard the service does not host, so a misrouted request cannot mutate unowned state
 (review finding 2). The resource derivation and the ingress guard are unit-tested
 (`rasn_runtime_module_ownership_resources`, `rasn_runtime_service_hosts_request`).
 Default off, so single-node/local runs and the `inproc` backend are unaffected;
 turning §8's operator-discipline single-writer into an *enforced* one requires
-`provider = simple|zookeeper`.
+`provider = zookeeper` across independent processes (`simple` is only
+single-facade).
 
-**What remains.** (a) Move breaker/dedup/admission/rate counters onto the shared
-state store for cluster-global protection (finding 1.5 wiring). (b) Validate
-cross-process single-writer on a `simple`/`zookeeper` backend under multi-node (the
-`inproc` backend only coordinates within one process). Quorum **replication** of the
-state itself remains the §13.5 `replicated_service_app_type_1` item.
+**Cluster-global circuit breakers (finding 1.5, as-built).**
+`coordination_breaker.{h,cpp}` adapts the existing `circuit_breaker_registry`
+without creating another breaker state machine. It is wired into every outbound
+dependency family:
+
+- core-service clients (`core_rpc`, keyed by service + endpoint);
+- runtime-module clients (`runtime_module`, keyed by module + shard + endpoint);
+- model providers (`model_provider`);
+- remote-agent dispatch (`remote_agent`).
+
+The adapter stores `rasn-breaker-v1` records below
+`shared_breaker_state_prefix/v1/<hex-scope>/<hex-key>/<fencing-version>`. Its
+distributed lock ID is a bounded, slash-free hash rather than this hierarchical
+state path (ZooKeeper lock IDs reject `/`). Every mutation takes a process-local
+per-key mutex and then acquires the rDSN lock with its monotonic grant version and a
+per-context, per-transition owner nonce (equal owner values are unsafe across
+independent ZooKeeper lock nodes).
+The version becomes a fenced state child; readers always select the greatest
+version, while obsolete children beyond a short reader-safety tail are pruned
+best-effort. Therefore an old holder whose
+lease expires may write only a lower fenced child — it cannot overwrite or become
+newer than the successor's record even though `meta_state_service::put_state` has
+no CAS and is last-writer-wins. Lock release preserves the lock directory so grant
+versions remain monotonic.
+
+Fenced final-state ordering alone is not enough for half-open admission: a paused
+old holder could write and verify its lower child before the newer holder publishes
+its child. Probe claims therefore use a completion barrier. After persisting, the
+claim releases its uniquely-owned lock, checks the ZooKeeper lock directory for an
+already-active newer grant, and rereads the greatest fenced record. It returns an
+admission only when both checks still identify its exact fence/revision/probe token.
+An ambiguous release, queued/newer owner, or superseding record fails closed. This
+may conservatively delay recovery for one probe lease during a handoff, but it never
+turns an uncertain stale claim into an executable probe.
+
+Records carry that fence, a monotonic diagnostic revision, a closed-state
+generation, state/failure/open timestamps, active probe token/deadline, and the
+breaker/shared timing tunables. Coordination contexts are retained per current
+rDSN app identity because ZooKeeper callbacks are bound to the initializing app's
+thread pools; no provider instance is shared across app roles in one process.
+Unknown/malformed records, coordination errors, lock timeouts, stale fences, and
+config mismatches fail closed and surface in logs/snapshots rather than silently
+falling back to a process-local breaker.
+
+The admission returned by `allow()` carries both a probe token and the current
+closed-state generation through `report()`. Only the current token may resolve
+`half_open`; after recovery, an ordinary request admitted before the prior open
+generation is also ignored, so it cannot reopen a healthy breaker. The probe
+deadline starts with the larger of `shared_breaker_probe_lease_ms` and the call's
+timeout/retry budget, clamps it to `shared_breaker_max_probe_lease_ms`, then adds
+`shared_breaker_clock_skew_ms`. This preserves one live cluster-wide probe,
+recovers abandoned probes, and prevents an unbounded request timeout from creating
+an effectively permanent lease. Model-provider hints use the provider's actual
+effective `[rasn.model] request_timeout_sec` when a request leaves `timeout_ms = 0`,
+rather than the unrelated 20-second agent fallback. Runtime ping prepares and
+authenticates its request before claiming admission, so local auth failure cannot
+abandon a probe.
+
+Enable this only on participants configured with the same ZooKeeper ensemble,
+namespaces, and breaker tunables:
+
+```ini
+[rasn.coordination]
+provider = zookeeper
+operation_timeout_ms = 5000
+shared_breaker_enabled = true
+shared_breaker_state_prefix = resilience/circuit_breakers
+shared_breaker_lock_timeout_ms = 1000
+shared_breaker_probe_lease_ms = 120000
+shared_breaker_max_probe_lease_ms = 600000
+shared_breaker_clock_skew_ms = 5000
+```
+
+The hosting app must also declare `THREAD_POOL_META_SERVER` and
+`THREAD_POOL_DLOCK` as described above. `inproc` and `simple` exercise the same
+adapter for development but do not make state authoritative across processes.
+All ZooKeeper participants must synchronize physical clocks (for example with
+NTP) and set `shared_breaker_clock_skew_ms` at least as large as the operational
+skew bound; cooldown and probe deadlines are persisted physical timestamps.
+Because the persisted record verifies its tunables, a rolling deployment with
+different breaker thresholds/timers deliberately fails closed. Drain the old
+participants and either prune the old breaker subtree or select a new
+`shared_breaker_state_prefix` when intentionally changing those values.
+
+**What remains.** (a) Design leased/transactional global admission, rate/cost,
+overload, and dedup authorities; they cannot safely use a naive
+`get`/modify/last-writer-wins `put`. (b) Extend the multi-process harness to assert
+shared breaker propagation and leased probe takeover on ZooKeeper. Quorum
+**replication** of runtime module state remains the §13.5
+`replicated_service_app_type_1` item.
 
 ### 13.8 Robustness hardening — cold-start readiness, diagnostic-leak cleanup, LLM parsing — RESOLVED (code)
 

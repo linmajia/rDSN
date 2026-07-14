@@ -82,16 +82,19 @@ private:
                                const agent_task &task,
                                nucleus_runtime &runtime,
                                llm_response *fast_fail);
-    // Returns false and fills *fast_fail when the breaker for the active provider
-    // is open and the request must be short-circuited without calling out.
-    bool model_breaker_admit(const std::string &provider,
-                             const agent_task &task,
-                             nucleus_runtime &runtime,
-                             llm_response *fast_fail);
+    // Returns the authoritative admission decision and fills *fast_fail when the
+    // request must be short-circuited. The decision is carried through report()
+    // so only the admitted half-open probe may resolve shared breaker state.
+    breaker_decision model_breaker_admit(const std::string &provider,
+                                         const agent_task &task,
+                                         nucleus_runtime &runtime,
+                                         uint64_t probe_lease_hint_ms,
+                                         llm_response *fast_fail);
     // Report the outcome of an admitted call back to the provider's breaker.
     void model_breaker_report(const std::string &provider,
                               const agent_task &task,
                               nucleus_runtime &runtime,
+                              const breaker_decision &admission,
                               bool ok);
     // Acquire an admission slot for the active provider. The returned slot
     // reserves capacity until destroyed; on rejection slot.admitted() is false and
@@ -240,13 +243,14 @@ private:
                                       const agent_request &request,
                                       nucleus_runtime &runtime,
                                       agent_response *fast_fail);
-    bool remote_agent_breaker_admit(const agent_descriptor &agent,
-                                    const agent_request &request,
-                                    nucleus_runtime &runtime,
-                                    agent_response *fast_fail);
+    breaker_decision remote_agent_breaker_admit(const agent_descriptor &agent,
+                                                const agent_request &request,
+                                                nucleus_runtime &runtime,
+                                                agent_response *fast_fail);
     void remote_agent_breaker_report(const agent_descriptor &agent,
                                      const agent_task &task,
                                      nucleus_runtime &runtime,
+                                     const breaker_decision &admission,
                                      bool ok);
     admission_slot remote_agent_admission_admit(const agent_descriptor &agent,
                                                 const agent_request &request,

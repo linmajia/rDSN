@@ -22,6 +22,7 @@
 // while still recovering reads and idempotent writes.
 
 #include <chrono>
+#include <limits>
 #include <string>
 #include <thread>
 #include <utility>
@@ -91,6 +92,27 @@ circuit_breaker_registry &global_rasn_core_breakers();
 rpc_resilience_options read_rasn_core_resilience_options();
 void ensure_rasn_core_breaker_config();
 
+inline uint64_t rpc_breaker_probe_lease_hint(const rpc_resilience_options &options,
+                                            std::chrono::milliseconds timeout)
+{
+    const uint64_t max = (std::numeric_limits<uint64_t>::max)();
+    const uint64_t timeout_ms =
+        timeout.count() <= 0 ? 0 : static_cast<uint64_t>(timeout.count());
+    const uint64_t attempts = options.max_attempts == 0 ? 1 : options.max_attempts;
+    const uint64_t call_budget =
+        timeout_ms != 0 && attempts > max / timeout_ms ? max : timeout_ms * attempts;
+    const uint64_t retry_count = attempts - 1;
+    const uint64_t backoff_factor =
+        retry_count > 0 && attempts > max / retry_count
+            ? max
+            : (retry_count * attempts) / 2;
+    const uint64_t backoff_budget =
+        options.backoff_ms != 0 && backoff_factor > max / options.backoff_ms
+            ? max
+            : backoff_factor * options.backoff_ms;
+    return call_budget > max - backoff_budget ? max : call_budget + backoff_budget;
+}
+
 // Generic resilient client RPC. `call` is invoked as `call(timeout)` and must
 // return `std::pair< ::dsn::error_code, TResponse>`. Applies a per-key circuit
 // breaker (fast-fail while the endpoint is unhealthy) and idempotency-aware
@@ -109,12 +131,21 @@ std::pair< ::dsn::error_code, TResponse> resilient_rpc_call(circuit_breaker_regi
                                                            std::chrono::milliseconds timeout,
                                                            FCall &&call)
 {
+    breaker_decision admission;
     if (options.breaker_enabled)
     {
-        circuit_breaker &breaker = breakers.get(breaker_key);
-        const breaker_decision decision = breaker.allow(::dsn_now_ms());
-        if (!decision.allowed)
+        admission = breakers.allow(
+            breaker_key, ::dsn_now_ms(), rpc_breaker_probe_lease_hint(options, timeout));
+        if (!admission.allowed)
         {
+            if (!admission.available)
+            {
+                dlog(LOG_LEVEL_WARNING,
+                     "rasn",
+                     "rASN core RPC shared circuit breaker unavailable for key=%s: %s",
+                     breaker_key.c_str(),
+                     admission.error.c_str());
+            }
             return std::make_pair(::dsn::ERR_BUSY, TResponse());
         }
     }
@@ -127,7 +158,16 @@ std::pair< ::dsn::error_code, TResponse> resilient_rpc_call(circuit_breaker_regi
         {
             if (options.breaker_enabled)
             {
-                breakers.get(breaker_key).report(true, ::dsn_now_ms());
+                const breaker_report reported =
+                    breakers.report(breaker_key, admission, true, ::dsn_now_ms());
+                if (!reported.available)
+                {
+                    dlog(LOG_LEVEL_WARNING,
+                         "rasn",
+                         "rASN core RPC circuit breaker report failed for key=%s: %s",
+                         breaker_key.c_str(),
+                         reported.error.c_str());
+                }
             }
             return result;
         }
@@ -135,7 +175,16 @@ std::pair< ::dsn::error_code, TResponse> resilient_rpc_call(circuit_breaker_regi
         {
             if (options.breaker_enabled)
             {
-                breakers.get(breaker_key).report(false, ::dsn_now_ms());
+                const breaker_report reported =
+                    breakers.report(breaker_key, admission, false, ::dsn_now_ms());
+                if (!reported.available)
+                {
+                    dlog(LOG_LEVEL_WARNING,
+                         "rasn",
+                         "rASN core RPC circuit breaker report failed for key=%s: %s",
+                         breaker_key.c_str(),
+                         reported.error.c_str());
+                }
             }
             return result;
         }

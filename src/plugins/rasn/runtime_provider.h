@@ -16,10 +16,13 @@
 
 #include <dsn/service_api_cpp.h>
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -502,7 +505,7 @@ class rasn_runtime_rpc_service : public ::dsn::serverlet<rasn_runtime_rpc_servic
 public:
     explicit rasn_runtime_rpc_service(std::vector<std::string> modules = std::vector<std::string>());
     void open_service();
-    void close_service();
+    bool close_service(std::chrono::milliseconds timeout);
     const std::vector<std::string> &modules() const { return _modules; }
 
 protected:
@@ -521,6 +524,32 @@ protected:
 private:
     bool register_module_handler(const std::string &module);
     void unregister_module_handler(const std::string &module);
+    bool begin_request();
+    void finish_request();
+    class request_guard
+    {
+    public:
+        explicit request_guard(rasn_runtime_rpc_service *service)
+            : _service(service), _active(service->begin_request())
+        {
+        }
+        ~request_guard()
+        {
+            if (_active)
+            {
+                _service->finish_request();
+            }
+        }
+
+        request_guard(const request_guard &) = delete;
+        request_guard &operator=(const request_guard &) = delete;
+
+        bool active() const { return _active; }
+
+    private:
+        rasn_runtime_rpc_service *_service;
+        bool _active;
+    };
     void reply_module_request(const std::string &module,
                               const rasn_runtime_request &request,
                               ::dsn::rpc_replier<rasn_runtime_response> &reply);
@@ -532,6 +561,10 @@ private:
     // ingress guard admits every request for it. Used to reject requests routed to
     // a shard this service does not host before they reach the module store.
     std::map<std::string, std::vector<uint32_t>> _hosted_shards;
+    std::mutex _request_lock;
+    std::condition_variable _requests_drained;
+    uint64_t _active_requests = 0;
+    bool _accepting_requests = false;
 };
 
 class rasn_runtime_client : public virtual ::dsn::clientlet
@@ -572,11 +605,18 @@ private:
     std::vector<agent_descriptor> _registry_descriptors;
     ::dsn::task_ptr _registry_heartbeat_timer;
     // Default-off single-writer ownership gate (see acquire_module_ownership).
-    // Null unless the gate is enabled; holds ownership of _owned_resources
-    // (acquired as _owner_id) until stop() releases them.
+    // Null unless the gate is enabled. The facade is private to this runtime,
+    // although the underlying rDSN ZooKeeper session is app-shared.
     std::unique_ptr<rasn_coordination_service> _coordination;
     std::vector<std::string> _owned_resources;
     std::string _owner_id;
+    struct ownership_lease_state
+    {
+        std::atomic<bool> lost{false};
+        std::atomic<bool> serving{false};
+    };
+    std::shared_ptr<ownership_lease_state> _ownership_state =
+        std::make_shared<ownership_lease_state>();
 };
 
 class rasn_agent_control_module_app : public rasn_runtime_app
