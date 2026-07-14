@@ -44,6 +44,10 @@ struct chat_completion_parse
 
 typedef std::function<void(const std::string &chunk)> llm_stream_callback;
 
+// Resolves a request override against [rasn.model] request_timeout_sec using
+// the same rules as the network provider.
+uint64_t effective_llm_request_timeout_ms(uint32_t request_timeout_ms);
+
 class llm_provider
 {
 public:

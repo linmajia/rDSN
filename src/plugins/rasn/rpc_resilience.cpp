@@ -1,4 +1,5 @@
 #include <rasn/rpc_resilience.h>
+#include <rasn/coordination_breaker.h>
 
 #include <limits>
 #include <mutex>
@@ -66,7 +67,11 @@ static breaker_config read_rasn_core_breaker_config()
 void ensure_rasn_core_breaker_config()
 {
     static std::once_flag once;
-    std::call_once(once, [] { global_rasn_core_breakers().set_config(read_rasn_core_breaker_config()); });
+    std::call_once(once, [] {
+        circuit_breaker_registry &registry = global_rasn_core_breakers();
+        registry.set_config(read_rasn_core_breaker_config());
+        configure_rasn_shared_breaker_registry(registry, "core_rpc");
+    });
 }
 
 } // namespace rasn

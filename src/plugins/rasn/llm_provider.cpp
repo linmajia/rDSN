@@ -96,21 +96,7 @@ std::string seconds_from_milliseconds(uint64_t timeout_ms)
 
 std::string effective_request_timeout_sec(uint32_t request_timeout_ms)
 {
-    const uint64_t configured_sec = llm_config_uint64("request_timeout_sec", 120, "provider request timeout");
-    if (request_timeout_ms == 0)
-    {
-        return std::to_string(configured_sec);
-    }
-
-    uint64_t effective_ms = request_timeout_ms;
-    if (configured_sec != 0)
-    {
-        const uint64_t configured_ms = configured_sec > (std::numeric_limits<uint64_t>::max() / 1000)
-                                           ? std::numeric_limits<uint64_t>::max()
-                                           : configured_sec * 1000;
-        effective_ms = (std::min)(effective_ms, configured_ms);
-    }
-    return seconds_from_milliseconds(effective_ms);
+    return seconds_from_milliseconds(effective_llm_request_timeout_ms(request_timeout_ms));
 }
 
 std::string command_quote(const std::string &value)
@@ -964,6 +950,23 @@ chat_completion_parse parse_chat_completion(const std::string &output, const std
     result.ok = true;
     result.text = trimmed;
     return result;
+}
+
+uint64_t effective_llm_request_timeout_ms(uint32_t request_timeout_ms)
+{
+    const uint64_t configured_sec =
+        llm_config_uint64("request_timeout_sec", 120, "provider request timeout");
+    const uint64_t configured_ms =
+        configured_sec > (std::numeric_limits<uint64_t>::max() / 1000)
+            ? std::numeric_limits<uint64_t>::max()
+            : configured_sec * 1000;
+    if (request_timeout_ms == 0)
+    {
+        return configured_ms;
+    }
+    return configured_sec == 0
+               ? request_timeout_ms
+               : (std::min)(static_cast<uint64_t>(request_timeout_ms), configured_ms);
 }
 
 void emit_llm_stream_chunks(const agent_task &task,

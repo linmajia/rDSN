@@ -2,8 +2,10 @@
 
 #include <rasn/agent_services.h>
 #include <rasn/circuit_breaker.h>
+#include <rasn/coordination_breaker.h>
 #include <rasn/metrics.h>
 #include <rasn/rasn_core.h>
+#include <rasn/rpc_resilience.h>
 #include <rasn/state_service.h>
 
 #include <dsn/cpp/utils.h>
@@ -529,6 +531,18 @@ bool rasn_runtime_ownership_gate_enabled()
         false,
         "Acquire single-writer ownership of hosted runtime module shards (via [rasn.coordination]) "
         "before opening RPC handlers; fail closed on contention");
+}
+
+std::chrono::milliseconds rasn_runtime_request_drain_timeout()
+{
+    const uint64_t configured = config_service_uint64(
+        "rasn_runtime_request_drain_timeout_ms",
+        30000,
+        "Maximum time to drain in-flight runtime module RPCs before releasing ownership");
+    const uint64_t chrono_max =
+        static_cast<uint64_t>((std::numeric_limits<int64_t>::max)());
+    return std::chrono::milliseconds(
+        static_cast<int64_t>((std::min)(configured, chrono_max)));
 }
 
 std::chrono::milliseconds rasn_runtime_state_hydration_timeout()
@@ -3174,7 +3188,11 @@ circuit_breaker_registry &global_rasn_runtime_breakers()
 void ensure_rasn_runtime_breaker_config()
 {
     static std::once_flag once;
-    std::call_once(once, [] { global_rasn_runtime_breakers().set_config(read_rasn_runtime_breaker_config()); });
+    std::call_once(once, [] {
+        circuit_breaker_registry &registry = global_rasn_runtime_breakers();
+        registry.set_config(read_rasn_runtime_breaker_config());
+        configure_rasn_shared_breaker_registry(registry, "runtime_module");
+    });
 }
 
 // In-process invocation: dispatch directly when no rDSN node is active (CLI
@@ -3248,26 +3266,36 @@ rasn_runtime_response invoke_remote_module(const rasn_runtime_request &request)
         return make_rasn_runtime_error(request, auth_error);
     }
 
+    const std::chrono::milliseconds timeout = rasn_runtime_rpc_timeout(module);
+    const uint32_t max_attempts = rasn_runtime_rpc_max_attempts(module);
+    const uint64_t backoff_ms = rasn_runtime_rpc_backoff_ms(module);
+    rpc_resilience_options lease_options;
+    lease_options.max_attempts = max_attempts;
+    lease_options.backoff_ms = backoff_ms;
+    breaker_decision admission;
     const bool breaker_enabled = rasn_runtime_breaker_enabled();
     if (breaker_enabled)
     {
         ensure_rasn_runtime_breaker_config();
-        circuit_breaker &breaker = global_rasn_runtime_breakers().get(breaker_key);
-        const breaker_decision decision = breaker.allow(::dsn_now_ms());
-        if (!decision.allowed)
+        admission = global_rasn_runtime_breakers().allow(
+            breaker_key,
+            ::dsn_now_ms(),
+            rpc_breaker_probe_lease_hint(lease_options, timeout));
+        if (!admission.allowed)
         {
-            dwarn("runtime module '%s' endpoint '%s' circuit breaker %s; short-circuiting RPC",
+            dwarn("runtime module '%s' endpoint '%s' circuit breaker %s; short-circuiting RPC%s%s",
                   module.c_str(),
                   endpoint.c_str(),
-                  to_string(decision.state));
+                  to_string(admission.state),
+                  admission.error.empty() ? "" : ": ",
+                  admission.error.c_str());
             return make_rasn_runtime_error(
-                request, std::string("runtime module circuit breaker ") + to_string(decision.state));
+                request,
+                std::string("runtime module circuit breaker ") + to_string(admission.state) +
+                    (admission.error.empty() ? "" : ": " + admission.error));
         }
     }
 
-    const std::chrono::milliseconds timeout = rasn_runtime_rpc_timeout(module);
-    const uint32_t max_attempts = rasn_runtime_rpc_max_attempts(module);
-    const uint64_t backoff_ms = rasn_runtime_rpc_backoff_ms(module);
     for (uint32_t attempt = 1; attempt <= max_attempts; ++attempt)
     {
         rasn_runtime_client client(address);
@@ -3276,7 +3304,15 @@ rasn_runtime_response invoke_remote_module(const rasn_runtime_request &request)
         {
             if (breaker_enabled)
             {
-                global_rasn_runtime_breakers().get(breaker_key).report(true, ::dsn_now_ms());
+                const breaker_report reported = global_rasn_runtime_breakers().report(
+                    breaker_key, admission, true, ::dsn_now_ms());
+                if (!reported.available)
+                {
+                    dwarn("runtime module '%s' endpoint '%s' circuit breaker report failed: %s",
+                          module.c_str(),
+                          endpoint.c_str(),
+                          reported.error.c_str());
+                }
             }
             return result.second;
         }
@@ -3284,13 +3320,21 @@ rasn_runtime_response invoke_remote_module(const rasn_runtime_request &request)
         {
             if (breaker_enabled)
             {
-                circuit_breaker &breaker = global_rasn_runtime_breakers().get(breaker_key);
-                if (breaker.report(false, ::dsn_now_ms()))
+                const breaker_report reported = global_rasn_runtime_breakers().report(
+                    breaker_key, admission, false, ::dsn_now_ms());
+                if (!reported.available)
+                {
+                    dwarn("runtime module '%s' endpoint '%s' circuit breaker report failed: %s",
+                          module.c_str(),
+                          endpoint.c_str(),
+                          reported.error.c_str());
+                }
+                else if (reported.opened)
                 {
                     dwarn("runtime module '%s' endpoint '%s' circuit breaker opened after %u consecutive failures",
                           module.c_str(),
                           endpoint.c_str(),
-                          static_cast<unsigned int>(breaker.consecutive_failures()));
+                          static_cast<unsigned int>(reported.consecutive_failures));
                 }
             }
             return make_rasn_runtime_error(
@@ -3337,19 +3381,7 @@ bool ping_remote_module(const std::string &module, std::string *error)
         const std::string breaker_key =
             module + "#" + std::to_string(resolved_endpoint.partition_index) + "@" + endpoint;
         const bool breaker_enabled = rasn_runtime_breaker_enabled();
-        if (breaker_enabled)
-        {
-            ensure_rasn_runtime_breaker_config();
-            if (global_rasn_runtime_breakers().get(breaker_key).is_open(::dsn_now_ms()))
-            {
-                all_ok = false;
-                if (first_error.empty())
-                {
-                    first_error = "runtime module circuit breaker open";
-                }
-                continue;
-            }
-        }
+        const std::chrono::milliseconds ping_timeout = rasn_runtime_ping_timeout(module);
         rasn_runtime_request ping = make_module_request(module, "ping");
         std::string auth_error;
         if (!prepare_rasn_runtime_rpc_request(&ping, &auth_error))
@@ -3361,14 +3393,39 @@ bool ping_remote_module(const std::string &module, std::string *error)
             }
             continue;
         }
+        breaker_decision admission;
+        if (breaker_enabled)
+        {
+            ensure_rasn_runtime_breaker_config();
+            admission = global_rasn_runtime_breakers().allow(
+                breaker_key, ::dsn_now_ms(), static_cast<uint64_t>(ping_timeout.count()));
+            if (!admission.allowed)
+            {
+                all_ok = false;
+                if (first_error.empty())
+                {
+                    first_error = admission.error.empty()
+                                      ? "runtime module circuit breaker open"
+                                      : "runtime module circuit breaker unavailable: " +
+                                            admission.error;
+                }
+                continue;
+            }
+        }
         rasn_runtime_client client(address);
         const std::pair< ::dsn::error_code, rasn_runtime_response> result =
-            client.call_sync(ping, rasn_runtime_ping_timeout(module));
+            client.call_sync(ping, ping_timeout);
         if (result.first != ::dsn::ERR_OK)
         {
             if (breaker_enabled)
             {
-                global_rasn_runtime_breakers().get(breaker_key).report(false, ::dsn_now_ms());
+                const breaker_report reported = global_rasn_runtime_breakers().report(
+                    breaker_key, admission, false, ::dsn_now_ms());
+                if (!reported.available && first_error.empty())
+                {
+                    first_error = "runtime module circuit breaker report failed: " +
+                                  reported.error;
+                }
             }
             all_ok = false;
             if (first_error.empty())
@@ -3379,7 +3436,14 @@ bool ping_remote_module(const std::string &module, std::string *error)
         }
         if (breaker_enabled)
         {
-            global_rasn_runtime_breakers().get(breaker_key).report(true, ::dsn_now_ms());
+            const breaker_report reported = global_rasn_runtime_breakers().report(
+                breaker_key, admission, true, ::dsn_now_ms());
+            if (!reported.available && first_error.empty())
+            {
+                first_error =
+                    "runtime module circuit breaker report failed: " + reported.error;
+                all_ok = false;
+            }
         }
         std::string response_error;
         if (!response_bool(result.second, &response_error))
@@ -5383,6 +5447,10 @@ rasn_runtime_rpc_service::rasn_runtime_rpc_service(std::vector<std::string> modu
 
 void rasn_runtime_rpc_service::open_service()
 {
+    {
+        std::lock_guard<std::mutex> guard(_request_lock);
+        _accepting_requests = true;
+    }
     dinfo("opening rasn.runtime serverlet with module API(s): %s", join_strings(_modules, ",").c_str());
     for (const std::string &module : _modules)
     {
@@ -5393,13 +5461,38 @@ void rasn_runtime_rpc_service::open_service()
     }
 }
 
-void rasn_runtime_rpc_service::close_service()
+bool rasn_runtime_rpc_service::close_service(std::chrono::milliseconds timeout)
 {
+    {
+        std::lock_guard<std::mutex> guard(_request_lock);
+        _accepting_requests = false;
+    }
     dinfo("closing rasn.runtime serverlet with %d module API(s)", static_cast<int>(_modules.size()));
     for (const std::string &module : _modules)
     {
         unregister_module_handler(module);
     }
+    std::unique_lock<std::mutex> guard(_request_lock);
+    return _requests_drained.wait_for(
+        guard, timeout, [this] { return _active_requests == 0; });
+}
+
+bool rasn_runtime_rpc_service::begin_request()
+{
+    std::lock_guard<std::mutex> guard(_request_lock);
+    if (!_accepting_requests)
+        return false;
+    ++_active_requests;
+    return true;
+}
+
+void rasn_runtime_rpc_service::finish_request()
+{
+    std::lock_guard<std::mutex> guard(_request_lock);
+    dassert(_active_requests > 0, "runtime RPC active-request counter underflow");
+    --_active_requests;
+    if (_active_requests == 0)
+        _requests_drained.notify_all();
 }
 
 bool rasn_runtime_rpc_service::register_module_handler(const std::string &module)
@@ -5483,12 +5576,18 @@ void rasn_runtime_rpc_service::reply_module_request(const std::string &module,
 {
     rasn_runtime_request copy = request;
     force_module(&copy, module);
+    if (!begin_request())
+    {
+        reply(make_rasn_runtime_error(copy, "rasn runtime service is shutting down"));
+        return;
+    }
     std::string auth_error;
     if (!authenticate_rasn_runtime_rpc_request(copy, &auth_error))
     {
         metrics_registry::instance().on_event("runtime.auth.rejected", module);
         dwarn("runtime module RPC auth rejected for module '%s'", module.c_str());
         reply(make_rasn_runtime_error(copy, auth_error));
+        finish_request();
         return;
     }
     copy.auth_token.clear();
@@ -5508,6 +5607,7 @@ void rasn_runtime_rpc_service::reply_module_request(const std::string &module,
               static_cast<unsigned int>(partition));
         reply(make_rasn_runtime_error(
             copy, "rasn runtime service does not host shard " + std::to_string(partition) + " of module " + module));
+        finish_request();
         return;
     }
 
@@ -5515,6 +5615,7 @@ void rasn_runtime_rpc_service::reply_module_request(const std::string &module,
     // logs and any nested module requests share the originating operation's trace.
     rasn_runtime_trace_scope trace(copy.trace_id);
     reply(dispatch_rasn_runtime_request(copy));
+    finish_request();
 }
 
 void rasn_runtime_rpc_service::on_agent_control(const rasn_runtime_request &request,
@@ -5681,6 +5782,7 @@ agent_descriptor make_rasn_runtime_module_descriptor(const std::string &module,
     const ::dsn::error_code ownership_error = acquire_module_ownership();
     if (ownership_error != ::dsn::ERR_OK)
     {
+        global_rasn_services().release();
         return ownership_error;
     }
     const ::dsn::error_code hydration_error = hydrate_modules_from_state();
@@ -5689,7 +5791,19 @@ agent_descriptor make_rasn_runtime_module_descriptor(const std::string &module,
         // Do not keep ownership we are not going to serve: release it so another
         // node can take over instead of parking the resource behind an aborting start.
         release_module_ownership();
+        global_rasn_services().release();
         return hydration_error;
+    }
+    if (!_owned_resources.empty())
+    {
+        _ownership_state->serving.store(true);
+        if (_ownership_state->lost.load())
+        {
+            _ownership_state->serving.store(false);
+            release_module_ownership();
+            global_rasn_services().release();
+            return ::dsn::ERR_INVALID_STATE;
+        }
     }
     _rpc.open_service();
     register_modules_with_registry();
@@ -5796,7 +5910,14 @@ rasn_runtime_app::rasn_runtime_app(::dsn_gpid gpid, std::vector<std::string> mod
                name().c_str());
         return ::dsn::ERR_UNKNOWN;
     }
-    _owner_id = endpoint.to_std_string();
+    static std::atomic<uint64_t> owner_sequence{0};
+    std::ostringstream owner;
+    owner << endpoint.to_std_string() << ".session." << std::hex
+          << ::dsn_random64(0, (std::numeric_limits<uint64_t>::max)()) << "."
+          << owner_sequence.fetch_add(1, std::memory_order_relaxed);
+    _owner_id = owner.str();
+    _ownership_state->lost.store(false);
+    _ownership_state->serving.store(false);
 
     _coordination = create_rasn_coordination_service(load_rasn_coordination_config());
     const ::dsn::error_code start_err = _coordination->start();
@@ -5805,6 +5926,7 @@ rasn_runtime_app::rasn_runtime_app(::dsn_gpid gpid, std::vector<std::string> mod
         derror("rASN runtime app %s failed to start coordination backend: %s; refusing to open module APIs",
                name().c_str(),
                start_err.to_string());
+        _coordination->stop();
         _coordination.reset();
         return start_err;
     }
@@ -5832,7 +5954,25 @@ rasn_runtime_app::rasn_runtime_app(::dsn_gpid gpid, std::vector<std::string> mod
         ::dsn::error_code acquired = ::dsn::ERR_OK;
         for (uint32_t attempt = 1; attempt <= max_attempts; ++attempt)
         {
-            acquired = _coordination->acquire_ownership(resource, _owner_id);
+            const std::shared_ptr<ownership_lease_state> lease_state =
+                _ownership_state;
+            const std::string app_name = name();
+            acquired = _coordination->acquire_ownership(
+                resource,
+                _owner_id,
+                [lease_state, app_name](const std::string &lost_resource,
+                                        uint64_t fencing_token) {
+                    lease_state->lost.store(true);
+                    if (lease_state->serving.exchange(false))
+                    {
+                        derror("rASN runtime app %s lost ownership of %s at fence %llu "
+                               "while serving; fail-stopping to prevent split-brain writes",
+                               app_name.c_str(),
+                               lost_resource.c_str(),
+                               static_cast<unsigned long long>(fencing_token));
+                        ::dsn_exit(1);
+                    }
+                });
             if (acquired == ::dsn::ERR_OK || attempt >= max_attempts)
             {
                 break;
@@ -5855,6 +5995,13 @@ rasn_runtime_app::rasn_runtime_app(::dsn_gpid gpid, std::vector<std::string> mod
             return acquired;
         }
         _owned_resources.push_back(resource);
+        if (_ownership_state->lost.load())
+        {
+            derror("rASN runtime app %s lost module ownership while starting; refusing to open module APIs",
+                   name().c_str());
+            release_module_ownership();
+            return ::dsn::ERR_INVALID_STATE;
+        }
     }
 
     if (!_owned_resources.empty())
@@ -5869,17 +6016,34 @@ rasn_runtime_app::rasn_runtime_app(::dsn_gpid gpid, std::vector<std::string> mod
 
 void rasn_runtime_app::release_module_ownership()
 {
+    _ownership_state->serving.store(false);
     if (!_coordination)
     {
         return;
     }
+    bool ambiguous_release = false;
     for (const std::string &resource : _owned_resources)
     {
-        (void)_coordination->release_ownership(resource, _owner_id);
+        const ::dsn::error_code released =
+            _coordination->release_ownership(resource, _owner_id);
+        if (released != ::dsn::ERR_OK)
+        {
+            ambiguous_release = true;
+            derror("rASN runtime app %s cannot prove ownership release for %s: %s",
+                   name().c_str(),
+                   resource.c_str(),
+                   released.to_string());
+        }
     }
     _owned_resources.clear();
     _coordination->stop();
     _coordination.reset();
+    if (ambiguous_release)
+    {
+        derror("rASN runtime ownership release is ambiguous; terminating the process so "
+               "the shared ZooKeeper session cannot retain a ghost owner");
+        ::dsn_exit(1);
+    }
 }
 
 void rasn_runtime_app::register_modules_with_registry()
@@ -6114,7 +6278,14 @@ void register_rasn_runtime_apps()
 {
     cancel_registry_heartbeat_timer();
     unregister_modules_from_registry();
-    _rpc.close_service();
+    if (!_rpc.close_service(rasn_runtime_request_drain_timeout()))
+    {
+        derror("rASN runtime app %s could not drain in-flight module RPCs before "
+               "the ownership-release deadline; fail-stopping",
+               name().c_str());
+        ::dsn_exit(1);
+        return ::dsn::ERR_TIMEOUT;
+    }
     release_module_ownership();
     global_rasn_services().release();
     return ::dsn::ERR_OK;

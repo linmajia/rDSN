@@ -3541,6 +3541,55 @@ TEST(rasn_circuit_breaker, half_open_admits_single_probe_then_recovers)
     EXPECT_EQ(0u, breaker.consecutive_failures());
 }
 
+TEST(rasn_circuit_breaker, stale_closed_report_cannot_resolve_half_open_probe)
+{
+    breaker_config cfg;
+    cfg.failure_threshold = 1;
+    cfg.open_ms = 100;
+    circuit_breaker breaker(cfg);
+
+    const breaker_decision stale_closed = breaker.allow(0);
+    ASSERT_TRUE(stale_closed.allowed);
+    EXPECT_TRUE(breaker.report(false, 0));
+
+    const breaker_decision probe = breaker.allow(100);
+    ASSERT_TRUE(probe.allowed);
+    ASSERT_TRUE(probe.half_open_probe);
+    const breaker_report stale =
+        breaker.report(stale_closed, true, 100);
+    EXPECT_FALSE(stale.applied);
+    EXPECT_EQ(breaker_state::half_open, stale.state);
+    EXPECT_FALSE(breaker.allow(100).allowed);
+
+    const breaker_report recovered = breaker.report(probe, true, 100);
+    EXPECT_TRUE(recovered.applied);
+    EXPECT_EQ(breaker_state::closed, recovered.state);
+}
+
+TEST(rasn_circuit_breaker, stale_preopen_failure_cannot_reopen_recovered_breaker)
+{
+    breaker_config cfg;
+    cfg.failure_threshold = 1;
+    cfg.open_ms = 100;
+    circuit_breaker breaker(cfg);
+
+    const breaker_decision stale = breaker.allow(0);
+    const breaker_decision opener = breaker.allow(0);
+    ASSERT_TRUE(stale.allowed);
+    ASSERT_TRUE(opener.allowed);
+    EXPECT_TRUE(breaker.report(opener, false, 0).opened);
+
+    const breaker_decision probe = breaker.allow(100);
+    ASSERT_TRUE(probe.half_open_probe);
+    EXPECT_TRUE(breaker.report(probe, true, 100).applied);
+    ASSERT_EQ(breaker_state::closed, breaker.state());
+
+    const breaker_report ignored = breaker.report(stale, false, 101);
+    EXPECT_FALSE(ignored.applied);
+    EXPECT_EQ(breaker_state::closed, ignored.state);
+    EXPECT_EQ(0u, ignored.consecutive_failures);
+}
+
 TEST(rasn_circuit_breaker, is_open_precheck_is_nonmutating_and_respects_cooldown)
 {
     breaker_config cfg;
@@ -4814,6 +4863,13 @@ TEST(rasn_llm_provider, chat_completion_extracts_content)
     const chat_completion_parse parsed = parse_chat_completion(body, "openai.chat");
     EXPECT_TRUE(parsed.ok);
     EXPECT_EQ("hello world", parsed.text);
+}
+
+TEST(rasn_llm_provider, effective_timeout_matches_network_provider_default)
+{
+    EXPECT_EQ(120000u, effective_llm_request_timeout_ms(0));
+    EXPECT_EQ(1234u, effective_llm_request_timeout_ms(1234));
+    EXPECT_EQ(120000u, effective_llm_request_timeout_ms(180000));
 }
 
 TEST(rasn_llm_provider, chat_completion_reasoning_content_fallback)

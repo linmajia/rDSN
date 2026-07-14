@@ -1405,8 +1405,11 @@ remaining limitations are:
   `rasn.registry` discovery lookup) all fail fast on an unhealthy endpoint via a
   shared per-endpoint circuit breaker and retry transient transport errors with an
   idempotency-aware policy (see `rpc_resilience.h` and DISTRIBUTED_RUNTIME.md §7.1).
-  This is per-service-process protection; it is not cross-process exactly-once and
-  does not add replication.
+  Breakers may use the optional ZooKeeper-backed, fenced cluster-global state in
+  §13.7. Probe claims combine immutable grant-version records with a post-release
+  fence barrier, per-transition owner nonces, bounded provider operations, and
+  provider-timeout-aware probe leases; retries still do not provide cross-process
+  exactly-once or replication.
 - **End-to-end trace propagation:** the runtime-module RPC envelope now carries a
   `trace_id` (EOF-safe on the wire) that is stamped from an ambient
   `rasn_runtime_trace_scope` on egress and restored/echoed on ingress, so a single
@@ -1419,10 +1422,12 @@ remaining limitations are:
   small facade with `inproc` (default fallback), `simple` (in-process rDSN
   provider), and `zookeeper` (HA) backends selected by `[rasn.coordination]`. This
   closes the ownership half of audit finding 1.1 and gives finding 1.5 a
-  cluster-shared, authoritative store; it is validated by unit tests on real
-  hardware (DISTRIBUTED_RUNTIME.md §13.7). Remaining work is wiring: having each
-  replicated/sharded module acquire ownership before serving writes, and moving
-  breaker/dedup/quota counters onto the shared store for cluster-global protection.
+  cluster-shared, authoritative store. Runtime module/shard ownership is enforced
+  before RPC handlers open; lease loss, undrained shutdown, and ambiguous release
+  fail-stop instead of risking split brain. All four breaker families can use
+  fenced grant-version records plus one leased cluster-wide probe
+  (DISTRIBUTED_RUNTIME.md §13.7). Admission/rate/cost/overload/dedup authorities
+  and quorum-replicated module state remain future work.
 - **Full-distribution audit:** a severity-ranked production-readiness audit across
   three lenses — is rASN fully distributed, does it reuse rDSN instead of
   reinventing, and are critical modules missing — is recorded in

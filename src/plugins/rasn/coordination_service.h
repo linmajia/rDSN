@@ -33,7 +33,9 @@
 
 #include <dsn/service_api_cpp.h>
 
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -52,6 +54,9 @@ struct rasn_coordination_config
     std::string state_namespace = "/rasn/state";
     // Lock acquisition timeout used by the blocking acquire_ownership() helper.
     int acquire_timeout_ms = 5000;
+    // Timeout for every other blocking provider operation, including state I/O,
+    // cancellation, unlock, and shutdown cleanup.
+    int operation_timeout_ms = 5000;
     // Filesystem directory used by the "simple" meta-state backend for its
     // durable log. Ignored by the "inproc" and "zookeeper" backends. Defaults
     // to the current working directory so it is never null (the underlying
@@ -78,6 +83,9 @@ rasn_coordination_config load_rasn_coordination_config();
 class rasn_coordination_service
 {
 public:
+    using ownership_lost_callback =
+        std::function<void(const std::string &resource_id, uint64_t fencing_token)>;
+
     virtual ~rasn_coordination_service() {}
 
     // Connect / initialize the backend. Must be called before any other method.
@@ -90,21 +98,51 @@ public:
     // Blocks until ownership of resource_id is granted to owner_id, or until
     // timeout_ms elapses. Returns ERR_OK on grant, ERR_TIMEOUT if another owner
     // holds it past the deadline, or a backend error. Re-acquiring a resource
-    // already owned by owner_id is idempotent and returns ERR_OK.
-    virtual ::dsn::error_code
-    acquire_ownership(const std::string &resource_id, const std::string &owner_id, int timeout_ms) = 0;
+    // already owned by owner_id is idempotent and returns ERR_OK. On success,
+    // fencing_token receives the backend's grant version; preserve the lock object
+    // on release when that token must remain monotonic across future owners.
+    virtual ::dsn::error_code acquire_ownership(const std::string &resource_id,
+                                                const std::string &owner_id,
+                                                int timeout_ms,
+                                                /*out*/ uint64_t *fencing_token,
+                                                const ownership_lost_callback &on_lost) = 0;
+
+    ::dsn::error_code
+    acquire_ownership(const std::string &resource_id, const std::string &owner_id, int timeout_ms);
+    ::dsn::error_code acquire_ownership(const std::string &resource_id,
+                                        const std::string &owner_id,
+                                        int timeout_ms,
+                                        /*out*/ uint64_t *fencing_token);
+    ::dsn::error_code acquire_ownership(const std::string &resource_id,
+                                        const std::string &owner_id,
+                                        const ownership_lost_callback &on_lost);
 
     // Convenience overload using the configured acquire_timeout_ms.
     ::dsn::error_code acquire_ownership(const std::string &resource_id, const std::string &owner_id);
 
     // Release ownership previously granted to owner_id. Returns ERR_OK even if
     // owner_id was not the holder (idempotent release).
-    virtual ::dsn::error_code
-    release_ownership(const std::string &resource_id, const std::string &owner_id) = 0;
+    // destroy=false preserves the lock object and its monotonically increasing
+    // grant version for fencing. Runtime ownership uses the default destroy=true;
+    // coordinated read/modify/write adapters use false.
+    virtual ::dsn::error_code release_ownership(const std::string &resource_id,
+                                                const std::string &owner_id,
+                                                bool destroy) = 0;
+    ::dsn::error_code
+    release_ownership(const std::string &resource_id, const std::string &owner_id);
+
+    // Post-release fencing barrier. ERR_OK means no newer grant was already
+    // active when the barrier was observed. A caller that persists a fenced
+    // transition must pass this before exposing the transition's side effect.
+    virtual ::dsn::error_code verify_ownership_fence(const std::string &resource_id,
+                                                     uint64_t fencing_token) = 0;
 
     // Non-blocking best-effort query of the current owner. Returns true and sets
     // owner_id if an owner is known, false otherwise.
-    virtual bool query_owner(const std::string &resource_id, /*out*/ std::string &owner_id) = 0;
+    virtual bool query_owner(const std::string &resource_id,
+                             /*out*/ std::string &owner_id,
+                             /*out*/ uint64_t *fencing_token) = 0;
+    bool query_owner(const std::string &resource_id, /*out*/ std::string &owner_id);
 
     // --- Cluster-shared state (HA registry / global state) ---------------
     //
@@ -139,6 +177,30 @@ protected:
 // single-node service.
 std::unique_ptr<rasn_coordination_service>
 create_rasn_coordination_service(const rasn_coordination_config &cfg);
+
+// Per-rDSN-app lifecycle wrapper. ZooKeeper callbacks are bound to the app that
+// initializes the provider, so a context must never be used from a different app
+// role/index in the same process.
+class rasn_coordination_context
+{
+public:
+    explicit rasn_coordination_context(const rasn_coordination_config &cfg);
+    ~rasn_coordination_context();
+
+    ::dsn::error_code start();
+    rasn_coordination_service *service() const { return _service.get(); }
+    const char *provider_name() const;
+
+private:
+    mutable std::mutex _lock;
+    std::unique_ptr<rasn_coordination_service> _service;
+    bool _started = false;
+};
+
+// Returns the current rDSN app's context, creating it from
+// load_rasn_coordination_config() when needed. Contexts are keyed by app identity
+// to preserve the ZooKeeper provider's app/thread affinity.
+std::shared_ptr<rasn_coordination_context> shared_rasn_coordination_context();
 
 } // namespace rasn
 } // namespace dsn
