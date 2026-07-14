@@ -55,6 +55,7 @@ public:
     resource_budget_decision reserve(const resource_request &request);
     bool release(const resource_request &request, std::string *error);
     bool usage(const std::string &scope, resource_usage *usage) const;
+    std::vector<resource_quota> quota_snapshot() const;
     std::vector<resource_usage> snapshot() const;
     std::string describe() const;
 

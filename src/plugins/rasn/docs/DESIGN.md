@@ -39,6 +39,8 @@ rASN should follow these existing rDSN patterns:
 | Locks | `dsn::service::zlock`, `zauto_lock` | Shared service state is protected using rDSN locks. |
 | Filesystem | `dsn::utils::filesystem::*` | Checkpoints, traces, temp payloads, and workflow files use rDSN utilities. |
 | Timers/tasks | `dsn::tasking::enqueue_timer` | Heartbeats, leases, retries, and background maintenance. |
+| Replication | `replicated_service_app_type_1` | `rasn.state.replicated` and every native runtime-module table commit mutations, checkpoint, learn, and fail over through rDSN. |
+| Partition routing | `dist::partition_resolver` | Stable module key hashes resolve the correct meta-managed partition/replica group. |
 | Echo sample | `src/plugins/apps.echo` | Minimal service_app/serverlet/clientlet/task-code pattern. |
 | SKV sample | `src/plugins/apps.skv` | Stateful service, locks, checkpoints, and recovery. |
 | Deployment sample | `src/plugins_ext/rDSN.dist.deployment` | Multi-RPC service and richer app wrapper pattern. |
@@ -1384,11 +1386,14 @@ remaining limitations are:
 
 - **State availability:** standalone state retains checkpoints, journals,
   conditional writes, workflow leases, optional local mirroring, and rDSN NFS
-  import. The optional `rasn.state.replicated` backend now commits state mutations
-  through rDSN `replicated_service_app_type_1` and supports framework checkpoint
-  learning. Runtime module stores themselves remain elected single-writer memory:
-  the replicated state authority makes their mirrors durable and hydratable, not
-  active-active. Multi-partition query fan-out and HA meta-server deployment remain.
+  import. The optional `rasn.state.replicated` backend and eleven direct
+  runtime-module tables now commit mutations through
+  `replicated_service_app_type_1` and support framework checkpoint learning.
+  Native module partitions checkpoint deterministic state plus bounded retry
+  dedup and fail over through rDSN; lightweight standalone roles remain elected
+  single-writer alternatives. Multi-partition generic-state query fan-out, safe
+  online checkpoint GC, migration tooling, and production HA meta deployment
+  remain.
 - **Tool isolation:** local tools are default-deny, policy-gated,
   approval-gated, allowlist-aware, workspace-rooted, timeout-bound, and can be
   routed through a configured container command wrapper. rASN still lacks a
@@ -1403,8 +1408,10 @@ remaining limitations are:
   provider-side nondeterminism.
 - **Deployment validation:** the Linux multi-process harness covers explicit
   runtime routing, registry-only discovery with a poisoned static fallback, and
-  optional ZooKeeper active/standby ownership handoff. Broader URI-backed,
-  replicated, and multi-host cluster coverage remains product work.
+  optional ZooKeeper active/standby ownership handoff. A one-meta/three-replica
+  development profile wires all eleven native module tables. Automated real
+  multi-host module-primary failover and checkpoint-transfer coverage remains
+  product work.
 - **Credential storage:** model credentials can be referenced with `env:`,
   `file:`, and `cmd:` handles and are protected by redaction, but vault-backed
   or OS-backed secret providers are not integrated.
@@ -1461,23 +1468,25 @@ remaining limitations are:
   before RPC handlers open; lease loss, undrained shutdown, and ambiguous release
   fail-stop instead of risking split brain. All four breaker families can use
   fenced grant-version records plus one leased cluster-wide probe
-  (DISTRIBUTED_RUNTIME.md §13.7). Admission/rate/cost/overload/dedup authorities
-  and directly quorum-replicated module state remain future work; the shared
-  `rasn.state` authority itself is now quorum-replicated.
+  (DISTRIBUTED_RUNTIME.md §13.7). Direct module tables now replicate deterministic
+  module state and bounded FIFO retry dedup per partition (§13.15). General
+  admission/rate/cost/overload authorities remain process-local; the shared
+  `rasn.state` authority is also quorum-replicated.
 - **Full-distribution audit:** a severity-ranked production-readiness audit across
   three lenses — is rASN fully distributed, does it reuse rDSN instead of
   reinventing, and are critical modules missing — is recorded in
   DISTRIBUTED_RUNTIME.md §13. It marks each finding RESOLVED (core-service
   resilience; HA registry discovery through fenced ZooKeeper-backed
   `meta_state_service`, `distributed_lock_service`, and rDSN groups — §13.14; and
-  distributed coordination — §13.7), MITIGATED (single-writer ownership 1.1 and
-  cluster-shared state 1.5), or DOCUMENTED, and maps the documented gaps to the
+  distributed coordination — §13.7; and direct runtime-module replication —
+  §13.15), MITIGATED (cluster-shared admission/rate state 1.5), or DOCUMENTED,
+  and maps the documented gaps to the
   exact rDSN facility that should back them:
-  `replicated_service_app_type_1` (now used by `rasn.state.replicated`; direct
-  module groups remain) for quorum-replicated storage,
-  `dist::partition_resolver` (now used by URI-backed runtime-module clients;
-  meta-managed module tables remain) for shard routing, and Thrift IDL for typed
-  RPC schemas. Remaining missing-module gaps (durable/vector agent memory, a
+  `replicated_service_app_type_1` (used by `rasn.state.replicated` and all eleven
+  module groups) for quorum-replicated storage,
+  `dist::partition_resolver` (used by URI-backed module tables) for shard routing,
+  and Thrift IDL for typed RPC schemas. Remaining missing-module gaps
+  (durable/vector agent memory, a
   **global** quota/rate authority consuming the new shared store, secrets vault,
   multi-tenancy, distributed scheduler/placement) are tracked there as roadmap
   items.

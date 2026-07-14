@@ -95,16 +95,32 @@ bool determinism_ledger::hydrate_choice(const deterministic_choice &choice, std:
     const std::string key = replay_key(choice.task_id, choice.key);
     for (deterministic_choice &existing : _choices)
     {
-        if (replay_key(existing.task_id, existing.key) == key)
+        if (existing.sequence == choice.sequence)
         {
+            if (replay_key(existing.task_id, existing.key) != key)
+            {
+                if (error != nullptr)
+                {
+                    *error = "deterministic choice sequence belongs to a different key";
+                }
+                return false;
+            }
             existing = choice;
-            _replay[key] = choice;
+            const std::map<std::string, deterministic_choice>::const_iterator replayed = _replay.find(key);
+            if (replayed == _replay.end() || replayed->second.sequence <= choice.sequence)
+            {
+                _replay[key] = choice;
+            }
             _next_sequence = (std::max)(_next_sequence, choice.sequence + 1);
             return true;
         }
     }
     _choices.push_back(choice);
-    _replay[key] = choice;
+    const std::map<std::string, deterministic_choice>::const_iterator replayed = _replay.find(key);
+    if (replayed == _replay.end() || replayed->second.sequence <= choice.sequence)
+    {
+        _replay[key] = choice;
+    }
     _next_sequence = (std::max)(_next_sequence, choice.sequence + 1);
     return true;
 }

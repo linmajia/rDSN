@@ -47,6 +47,7 @@ set(MY_BINPLACES
     "${CMAKE_CURRENT_SOURCE_DIR}/config.ini"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../config.rasn.ini"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../config.rasn.state.ini"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../config.rasn.runtime.replicated.ini"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../config.rasn.defaults.ini")
 
 set(RASN_INTEGRATION_PROGRAMS

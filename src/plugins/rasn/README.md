@@ -1175,6 +1175,18 @@ three-replica `rasn.state.replicated` development cluster. Point runtime hosts a
 the same state API. The single-machine profile validates quorum behavior but must
 be split into independently supervised replica nodes for host-failure tolerance.
 
+For direct runtime-module replication, launch
+`config.rasn.runtime.replicated.ini` instead. It creates eleven native rDSN
+type-1 tables with three replicas per partition; the message bus, resource budget,
+and blackboard use four partitions, and the other modules use one. Their quorum
+logs and decree checkpoints are authoritative, so this profile disables the
+legacy state mirror and standalone ownership gate. The checked-in profile
+co-hosts one meta server and three replica servers for development only;
+production must place and supervise those roles on separate failure domains.
+Pass `"meta;replica"` as the optional `serve` app-list argument, as shown in the
+profile header, so the generic standalone-role list does not filter those two
+cluster roles.
+
 `rasn.llm.agent`, `rasn.tool.agent`, `rasn.coordinator`, `rasn.workflow`, and
 `rasn.observability` all retain the shared
 `rasn_service_graph` while active; service shutdown releases those references in
@@ -1357,10 +1369,10 @@ factory = partition_resolver_simple
 arguments = meta-1:27601,meta-2:27601
 ```
 
-The client path is resolver-aware, but current runtime module app roles are still
-single-writer in-memory services rather than rDSN replicated tables. Meta-managed
-module replica groups require the direct module-replication work described in
-`docs/DISTRIBUTED_RUNTIME.md`.
+The client path serves both lightweight standalone roles and the eleven
+meta-managed tables in `config.rasn.runtime.replicated.ini`. The latter commit
+mutations through rDSN type-1 replication and recover partitions through
+checkpoint learning; see `docs/DISTRIBUTED_RUNTIME.md` §13.15.
 
 For registry-routed sharded deployments, set the same shard count on clients and
 configure each standalone module service with the shard labels it owns:
@@ -1402,16 +1414,22 @@ single unhealthy module node cannot stall or corrupt the system:
   cache, and the completed-response window is bounded by
   `rasn_runtime_dedup_capacity` plus `rasn_runtime_dedup_ttl_ms`. Hit/miss/wait/
   eviction/expiry counters are exposed as rASN metrics. This suppresses
-  lost-reply double-apply within one service process; it is not cross-process
-  exactly-once.
-- **Optional service-to-service auth.** When `rasn_runtime_auth_enabled` is true,
+  lost-reply double-apply within one standalone service process. Native type-1
+  module tables instead replicate and checkpoint a deterministic FIFO result
+  window with a protocol-fixed capacity of 8192, so retries remain deduplicated
+  after primary failover.
+- **Optional standalone service-to-service auth.** When
+  `rasn_runtime_auth_enabled` is true,
   distributed/hybrid clients stamp a shared token onto runtime module RPC
   envelopes and runtime services reject missing or invalid tokens before
   dispatching to module handlers. Rejections increment
   `rasn_runtime_auth_rejected_total`. Keep it disabled for trusted local
   experiments; for multi-node deployments, provide the same
   `rasn_runtime_auth_token` to every client and module service through
-  deployment-specific config, not the checked-in sample config.
+  deployment-specific config, not the checked-in sample config. Native type-1
+  apps fail startup when this mode is enabled because writes are intercepted
+  before app-level authentication; use transport/network identity for those
+  tables.
 
 ```ini
 rasn_runtime_breaker_enabled = true
@@ -1432,24 +1450,27 @@ endpoint surfaces quickly; sharded modules probe every configured shard.
 `rasn_runtime::describe_topology()` renders where each module is routed (local
 vs. remote), whether the endpoint came from `registry:`, `static:`, or
 resolver-backed `resolver:` config, per-shard endpoint labels when applicable,
-its standalone role, and both its
-intended consistency model and its `actual=single_writer_in_memory` runtime
-backing, which is useful for verifying a hybrid or multi-node layout.
+its standalone role, and both its intended consistency model and actual backing.
+Native remote tables report `actual=rdsn_type1_replica_group`; local and
+standalone services report `actual=single_writer_in_memory`, which is useful for
+verifying a hybrid or multi-node layout.
 
 Each module declares an intended distributed consistency model
 (`rasn_runtime_module_descriptors()`): `sharded` modules (`blackboard` by key,
 `resource_budget` by scope, `agent_message_bus` by message id) now have
 deterministic partition routing, ownership/ledger modules are `replicated` (for
 example `agent_control_plane`, `determinism_ledger`), and control-surface modules
-are `singleton` (for example `human_interaction`, `sandbox_runtime`). These
-document the target rDSN-native replication strategy; the current in-memory
-service store realizes each shard/replica as a single-writer service store.
+are `singleton` (for example `human_interaction`, `sandbox_runtime`). Standalone
+roles realize these as single-writer stores; the native replicated profile gives
+each module an independent table, mutation log, checkpoint stream, and failover
+boundary.
 
-> **Operational warning — one active writer per shard.** Key-based sharding is a
-> placement/routing layer, not replication. Do **not** run multiple active
-> instances for the same shard expecting high availability: you would get split
-> state. Replicated modules still need one active writer until real rDSN
-> replication fronts them. The state-service mirror written in `distributed` mode
+> **Operational warning for standalone roles — one active writer per shard.**
+> Key-based sharding alone is placement, not replication. Do **not** run multiple
+> standalone instances for the same shard expecting high availability: you would
+> get split state. Use the ownership gate plus replicated state mirror for elected
+> active/standby, or use the native type-1 module tables for direct quorum commit
+> and primary failover. The state-service mirror written in `distributed` mode
 > is replayed by module services on startup. Each mirrored mutation also writes a
 > per-module watermark by default; hydration verifies those watermarks before
 > replay so a torn, incomplete, or pre-watermark mirror fails closed instead of
@@ -1476,11 +1497,11 @@ hardening gaps remain:
 
 | Area | Current capability | Remaining limitation |
 | --- | --- | --- |
-| State availability | Standalone checkpoints/journal/NFS/local mirror, plus optional one-partition `rasn.state.replicated` quorum writes and checkpoint learning over rDSN type-1 replication. | Runtime modules still execute as elected single-writer in-memory stores; multi-partition query fan-out, safe online checkpoint GC, and an HA meta-server deployment remain. |
+| State availability | Standalone checkpoints/journal/NFS/local mirror; optional one-partition `rasn.state.replicated`; and eleven direct runtime-module type-1 tables with quorum writes, deterministic replay/dedup, checkpoint learning, resolver-backed partitions, and primary failover. | Multi-partition generic-state query fan-out, safe online checkpoint GC, production HA meta-server deployment, and standalone-to-table migration tooling remain. |
 | Discovery availability | Local registry by default; optional ZooKeeper-backed shared descriptors/leases, committed-epoch active-writer failover, read-capable standby frontends, bounded epoch/tombstone retention, and rDSN group-address client failover across `registry_addresses`. | Automated multi-process registry-writer failover evidence remains. |
 | Tool isolation | Default-deny side effects, workspace scoping, approvals, command allowlists, timeout/job containment, and a configurable container command wrapper. | No hardened container orchestrator with image, mount, network, and lifecycle policy. |
 | Replay fidelity | Replay for model responses, tool results, workflow scheduling, filesystem snapshots, and an `external.effect` ledger for side-effect intents. | No full virtualization of arbitrary external services, clocks, network state, or process environments. |
-| Deployment validation | Inline mode, typed service-mode RPC, URI/host endpoint configuration, registry heartbeats, active lease cleanup, distributed runtime modules, state-mirror hydration/watermarks, and a deployable rDSN type-1 replicated-state profile. | Full replicated-state cluster automation, direct quorum replication/sharding of module state, explicit watermark pruning, and local-to-remote migration tooling are not yet implemented. |
+| Deployment validation | Inline mode, typed service-mode RPC, URI/host endpoint configuration, registry heartbeats, active lease cleanup, distributed runtime modules, state-mirror hydration/watermarks, and deployable rDSN type-1 profiles for shared state and all runtime modules. | Automated real multi-host module-primary failover/checkpoint transfer, explicit watermark pruning, and standalone-to-table migration tooling remain. |
 | Credentials | `token_ref` handles for environment variables, files, and commands, plus deterministic redaction. | No vault-backed or OS-backed credential provider integration. |
 | SDK packaging | Generated C++/TypeScript/Python contracts and RPC-client source. | Packaged SDKs and concrete TypeScript/Python transports are not shipped. |
 | Evaluation evidence | Unit tests, self-tests, service smokes, schema smokes, report build, and a small eval harness. | Large benchmarks and user studies for debugging effectiveness remain future work. |

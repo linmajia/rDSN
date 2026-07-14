@@ -1609,6 +1609,32 @@ TEST(rasn_determinism_ledger, records_and_replays_choices)
     EXPECT_EQ("generated", second.choice.value);
 }
 
+TEST(rasn_determinism_ledger, hydration_preserves_repeated_keys_by_sequence)
+{
+    determinism_ledger ledger;
+    deterministic_choice first;
+    first.sequence = 1;
+    first.task_id = "task";
+    first.key = "model";
+    first.source = "unit";
+    first.value = "first";
+    std::string error;
+    ASSERT_TRUE(ledger.hydrate_choice(first, &error)) << error;
+
+    deterministic_choice second = first;
+    second.sequence = 2;
+    second.value = "second";
+    ASSERT_TRUE(ledger.hydrate_choice(second, &error)) << error;
+    ASSERT_EQ(2u, ledger.snapshot().size());
+    const deterministic_replay_result replayed = ledger.replay("task", "model");
+    ASSERT_TRUE(replayed.ok) << replayed.error;
+    EXPECT_EQ("second", replayed.choice.value);
+
+    deterministic_choice conflicting = second;
+    conflicting.key = "tool";
+    EXPECT_FALSE(ledger.hydrate_choice(conflicting, &error));
+}
+
 TEST(rasn_sandbox_runtime, evaluates_filesystem_network_and_process_policy)
 {
     const std::string root = temp_file_path("rasn-sandbox-root");
@@ -5040,6 +5066,145 @@ TEST(rasn_runtime, dispatch_dedups_repeated_request_signatures)
     no_id_b.key = "no-id-key-b";
     const rasn_runtime_response no_id_b_response = dispatch_rasn_runtime_request(no_id_b);
     EXPECT_EQ("no-id-key-b", no_id_b_response.key);
+}
+
+TEST(rasn_runtime, replicated_requests_use_parallel_read_and_write_codes)
+{
+    rasn_runtime_request read;
+    read.module = "determinism_ledger";
+    read.operation = "snapshot";
+    EXPECT_EQ(RPC_RASN_DETERMINISM_LEDGER, rasn_runtime_rpc_code_for_request(read));
+
+    rasn_runtime_request write = read;
+    write.operation = "record";
+    EXPECT_EQ(RPC_RASN_DETERMINISM_LEDGER_WRITE, rasn_runtime_rpc_code_for_request(write));
+    EXPECT_NE(rasn_runtime_rpc_code_for_request(read), rasn_runtime_rpc_code_for_request(write));
+}
+
+TEST(rasn_runtime, replica_checkpoint_restores_module_state_and_dedup)
+{
+    ::dsn_gpid gpid = {};
+    gpid.u.app_id = 1;
+    gpid.u.partition_index = 0;
+    const int64_t decree = 42;
+    const auto encode_field = [](const std::string &key, const std::string &value) {
+        return key + "=" + std::to_string(value.size()) + ":" + value + "\n";
+    };
+    const auto count_substring = [](const std::string &text, const std::string &needle) {
+        size_t count = 0;
+        size_t offset = 0;
+        while ((offset = text.find(needle, offset)) != std::string::npos)
+        {
+            ++count;
+            offset += needle.size();
+        }
+        return count;
+    };
+
+    rasn_runtime_replica_store source("determinism_ledger");
+    EXPECT_GT(source.dedup_capacity(), 0u);
+    rasn_runtime_request record;
+    record.module = "determinism_ledger";
+    record.operation = "record";
+    record.key = "replica-task/route";
+    record.payload = encode_field("task_id", "replica-task") + encode_field("key", "route") +
+                     encode_field("source", "unit") + encode_field("value", "primary");
+    record.request_id = "replica-dedup-1";
+    const rasn_runtime_response first = source.dispatch(record);
+    ASSERT_TRUE(first.ok) << first.error;
+    EXPECT_EQ(first.payload, source.dispatch(record).payload);
+    rasn_runtime_request second = record;
+    second.payload = encode_field("task_id", "replica-task") + encode_field("key", "route") +
+                     encode_field("source", "unit") + encode_field("value", "secondary");
+    second.request_id = "replica-dedup-2";
+    ASSERT_TRUE(source.dispatch(second).ok);
+
+    std::vector<state_record> records;
+    std::string error;
+    ASSERT_TRUE(source.checkpoint_records(gpid, decree, &records, &error)) << error;
+    ASSERT_FALSE(records.empty());
+
+    rasn_runtime_replica_store restored("determinism_ledger");
+    ASSERT_TRUE(restored.validate_checkpoint_records(records, gpid, decree, &error)) << error;
+    ::dsn_gpid wrong_partition = gpid;
+    wrong_partition.u.partition_index = 1;
+    EXPECT_FALSE(restored.validate_checkpoint_records(records, wrong_partition, decree, &error));
+    EXPECT_FALSE(restored.validate_checkpoint_records(records, gpid, decree + 1, &error));
+    rasn_runtime_replica_store wrong_module("blackboard");
+    EXPECT_FALSE(wrong_module.validate_checkpoint_records(records, gpid, decree, &error));
+
+    rasn_runtime_request snapshot;
+    snapshot.module = "determinism_ledger";
+    snapshot.operation = "snapshot";
+    EXPECT_EQ(0u, count_substring(restored.dispatch(snapshot).payload, "replica-task"));
+
+    ASSERT_TRUE(restored.replace_checkpoint_records(records, gpid, decree, &error)) << error;
+    EXPECT_EQ(2u, count_substring(restored.dispatch(snapshot).payload, "replica-task"));
+    EXPECT_EQ(first.payload, restored.dispatch(record).payload);
+    EXPECT_EQ(2u, count_substring(restored.dispatch(snapshot).payload, "replica-task"));
+
+    bool corrupted = false;
+    for (state_record &checkpoint_record : records)
+    {
+        if (checkpoint_record.kind == "rasn.runtime.determinism_ledger.dedup")
+        {
+            checkpoint_record.value = "corrupt";
+            corrupted = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(corrupted);
+    EXPECT_FALSE(restored.validate_checkpoint_records(records, gpid, decree, &error));
+}
+
+TEST(rasn_runtime, replica_rejects_nondeterministic_mutations)
+{
+    rasn_runtime_replica_store store("blackboard");
+    rasn_runtime_request request;
+    request.module = "blackboard";
+    request.operation = "put";
+    request.key = "missing-timestamp";
+    request.request_id = "replica-nondeterministic-1";
+    request.payload = "schema_version=1:1\nkey=17:missing-timestamp\n";
+    const rasn_runtime_response response = store.dispatch(request);
+    EXPECT_FALSE(response.ok);
+    EXPECT_NE(std::string::npos, response.error.find("timestamp"));
+
+    request.key = "envelope-key";
+    request.request_id = "replica-mismatched-key";
+    request.payload = "key=11:payload-key\nupdated_at_ms=1:1\n";
+    const rasn_runtime_response mismatched = store.dispatch(request);
+    EXPECT_FALSE(mismatched.ok);
+    EXPECT_NE(std::string::npos, mismatched.error.find("request key"));
+}
+
+TEST(rasn_runtime, replica_dedup_preserves_failed_mutation_outcome)
+{
+    const auto encode_field = [](const std::string &key, const std::string &value) {
+        return key + "=" + std::to_string(value.size()) + ":" + value + "\n";
+    };
+    rasn_runtime_replica_store store("task_orchestration_kernel");
+
+    rasn_runtime_request complete;
+    complete.module = "task_orchestration_kernel";
+    complete.operation = "complete";
+    complete.key = "late-task";
+    complete.payload = "result";
+    complete.request_id = "complete-before-add";
+    const rasn_runtime_response first = store.dispatch(complete);
+    ASSERT_FALSE(first.ok);
+
+    rasn_runtime_request add;
+    add.module = "task_orchestration_kernel";
+    add.operation = "add_task";
+    add.key = "late-task";
+    add.payload = encode_field("task_id", "late-task") + encode_field("state", "pending");
+    add.request_id = "add-late-task";
+    ASSERT_TRUE(store.dispatch(add).ok);
+
+    const rasn_runtime_response retried = store.dispatch(complete);
+    EXPECT_FALSE(retried.ok);
+    EXPECT_EQ(first.error, retried.error);
 }
 
 TEST(rasn_runtime, ownership_resources_expand_modules_and_shards)

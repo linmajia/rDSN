@@ -18,7 +18,7 @@ bool shared_blackboard::put(blackboard_entry entry, blackboard_entry *stored, st
         }
         return false;
     }
-    const uint64_t now_ms = ::dsn_now_ms();
+    const uint64_t now_ms = entry.updated_at_ms == 0 ? ::dsn_now_ms() : entry.updated_at_ms;
     ::dsn::service::zauto_lock guard(_lock);
     const std::map<std::string, blackboard_entry>::const_iterator previous = _entries.find(entry.key);
     entry.generation = previous == _entries.end() ? 1 : previous->second.generation + 1;

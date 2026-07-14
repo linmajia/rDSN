@@ -129,6 +129,18 @@ bool resource_budget_manager::usage(const std::string &scope, resource_usage *us
     return true;
 }
 
+std::vector<resource_quota> resource_budget_manager::quota_snapshot() const
+{
+    ::dsn::service::zauto_lock guard(_lock);
+    std::vector<resource_quota> result;
+    result.reserve(_quotas.size());
+    for (const std::map<std::string, resource_quota>::value_type &entry : _quotas)
+    {
+        result.push_back(entry.second);
+    }
+    return result;
+}
+
 std::vector<resource_usage> resource_budget_manager::snapshot() const
 {
     ::dsn::service::zauto_lock guard(_lock);

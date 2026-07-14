@@ -12,6 +12,7 @@
 #include <rasn/recovery_supervisor.h>
 #include <rasn/resource_budget.h>
 #include <rasn/sandbox_runtime.h>
+#include <rasn/state_service.h>
 #include <rasn/task_orchestration.h>
 
 #include <dsn/service_api_cpp.h>
@@ -19,6 +20,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -163,6 +165,39 @@ inline void unmarshall(::dsn::binary_reader &reader, rasn_runtime_response &valu
         value.trace_id.clear();
     }
 }
+
+// Isolated deterministic state machine used by each native rDSN replica
+// partition. Its checkpoint image includes both module state and the bounded
+// idempotency window needed to make ambiguous client retries safe after failover.
+class rasn_runtime_replica_store
+{
+public:
+    explicit rasn_runtime_replica_store(std::string module);
+    ~rasn_runtime_replica_store();
+
+    rasn_runtime_replica_store(const rasn_runtime_replica_store &) = delete;
+    rasn_runtime_replica_store &operator=(const rasn_runtime_replica_store &) = delete;
+
+    rasn_runtime_response dispatch(const rasn_runtime_request &request);
+    bool checkpoint_records(::dsn_gpid gpid,
+                            int64_t decree,
+                            std::vector<state_record> *records,
+                            std::string *error) const;
+    bool validate_checkpoint_records(const std::vector<state_record> &records,
+                                     ::dsn_gpid gpid,
+                                     int64_t decree,
+                                     std::string *error) const;
+    bool replace_checkpoint_records(const std::vector<state_record> &records,
+                                    ::dsn_gpid gpid,
+                                    int64_t decree,
+                                    std::string *error);
+    const std::string &module() const;
+    size_t dedup_capacity() const;
+
+private:
+    struct impl;
+    std::unique_ptr<impl> _impl;
+};
 
 // Ambient end-to-end trace propagation for runtime module RPC.
 //
@@ -505,12 +540,17 @@ rasn_runtime_state_compaction_report compact_rasn_runtime_state_mirror(rasn_serv
                                                                        const std::string &checkpoint_path = "",
                                                                        const std::string &state_prefix = "");
 void register_rasn_runtime_apps();
+::dsn::task_code rasn_runtime_rpc_code_for_request(const rasn_runtime_request &request);
 
 class rasn_runtime_rpc_service : public ::dsn::serverlet<rasn_runtime_rpc_service>
 {
 public:
-    explicit rasn_runtime_rpc_service(std::vector<std::string> modules = std::vector<std::string>());
-    void open_service();
+    using dispatch_callback = std::function<rasn_runtime_response(const rasn_runtime_request &)>;
+
+    explicit rasn_runtime_rpc_service(std::vector<std::string> modules = std::vector<std::string>(),
+                                      dispatch_callback dispatcher = dispatch_callback(),
+                                      bool replicated = false);
+    void open_service(::dsn_gpid gpid = ::dsn_gpid());
     bool close_service(std::chrono::milliseconds timeout);
     const std::vector<std::string> &modules() const { return _modules; }
 
@@ -526,6 +566,28 @@ protected:
     void on_contract_verifier(const rasn_runtime_request &request, ::dsn::rpc_replier<rasn_runtime_response> &reply);
     void on_human_interaction(const rasn_runtime_request &request, ::dsn::rpc_replier<rasn_runtime_response> &reply);
     void on_sandbox_runtime(const rasn_runtime_request &request, ::dsn::rpc_replier<rasn_runtime_response> &reply);
+    void on_agent_control_write(const rasn_runtime_request &request,
+                                ::dsn::rpc_replier<rasn_runtime_response> &reply);
+    void on_message_bus_write(const rasn_runtime_request &request,
+                              ::dsn::rpc_replier<rasn_runtime_response> &reply);
+    void on_task_orchestration_write(const rasn_runtime_request &request,
+                                     ::dsn::rpc_replier<rasn_runtime_response> &reply);
+    void on_determinism_ledger_write(const rasn_runtime_request &request,
+                                     ::dsn::rpc_replier<rasn_runtime_response> &reply);
+    void on_capability_directory_write(const rasn_runtime_request &request,
+                                       ::dsn::rpc_replier<rasn_runtime_response> &reply);
+    void on_resource_budget_write(const rasn_runtime_request &request,
+                                  ::dsn::rpc_replier<rasn_runtime_response> &reply);
+    void on_recovery_supervisor_write(const rasn_runtime_request &request,
+                                      ::dsn::rpc_replier<rasn_runtime_response> &reply);
+    void on_blackboard_write(const rasn_runtime_request &request,
+                             ::dsn::rpc_replier<rasn_runtime_response> &reply);
+    void on_contract_verifier_write(const rasn_runtime_request &request,
+                                    ::dsn::rpc_replier<rasn_runtime_response> &reply);
+    void on_human_interaction_write(const rasn_runtime_request &request,
+                                    ::dsn::rpc_replier<rasn_runtime_response> &reply);
+    void on_sandbox_runtime_write(const rasn_runtime_request &request,
+                                  ::dsn::rpc_replier<rasn_runtime_response> &reply);
 
 private:
     bool register_module_handler(const std::string &module);
@@ -558,9 +620,13 @@ private:
     };
     void reply_module_request(const std::string &module,
                               const rasn_runtime_request &request,
-                              ::dsn::rpc_replier<rasn_runtime_response> &reply);
+                              ::dsn::rpc_replier<rasn_runtime_response> &reply,
+                              bool write_channel);
 
     std::vector<std::string> _modules;
+    dispatch_callback _dispatcher;
+    bool _replicated = false;
+    ::dsn_gpid _gpid;
     // Shards this service hosts per module, populated from config at construction
     // for sharded modules that host only a subset of partitions. A module absent
     // from the map (or mapped to an empty vector) hosts the whole module, so the
@@ -723,6 +789,59 @@ public:
     {
     }
 };
+
+class rasn_replicated_runtime_app : public ::dsn::replicated_service_app_type_1
+{
+public:
+    ::dsn::error_code start(int argc, char **argv) override;
+    ::dsn::error_code stop(bool cleanup = false) override;
+    ::dsn::error_code sync_checkpoint(int64_t last_commit) override;
+    ::dsn::error_code async_checkpoint(int64_t last_commit) override;
+    int64_t get_last_checkpoint_decree() override;
+    ::dsn::error_code get_checkpoint(int64_t learn_start,
+                                     int64_t local_commit,
+                                     void *learn_request,
+                                     int learn_request_size,
+                                     app_learn_state &state) override;
+    ::dsn::error_code apply_checkpoint(::dsn_chkpt_apply_mode mode,
+                                       int64_t local_commit,
+                                       const ::dsn_app_learn_state &state) override;
+
+protected:
+    rasn_replicated_runtime_app(::dsn_gpid gpid, std::string module);
+
+private:
+    ::dsn::error_code recover_latest_checkpoint();
+    std::string checkpoint_path(int64_t decree) const;
+
+    std::string _module;
+    std::string _data_dir;
+    ::dsn::service::zlock _checkpoint_lock;
+    std::atomic<int64_t> _last_durable_decree{0};
+    rasn_runtime_replica_store _store;
+    rasn_runtime_rpc_service _rpc;
+};
+
+#define RASN_DECLARE_REPLICATED_RUNTIME_APP(class_name, module_name)                                  \
+    class class_name : public rasn_replicated_runtime_app                                              \
+    {                                                                                                  \
+    public:                                                                                            \
+        explicit class_name(::dsn_gpid gpid) : rasn_replicated_runtime_app(gpid, module_name) {}      \
+    }
+
+RASN_DECLARE_REPLICATED_RUNTIME_APP(rasn_replicated_agent_control_app, "agent_control_plane");
+RASN_DECLARE_REPLICATED_RUNTIME_APP(rasn_replicated_message_bus_app, "agent_message_bus");
+RASN_DECLARE_REPLICATED_RUNTIME_APP(rasn_replicated_task_orchestration_app, "task_orchestration_kernel");
+RASN_DECLARE_REPLICATED_RUNTIME_APP(rasn_replicated_determinism_ledger_app, "determinism_ledger");
+RASN_DECLARE_REPLICATED_RUNTIME_APP(rasn_replicated_capability_directory_app, "capability_directory");
+RASN_DECLARE_REPLICATED_RUNTIME_APP(rasn_replicated_resource_budget_app, "resource_budget");
+RASN_DECLARE_REPLICATED_RUNTIME_APP(rasn_replicated_recovery_supervisor_app, "recovery_supervisor");
+RASN_DECLARE_REPLICATED_RUNTIME_APP(rasn_replicated_blackboard_app, "blackboard");
+RASN_DECLARE_REPLICATED_RUNTIME_APP(rasn_replicated_contract_verifier_app, "contract_verifier");
+RASN_DECLARE_REPLICATED_RUNTIME_APP(rasn_replicated_human_interaction_app, "human_interaction");
+RASN_DECLARE_REPLICATED_RUNTIME_APP(rasn_replicated_sandbox_runtime_app, "sandbox_runtime");
+
+#undef RASN_DECLARE_REPLICATED_RUNTIME_APP
 
 std::string describe_agent_control_record(const agent_control_record &record);
 std::string describe_capability_provider_record(const capability_provider &provider);

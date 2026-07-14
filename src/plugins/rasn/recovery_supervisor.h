@@ -49,6 +49,7 @@ public:
     recovery_action decide(const failure_observation &failure) const;
     recovery_action observe(const failure_observation &failure);
     bool clear_history(const std::string &task_id, std::string *error);
+    std::vector<recovery_policy> policy_snapshot() const;
     std::vector<failure_observation> history(const std::string &task_id = "") const;
     std::string describe() const;
 

@@ -52,7 +52,7 @@ bool agent_message_bus::publish(agent_message message, agent_message *stored, st
         }
         return false;
     }
-    const uint64_t now_ms = ::dsn_now_ms();
+    const uint64_t now_ms = message.updated_at_ms == 0 ? ::dsn_now_ms() : message.updated_at_ms;
     if (message.created_at_ms == 0)
     {
         message.created_at_ms = now_ms;
@@ -125,7 +125,7 @@ std::vector<agent_message> agent_message_bus::pull(const std::string &receiver, 
     return result;
 }
 
-bool agent_message_bus::ack(const std::string &message_id, std::string *error)
+bool agent_message_bus::ack(const std::string &message_id, std::string *error, uint64_t now_ms)
 {
     ::dsn::service::zauto_lock guard(_lock);
     std::map<std::string, agent_message>::iterator it = _messages.find(message_id);
@@ -146,11 +146,15 @@ bool agent_message_bus::ack(const std::string &message_id, std::string *error)
         return false;
     }
     it->second.state = "acked";
-    it->second.updated_at_ms = ::dsn_now_ms();
+    it->second.updated_at_ms = now_ms == 0 ? ::dsn_now_ms() : now_ms;
     return true;
 }
 
-bool agent_message_bus::defer(const std::string &message_id, uint64_t available_at_ms, const std::string &reason, std::string *error)
+bool agent_message_bus::defer(const std::string &message_id,
+                              uint64_t available_at_ms,
+                              const std::string &reason,
+                              std::string *error,
+                              uint64_t now_ms)
 {
     ::dsn::service::zauto_lock guard(_lock);
     std::map<std::string, agent_message>::iterator it = _messages.find(message_id);
@@ -173,11 +177,14 @@ bool agent_message_bus::defer(const std::string &message_id, uint64_t available_
     it->second.state = "deferred";
     it->second.available_at_ms = available_at_ms;
     it->second.error = reason;
-    it->second.updated_at_ms = ::dsn_now_ms();
+    it->second.updated_at_ms = now_ms == 0 ? ::dsn_now_ms() : now_ms;
     return true;
 }
 
-bool agent_message_bus::dead_letter(const std::string &message_id, const std::string &reason, std::string *error)
+bool agent_message_bus::dead_letter(const std::string &message_id,
+                                    const std::string &reason,
+                                    std::string *error,
+                                    uint64_t now_ms)
 {
     ::dsn::service::zauto_lock guard(_lock);
     std::map<std::string, agent_message>::iterator it = _messages.find(message_id);
@@ -199,7 +206,7 @@ bool agent_message_bus::dead_letter(const std::string &message_id, const std::st
     }
     it->second.state = "dead_letter";
     it->second.error = reason;
-    it->second.updated_at_ms = ::dsn_now_ms();
+    it->second.updated_at_ms = now_ms == 0 ? ::dsn_now_ms() : now_ms;
     return true;
 }
 

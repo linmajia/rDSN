@@ -33,9 +33,16 @@ public:
     bool publish(agent_message message, agent_message *stored, std::string *error);
     bool hydrate_message(const agent_message &message, std::string *error);
     std::vector<agent_message> pull(const std::string &receiver, size_t max_messages, uint64_t now_ms);
-    bool ack(const std::string &message_id, std::string *error);
-    bool defer(const std::string &message_id, uint64_t available_at_ms, const std::string &reason, std::string *error);
-    bool dead_letter(const std::string &message_id, const std::string &reason, std::string *error);
+    bool ack(const std::string &message_id, std::string *error, uint64_t now_ms = 0);
+    bool defer(const std::string &message_id,
+               uint64_t available_at_ms,
+               const std::string &reason,
+               std::string *error,
+               uint64_t now_ms = 0);
+    bool dead_letter(const std::string &message_id,
+                     const std::string &reason,
+                     std::string *error,
+                     uint64_t now_ms = 0);
     size_t expire_deadlines(uint64_t now_ms);
     bool find(const std::string &message_id, agent_message *message) const;
     std::vector<agent_message> outbox(const std::string &sender) const;

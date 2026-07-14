@@ -120,6 +120,18 @@ bool recovery_supervisor::clear_history(const std::string &task_id, std::string 
     return true;
 }
 
+std::vector<recovery_policy> recovery_supervisor::policy_snapshot() const
+{
+    ::dsn::service::zauto_lock guard(_lock);
+    std::vector<recovery_policy> result;
+    result.reserve(_policies.size());
+    for (const std::map<std::string, recovery_policy>::value_type &entry : _policies)
+    {
+        result.push_back(entry.second);
+    }
+    return result;
+}
+
 std::vector<failure_observation> recovery_supervisor::history(const std::string &task_id) const
 {
     ::dsn::service::zauto_lock guard(_lock);
