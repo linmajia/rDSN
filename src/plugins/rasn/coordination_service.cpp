@@ -614,8 +614,7 @@ public:
                 h.version =
                     grant_won ? granted_version->load() : cancel->version;
                 _ownership->holds[resource_id] = h;
-                _ownership->latest_versions[resource_id] =
-                    (std::max)(_ownership->latest_versions[resource_id], h.version);
+                remember_latest_version(resource_id, h.version);
                 if (fencing_token != nullptr)
                     *fencing_token = h.version;
                 return ::dsn::ERR_OK;
@@ -635,8 +634,7 @@ public:
             h.lease_task = tasks.second;
             h.version = granted_version->load();
             _ownership->holds[resource_id] = h;
-            _ownership->latest_versions[resource_id] =
-                (std::max)(_ownership->latest_versions[resource_id], h.version);
+            remember_latest_version(resource_id, h.version);
             if (fencing_token != nullptr)
                 *fencing_token = h.version;
         } else if (tasks.second != nullptr) {
@@ -686,10 +684,25 @@ public:
                 auto it = _ownership->holds.find(resource_id);
                 if (it != _ownership->holds.end() && it->second.owner == owner_id &&
                     it->second.version == version)
+                {
                     _ownership->holds.erase(it);
+                }
+                if (destroy && _cfg.provider != "zookeeper" &&
+                    _ownership->holds.find(resource_id) == _ownership->holds.end())
+                {
+                    const auto latest = _ownership->latest_versions.find(resource_id);
+                    if (latest != _ownership->latest_versions.end() &&
+                        latest->second <= version)
+                    {
+                        _ownership->latest_versions.erase(latest);
+                    }
+                }
             }
             if (lease != nullptr)
                 cancel_and_wait(lease);
+            // Idempotent release treats every outcome that proves this owner no
+            // longer holds the lock as success. Only uncertain outcomes escape.
+            return ::dsn::ERR_OK;
         }
         return out;
     }
@@ -707,13 +720,21 @@ public:
                        : ::dsn::ERR_INVALID_STATE;
         }
 
+        // The provider has no public queued-grant query, so this barrier pins
+        // its private <lock-root>/<lock-id>/LOCKNODE<sequence> layout. Because
+        // rASN releases fenced locks non-destructively, the directory must still
+        // exist; missing or malformed layout is a fail-closed provider mismatch.
         std::vector<std::string> children;
         const ::dsn::error_code listed =
             list_children_sync(join_path(_cfg.lock_namespace, resource_id), children);
         if (listed == ::dsn::ERR_OBJECT_NOT_FOUND ||
             listed == ::dsn::ERR_PATH_NOT_FOUND)
         {
-            return ::dsn::ERR_OK;
+            derror("rasn.coordination expected the ZooKeeper lock directory for '%s' "
+                   "to survive non-destructive release; refusing to weaken the "
+                   "fencing barrier",
+                   resource_id.c_str());
+            return ::dsn::ERR_INVALID_STATE;
         }
         if (listed != ::dsn::ERR_OK)
             return listed;
@@ -724,7 +745,13 @@ public:
         {
             uint64_t version = 0;
             if (!parse_lock_version(child, &version))
+            {
+                derror("rasn.coordination expected ZooKeeper lock child '%s' to use "
+                       "the provider's LOCKNODE<sequence> layout; refusing to weaken "
+                       "the fencing barrier",
+                       child.c_str());
                 return ::dsn::ERR_INVALID_STATE;
+            }
             if (version <= fencing_token)
                 return ::dsn::ERR_INVALID_STATE;
         }
@@ -817,8 +844,21 @@ private:
     {
         std::mutex mu;
         std::map<std::string, hold> holds;
+        // The simple provider has no public post-release grant query, so retain
+        // each resource's latest fence for delayed barrier checks. ZooKeeper
+        // verifies live sequential children instead and never populates this map.
         std::map<std::string, uint64_t> latest_versions;
     };
+
+    void remember_latest_version(const std::string &resource_id, uint64_t version)
+    {
+        if (_cfg.provider == "zookeeper")
+        {
+            return;
+        }
+        _ownership->latest_versions[resource_id] =
+            (std::max)(_ownership->latest_versions[resource_id], version);
+    }
 
     bool wait_for_operation(const ::dsn::task_ptr &task)
     {
@@ -928,14 +968,19 @@ private:
 
     static bool parse_lock_version(const std::string &node, uint64_t *version)
     {
-        const size_t first_digit = node.find_first_of("0123456789");
-        if (first_digit == std::string::npos ||
-            node.compare(0, first_digit, "LOCKNODE") != 0)
+        // distributed_lock_service_zookeeper currently creates private
+        // ephemeral-sequential children named LOCKNODE<sequence>. Its public
+        // API exposes no equivalent queued-grant fence, so pin that internal
+        // layout explicitly and fail closed if the provider ever changes it.
+        static const char kLockNodePrefix[] = "LOCKNODE";
+        const size_t prefix_length = sizeof(kLockNodePrefix) - 1;
+        if (node.size() <= prefix_length ||
+            node.compare(0, prefix_length, kLockNodePrefix) != 0)
         {
             return false;
         }
         uint64_t parsed = 0;
-        for (size_t i = first_digit; i < node.size(); ++i)
+        for (size_t i = prefix_length; i < node.size(); ++i)
         {
             if (node[i] < '0' || node[i] > '9' ||
                 parsed > ((std::numeric_limits<uint64_t>::max)() -

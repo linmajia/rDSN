@@ -526,6 +526,30 @@ private:
     void unregister_module_handler(const std::string &module);
     bool begin_request();
     void finish_request();
+    class request_guard
+    {
+    public:
+        explicit request_guard(rasn_runtime_rpc_service *service)
+            : _service(service), _active(service->begin_request())
+        {
+        }
+        ~request_guard()
+        {
+            if (_active)
+            {
+                _service->finish_request();
+            }
+        }
+
+        request_guard(const request_guard &) = delete;
+        request_guard &operator=(const request_guard &) = delete;
+
+        bool active() const { return _active; }
+
+    private:
+        rasn_runtime_rpc_service *_service;
+        bool _active;
+    };
     void reply_module_request(const std::string &module,
                               const rasn_runtime_request &request,
                               ::dsn::rpc_replier<rasn_runtime_response> &reply);

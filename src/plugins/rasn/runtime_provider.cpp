@@ -5576,7 +5576,8 @@ void rasn_runtime_rpc_service::reply_module_request(const std::string &module,
 {
     rasn_runtime_request copy = request;
     force_module(&copy, module);
-    if (!begin_request())
+    request_guard guard(this);
+    if (!guard.active())
     {
         reply(make_rasn_runtime_error(copy, "rasn runtime service is shutting down"));
         return;
@@ -5587,7 +5588,6 @@ void rasn_runtime_rpc_service::reply_module_request(const std::string &module,
         metrics_registry::instance().on_event("runtime.auth.rejected", module);
         dwarn("runtime module RPC auth rejected for module '%s'", module.c_str());
         reply(make_rasn_runtime_error(copy, auth_error));
-        finish_request();
         return;
     }
     copy.auth_token.clear();
@@ -5607,7 +5607,6 @@ void rasn_runtime_rpc_service::reply_module_request(const std::string &module,
               static_cast<unsigned int>(partition));
         reply(make_rasn_runtime_error(
             copy, "rasn runtime service does not host shard " + std::to_string(partition) + " of module " + module));
-        finish_request();
         return;
     }
 
@@ -5615,7 +5614,6 @@ void rasn_runtime_rpc_service::reply_module_request(const std::string &module,
     // logs and any nested module requests share the originating operation's trace.
     rasn_runtime_trace_scope trace(copy.trace_id);
     reply(dispatch_rasn_runtime_request(copy));
-    finish_request();
 }
 
 void rasn_runtime_rpc_service::on_agent_control(const rasn_runtime_request &request,

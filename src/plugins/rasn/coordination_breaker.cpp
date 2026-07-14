@@ -570,11 +570,25 @@ public:
             }
         }
 
+        // Reports only commit fenced state; unlike probe claims, they do not
+        // authorize a side effect and therefore need no post-release barrier.
         err = service->release_ownership(resource, owner_id, false);
         if (err != ::dsn::ERR_OK)
         {
-            return unavailable_report("failed to release shared breaker lock: " +
-                                      std::string(err.to_string()));
+            const std::string release_error =
+                "failed to release shared breaker lock: " +
+                std::string(err.to_string());
+            if (result.available)
+            {
+                dwarn("%s; the breaker report was already committed",
+                      release_error.c_str());
+                return result;
+            }
+            if (!result.error.empty())
+            {
+                result.error += "; ";
+            }
+            result.error += release_error;
         }
         return result;
     }
