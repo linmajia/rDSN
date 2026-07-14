@@ -3,9 +3,11 @@
 #include <rasn/agent_types.h>
 #include <rasn/rasn.code.definition.h>
 
+#include <dsn/cpp/replicated_service_app.h>
 #include <dsn/cpp/zlocks.h>
 #include <dsn/service_api_cpp.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <map>
@@ -187,15 +189,24 @@ inline void unmarshall(::dsn::binary_reader &reader, state_response &value, ::ds
 class state_store
 {
 public:
+    explicit state_store(bool journal_enabled = true) : _journal_enabled(journal_enabled) {}
+
     state_response put(const state_record &record);
     state_response put(const state_put_request &request);
     state_response get(const state_key_request &request) const;
     state_response query(const state_query_request &request) const;
     state_response checkpoint(const state_checkpoint_request &request) const;
+    state_response copy_checkpoint(const state_checkpoint_request &request,
+                                   const std::string &durable_path);
+    state_response replace_from_checkpoint(const state_checkpoint_request &request,
+                                           const std::string &durable_path = "");
     state_response recover(const state_checkpoint_request &request);
     bool has_recovery_state(const state_checkpoint_request &request) const;
 
 private:
+    state_response import_checkpoint(const state_checkpoint_request &request,
+                                     const std::string &durable_path,
+                                     bool replace);
     state_response error_response(const std::string &error) const;
     std::string default_checkpoint_path() const;
     std::string default_journal_path() const;
@@ -207,6 +218,9 @@ private:
     // Incremented on every successful put; lets checkpoint detect whether any
     // write landed since it snapshotted so it can safely compact the journal.
     uint64_t _write_epoch = 0;
+    // Standalone stores journal before exposing writes. Type-1 replicated stores
+    // disable this because rDSN's quorum mutation log is their durability source.
+    const bool _journal_enabled;
 };
 
 std::string configured_state_checkpoint_path();
@@ -219,9 +233,14 @@ state_store &global_state_store();
 class rasn_state_rpc_service : public ::dsn::serverlet<rasn_state_rpc_service>
 {
 public:
-    rasn_state_rpc_service() : ::dsn::serverlet<rasn_state_rpc_service>("rasn.state") {}
-    void open_service();
-    void close_service();
+    explicit rasn_state_rpc_service(state_store *store = nullptr, bool replicated = false)
+        : ::dsn::serverlet<rasn_state_rpc_service>("rasn.state"),
+          _store(store == nullptr ? &global_state_store() : store),
+          _replicated(replicated)
+    {
+    }
+    void open_service(::dsn_gpid gpid = ::dsn_gpid());
+    void close_service(::dsn_gpid gpid = ::dsn_gpid());
 
 protected:
     void on_put(const state_record &request, ::dsn::rpc_replier<state_response> &reply);
@@ -230,6 +249,10 @@ protected:
     void on_query(const state_query_request &request, ::dsn::rpc_replier<state_response> &reply);
     void on_checkpoint(const state_checkpoint_request &request, ::dsn::rpc_replier<state_response> &reply);
     void on_recover(const state_checkpoint_request &request, ::dsn::rpc_replier<state_response> &reply);
+
+private:
+    state_store *_store;
+    bool _replicated;
 };
 
 class rasn_state_client : public virtual ::dsn::clientlet
@@ -287,6 +310,37 @@ public:
 private:
     rasn_state_rpc_service _rpc;
 };
+
+class rasn_replicated_state_app : public ::dsn::replicated_service_app_type_1
+{
+public:
+    explicit rasn_replicated_state_app(::dsn_gpid gpid);
+
+    ::dsn::error_code start(int argc, char **argv) override;
+    ::dsn::error_code stop(bool cleanup = false) override;
+    ::dsn::error_code sync_checkpoint(int64_t last_commit) override;
+    int64_t get_last_checkpoint_decree() override;
+    ::dsn::error_code get_checkpoint(int64_t learn_start,
+                                     int64_t local_commit,
+                                     void *learn_request,
+                                     int learn_request_size,
+                                     app_learn_state &state) override;
+    ::dsn::error_code apply_checkpoint(::dsn_chkpt_apply_mode mode,
+                                       int64_t local_commit,
+                                       const ::dsn_app_learn_state &state) override;
+
+private:
+    ::dsn::error_code recover_latest_checkpoint();
+    std::string checkpoint_path(int64_t decree) const;
+
+    ::dsn::service::zlock _checkpoint_lock;
+    state_store _store;
+    rasn_state_rpc_service _rpc;
+    std::string _data_dir;
+    std::atomic<int64_t> _last_durable_decree;
+};
+
+void register_rasn_state_apps();
 
 } // namespace rasn
 } // namespace dsn

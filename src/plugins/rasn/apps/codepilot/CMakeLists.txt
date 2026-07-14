@@ -37,7 +37,7 @@ set(MY_PROJ_LIBS rasn)
 set(MY_PROJ_LIB_PATH "")
 
 # Binplace this app's own thin config.ini (the app always loads it) alongside the
-# runtime host config.rasn.ini and the shared tuning defaults config.rasn.defaults.ini.
+# runtime host/config defaults and the optional replicated-state cluster profile.
 # A plain `./codepilot <cmd>` loads ONLY config.ini (thin, local placement -- no
 # service/deployment config is ever exposed to the app). `./codepilot serve` loads
 # the runtime host config.rasn.ini (full service fleet), which @includes
@@ -46,6 +46,7 @@ set(MY_PROJ_LIB_PATH "")
 set(MY_BINPLACES
     "${CMAKE_CURRENT_SOURCE_DIR}/config.ini"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../config.rasn.ini"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../config.rasn.state.ini"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../config.rasn.defaults.ini")
 
 set(RASN_INTEGRATION_PROGRAMS

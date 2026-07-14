@@ -450,8 +450,9 @@ does not replace the replicated backends discussed in §8 and §13.
 
 Stateful modules are not all the same, so each declares an **intended** consistency
 model (`rasn_runtime_module_descriptors()`). These describe the target rDSN-native
-replication strategy; today's in-memory store realizes each as a single-writer
-singleton per service.
+replication strategy. Each module still executes as a single-writer in-memory
+singleton per service, but its acknowledged mirror can now use the optional
+quorum-replicated `rasn.state` backend described in §13.13.
 
 | Model | Meaning | Modules |
 | --- | --- | --- |
@@ -486,8 +487,10 @@ than reinventing consensus in rASN.
 > defaults **off**: the `inproc` and `simple` backends coordinate only within one
 > process/facade, so real cross-process single-writer enforcement needs
 > `provider = zookeeper`.
-> This lands the ownership half of finding 1.1 even before quorum replication of the
-> state itself.
+> Together with the replicated state backend, this provides durable active/standby
+> failover: the elected owner mirrors mutations to a quorum and a successor hydrates
+> from that authority. It does not make module execution active-active; directly
+> replicated module state machines remain future work.
 >
 > **Shard-ingress enforcement (always on when sharded).** Independently of the
 > ownership gate, a runtime service that hosts only a subset of a sharded module's
@@ -789,7 +792,7 @@ bespoke mechanism, the audit names the rDSN facility that should back it.
 
 | # | Sev | Finding | Status |
 | --- | --- | --- | --- |
-| 1.1 | P0 | **Stateful modules are single-writer in-memory, not quorum-replicated.** The 11 runtime modules and the state service realize `replicated`/`sharded` intent (§8) as single-writer singletons mirrored to `rasn.state`; running >1 active writer per shard is split-brain, not HA. | **MITIGATED (code)** — the coordination module (§13.7) reuses rDSN `distributed_lock_service`, and `rasn_runtime_app::start()` now **acquires ownership of each hosted module/shard before opening its RPC API** (`rasn_runtime_ownership_gate_enabled`, default off, fail-closed on contention), enforcing exactly one active owner per shard. Lease loss, an ambiguous release, or an undrained handler deadline fail-stops the runtime. Quorum **replication** of the state itself still DOCUMENTED → §13.5 (`replicated_service_app_type_1`); cross-process enforcement requires `zookeeper` + multi-node validation |
+| 1.1 | P0 | **Stateful modules execute in single-writer memory.** Running >1 active writer for the same module/shard is split-brain; durable failover also requires an authoritative mirror. | **PARTIALLY RESOLVED (code)** — the ownership gate (§13.7) enforces one active module/shard owner, and `rasn.state.replicated` (§13.13) now uses rDSN `replicated_service_app_type_1` for quorum-committed mirror mutations, checkpoints, and learning. A successor can hydrate from that authority. Direct active-active replicated module state machines and multi-partition state queries remain future work |
 | 1.2 | P0 | **Core services had no RPC resilience.** `rasn.state` / `rasn.workflow` / `rasn.observability` clients made one-shot RPCs — no breaker, no retry — while the module path was fully hardened. A single transient blip failed the call. | **RESOLVED (code)** — §7.1, `rpc_resilience.h`, wrapped in `agent_services.cpp` |
 | 1.3 | P0 | **Registry discovery is an in-memory SPOF on the request path.** Routing resolves live endpoints through a single `rasn.registry`; if that lookup blips the request fails, and the registry itself is not replicated. | **MITIGATED (code)** — the routing-critical discovery query in `coordinator_service.cpp` now goes through `resilient_rpc_call` (breaker + idempotent retry). Registry **HA** still DOCUMENTED → §13.5 (meta-server / ZooKeeper) |
 | 1.4 | P1 | **RPC envelopes carry no end-to-end trace id.** `agent_request`/`response` carry `trace_id`, but the runtime-module envelope (`make_module_request`) didn't propagate it, so a call couldn't be followed across nodes in logs. | **RESOLVED (code)** — §13.4; `trace_id` added to the runtime-module envelope (EOF-safe), stamped from an ambient scope on egress, restored/echoed on ingress |
@@ -807,20 +810,19 @@ where rASN grew a parallel mechanism that an existing rDSN facility should own:
 
 | Concern | rASN today | rDSN facility to reuse | Status |
 | --- | --- | --- | --- |
-| State replication / HA | in-memory map + file checkpoint/journal + optional local replica copy | `replicated_service_app_type_1` (layer-2 replication SM: `checkpoint`/`learn`/`apply`) | DOCUMENTED |
+| State replication / HA | standalone journaled store by default; optional `rasn.state.replicated` authority | `replicated_service_app_type_1` (layer-2 replication SM: `checkpoint`/`learn`/`apply`) | **DELIVERED for `rasn.state` (§13.13); direct module groups remain** |
 | Partition routing | hand-rolled `fnv1a64(key) % shard_count` in the module bus/budget/blackboard | `dist::partition_resolver` (partition→endpoint resolution with config/meta integration) | DOCUMENTED |
 | Discovery + failure detection | `rasn.registry` heartbeat/lease table (single instance) | meta-server + `failure_detector` + `ext/zookeeper` for HA membership | DOCUMENTED |
 | Wire schema / IDL | generic envelope with a field-map payload + `schema_manifest` codegen | Thrift IDL + `dsn.tools` codegen (typed, versioned RPC structs) | DOCUMENTED |
 
-The coordination module (§13.7) proves this reuse pattern is viable end-to-end: the
+The coordination module (§13.7) and replicated state backend (§13.13) prove this
+reuse pattern is viable end-to-end: the
 `rDSN.dist.service` ext plugin builds and links into rASN under a full
 `--build_plugins` checkout, and its `distributed_lock_service`/`meta_state_service`
-providers are consumed directly (validated on real hardware). The four migrations
-above are larger in scope — each swaps a core data-plane mechanism (replication state
-machine, partition resolver, HA membership, or the entire wire schema) and pulls in
-the framework's Thrift/boost/ZooKeeper `ExternalProject` toolchain — so they are
-documented with their exact target facility and sequenced behind the coordination
-groundwork rather than stubbed.
+providers and type-1 replication application are consumed directly. The remaining
+migrations still replace core data-plane mechanisms (module state machines,
+partition resolution, HA membership, or the wire schema), so they stay explicitly
+sequenced rather than being approximated with rASN-local substitutes.
 
 ### 13.3 Lens 3 — Missing critical modules
 
@@ -889,22 +891,25 @@ inside the server dispatch scope) and does not change the propagation contract.
 The end state keeps the app-facing `rasn_runtime` facade and the module API
 contract (§4) exactly as they are, and swaps the *backing* of stateful modules:
 
-- Back each `replicated` module and the state service with
-  `replicated_service_app_type_1`, so `checkpoint`/`learn`/`apply` provide quorum
-  durability and automatic learning of a new replica — replacing the single-writer
-  mirror. `describe_topology()` would then report `actual=replicated` instead of
-  `single_writer_in_memory`.
+- The state-service half is now delivered: `rasn.state.replicated` uses
+  `replicated_service_app_type_1`, so quorum-committed mutations plus
+  checkpoint/learn/apply provide an authoritative mirror (§13.13).
+- Back each `replicated` runtime module directly with a replicated state machine.
+  Only then should `describe_topology()` report `actual=replicated` instead of
+  `single_writer_in_memory`; the shared durable mirror does not change the module's
+  execution consistency.
 - Resolve `sharded` modules through `dist::partition_resolver` instead of
   `fnv1a64 % count`, so partitions map to replica groups managed by the meta-server.
 - Make membership/discovery HA via the meta-server + `failure_detector` +
   `ext/zookeeper`, removing the single-registry SPOF (1.3) and giving 1.5 a shared,
   authoritative view for cluster-global quotas and coordination.
 
-Until quorum replication lands, the operational contract in §8 stands: **exactly
-one active writer per shard** — now *enforceable* through the coordination module's
-`distributed_lock_service`-backed ownership election (§13.7) rather than by operator
-discipline alone — with the client-side resilience from §7/§7.1 masking transient
-failures but not providing replication.
+Until direct module replication lands, the operational contract in §8 remains:
+**exactly one active writer per shard**, enforced through the coordination module's
+`distributed_lock_service`-backed election (§13.7). Point that writer at the
+replicated state authority for quorum-durable mirror acknowledgements and standby
+hydration; client resilience from §7/§7.1 masks transient failures but does not
+turn the module process itself into a replicated state machine.
 
 ### 13.6 What changed — core-service resilience + trace round
 
@@ -926,11 +931,10 @@ Resolved/mitigated **in code and validated** (committed as
   four focused tests for wire round-trip, legacy back-compat, scope nesting, and
   dispatch echo.
 
-Everything else above is either landed in the coordination round (§13.7) or
-DOCUMENTED with its rDSN-native target because it depends on framework subsystems
-(replication SM, partition resolver, IDL codegen) that are larger data-plane
-migrations. This section, together with §13.7, is the source of truth for the
-roadmap in §11.
+Everything else above is either landed in the coordination (§13.7) and replicated
+state (§13.13) rounds or DOCUMENTED with its rDSN-native target because it depends
+on larger data-plane migrations (direct module replication, partition resolution,
+HA discovery, or IDL codegen). These sections are the source of truth for §11.
 
 ### 13.7 Distributed coordination module (findings 1.1 ownership, 1.5 shared state) — RESOLVED (code)
 
@@ -1151,9 +1155,8 @@ participants and either prune the old breaker subtree or select a new
 **What remains.** (a) Design leased/transactional global admission, rate/cost,
 overload, and dedup authorities; they cannot safely use a naive
 `get`/modify/last-writer-wins `put`. (b) Extend the multi-process harness to assert
-shared breaker propagation and leased probe takeover on ZooKeeper. Quorum
-**replication** of runtime module state remains the §13.5
-`replicated_service_app_type_1` item.
+shared breaker propagation and leased probe takeover on ZooKeeper. Direct quorum **replication** of runtime module state remains the §13.5 item; the
+shared `rasn.state` authority is now replicated as described in §13.13.
 
 ### 13.8 Robustness hardening — cold-start readiness, diagnostic-leak cleanup, LLM parsing — RESOLVED (code)
 
@@ -1389,3 +1392,54 @@ Build validation covered `codepilot`, `srepilot`, and `rasn.unit_tests`.
 Two-process smoke validation covered both explicit-address routing and
 registry-only discovery with `rasn_runtime_advertise_host`; a negative control
 without the advertise override reproduced the original unreachable-NIC timeout.
+
+### 13.13 Quorum-replicated `rasn.state` authority — RESOLVED (code/config)
+
+`rasn.state.replicated` is an opt-in application built directly on rDSN
+`replicated_service_app_type_1`. It preserves the existing state RPC schema and
+`rasn_service_graph`/`rasn_runtime` facades, so applications and runtime modules
+switch durability backends only by setting:
+
+```ini
+[rasn.service]
+state_uri = dsn://rasn-cluster/rasn-state
+
+[uri-resolver.dsn://rasn-cluster]
+factory = partition_resolver_simple
+arguments = <meta-server-host>:27601
+```
+
+`config.rasn.state.ini` is the deployable single-machine profile: one meta server,
+three replica servers, one `rasn-state` partition, and replication factor three.
+It requires a `--build_plugins` build because it loads
+`dsn.dist.service.meta_server`, `dsn.dist.service.stateful.type1`, and
+`dsn.dist.uri.resolver`. Co-locating all replicas is useful for development and
+quorum-path validation but does not survive host loss; production derives
+per-node configs with one replica server and unique listen/data paths, plus an HA
+meta-server deployment.
+
+The application owns a journal-free `state_store`: rDSN's committed mutation log
+is the durability authority, so a second per-replica append journal would introduce
+filesystem-dependent divergence. `RPC_RASN_STATE_PUT` and
+`RPC_RASN_STATE_PUT_CONDITIONAL` are marked `rpc_request_is_write_operation`; the
+replication layer commits them before dispatching the same deterministic mutation
+on every replica. Ordered replay and checkpoint-restored `_last_sequence` make
+server-assigned sequences and conditional-write outcomes deterministic.
+`RPC_RASN_STATE_RECOVER` is also classified as a write but is rejected by replicated
+instances: operators cannot replace one live replica from an arbitrary path.
+
+Framework checkpoints are named `rasn-state-checkpoint.<decree>` in each partition
+data directory. `sync_checkpoint()` snapshots the committed store,
+`get_checkpoint()` exports the latest durable file for learning, and
+`apply_checkpoint()` validates all input before acting. `DSN_CHKPT_COPY` persists
+the learned checkpoint without replacing live memory (so copying a newer snapshot
+cannot roll a serving primary backward); `DSN_CHKPT_LEARN` persists and atomically
+replaces the in-memory store, after which rDSN replays later mutations.
+
+The current profile intentionally has **one partition**. Existing `GET`/`QUERY`
+semantics address one state authority and prefix queries do not fan out or merge
+across replica groups. Multi-partition state requires the partition-resolver/fan-out
+work in §13.2. Likewise, the 11 runtime modules remain elected single-writer
+processes with in-memory stores; their acknowledged mirrors are now quorum durable,
+and a standby hydrates from that authority, but direct active-active module state
+machines remain §13.5 work.

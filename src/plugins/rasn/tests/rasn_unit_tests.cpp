@@ -2304,6 +2304,94 @@ TEST(rasn_state, checkpoints_and_recovers_records)
     std::remove((checkpoint_path + ".bak").c_str());
 }
 
+TEST(rasn_state, replicated_checkpoint_copy_does_not_replace_live_state)
+{
+    const std::string source_path =
+        temp_file_path("rasn-state-replicated-source-unit.chkpt");
+    const std::string copied_path =
+        temp_file_path("rasn-state-replicated-copy-unit.chkpt");
+    for (const std::string &path : {source_path, copied_path})
+    {
+        std::remove(path.c_str());
+        std::remove((path + ".tmp").c_str());
+        std::remove((path + ".bak").c_str());
+    }
+
+    state_store source(false);
+    state_record durable;
+    durable.key = "unit/replicated";
+    durable.kind = "observation";
+    durable.scope = "unit";
+    durable.value = "quorum-value";
+    ASSERT_TRUE(source.put(durable).ok);
+
+    state_checkpoint_request checkpoint;
+    checkpoint.path = source_path;
+    ASSERT_TRUE(source.checkpoint(checkpoint).ok);
+
+    state_store live(false);
+    state_record current;
+    current.key = "unit/live";
+    current.kind = "observation";
+    current.scope = "unit";
+    current.value = "primary-value";
+    ASSERT_TRUE(live.put(current).ok);
+
+    const state_response copied = live.copy_checkpoint(checkpoint, copied_path);
+    ASSERT_TRUE(copied.ok) << copied.error;
+    state_key_request live_key;
+    live_key.key = current.key;
+    EXPECT_TRUE(live.get(live_key).ok);
+
+    state_checkpoint_request learned;
+    learned.path = copied_path;
+    const state_response replaced = live.replace_from_checkpoint(learned);
+    ASSERT_TRUE(replaced.ok) << replaced.error;
+    EXPECT_FALSE(live.get(live_key).ok);
+
+    state_key_request durable_key;
+    durable_key.key = durable.key;
+    const state_response recovered = live.get(durable_key);
+    ASSERT_TRUE(recovered.ok) << recovered.error;
+    EXPECT_EQ("quorum-value", recovered.record.value);
+
+    for (const std::string &path : {source_path, copied_path})
+    {
+        std::remove(path.c_str());
+        std::remove((path + ".tmp").c_str());
+        std::remove((path + ".bak").c_str());
+    }
+}
+
+TEST(rasn_state, replicated_stores_assign_deterministic_sequences)
+{
+    state_store first(false);
+    state_store second(false);
+
+    state_record record;
+    record.key = "unit/deterministic";
+    record.kind = "observation";
+    record.scope = "unit";
+    record.value = "created";
+    const state_response first_created = first.put(record);
+    const state_response second_created = second.put(record);
+    ASSERT_TRUE(first_created.ok) << first_created.error;
+    ASSERT_TRUE(second_created.ok) << second_created.error;
+    EXPECT_EQ(first_created.record.sequence, second_created.record.sequence);
+
+    state_put_request update;
+    update.record = record;
+    update.record.value = "updated";
+    update.check_sequence = true;
+    update.expected_sequence = first_created.record.sequence;
+    const state_response first_updated = first.put(update);
+    const state_response second_updated = second.put(update);
+    ASSERT_TRUE(first_updated.ok) << first_updated.error;
+    ASSERT_TRUE(second_updated.ok) << second_updated.error;
+    EXPECT_EQ(first_updated.record.sequence, second_updated.record.sequence);
+    EXPECT_EQ(first_updated.last_sequence, second_updated.last_sequence);
+}
+
 TEST(rasn_wire_limits, bounded_reserve_caps_untrusted_counts)
 {
     // Small, legitimate counts pass through unchanged.
