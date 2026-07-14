@@ -1769,7 +1769,11 @@ deadline-expiry mutations through its write code, and routes find, requester-
 filtered pending, snapshot, and describe operations through its read code.
 Request IDs and transition timestamps are materialized by the client facade
 before replication; checkpoint hydration remains an internal recovery-only
-operation.
+operation. It is one partition in the reference profile. Global expiry,
+snapshot, and pending operations nevertheless use the partition fan-out path;
+replicated ingress requires each expiry write to carry its explicit partition.
+This prevents a future shard-count change from silently expiring only the shard
+selected by the literal `"*"` key.
 
 Checkpoint files are named `rasn-runtime-checkpoint.<decree>` in each partition
 data directory and reuse the validated `state_store` snapshot format without

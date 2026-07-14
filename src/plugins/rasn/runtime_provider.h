@@ -505,6 +505,12 @@ std::vector<std::string> rasn_runtime_module_ownership_resources_for(const std::
 // Sharded modules hash every natural key, including the empty string, to preserve
 // the original hash/modulo mapping; unsharded keyless requests use zero.
 uint64_t rasn_runtime_partition_hash(const rasn_runtime_request &request);
+// Global mutations normally need one committed write per partition rather than
+// natural-key routing to a single partition. The provider fans these requests
+// out with an explicit route_partition, and replicated ingress rejects an
+// unscoped request so a future shard-count change cannot silently update only
+// one partition.
+bool rasn_runtime_request_is_partition_fanout(const rasn_runtime_request &request);
 // Ingress shard-ownership guard: true when a runtime service that hosts
 // `hosted_shards` of a module should serve `request`. An empty hosted set means
 // the service owns the whole module (or the module is unsharded) and serves every

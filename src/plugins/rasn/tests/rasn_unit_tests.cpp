@@ -5398,6 +5398,22 @@ TEST(rasn_runtime, partition_hash_preserves_keys_and_explicit_shard_routes)
     rasn_runtime_request unkeyed_control;
     unkeyed_control.module = "agent_control_plane";
     EXPECT_EQ(0u, rasn_runtime_partition_hash(unkeyed_control));
+
+    rasn_runtime_request expire_human;
+    expire_human.module = "human_interaction";
+    expire_human.operation = "expire";
+    expire_human.key = "*";
+    EXPECT_TRUE(rasn_runtime_request_is_partition_fanout(expire_human));
+    expire_human.route_partition = 3;
+    EXPECT_EQ(3u, rasn_runtime_partition_hash(expire_human));
+
+    rasn_runtime_request open_human = expire_human;
+    open_human.operation = "open";
+    EXPECT_FALSE(rasn_runtime_request_is_partition_fanout(open_human));
+
+    rasn_runtime_request human_snapshot = expire_human;
+    human_snapshot.operation = "snapshot";
+    EXPECT_FALSE(rasn_runtime_request_is_partition_fanout(human_snapshot));
 }
 
 TEST(rasn_runtime, ingress_guard_admits_hosted_shards_and_rejects_others)

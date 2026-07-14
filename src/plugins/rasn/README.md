@@ -1187,7 +1187,9 @@ Pass `"meta;replica"` as the optional `serve` app-list argument, as shown in the
 profile header, so the generic standalone-role list does not filter those two
 cluster roles. The `human_interaction` table accepts live open, answer, cancel,
 and expiry mutations through the same runtime facade; it is not limited to
-checkpoint import.
+checkpoint import. Expiry and global queue reads use partition fan-out even
+though the shipped table is a singleton, avoiding partial behavior if its
+placement is expanded later.
 
 `rasn.llm.agent`, `rasn.tool.agent`, `rasn.coordinator`, `rasn.workflow`, and
 `rasn.observability` all retain the shared

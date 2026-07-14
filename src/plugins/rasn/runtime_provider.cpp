@@ -546,6 +546,11 @@ bool runtime_operation_is_mutating(const std::string &operation)
     return true;
 }
 
+bool runtime_request_is_partition_fanout_impl(const rasn_runtime_request &request)
+{
+    return request.module == "human_interaction" && request.operation == "expire";
+}
+
 bool rasn_runtime_registry_discovery_enabled()
 {
     return config_service_bool(
@@ -4760,6 +4765,11 @@ uint64_t rasn_runtime_partition_hash(const rasn_runtime_request &request)
     return rasn_runtime_partition_hash_impl(request);
 }
 
+bool rasn_runtime_request_is_partition_fanout(const rasn_runtime_request &request)
+{
+    return runtime_request_is_partition_fanout_impl(request);
+}
+
 ::dsn::task_code rasn_runtime_rpc_code_for_request(const rasn_runtime_request &request)
 {
     return rpc_code_for_module(request.module, runtime_operation_is_mutating(request.operation));
@@ -6399,17 +6409,29 @@ bool rasn_runtime_provider::find_human_interaction(const std::string &request_id
 
 size_t rasn_runtime_provider::expire_human_interactions(uint64_t now_ms)
 {
-    const rasn_runtime_response response = call_module_api(make_module_request(
-        "human_interaction", "expire", "*", encode_fields({{"now_ms", std::to_string(now_ms)}})));
-    if (!response.ok)
+    const rasn_runtime_request request = make_module_request(
+        "human_interaction", "expire", "*", encode_fields({{"now_ms", std::to_string(now_ms)}}));
+    size_t expired = 0;
+    for (const rasn_runtime_response &response : call_module_api_shards(request))
     {
-        return 0;
+        if (!response.ok)
+        {
+            dwarn("human interaction expiry partition %u failed: %s",
+                  static_cast<unsigned int>(response.route_partition),
+                  response.error.c_str());
+            continue;
+        }
+        field_map fields;
+        std::string error;
+        if (!decode_fields(response.payload, &fields, &error))
+        {
+            dwarn("human interaction expiry partition %u response decode failed: %s",
+                  static_cast<unsigned int>(response.route_partition),
+                  error.c_str());
+            continue;
+        }
+        expired += field_size(fields, "count");
     }
-    field_map fields;
-    std::string error;
-    const size_t expired = decode_fields(response.payload, &fields, &error)
-                               ? field_size(fields, "count")
-                               : 0;
     if (expired > 0)
     {
         for (const human_interaction_request &request : human_snapshot())
@@ -6425,12 +6447,29 @@ size_t rasn_runtime_provider::expire_human_interactions(uint64_t now_ms)
 
 std::vector<human_interaction_request> rasn_runtime_provider::human_snapshot() const
 {
-    const rasn_runtime_response response = call_module_api(make_module_request("human_interaction", "snapshot"));
     std::vector<human_interaction_request> requests;
-    std::string error;
-    if (response.ok)
+    for (const rasn_runtime_response &response :
+         call_module_api_shards(make_module_request("human_interaction", "snapshot")))
     {
-        (void)decode_items(response.payload, &requests, decode_human_payload, &error);
+        if (!response.ok)
+        {
+            dwarn("human interaction snapshot partition %u failed: %s",
+                  static_cast<unsigned int>(response.route_partition),
+                  response.error.c_str());
+            continue;
+        }
+        std::vector<human_interaction_request> partition_requests;
+        std::string error;
+        if (decode_items(response.payload, &partition_requests, decode_human_payload, &error))
+        {
+            requests.insert(requests.end(), partition_requests.begin(), partition_requests.end());
+        }
+        else
+        {
+            dwarn("human interaction snapshot partition %u decode failed: %s",
+                  static_cast<unsigned int>(response.route_partition),
+                  error.c_str());
+        }
     }
     return requests;
 }
@@ -6438,13 +6477,29 @@ std::vector<human_interaction_request> rasn_runtime_provider::human_snapshot() c
 std::vector<human_interaction_request>
 rasn_runtime_provider::pending_human(const std::string &requester) const
 {
-    const rasn_runtime_response response =
-        call_module_api(make_module_request("human_interaction", "pending", requester));
     std::vector<human_interaction_request> requests;
-    std::string error;
-    if (response.ok)
+    const rasn_runtime_request request = make_module_request("human_interaction", "pending", requester);
+    for (const rasn_runtime_response &response : call_module_api_shards(request))
     {
-        (void)decode_items(response.payload, &requests, decode_human_payload, &error);
+        if (!response.ok)
+        {
+            dwarn("pending human interaction partition %u failed: %s",
+                  static_cast<unsigned int>(response.route_partition),
+                  response.error.c_str());
+            continue;
+        }
+        std::vector<human_interaction_request> partition_requests;
+        std::string error;
+        if (decode_items(response.payload, &partition_requests, decode_human_payload, &error))
+        {
+            requests.insert(requests.end(), partition_requests.begin(), partition_requests.end());
+        }
+        else
+        {
+            dwarn("pending human interaction partition %u decode failed: %s",
+                  static_cast<unsigned int>(response.route_partition),
+                  error.c_str());
+        }
     }
     return requests;
 }
@@ -6904,14 +6959,28 @@ void rasn_runtime_rpc_service::reply_module_request(const std::string &module,
         uint32_t request_partition = rasn_runtime_partition_for_request(copy);
         if (mutating && partition_count > 1)
         {
-            request_partition = rasn_runtime_partition_for_key(module, copy.key);
-            if (copy.route_partition != (std::numeric_limits<uint32_t>::max)() &&
-                copy.route_partition % partition_count != request_partition)
+            if (runtime_request_is_partition_fanout_impl(copy))
             {
-                metrics_registry::instance().on_event("runtime.replica.partition_rejected", module);
-                reply(make_rasn_runtime_error(
-                    copy, "replicated runtime mutation route does not match its request key"));
-                return;
+                if (copy.route_partition == (std::numeric_limits<uint32_t>::max)())
+                {
+                    metrics_registry::instance().on_event("runtime.replica.partition_rejected", module);
+                    reply(make_rasn_runtime_error(
+                        copy, "replicated partition-fanout mutation requires an explicit route"));
+                    return;
+                }
+                request_partition = copy.route_partition % partition_count;
+            }
+            else
+            {
+                request_partition = rasn_runtime_partition_for_key(module, copy.key);
+                if (copy.route_partition != (std::numeric_limits<uint32_t>::max)() &&
+                    copy.route_partition % partition_count != request_partition)
+                {
+                    metrics_registry::instance().on_event("runtime.replica.partition_rejected", module);
+                    reply(make_rasn_runtime_error(
+                        copy, "replicated runtime mutation route does not match its request key"));
+                    return;
+                }
             }
         }
         if (partition_count > 1 &&
