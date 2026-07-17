@@ -23,8 +23,9 @@ else ()
     set(target_bin_subdir "")
 endif ()
 set(target_install_dir ${PROJECT_BINARY_DIR}/lib)
+set(target_copy_dir ${target_install_dir})
 if(DEFINED target_install_subdir)
-    set(target_install_dir ${target_install_dir}/${target_install_subdir})
+    set(target_copy_dir ${target_copy_dir}/${target_install_subdir})
 endif()
 set(install_cmd "")
 if(NOT DEFINED exclude_from_all)
@@ -35,22 +36,22 @@ if(DEFINED skip_install AND skip_install)
     set(install_cmd ${CMAKE_COMMAND} -E echo "Skipping external project installation")
 elseif(WIN32)
     if(EXISTS "${PROJECT_SOURCE_DIR}/bin/dsn.ext.copy.cmd")
-        set(copy_cmd CALL ${PROJECT_SOURCE_DIR}/bin/dsn.ext.copy.cmd ${target_bin_dir}${target_bin_subdir} ${target_install_dir} ${target_install_subdir})
+        set(copy_cmd CALL ${PROJECT_SOURCE_DIR}/bin/dsn.ext.copy.cmd ${target_bin_dir}${target_bin_subdir} ${target_copy_dir} ${target_install_subdir})
     else()
-        set(copy_cmd CALL $ENV{DSN_ROOT}/bin/dsn.ext.copy.cmd ${target_bin_dir}${target_bin_subdir} ${target_install_dir} ${target_install_subdir})
+        set(copy_cmd CALL $ENV{DSN_ROOT}/bin/dsn.ext.copy.cmd ${target_bin_dir}${target_bin_subdir} ${target_copy_dir} ${target_install_subdir})
     endif()
     set(install_cmd
-        ${CMAKE_COMMAND} -E make_directory "${target_install_dir}"
+        ${CMAKE_COMMAND} -E make_directory "${target_copy_dir}"
         COMMAND cmd /c ${copy_cmd})
 else()
-    set(install_cmd ${CMAKE_COMMAND} -E make_directory "${target_install_dir}")
+    set(install_cmd ${CMAKE_COMMAND} -E make_directory "${target_copy_dir}")
     foreach(file_i ${target_binaries})
         set(install_cmd
             ${install_cmd}
             COMMAND
                 ${CMAKE_COMMAND} -E copy
                 "${target_bin_dir}${target_bin_subdir}/${file_i}"
-                "${target_install_dir}")
+                "${target_copy_dir}")
     endforeach()
 endif()
 
