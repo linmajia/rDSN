@@ -30,6 +30,7 @@ if(CMAKE_CONFIGURATION_TYPES)
         set_target_properties(
             dsn.test.support
             PROPERTIES
-                "ARCHIVE_OUTPUT_DIRECTORY_${CONFIGURATION_UPPER}" "${CMAKE_BINARY_DIR}/test/lib")
+            "ARCHIVE_OUTPUT_DIRECTORY_${CONFIGURATION_UPPER}"
+            "${CMAKE_BINARY_DIR}/test/lib/${CONFIGURATION}")
     endforeach()
 endif()

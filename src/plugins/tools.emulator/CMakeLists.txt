@@ -23,11 +23,18 @@ endif()
 # "GLOB_RECURSE" for recursive search
 # "GLOB" for non-recursive search
 set(MY_SRC_SEARCH_MODE "GLOB")
-set(MY_PROJ_EXCLUDE_REGEXES "\\.test\\.cpp$")
+if(WIN32 AND BUILD_TESTING)
+    # Keep scheduler tests in the DLL that owns its inline singleton and
+    # extension-slot state. The shared GoogleTest registry exposes them to the
+    # standalone host after this module is loaded from the test configuration.
+    set(MY_PROJ_EXCLUDE_REGEXES "")
+    set(MY_PROJ_LIBS gtest)
+else()
+    set(MY_PROJ_EXCLUDE_REGEXES "\\.test\\.cpp$")
+    set(MY_PROJ_LIBS "")
+endif()
 
 set(MY_PROJ_INC_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../tools.common")
-
-set(MY_PROJ_LIBS "")
 
 set(MY_BOOST_PACKAGES "")
 

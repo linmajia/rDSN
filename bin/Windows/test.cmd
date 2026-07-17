@@ -95,11 +95,8 @@ IF ERRORLEVEL 1 GOTO error
 CALL "%bin_dir%\echoc.exe" 2 run the tests here ...
 
 REM set the path of built binaries
-SET DSN_TMP_BUILD_DIR_IN_PATH=
-@FOR %%P in ("%Path:;=";"%") DO @IF /I %%P=="%build_dir%\bin\%build_type%" SET DSN_TMP_BUILD_DIR_IN_PATH=true
-REM SET DSN_TMP_OLD_PATH=%Path%
-IF NOT DEFINED DSN_TMP_BUILD_DIR_IN_PATH SET Path=%build_dir%\bin\%build_type%;%build_dir%\lib;%Path%
-SET DSN_TMP_BUILD_DIR_IN_PATH=
+IF DEFINED DSN_ROOT SET "Path=%DSN_ROOT%\bin\%build_type%;%DSN_ROOT%\bin;%DSN_ROOT%\lib\%build_type%;%DSN_ROOT%\lib;%Path%"
+SET "Path=%build_dir%\bin\%build_type%;%build_dir%\bin;%build_dir%\lib\%build_type%;%build_dir%\lib;%Path%"
 
 REM run component unit tests
 PUSHD "%build_dir%"
@@ -112,7 +109,9 @@ IF ERRORLEVEL 1 (
 POPD
 
 REM run legacy dll-embedded external plugin tests
-SET DSN_TEST_HOST=%build_dir%\test\dsn.legacy.tests\%build_type%\dsn.legacy.tests.exe
+SET "DSN_TEST_HOST=%build_dir%\test\dsn.legacy.tests\%build_type%\dsn.legacy.tests.exe"
+IF NOT EXIST "%DSN_TEST_HOST%" IF DEFINED DSN_ROOT SET "DSN_TEST_HOST=%DSN_ROOT%\bin\dsn.legacy.tests\%build_type%\dsn.legacy.tests.exe"
+IF NOT EXIST "%DSN_TEST_HOST%" IF DEFINED DSN_ROOT SET "DSN_TEST_HOST=%DSN_ROOT%\bin\dsn.legacy.tests\dsn.legacy.tests.exe"
 
 FOR /D %%A IN ("%build_dir%\test\*") DO (
     IF EXIST "%%A\gtests" (

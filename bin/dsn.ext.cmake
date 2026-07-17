@@ -22,6 +22,10 @@ if (DEFINED target_bin_subdir)
 else ()
     set(target_bin_subdir "")
 endif ()
+set(target_install_dir ${PROJECT_BINARY_DIR}/lib)
+if(DEFINED target_install_subdir)
+    set(target_install_dir ${target_install_dir}/${target_install_subdir})
+endif()
 set(install_cmd "")
 if(NOT DEFINED exclude_from_all)
     set(exclude_from_all FALSE)
@@ -31,18 +35,22 @@ if(DEFINED skip_install AND skip_install)
     set(install_cmd ${CMAKE_COMMAND} -E echo "Skipping external project installation")
 elseif(WIN32)
     if(EXISTS "${PROJECT_SOURCE_DIR}/bin/dsn.ext.copy.cmd")
-        set (install_cmd CALL ${PROJECT_SOURCE_DIR}/bin/dsn.ext.copy.cmd ${target_bin_dir}${target_bin_subdir} ${PROJECT_BINARY_DIR}/lib)
+        set(copy_cmd CALL ${PROJECT_SOURCE_DIR}/bin/dsn.ext.copy.cmd ${target_bin_dir}${target_bin_subdir} ${target_install_dir} ${target_install_subdir})
     else()
-        set (install_cmd CALL $ENV{DSN_ROOT}/bin/dsn.ext.copy.cmd ${target_bin_dir}${target_bin_subdir} ${PROJECT_BINARY_DIR}/lib)
+        set(copy_cmd CALL $ENV{DSN_ROOT}/bin/dsn.ext.copy.cmd ${target_bin_dir}${target_bin_subdir} ${target_install_dir} ${target_install_subdir})
     endif()
-    set (install_cmd cmd /c ${install_cmd})
+    set(install_cmd
+        ${CMAKE_COMMAND} -E make_directory "${target_install_dir}"
+        COMMAND cmd /c ${copy_cmd})
 else()
+    set(install_cmd ${CMAKE_COMMAND} -E make_directory "${target_install_dir}")
     foreach(file_i ${target_binaries})
-        if(install_cmd STREQUAL "")
-            set(install_cmd ${CMAKE_COMMAND} -E copy "${target_bin_dir}${target_bin_subdir}/${file_i}" "${PROJECT_BINARY_DIR}/lib")
-        else()
-            set(install_cmd ${install_cmd} COMMAND ${CMAKE_COMMAND} -E copy "${target_bin_dir}${target_bin_subdir}/${file_i}" "${PROJECT_BINARY_DIR}/lib")
-        endif()
+        set(install_cmd
+            ${install_cmd}
+            COMMAND
+                ${CMAKE_COMMAND} -E copy
+                "${target_bin_dir}${target_bin_subdir}/${file_i}"
+                "${target_install_dir}")
     endforeach()
 endif()
 
@@ -56,7 +64,7 @@ ExternalProject_Add(${project_name}
     CMAKE_ARGS
         "${CMAKE_ARGS};-DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX};-DCMAKE_C_COMPILER=${CMAKE_C_COMPILER};-DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER};-DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM};${my_cmake_args};"
     BINARY_DIR "${target_bin_dir}"
-    INSTALL_DIR "${PROJECT_BINARY_DIR}/lib"
+    INSTALL_DIR "${target_install_dir}"
     INSTALL_COMMAND ${install_cmd}
 )
 

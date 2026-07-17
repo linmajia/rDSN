@@ -1,6 +1,7 @@
 @ECHO OFF
 SET PROJ_LIB_DIR=%~1
 SET DST_LIB_DIR=%~2
+SET BUILD_CONFIG=%~3
 SET max_time=
 SET max_config=
 
@@ -9,6 +10,11 @@ IF "%DST_LIB_DIR%" EQU "" ECHO "destination lib dir is not set" && GOTO exit
 
 SET PROJ_LIB_DIR=%PROJ_LIB_DIR:/=\%
 SET DST_LIB_DIR=%DST_LIB_DIR:/=\%
+
+IF NOT "%BUILD_CONFIG%" EQU "" (
+    SET max_config=%BUILD_CONFIG%
+    GOTO copy_latest
+)
 
 FOR %%i IN (Debug Release RelWithDebInfo MinSizeRel) DO CALL :check_latest %%i
 

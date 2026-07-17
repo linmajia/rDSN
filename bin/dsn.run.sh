@@ -160,8 +160,9 @@ function run_build()
 #####################
 function usage_test()
 {
-    echo "Options for subcommand 'build':"
+    echo "Options for subcommand 'test':"
     echo "   -h|--help         print the help info"
+    echo "   -t|--type         configuration for a multi-config build: debug|release"
     echo "   --enable_gcov     generate gcov code coverage report, default no"
     echo "   -v|--verbose      build in verbose mode, default no"
     echo "   -m|--test_module  TODO: specify modules to test, split by ',',"
@@ -174,6 +175,7 @@ function run_test()
     ENABLE_GCOV=NO
     RUN_VERBOSE=NO
     TEST_MODULE=""
+    BUILD_TYPE=""
     while [[ $# > 0 ]]; do
         key="$1"
         case $key in
@@ -183,6 +185,10 @@ function run_test()
                 ;;
             --enable_gcov)
                 ENABLE_GCOV=YES
+                ;;
+            -t|--type)
+                BUILD_TYPE="$2"
+                shift
                 ;;
             -v|--verbose)
                 RUN_VERBOSE=YES
@@ -200,7 +206,14 @@ function run_test()
         esac
         shift
     done
-    ENABLE_GCOV="$ENABLE_GCOV" RUN_VERBOSE="$RUN_VERBOSE" TEST_MODULE="$TEST_MODULE" $scripts_dir/test.sh
+    if [ -n "$BUILD_TYPE" ] && [ "$BUILD_TYPE" != "debug" ] && [ "$BUILD_TYPE" != "release" ]; then
+        echo "ERROR: invalid build type \"$BUILD_TYPE\""
+        echo
+        usage_test
+        exit -1
+    fi
+    ENABLE_GCOV="$ENABLE_GCOV" RUN_VERBOSE="$RUN_VERBOSE" TEST_MODULE="$TEST_MODULE" \
+        BUILD_TYPE="$BUILD_TYPE" $scripts_dir/test.sh
 }
 
 #####################

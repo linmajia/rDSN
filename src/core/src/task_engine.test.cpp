@@ -42,9 +42,6 @@
 
 using namespace ::dsn;
 
-DEFINE_THREAD_POOL_CODE(THREAD_POOL_FOR_TEST_1)
-DEFINE_THREAD_POOL_CODE(THREAD_POOL_FOR_TEST_2)
-
 TEST(core, task_engine)
 {
     scoped_test_stderr stderr_capture;

@@ -3,13 +3,20 @@ set(project_name googletest)
 set(target_url ${GTEST_GIT_SOURCE})
 set(git_tag ${GTEST_GIT_TAG})
 set(target_bin_subdir src)
-set(gtest_lib_dir "${PROJECT_BINARY_DIR}/${project_name}/${target_bin_subdir}")
+set(gtest_lib_dir "${PROJECT_BINARY_DIR}/${project_name}/src")
+if(CMAKE_CONFIGURATION_TYPES)
+    set(target_install_subdir "$<CONFIG>")
+    if(NOT WIN32)
+        set(target_bin_subdir "src/$<CONFIG>")
+    endif()
+endif()
 
 set(my_cmake_args "-Wno-dev;-DCMAKE_SUPPRESS_DEVELOPER_WARNINGS=ON;-DCMAKE_POSITION_INDEPENDENT_CODE=ON;-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=${gtest_lib_dir};-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY=${gtest_lib_dir};-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=${gtest_lib_dir};")
 
-if(BUILD_TESTING AND BUILD_PLUGINS)
-    # External plugins still register tests from shared libraries. They and the
-    # dedicated legacy test host must therefore share one GoogleTest registry.
+if(BUILD_TESTING)
+    # Installed SDKs still support external plugins that register tests from
+    # shared libraries. All test-enabled builds therefore provide one shared
+    # GoogleTest registry and the dedicated legacy test host.
     set(my_cmake_args "${my_cmake_args};-DBUILD_SHARED_LIBS=ON;")
     set(skip_install FALSE)
     set(GTEST_LINKED_AS_SHARED_LIBRARY TRUE PARENT_SCOPE)
@@ -41,5 +48,16 @@ endif()
 
 include(${PROJECT_SOURCE_DIR}/bin/dsn.ext.cmake)
 
+if(BUILD_TESTING)
+    install(
+        DIRECTORY ${my_source_dir}/include/gtest
+        DESTINATION include/ext
+        FILES_MATCHING
+        PATTERN "*.h"
+        PATTERN "*.hpp"
+        PATTERN "*.tcc"
+        PATTERN "*.cpp")
+endif()
+
 set(GTEST_INCLUDE_DIR ${my_source_dir}/include PARENT_SCOPE)
-set(GTEST_LIB_DIR ${my_binary_dir}/${target_bin_subdir} PARENT_SCOPE)
+set(GTEST_LIB_DIR ${PROJECT_BINARY_DIR}/lib PARENT_SCOPE)

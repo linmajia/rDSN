@@ -3,6 +3,9 @@
 #include <dsn/tool-api/admission_controller.h>
 #include <dsn/tool_api.h>
 
+extern const dsn::threadpool_code THREAD_POOL_FOR_TEST_1;
+extern const dsn::threadpool_code THREAD_POOL_FOR_TEST_2;
+
 class admission_controller_for_test : public dsn::admission_controller
 {
 public:

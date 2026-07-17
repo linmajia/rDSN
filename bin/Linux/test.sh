@@ -93,9 +93,47 @@ rm -rf "$TEST_TMP_DIR"
 mkdir -p "$TEST_TMP_DIR"
 
 ##### CTest unit tests #######
+CTEST_CONFIGURATION=""
+case "$BUILD_TYPE" in
+    debug|Debug) CTEST_CONFIGURATION=Debug ;;
+    release|Release) CTEST_CONFIGURATION=Release ;;
+esac
+if [ -z "$CTEST_CONFIGURATION" ] && [ -f "$BUILD_DIR/CMakeCache.txt" ]
+then
+    CTEST_CONFIGURATION=`sed -n 's/^CMAKE_BUILD_TYPE:[^=]*=//p' "$BUILD_DIR/CMakeCache.txt" | head -n 1`
+    if [ -z "$CTEST_CONFIGURATION" ]
+    then
+        CTEST_CONFIGURATION=`sed -n 's/^CMAKE_CONFIGURATION_TYPES:[^=]*=//p' "$BUILD_DIR/CMakeCache.txt" | head -n 1 | cut -d';' -f1`
+    fi
+fi
+
+RUNTIME_LIBRARY_PATH="$BUILD_DIR/lib"
+if [ -n "$CTEST_CONFIGURATION" ]
+then
+    RUNTIME_LIBRARY_PATH="$BUILD_DIR/lib/$CTEST_CONFIGURATION:$RUNTIME_LIBRARY_PATH"
+fi
+if [ -n "$DSN_ROOT" ]
+then
+    if [ -n "$CTEST_CONFIGURATION" ]
+    then
+        RUNTIME_LIBRARY_PATH="$RUNTIME_LIBRARY_PATH:$DSN_ROOT/lib/$CTEST_CONFIGURATION"
+    fi
+    RUNTIME_LIBRARY_PATH="$RUNTIME_LIBRARY_PATH:$DSN_ROOT/lib"
+fi
+if [ "`uname`" = "Darwin" ]
+then
+    export DYLD_LIBRARY_PATH="$RUNTIME_LIBRARY_PATH${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+else
+    export LD_LIBRARY_PATH="$RUNTIME_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
 if [ -f "$BUILD_DIR/CTestTestfile.cmake" ]
 then
     CTEST_OPTIONS=(--output-on-failure -LE "performance|fault")
+    if [ -n "$CTEST_CONFIGURATION" ]
+    then
+        CTEST_OPTIONS+=(-C "$CTEST_CONFIGURATION")
+    fi
     if [ -n "$TEST_MODULE" ]
     then
         CTEST_OPTIONS+=(-L "${TEST_MODULE//,/|}")
@@ -112,6 +150,16 @@ fi
 
 ##### legacy plugin unit tests #######
 LEGACY_TEST_HOST="$BUILD_DIR/test/dsn.legacy.tests/dsn.legacy.tests"
+if [ -n "$CTEST_CONFIGURATION" ] && [ -x "$BUILD_DIR/test/dsn.legacy.tests/$CTEST_CONFIGURATION/dsn.legacy.tests" ]
+then
+    LEGACY_TEST_HOST="$BUILD_DIR/test/dsn.legacy.tests/$CTEST_CONFIGURATION/dsn.legacy.tests"
+elif [ -n "$CTEST_CONFIGURATION" ] && [ -n "$DSN_ROOT" ] && [ -x "$DSN_ROOT/bin/dsn.legacy.tests/$CTEST_CONFIGURATION/dsn.legacy.tests" ]
+then
+    LEGACY_TEST_HOST="$DSN_ROOT/bin/dsn.legacy.tests/$CTEST_CONFIGURATION/dsn.legacy.tests"
+elif [ ! -x "$LEGACY_TEST_HOST" ] && [ -n "$DSN_ROOT" ]
+then
+    LEGACY_TEST_HOST="$DSN_ROOT/bin/dsn.legacy.tests/dsn.legacy.tests"
+fi
 
 for dir in $BUILD_DIR/test/*/
 do

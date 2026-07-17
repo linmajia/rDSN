@@ -1,4 +1,8 @@
-file(GLOB TEST_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../*.test.cpp")
+if(WIN32)
+    set(TEST_SOURCES "")
+else()
+    file(GLOB TEST_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../*.test.cpp")
+endif()
 
 dsn_add_test_executable(
     NAME dsn.tools.emulator.tests

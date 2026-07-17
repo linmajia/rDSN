@@ -10,6 +10,9 @@
 #include <string>
 #include <vector>
 
+DEFINE_THREAD_POOL_CODE(THREAD_POOL_FOR_TEST_1)
+DEFINE_THREAD_POOL_CODE(THREAD_POOL_FOR_TEST_2)
+
 namespace dsn {
 namespace tests {
 namespace {
