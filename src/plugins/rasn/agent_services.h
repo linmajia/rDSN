@@ -396,7 +396,12 @@ public:
     state_response put_state(const state_put_request &request);
     state_response get_state(const state_key_request &request);
     state_response query_state(const state_query_request &request);
+    state_response delete_state_prefix(const state_delete_prefix_request &request);
+    state_response
+    advance_state_sequence(const state_sequence_barrier_request &request);
     state_response checkpoint_state(const state_checkpoint_request &request);
+    state_checkpoint_result
+    checkpoint_state_detailed(const state_checkpoint_request &request);
     state_response recover_state(const state_checkpoint_request &request);
     workflow_response validate_workflow(const workflow_source &source);
     workflow_response compile_workflow(const workflow_source &source);
@@ -420,6 +425,8 @@ private:
     void start_registry_heartbeat_timer();
     void cancel_registry_heartbeat_timer();
     void register_ops_commands_once();
+    bool ensure_inline_state_recovered(std::string *error);
+    void record_inline_state_recovery(const state_response &response);
     void start_unlocked();
     void stop_unlocked();
 
@@ -436,11 +443,38 @@ private:
     ::dsn::rpc_address _observability_address;
     ::dsn::task_ptr _registry_heartbeat_timer;
     mutable ::dsn::service::zlock _lifecycle_lock;
+    mutable ::dsn::service::zlock _inline_state_recovery_lock;
     uint32_t _lifecycle_ref_count;
     bool _lifecycle_transitioning;
     bool _rpc_clients_enabled;
     bool _started;
+    bool _inline_state_recovery_attempted;
+    std::string _inline_state_recovery_error;
 };
+
+struct state_migration_report
+{
+    bool ok = false;
+    bool applied = false;
+    std::string error;
+    std::string checkpoint_path;
+    std::string key_prefix;
+    uint64_t source_last_sequence = 0;
+    uint64_t target_last_sequence = 0;
+    size_t source_records = 0;
+    size_t target_records = 0;
+    size_t planned_records = 0;
+    size_t unchanged_records = 0;
+    size_t migrated_records = 0;
+    size_t verified_records = 0;
+    bool sequence_advance_required = false;
+    std::vector<std::string> conflict_keys;
+};
+
+state_migration_report migrate_state_checkpoint(rasn_service_graph &services,
+                                                const std::string &checkpoint_path,
+                                                const std::string &key_prefix,
+                                                bool apply);
 
 rasn_service_graph &global_rasn_services();
 

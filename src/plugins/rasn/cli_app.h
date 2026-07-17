@@ -25,6 +25,9 @@
 namespace dsn {
 namespace rasn {
 
+int run_rasn_state_command(rasn_service_graph &services,
+                           const std::vector<std::string> &args);
+
 class rasn_service_graph_lifecycle_scope
 {
 public:

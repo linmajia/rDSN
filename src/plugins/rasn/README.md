@@ -839,7 +839,7 @@ rasn/
 | `[rasn.workflow] execution_lease_ms` | Time-to-live for durable workflow execution owner leases. Active duplicate starts are rejected until the owner finishes or the lease becomes stale. |
 | `[rasn.workflow] execution_lease_renew_ms` | Lease renewal interval for active workflow runs. `0` derives a safe interval from the lease TTL. |
 | `[rasn.registry] dynamic_registration/heartbeat_ms/lease_ms/sweep_interval_ms/registration_timeout_ms` | Enables best-effort RPC registration of built-in agents plus rDSN timer-driven heartbeats and lease cleanup. `lease_ms = 0` disables TTL filtering; `sweep_interval_ms = 0` disables active cleanup. |
-| `[rasn.state] checkpoint_dir/checkpoint_file/journal_file/recover_on_start` | Durable state checkpoint and append-only journal paths. Defaults place checkpoints and journals under `rasn/state`. `recover_on_start` names an explicit recovery checkpoint; if set, recovery failures are surfaced instead of falling back to an empty store. State writes also support create-only and expected-sequence conditions for leases and compare-and-swap style ownership. |
+| `[rasn.state] checkpoint_dir/checkpoint_file/journal_file/recover_on_start` | Durable state checkpoint and append-only mutation-journal paths. Defaults place checkpoints and journals under `rasn/state`. `recover_on_start` names an explicit recovery checkpoint; if set, recovery failures are surfaced instead of falling back to an empty store. State writes support create-only/expected-sequence conditions, cutoff-guarded prefix deletion with durable tombstones, and migration sequence barriers. A custom checkpoint export retains the configured recovery journal; only checkpointing the configured recovery path can compact it. |
 | `[rasn.state.nfs] enabled/remote_host/remote_port/remote_checkpoint_dir/timeout_ms` | Optional rDSN NFS import source used before state recovery when no local checkpoint or journal exists. Enable `[core] start_nfs` on the importing process and run `dsn.tools.nfs` on the source process. `timeout_ms` defaults to `20000` (20 seconds); use about `5000` for local/LAN interactive CLI fail-fast behavior, and keep `20000` or higher when remote recovery success is more important than command latency. |
 | `[rasn.state.replica] enabled/directory/recover` | Optional local mirror for state checkpoints and journals. When enabled, writes fail explicitly if the mirror cannot be updated, and recovery can seed missing primary state from the replica directory. The default mirror path is `rasn/state/replica`. Keep `directory` non-empty; an empty directory is a configuration error and should block persistence rather than silently disabling recovery protection. |
 | `[rasn.runtime] trace_file` | JSONL file for runtime traces. Defaults use `rasn/traces/<app>.trace.jsonl`; the trace writer creates parent directories. |
@@ -1485,12 +1485,25 @@ replicated placement.
 > with only a warning. `codepilot state compact [--prefix <state-prefix>]
 > [checkpoint-path]`
 > lets operators verify existing watermarks and fold the shared state service into
-> a compact checkpoint/journal baseline. When hydration is enabled, a module
+> a compact configured checkpoint/journal baseline. Supplying a custom checkpoint
+> path creates a verified export and keeps the recovery journal. Both applications
+> expose `state migrate <checkpoint> [--prefix ...] [--apply]` for dry-run-first,
+> resumable, sequence-preserving import into the configured state service, and
+> `state prune --prefix ... --max-sequence ... [--apply]` for cutoff-guarded
+> **logical deletion of an explicitly obsolete namespace**. Compaction never
+> deletes active mirror keys: module hydration still queries them. When hydration is enabled, a module
 > service refuses to open its RPC API if the configured state service cannot be
 > queried; disable hydration only for intentionally cold local experiments. In `hybrid` mode,
 > flipping a module from `local` to `remote` is still a cold migration:
 > local-routed modules are not mirrored, so the remote service starts without the
 > previously local state unless the operator explicitly migrates it.
+> For cross-host state-service migration, create/copy the export where the CLI can
+> read it, then repoint `[rasn.service]` to the destination before the dry run.
+> Direct local state commands recover configured durable state once before any
+> read, mutation, checkpoint, or prune and cache recovery failures fail-closed.
+> An unprovable primary/replica journal rollback fail-stops and leaves quarantine
+> evidence; repair it offline from a verified checkpoint/journal and restart.
+> Removing only a sidecar must not be used to bypass an in-journal quarantine marker.
 
 For the full architecture, provider model, resilience contracts, consistency
 models, and the multi-node roadmap, see
@@ -1503,11 +1516,11 @@ hardening gaps remain:
 
 | Area | Current capability | Remaining limitation |
 | --- | --- | --- |
-| State availability | Standalone checkpoints/journal/NFS/local mirror; optional one-partition `rasn.state.replicated`; and eleven direct runtime-module type-1 tables with quorum writes, deterministic replay/dedup, checkpoint learning, resolver-backed partitions, and primary failover. | Multi-partition generic-state query fan-out, safe online checkpoint GC, production HA meta-server deployment, and standalone-to-table migration tooling remain. |
+| State availability | Standalone checkpoints/journal/NFS/local mirror, cutoff tombstones, dry-run-first checkpoint-to-state-service migration, optional one-partition `rasn.state.replicated`, and eleven direct runtime-module type-1 tables with quorum writes, deterministic replay/dedup, checkpoint learning, resolver-backed partitions, and primary failover. | Multi-partition generic-state query fan-out, safe online checkpoint GC, production HA meta-server deployment, and standalone-state-to-native-module-table migration remain. |
 | Discovery availability | Local registry by default; optional ZooKeeper-backed shared descriptors/leases, committed-epoch active-writer failover, read-capable standby frontends, bounded epoch/tombstone retention, and rDSN group-address client failover across `registry_addresses`. | Automated multi-process registry-writer failover evidence remains. |
 | Tool isolation | Default-deny side effects, workspace scoping, approvals, command allowlists, timeout/job containment, and a configurable container command wrapper. | No hardened container orchestrator with image, mount, network, and lifecycle policy. |
 | Replay fidelity | Replay for model responses, tool results, workflow scheduling, filesystem snapshots, and an `external.effect` ledger for side-effect intents. | No full virtualization of arbitrary external services, clocks, network state, or process environments. |
-| Deployment validation | Inline mode, typed service-mode RPC, URI/host endpoint configuration, registry heartbeats, active lease cleanup, distributed runtime modules, state-mirror hydration/watermarks, and deployable rDSN type-1 profiles for shared state and all runtime modules. | Automated real multi-host module-primary failover/checkpoint transfer, explicit watermark pruning, and standalone-to-table migration tooling remain. |
+| Deployment validation | Inline mode, typed service-mode RPC, URI/host endpoint configuration, registry heartbeats, active lease cleanup, distributed runtime modules, state-mirror hydration/watermarks, safe journal compaction/custom export, explicit obsolete-prefix pruning, checkpoint-to-state-service migration, and deployable rDSN type-1 profiles for shared state and all runtime modules. | Automated real multi-host module-primary failover/checkpoint transfer and standalone-state-to-native-module-table migration remain. |
 | Credentials | `token_ref` handles for environment variables, files, and commands, plus deterministic redaction. | No vault-backed or OS-backed credential provider integration. |
 | SDK packaging | Generated C++/TypeScript/Python contracts and RPC-client source. | Packaged SDKs and concrete TypeScript/Python transports are not shipped. |
 | Evaluation evidence | Unit tests, self-tests, service smokes, schema smokes, report build, and a small eval harness. | Large benchmarks and user studies for debugging effectiveness remain future work. |

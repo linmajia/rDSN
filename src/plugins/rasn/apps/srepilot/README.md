@@ -40,6 +40,8 @@ srepilot.exe observe events
 srepilot.exe observe failures
 srepilot.exe observe metrics text
 srepilot.exe observe resilience
+srepilot.exe state query rasn/runtime
+srepilot.exe state migrate rasn/state/export.chkpt --prefix rasn/runtime
 srepilot.exe provider simulator
 srepilot.exe interactive
 srepilot.exe C:\path\to\service-repo

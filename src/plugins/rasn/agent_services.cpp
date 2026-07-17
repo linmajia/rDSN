@@ -67,6 +67,13 @@ struct service_endpoint_config
     std::string endpoint_uri;
 };
 
+bool same_state_record_content(const state_record &left, const state_record &right)
+{
+    return left.schema_version == right.schema_version && left.key == right.key &&
+           left.kind == right.kind && left.scope == right.scope &&
+           left.value == right.value;
+}
+
 void set_rdsn_rpc_enabled(bool enabled)
 {
     g_rdsn_rpc_enabled = enabled;
@@ -2411,7 +2418,8 @@ rasn_service_graph::rasn_service_graph()
     _lifecycle_ref_count(0),
     _lifecycle_transitioning(false),
     _rpc_clients_enabled(false),
-    _started(false)
+    _started(false),
+    _inline_state_recovery_attempted(false)
 {
     const char *trace_path_value = ::dsn_config_get_value_string(
         "rasn.runtime", "trace_file", "", "JSONL file for rASN runtime trace events");
@@ -3219,6 +3227,14 @@ state_response rasn_service_graph::put_state(const state_record &record)
         failure.error = std::string("RPC_RASN_STATE_PUT failed: ") + err.to_string();
         return failure;
     }
+    std::string recovery_error;
+    if (!ensure_inline_state_recovered(&recovery_error))
+    {
+        state_response failure;
+        failure.ok = false;
+        failure.error = recovery_error;
+        return failure;
+    }
     return global_state_store().put(record);
 }
 
@@ -3241,6 +3257,14 @@ state_response rasn_service_graph::put_state(const state_put_request &request)
         state_response failure;
         failure.ok = false;
         failure.error = std::string("RPC_RASN_STATE_PUT_CONDITIONAL failed: ") + err.to_string();
+        return failure;
+    }
+    std::string recovery_error;
+    if (!ensure_inline_state_recovered(&recovery_error))
+    {
+        state_response failure;
+        failure.ok = false;
+        failure.error = recovery_error;
         return failure;
     }
     return global_state_store().put(request);
@@ -3267,6 +3291,14 @@ state_response rasn_service_graph::get_state(const state_key_request &request)
         failure.error = std::string("RPC_RASN_STATE_GET failed: ") + err.to_string();
         return failure;
     }
+    std::string recovery_error;
+    if (!ensure_inline_state_recovered(&recovery_error))
+    {
+        state_response failure;
+        failure.ok = false;
+        failure.error = recovery_error;
+        return failure;
+    }
     return global_state_store().get(request);
 }
 
@@ -3291,10 +3323,19 @@ state_response rasn_service_graph::query_state(const state_query_request &reques
         failure.error = std::string("RPC_RASN_STATE_QUERY failed: ") + err.to_string();
         return failure;
     }
+    std::string recovery_error;
+    if (!ensure_inline_state_recovered(&recovery_error))
+    {
+        state_response failure;
+        failure.ok = false;
+        failure.error = recovery_error;
+        return failure;
+    }
     return global_state_store().query(request);
 }
 
-state_response rasn_service_graph::checkpoint_state(const state_checkpoint_request &request)
+state_response
+rasn_service_graph::delete_state_prefix(const state_delete_prefix_request &request)
 {
     start();
     if (_rpc_clients_enabled)
@@ -3303,8 +3344,11 @@ state_response rasn_service_graph::checkpoint_state(const state_checkpoint_reque
         ::dsn::error_code err;
         state_response response;
         std::tie(err, response) = core_rpc_with_resilience<state_response>(
-            "state.checkpoint", _state_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
-                return client.checkpoint_sync(request, timeout);
+            "state.delete_prefix",
+            _state_address,
+            /*idempotent=*/false,
+            [&](std::chrono::milliseconds timeout) {
+                return client.delete_prefix_sync(request, timeout);
             });
         if (err == ::dsn::ERR_OK)
         {
@@ -3312,10 +3356,126 @@ state_response rasn_service_graph::checkpoint_state(const state_checkpoint_reque
         }
         state_response failure;
         failure.ok = false;
-        failure.error = std::string("RPC_RASN_STATE_CHECKPOINT failed: ") + err.to_string();
+        failure.error =
+            std::string("RPC_RASN_STATE_DELETE_PREFIX failed: ") + err.to_string();
         return failure;
     }
-    return global_state_store().checkpoint(request);
+    std::string recovery_error;
+    if (!ensure_inline_state_recovered(&recovery_error))
+    {
+        state_response failure;
+        failure.ok = false;
+        failure.error = recovery_error;
+        return failure;
+    }
+    return global_state_store().delete_prefix(request);
+}
+
+state_response rasn_service_graph::advance_state_sequence(
+    const state_sequence_barrier_request &request)
+{
+    start();
+    if (_rpc_clients_enabled)
+    {
+        rasn_state_client client(_state_address);
+        ::dsn::error_code err;
+        state_response response;
+        std::tie(err, response) = core_rpc_with_resilience<state_response>(
+            "state.advance_sequence",
+            _state_address,
+            /*idempotent=*/true,
+            [&](std::chrono::milliseconds timeout) {
+                return client.advance_sequence_sync(request, timeout);
+            });
+        if (err == ::dsn::ERR_OK)
+        {
+            return response;
+        }
+        state_response failure;
+        failure.ok = false;
+        failure.error =
+            std::string("RPC_RASN_STATE_ADVANCE_SEQUENCE failed: ") +
+            err.to_string();
+        return failure;
+    }
+    std::string recovery_error;
+    if (!ensure_inline_state_recovered(&recovery_error))
+    {
+        state_response failure;
+        failure.ok = false;
+        failure.error = recovery_error;
+        return failure;
+    }
+    return global_state_store().advance_sequence(request);
+}
+
+state_response rasn_service_graph::checkpoint_state(const state_checkpoint_request &request)
+{
+    return checkpoint_state_detailed(request).response;
+}
+
+state_checkpoint_result rasn_service_graph::checkpoint_state_detailed(
+    const state_checkpoint_request &request)
+{
+    start();
+    if (_rpc_clients_enabled)
+    {
+        rasn_state_client client(_state_address);
+        ::dsn::error_code err;
+        state_checkpoint_result result;
+        std::tie(err, result) =
+            core_rpc_with_resilience<state_checkpoint_result>(
+                "state.checkpoint_detailed",
+                _state_address,
+                /*idempotent=*/true,
+                [&](std::chrono::milliseconds timeout)
+                    -> std::pair< ::dsn::error_code,
+                                  state_checkpoint_result> {
+                    const std::pair< ::dsn::error_code,
+                                     state_checkpoint_result>
+                        detailed =
+                            client.checkpoint_detailed_sync(request, timeout);
+                    if (detailed.first != ::dsn::ERR_HANDLER_NOT_FOUND)
+                    {
+                        return detailed;
+                    }
+
+                    state_checkpoint_result compatible;
+                    compatible.details_available = false;
+                    compatible.checkpoint_path = request.path;
+                    if (!request.path.empty())
+                    {
+                        compatible.response.ok = false;
+                        compatible.response.error =
+                            "the state service does not support safe custom "
+                            "checkpoint exports; upgrade it before retrying";
+                        return std::make_pair(::dsn::ERR_OK, compatible);
+                    }
+
+                    const std::pair< ::dsn::error_code, state_response> legacy =
+                        client.checkpoint_sync(request, timeout);
+                    compatible.response = legacy.second;
+                    return std::make_pair(legacy.first, compatible);
+                });
+        if (err == ::dsn::ERR_OK)
+        {
+            return result;
+        }
+        result.response.ok = false;
+        result.response.error =
+            std::string("RPC_RASN_STATE_CHECKPOINT_DETAILED failed: ") +
+            err.to_string();
+        return result;
+    }
+    std::string recovery_error;
+    if (!ensure_inline_state_recovered(&recovery_error))
+    {
+        state_checkpoint_result failure;
+        failure.response.ok = false;
+        failure.response.error = recovery_error;
+        return failure;
+    }
+    return global_state_store().checkpoint_detailed(request);
 }
 
 state_response rasn_service_graph::recover_state(const state_checkpoint_request &request)
@@ -3339,7 +3499,255 @@ state_response rasn_service_graph::recover_state(const state_checkpoint_request 
         failure.error = std::string("RPC_RASN_STATE_RECOVER failed: ") + err.to_string();
         return failure;
     }
-    return global_state_store().recover(request);
+    const state_response recovered = global_state_store().recover(request);
+    record_inline_state_recovery(recovered);
+    return recovered;
+}
+
+bool rasn_service_graph::ensure_inline_state_recovered(std::string *error)
+{
+    ::dsn::service::zauto_lock guard(_inline_state_recovery_lock);
+    if (_inline_state_recovery_attempted)
+    {
+        if (error != nullptr)
+        {
+            *error = _inline_state_recovery_error;
+        }
+        return _inline_state_recovery_error.empty();
+    }
+
+    _inline_state_recovery_attempted = true;
+    const state_checkpoint_request recovery =
+        configured_state_recovery_request();
+    if (!configured_state_recovery_available(recovery))
+    {
+        return true;
+    }
+
+    const state_response recovered = global_state_store().recover(recovery);
+    if (!recovered.ok)
+    {
+        _inline_state_recovery_error =
+            "failed to recover inline state before use: " + recovered.error;
+        if (error != nullptr)
+        {
+            *error = _inline_state_recovery_error;
+        }
+        return false;
+    }
+    return true;
+}
+
+void rasn_service_graph::record_inline_state_recovery(
+    const state_response &response)
+{
+    ::dsn::service::zauto_lock guard(_inline_state_recovery_lock);
+    _inline_state_recovery_attempted = true;
+    _inline_state_recovery_error =
+        response.ok ? std::string()
+                    : "failed to recover inline state before use: " +
+                          response.error;
+}
+
+state_migration_report migrate_state_checkpoint(rasn_service_graph &services,
+                                                const std::string &checkpoint_path,
+                                                const std::string &key_prefix,
+                                                bool apply)
+{
+    state_migration_report report;
+    report.applied = apply;
+    report.checkpoint_path = checkpoint_path;
+    report.key_prefix = key_prefix;
+    if (checkpoint_path.empty())
+    {
+        report.error = "state migration requires a checkpoint path";
+        return report;
+    }
+    if (key_prefix.empty())
+    {
+        report.error = "state migration requires a non-empty key prefix";
+        return report;
+    }
+
+    state_store source(false);
+    state_checkpoint_request checkpoint;
+    checkpoint.path = checkpoint_path;
+    const state_response loaded = source.replace_from_checkpoint(checkpoint);
+    if (!loaded.ok)
+    {
+        report.error = loaded.error;
+        return report;
+    }
+
+    state_query_request query;
+    query.key_prefix = key_prefix;
+    const state_response source_state = source.query(query);
+    if (!source_state.ok)
+    {
+        report.error = source_state.error;
+        return report;
+    }
+    const state_response target_state = services.query_state(query);
+    if (!target_state.ok)
+    {
+        report.error = target_state.error;
+        return report;
+    }
+
+    report.source_last_sequence = source_state.last_sequence;
+    report.target_last_sequence = target_state.last_sequence;
+    report.source_records = source_state.records.size();
+    report.target_records = target_state.records.size();
+    report.sequence_advance_required =
+        target_state.last_sequence < source_state.last_sequence;
+
+    std::map<std::string, state_record> target_records;
+    for (const state_record &record : target_state.records)
+    {
+        target_records[record.key] = record;
+    }
+
+    std::map<std::string, state_record> source_records;
+    std::vector<state_record> planned;
+    for (const state_record &record : source_state.records)
+    {
+        source_records[record.key] = record;
+        const std::map<std::string, state_record>::const_iterator target =
+            target_records.find(record.key);
+        if (target == target_records.end())
+        {
+            planned.push_back(record);
+            continue;
+        }
+        if (!same_state_record_content(target->second, record))
+        {
+            report.conflict_keys.push_back(record.key);
+            continue;
+        }
+        if (target->second.sequence == record.sequence)
+        {
+            ++report.unchanged_records;
+            continue;
+        }
+        if (target->second.sequence > record.sequence)
+        {
+            report.conflict_keys.push_back(record.key);
+            continue;
+        }
+        planned.push_back(record);
+    }
+    for (const std::map<std::string, state_record>::value_type &target :
+         target_records)
+    {
+        if (source_records.find(target.first) == source_records.end())
+        {
+            report.conflict_keys.push_back(target.first);
+        }
+    }
+    std::sort(planned.begin(),
+              planned.end(),
+              [](const state_record &left, const state_record &right) {
+                  return left.sequence == right.sequence ? left.key < right.key
+                                                        : left.sequence < right.sequence;
+              });
+    report.planned_records = planned.size();
+
+    if (!report.conflict_keys.empty())
+    {
+        report.error = "state migration found " +
+                       std::to_string(report.conflict_keys.size()) +
+                       " newer, divergent, or target-only record(s); first conflict: " +
+                       report.conflict_keys.front();
+        return report;
+    }
+    if (!apply)
+    {
+        report.ok = true;
+        return report;
+    }
+
+    if (report.target_last_sequence < report.source_last_sequence)
+    {
+        state_sequence_barrier_request barrier;
+        barrier.minimum_sequence = report.source_last_sequence;
+        const state_response advanced = services.advance_state_sequence(barrier);
+        if (!advanced.ok)
+        {
+            report.error =
+                "state migration sequence barrier failed: " + advanced.error;
+            return report;
+        }
+        report.target_last_sequence = advanced.last_sequence;
+    }
+
+    for (const state_record &record : planned)
+    {
+        state_put_request put;
+        put.record = record;
+        put.check_sequence = true;
+        const std::map<std::string, state_record>::const_iterator existing =
+            target_records.find(record.key);
+        put.expected_sequence =
+            existing == target_records.end() ? 0 : existing->second.sequence;
+
+        state_response stored = services.put_state(put);
+        if (!stored.ok)
+        {
+            state_key_request get;
+            get.key = record.key;
+            const state_response reconciled = services.get_state(get);
+            if (!reconciled.ok ||
+                !same_state_record_content(reconciled.record, record) ||
+                reconciled.record.sequence != record.sequence)
+            {
+                report.error = "state migration failed for " + record.key +
+                               ": " + stored.error;
+                return report;
+            }
+            stored = reconciled;
+        }
+        target_records[record.key] = stored.record;
+        report.target_last_sequence =
+            (std::max)(report.target_last_sequence, stored.last_sequence);
+        ++report.migrated_records;
+    }
+
+    const state_response verified = services.query_state(query);
+    if (!verified.ok)
+    {
+        report.error = "state migration verification failed: " + verified.error;
+        return report;
+    }
+    report.target_records = verified.records.size();
+    report.target_last_sequence = verified.last_sequence;
+    if (verified.records.size() != source_state.records.size())
+    {
+        report.error =
+            "state migration verification found target-only or missing records";
+        return report;
+    }
+    std::map<std::string, state_record> verified_records;
+    for (const state_record &record : verified.records)
+    {
+        verified_records[record.key] = record;
+    }
+    for (const state_record &record : source_state.records)
+    {
+        const std::map<std::string, state_record>::const_iterator migrated =
+            verified_records.find(record.key);
+        if (migrated == verified_records.end() ||
+            !same_state_record_content(migrated->second, record) ||
+            migrated->second.sequence != record.sequence)
+        {
+            report.error =
+                "state migration verification mismatch for " + record.key;
+            return report;
+        }
+        ++report.verified_records;
+    }
+
+    report.ok = true;
+    return report;
 }
 
 workflow_response rasn_service_graph::validate_workflow(const workflow_source &source)

@@ -435,10 +435,20 @@ rDSN design:
 - Mutations can be unconditional, create-only, or expected-sequence checked.
   The conditional path is exposed as `RPC_RASN_STATE_PUT_CONDITIONAL` and is used
   by workflow ownership leases.
+- Explicitly obsolete namespaces can be removed through a sequence-cutoff
+  `RPC_RASN_STATE_DELETE_PREFIX` mutation. Standalone journals persist the
+  tombstone; native replicas commit it through the type-1 log. Migration uses an
+  idempotent sequence-barrier mutation so a checkpoint's historical sequence floor
+  is retained even when its highest mutation deleted the last live record.
 - If `[rasn.state] recover_on_start` is configured, service startup recovers that
   explicit path and fails on recovery errors. If it is empty, startup
   auto-recovers the configured default checkpoint/journal when one exists and
   skips recovery on first boot.
+- Local service-graph access performs that recovery once, before its first state
+  read, mutation, sequence barrier, checkpoint, or prune. The outcome is cached
+  fail-closed for the graph, preventing a fresh one-shot CLI process from
+  checkpointing an empty store over persisted state. RPC clients leave recovery
+  to the state-service process.
 - Optional `[rasn.state.nfs]` settings let recovery first pull checkpoint files
   from an existing `dsn.tools.nfs` source when local state is absent. This reuses
   rDSN's NFS module for remote state seeding without making the default local
@@ -455,17 +465,25 @@ rDSN design:
   empty in-memory store over durable state.
 - Files and directories use `dsn::utils::filesystem`.
 - The optional `rasn.state.replicated` app follows
-  `replicated_service_app_type_1` directly: PUT/conditional PUT are quorum writes,
-  each replica applies the ordered mutation to a journal-free store, and rDSN owns
-  checkpoint transfer, learning, and mutation-log durability. It currently uses
-  one partition because prefix queries do not yet fan out.
+  `replicated_service_app_type_1` directly: PUT/conditional PUT, cutoff deletion,
+  and sequence barriers are quorum writes; each replica applies the ordered
+  mutation to a journal-free store, and rDSN owns checkpoint transfer, learning,
+  and mutation-log durability. It currently uses one partition because prefix
+  queries do not yet fan out.
 
 Correctness and robustness requirements:
 
 - Writes are atomic at the logical operation level.
 - Checkpoints include schema version and last committed event sequence.
 - Replica mirrors are write-through rather than best-effort; mirror failures are
-  surfaced to the caller instead of being silently ignored.
+  rolled back from the primary journal before being surfaced. If rollback cannot
+  be proven, the process fail-stops rather than replaying a mutation reported as
+  failed. The store persists an in-journal marker plus an external sidecar or
+  quarantined-journal rename where possible; subsequent reads, mutations,
+  imports, checkpoints, and recovery fail closed across restart. Repair is an
+  offline operator action: preserve the evidence, reconcile primary and replica,
+  install a known-good checkpoint/journal, remove the external marker, and restart.
+  There is no in-process quarantine bypass.
 - Recovery validates checkpoint integrity and refuses corrupt state unless
   configured for best-effort diagnosis.
 
@@ -1208,8 +1226,8 @@ uses rDSN's quorum mutation log plus framework checkpoints instead.
 
 Responsibilities:
 
-- Append every committed state mutation to a journal before making it visible in
-  memory.
+- Append every committed state mutation (PUT, cutoff tombstone, or sequence
+  barrier) to a journal before making it visible in memory.
 - Write compact checkpoints atomically and remove covered journal entries.
 - Recover from checkpoint plus journal, or from journal alone if a checkpoint has
   not yet been created.
@@ -1217,9 +1235,11 @@ Responsibilities:
 rDSN design:
 
 - State records remain guarded by `dsn::service::zlock`.
-- Checkpoint paths are config-driven under `[rasn.state]`; journal writes use a
-  single configured/default journal so explicit checkpoints and default
-  checkpoints share one recovery stream.
+- Checkpoint paths are config-driven under `[rasn.state]`; journal writes use one
+  configured recovery stream. A checkpoint of that configured recovery path can
+  compact covered journal mutations. A custom-path checkpoint is an export and
+  deliberately retains the recovery journal so the next normal startup cannot
+  lose writes that exist only there.
 - Remote checkpoint import uses `dsn::file::copy_remote_files` from
   `dsn.tools.nfs`, waits with a bounded timeout, stages files locally, then moves
   them into the configured recovery paths before normal validation and replay.
@@ -1231,6 +1251,12 @@ Correctness and robustness requirements:
 - Conditional state writes compare against the currently visible sequence while
   holding the store lock, then append the committed record to the journal before
   publishing it.
+- Prefix deletion requires an explicit non-zero cutoff, deletes only matching
+  records at or below that sequence, and replays from a durable tombstone.
+- Checkpoint migration preflights all target conflicts before writing, preserves
+  explicit source sequences, treats exact replay as success, rejects
+  destination-only keys, restores the source sequence floor (including an empty
+  source prefix), and defaults to dry-run until `--apply`.
 - Recovery validates headers, schema versions, namespaces, and encoding before
   swapping in recovered state.
 - Checkpoint compaction is serialized with writes.
@@ -1392,8 +1418,9 @@ remaining limitations are:
   Native module partitions checkpoint deterministic state plus bounded retry
   dedup and fail over through rDSN; lightweight standalone roles remain elected
   single-writer alternatives. Multi-partition generic-state query fan-out, safe
-  online checkpoint GC, migration tooling, and production HA meta deployment
-  remain.
+  online checkpoint GC, standalone-state-to-native-module-table migration, and
+  production HA meta deployment remain. Checkpoint-to-state-service migration is
+  available through the shared CodePilot/SREPilot state command.
 - **Tool isolation:** local tools are default-deny, policy-gated,
   approval-gated, allowlist-aware, workspace-rooted, timeout-bound, and can be
   routed through a configured container command wrapper. rASN still lacks a

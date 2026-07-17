@@ -36,6 +36,8 @@ codepilot.exe plan "Add a retry budget to an rASN workflow"
 codepilot.exe agent "Inspect the rASN state service and suggest tests"
 codepilot.exe tools
 codepilot.exe observe resilience
+codepilot.exe state query rasn/runtime
+codepilot.exe state migrate rasn/state/export.chkpt --prefix rasn/runtime
 codepilot.exe interactive
 codepilot.exe C:\path\to\repo
 codepilot.exe C:\path\to\file.cpp

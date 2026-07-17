@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <new>
 #include <sstream>
 #include <thread>
@@ -56,6 +57,32 @@ std::string join_args(const std::vector<std::string> &args, size_t begin)
         oss << args[i];
     }
     return trim(oss.str());
+}
+
+bool parse_uint64_cli(const std::string &text, uint64_t *value)
+{
+    if (text.empty() || text[0] == '-')
+    {
+        return false;
+    }
+    errno = 0;
+    char *end = nullptr;
+    const unsigned long long parsed = std::strtoull(text.c_str(), &end, 10);
+    if (errno == ERANGE || end == text.c_str() || *end != '\0')
+    {
+        return false;
+    }
+    if (value != nullptr)
+    {
+        *value = static_cast<uint64_t>(parsed);
+    }
+    return true;
+}
+
+void print_state_record(const state_record &record)
+{
+    std::cout << record.key << " kind=" << record.kind << " scope=" << record.scope
+              << " sequence=" << record.sequence << " value=" << record.value << "\n";
 }
 
 bool starts_with(const std::string &value, const std::string &prefix)
@@ -690,6 +717,303 @@ std::string join_strings(const std::vector<std::string> &values, const std::stri
 }
 
 } // namespace
+
+int run_rasn_state_command(rasn_service_graph &services,
+                           const std::vector<std::string> &args)
+{
+    if (args.empty())
+    {
+        std::cout << "usage: state put|get|query|checkpoint|recover|compact|migrate|prune ...\n";
+        return 1;
+    }
+
+    state_response response;
+    if (args[0] == "put")
+    {
+        if (args.size() < 3)
+        {
+            std::cout << "usage: state put <scope/key> <value>\n";
+            return 1;
+        }
+        state_record record;
+        record.key = args[1];
+        record.value = join_args(args, 2);
+        record.kind = "memory";
+        record.scope = record.key.substr(0, record.key.find('/'));
+        response = services.put_state(record);
+    }
+    else if (args[0] == "get")
+    {
+        if (args.size() != 2)
+        {
+            std::cout << "usage: state get <scope/key>\n";
+            return 1;
+        }
+        state_key_request request;
+        request.key = args[1];
+        response = services.get_state(request);
+    }
+    else if (args[0] == "query")
+    {
+        state_query_request request;
+        request.key_prefix = args.size() > 1 ? args[1] : "";
+        response = services.query_state(request);
+    }
+    else if (args[0] == "checkpoint")
+    {
+        state_checkpoint_request request;
+        request.path = args.size() > 1 ? args[1] : "";
+        response = services.checkpoint_state(request);
+    }
+    else if (args[0] == "recover")
+    {
+        state_checkpoint_request request;
+        request.path = args.size() > 1 ? args[1] : "";
+        response = services.recover_state(request);
+    }
+    else if (args[0] == "compact")
+    {
+        std::string checkpoint_path;
+        std::string state_prefix;
+        for (size_t i = 1; i < args.size(); ++i)
+        {
+            if (args[i] == "--prefix")
+            {
+                if (i + 1 >= args.size() || !state_prefix.empty())
+                {
+                    std::cout << "usage: state compact [--prefix <state-prefix>] [checkpoint-path]\n";
+                    return 1;
+                }
+                state_prefix = args[++i];
+            }
+            else if (args[i].compare(0, 9, "--prefix=") == 0)
+            {
+                if (!state_prefix.empty())
+                {
+                    std::cout << "usage: state compact [--prefix <state-prefix>] [checkpoint-path]\n";
+                    return 1;
+                }
+                state_prefix = args[i].substr(9);
+            }
+            else if (checkpoint_path.empty())
+            {
+                checkpoint_path = args[i];
+            }
+            else
+            {
+                std::cout << "usage: state compact [--prefix <state-prefix>] [checkpoint-path]\n";
+                return 1;
+            }
+        }
+        const rasn_runtime_state_compaction_report report =
+            compact_rasn_runtime_state_mirror(
+                services, checkpoint_path, state_prefix);
+        if (!report.ok)
+        {
+            std::cout << "state compact failed: " << report.error << "\n";
+            return 1;
+        }
+        std::cout << "state compact ok: prefix=" << report.state_prefix
+                  << " runtime_records=" << report.runtime_records
+                  << " watermarks=" << report.watermark_records
+                  << " queried=" << report.queried_records
+                  << " checkpoint_records=" << report.checkpointed_records
+                  << " last_sequence=" << report.last_sequence
+                  << " recovery_journal_compacted="
+                  << (report.compaction_details_available
+                          ? (report.recovery_journal_compacted ? "yes" : "no")
+                          : "unknown")
+                  << " checkpoint="
+                  << (report.checkpoint_path.empty()
+                          ? "<state-service default>"
+                          : report.checkpoint_path)
+                  << "\n";
+        return 0;
+    }
+    else if (args[0] == "migrate")
+    {
+        std::string checkpoint_path;
+        std::string state_prefix = load_rasn_runtime_config().state_prefix;
+        bool apply = false;
+        for (size_t i = 1; i < args.size(); ++i)
+        {
+            if (args[i] == "--prefix")
+            {
+                if (i + 1 >= args.size())
+                {
+                    std::cout << "usage: state migrate <checkpoint-path> [--prefix <state-prefix>] [--apply]\n";
+                    return 1;
+                }
+                state_prefix = args[++i];
+            }
+            else if (args[i] == "--apply")
+            {
+                apply = true;
+            }
+            else if (checkpoint_path.empty() && !args[i].empty() &&
+                     args[i][0] != '-')
+            {
+                checkpoint_path = args[i];
+            }
+            else
+            {
+                std::cout << "usage: state migrate <checkpoint-path> [--prefix <state-prefix>] [--apply]\n";
+                return 1;
+            }
+        }
+        const state_migration_report report =
+            migrate_state_checkpoint(services, checkpoint_path, state_prefix, apply);
+        std::cout << "state migrate " << (report.ok ? "ok" : "failed")
+                  << (apply ? " (apply)" : " (dry-run)")
+                  << ": prefix=" << report.key_prefix
+                  << " source_records=" << report.source_records
+                  << " target_records=" << report.target_records
+                  << " planned=" << report.planned_records
+                  << " unchanged=" << report.unchanged_records
+                  << " migrated=" << report.migrated_records
+                  << " sequence_advance="
+                  << (report.sequence_advance_required ? "yes" : "no")
+                  << " conflicts=" << report.conflict_keys.size() << "\n";
+        if (!report.ok)
+        {
+            std::cout << report.error << "\n";
+            return 1;
+        }
+        if (!apply &&
+            (report.planned_records != 0 ||
+             report.sequence_advance_required))
+        {
+            std::cout << "dry-run only; rerun with --apply after reviewing the target\n";
+        }
+        return 0;
+    }
+    else if (args[0] == "prune")
+    {
+        std::string key_prefix;
+        uint64_t max_sequence = 0;
+        bool have_max_sequence = false;
+        bool apply = false;
+        for (size_t i = 1; i < args.size(); ++i)
+        {
+            if (args[i] == "--prefix" && i + 1 < args.size() &&
+                key_prefix.empty())
+            {
+                key_prefix = args[++i];
+            }
+            else if (args[i] == "--max-sequence" && i + 1 < args.size() &&
+                     !have_max_sequence)
+            {
+                have_max_sequence =
+                    parse_uint64_cli(args[++i], &max_sequence) &&
+                    max_sequence != 0;
+                if (!have_max_sequence)
+                {
+                    std::cout << "state prune requires a non-zero uint64 --max-sequence\n";
+                    return 1;
+                }
+            }
+            else if (args[i] == "--apply")
+            {
+                apply = true;
+            }
+            else
+            {
+                std::cout << "usage: state prune --prefix <obsolete-prefix> --max-sequence <cutoff> [--apply]\n";
+                return 1;
+            }
+        }
+        if (key_prefix.empty() || !have_max_sequence)
+        {
+            std::cout << "usage: state prune --prefix <obsolete-prefix> --max-sequence <cutoff> [--apply]\n";
+            return 1;
+        }
+
+        state_query_request query;
+        query.key_prefix = key_prefix;
+        const state_response existing = services.query_state(query);
+        if (!existing.ok)
+        {
+            std::cout << "state prune failed: " << existing.error << "\n";
+            return 1;
+        }
+        if (max_sequence > existing.last_sequence)
+        {
+            std::cout << "state prune failed: maximum sequence " << max_sequence
+                      << " exceeds current sequence " << existing.last_sequence
+                      << "\n";
+            return 1;
+        }
+        size_t eligible = 0;
+        for (const state_record &record : existing.records)
+        {
+            eligible += record.sequence <= max_sequence ? 1 : 0;
+        }
+        if (!apply)
+        {
+            std::cout << "state prune dry-run: prefix=" << key_prefix
+                      << " eligible=" << eligible
+                      << " preserved_newer=" << existing.records.size() - eligible
+                      << " max_sequence=" << max_sequence << "\n"
+                      << "This is a logical delete, not checkpoint compaction; rerun with --apply only for explicitly obsolete keys.\n";
+            return 0;
+        }
+
+        state_delete_prefix_request request;
+        request.key_prefix = key_prefix;
+        request.max_sequence = max_sequence;
+        response = services.delete_state_prefix(request);
+        if (!response.ok)
+        {
+            std::cout << "state error: " << response.error << "\n";
+            return 1;
+        }
+        std::cout << "state prune ok (apply): prefix=" << key_prefix
+                  << " deleted=" << response.records.size()
+                  << " max_sequence=" << max_sequence
+                  << " last_sequence=" << response.last_sequence << "\n";
+        return 0;
+    }
+    else
+    {
+        std::cout << "unknown state command: " << args[0] << "\n";
+        return 1;
+    }
+
+    if (!response.ok)
+    {
+        std::cout << "state error: " << response.error << "\n";
+        return 1;
+    }
+    if (args[0] == "put")
+    {
+        std::cout << "stored ";
+        print_state_record(response.record);
+    }
+    else if (args[0] == "get")
+    {
+        print_state_record(response.record);
+    }
+    else if (args[0] == "query")
+    {
+        for (const state_record &record : response.records)
+        {
+            print_state_record(record);
+        }
+        std::cout << "records=" << response.records.size()
+                  << " last_sequence=" << response.last_sequence << "\n";
+    }
+    else if (args[0] == "checkpoint")
+    {
+        std::cout << "checkpointed records=" << response.records.size()
+                  << " last_sequence=" << response.last_sequence << "\n";
+    }
+    else if (args[0] == "recover")
+    {
+        std::cout << "recovered records=" << response.records.size()
+                  << " last_sequence=" << response.last_sequence << "\n";
+    }
+    return 0;
+}
 
 rasn_service_graph_lifecycle_scope::rasn_service_graph_lifecycle_scope(rasn_service_graph &services)
     : _services(services)

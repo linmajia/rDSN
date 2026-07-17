@@ -31,7 +31,7 @@ std::vector<std::string> srepilot_commands()
 {
     static const std::vector<std::string> commands = {
         "help", "-h", "--help", "interactive", "repl", "diagnose", "runbook",
-        "status", "observe", "runtime", "selftest", "provider",
+        "status", "observe", "runtime", "state", "selftest", "provider",
     };
     return commands;
 }
@@ -227,6 +227,11 @@ int srepilot_cli::run_command(const std::vector<std::string> &args, bool interac
         }
         std::cout << "usage: runtime [topology|health]\n";
         return 1;
+    }
+    if (args[0] == "state")
+    {
+        return run_rasn_state_command(
+            _services, std::vector<std::string>(args.begin() + 1, args.end()));
     }
     if (args[0] == "selftest")
     {
@@ -667,6 +672,7 @@ void srepilot_cli::print_help(bool interactive_mode) const
               << cli_help_item(interactive_mode, "observe metrics [format]", "dump runtime metrics (text|prometheus|json)")
               << cli_help_item(interactive_mode, "observe resilience", "dump overload/model/tool/remote-agent guards")
               << cli_help_item(interactive_mode, "runtime [topology|health]", "show runtime state, resolved module routes, or reachability")
+              << cli_help_item(interactive_mode, "state <cmd> [args]", "use rASN state/checkpoint lifecycle commands")
               << cli_help_item(interactive_mode, "provider [name]", "show or switch model provider")
               << cli_help_item(interactive_mode, "selftest", "run model/state/observability checks")
               << cli_help_item(interactive_mode, "interactive", "start REPL mode");

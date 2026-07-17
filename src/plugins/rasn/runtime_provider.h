@@ -241,6 +241,8 @@ struct rasn_runtime_state_compaction_report
     size_t watermark_records = 0;
     size_t checkpointed_records = 0;
     uint64_t last_sequence = 0;
+    bool recovery_journal_compacted = false;
+    bool compaction_details_available = false;
 };
 
 // Static description of a rASN runtime module: its app-facing API name, the

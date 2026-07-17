@@ -596,6 +596,21 @@ std::vector<schema_type_descriptor> rasn_schema_manifest()
             field("schema_version", "uint32", true),
             field("key_prefix", "string", false)}));
     manifest.push_back(schema(
+        "state_delete_prefix_request",
+        RASN_AGENT_SCHEMA_VERSION,
+        "Cutoff-guarded logical deletion of an explicitly obsolete state-key prefix.",
+        std::vector<schema_field_descriptor>{
+            field("schema_version", "uint32", true),
+            field("key_prefix", "string", true),
+            field("max_sequence", "uint64", true)}));
+    manifest.push_back(schema(
+        "state_sequence_barrier_request",
+        RASN_AGENT_SCHEMA_VERSION,
+        "Idempotent sequence-floor mutation used by checkpoint migration.",
+        std::vector<schema_field_descriptor>{
+            field("schema_version", "uint32", true),
+            field("minimum_sequence", "uint64", true)}));
+    manifest.push_back(schema(
         "state_checkpoint_request",
         RASN_AGENT_SCHEMA_VERSION,
         "Checkpoint or recovery request naming a state snapshot path.",
@@ -613,6 +628,16 @@ std::vector<schema_type_descriptor> rasn_schema_manifest()
             field("record", "state_record", false),
             field("records", "state_record[]", false),
             field("last_sequence", "uint64", false)}));
+    manifest.push_back(schema(
+        "state_checkpoint_result",
+        RASN_AGENT_SCHEMA_VERSION,
+        "Detailed checkpoint response with server-confirmed path and journal outcome.",
+        std::vector<schema_field_descriptor>{
+            field("schema_version", "uint32", true),
+            field("response", "state_response", true),
+            field("checkpoint_path", "string", false),
+            field("journal_compacted", "bool", false),
+            field("details_available", "bool", true)}));
     manifest.push_back(schema(
         "workflow_node",
         RASN_AGENT_SCHEMA_VERSION,
@@ -673,7 +698,10 @@ std::vector<rpc_operation_descriptor> rasn_rpc_operation_manifest()
     operations.push_back(operation("rasn.state", "state_rpc_client", "put_conditional", "RPC_RASN_STATE_PUT_CONDITIONAL", "state_put_request", "state_response"));
     operations.push_back(operation("rasn.state", "state_rpc_client", "get", "RPC_RASN_STATE_GET", "state_key_request", "state_response"));
     operations.push_back(operation("rasn.state", "state_rpc_client", "query", "RPC_RASN_STATE_QUERY", "state_query_request", "state_response"));
+    operations.push_back(operation("rasn.state", "state_rpc_client", "delete_prefix", "RPC_RASN_STATE_DELETE_PREFIX", "state_delete_prefix_request", "state_response"));
+    operations.push_back(operation("rasn.state", "state_rpc_client", "advance_sequence", "RPC_RASN_STATE_ADVANCE_SEQUENCE", "state_sequence_barrier_request", "state_response"));
     operations.push_back(operation("rasn.state", "state_rpc_client", "checkpoint", "RPC_RASN_STATE_CHECKPOINT", "state_checkpoint_request", "state_response"));
+    operations.push_back(operation("rasn.state", "state_rpc_client", "checkpoint_detailed", "RPC_RASN_STATE_CHECKPOINT_DETAILED", "state_checkpoint_request", "state_checkpoint_result"));
     operations.push_back(operation("rasn.state", "state_rpc_client", "recover", "RPC_RASN_STATE_RECOVER", "state_checkpoint_request", "state_response"));
 
     operations.push_back(operation("rasn.workflow", "workflow_rpc_client", "validate", "RPC_RASN_WORKFLOW_VALIDATE", "workflow_source", "workflow_response"));

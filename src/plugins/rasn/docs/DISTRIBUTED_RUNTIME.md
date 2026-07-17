@@ -177,12 +177,21 @@ Design notes:
   has mirrored data records must also have a valid watermark, so a torn,
   incomplete, or pre-watermark mirror fails closed instead of silently serving
   partial state.
-  Operators can run `codepilot state compact` with an optional `--prefix` and
-  checkpoint path to query the mirror, verify existing watermarks, and fold the
-  shared state service into a compact checkpoint/journal baseline. Locally
-  routed hybrid modules are intentionally not mirrored, so flipping a module from
-  `local` to `remote` is still a **cold migration** unless an operator exports/
-  imports that module's prior local state.
+  Operators can run `codepilot state compact` (or the equivalent SREPilot
+  command) with an optional `--prefix` to query the mirror, verify existing
+  watermarks, checkpoint the configured recovery image, and compact its journal.
+  Supplying an explicit checkpoint path creates a verified export but deliberately
+  retains the configured recovery journal because that export is not necessarily
+  the next startup image. `state migrate <checkpoint> [--prefix ...]` preflights a
+  sequence-preserving import into the configured state service and defaults to a
+  dry run; `--apply` performs resumable CAS writes and restores the source sequence
+  floor. `state prune --prefix ... --max-sequence ...` is a separate, default-dry-run
+  **logical delete** for an explicitly obsolete namespace. It is not part of
+  compaction, and operators must not prune the active runtime-mirror prefix merely
+  because its records are present in a checkpoint: hydration still queries those
+  live records. Locally routed hybrid modules are intentionally not mirrored, so
+  flipping a module from `local` to `remote` is still a **cold migration** unless
+  an operator exports/imports that module's prior local state.
 
 ## 6. Endpoints, placement, and topology
 
@@ -815,12 +824,47 @@ rasn_runtime_state_watermark_enabled = true
 rasn_runtime_state_watermark_verify_enabled = true
 ```
 
-Compact the verified mirror into the state checkpoint/journal baseline:
+Compact the verified mirror into the configured recovery checkpoint/journal
+baseline (omit the path for actual journal compaction):
 
 ```bat
 codepilot.exe state compact --prefix rasn/runtime
-codepilot.exe state compact --prefix rasn/runtime rasn/state/runtime-mirror.chkpt
 ```
+
+Create a verified export while attached to the source state service. The export
+path is local to that service process; run the command on the source host or copy
+the file through the existing NFS workflow. Then point `[rasn.service]` at the
+destination state service and preflight/apply from a CLI process that can read the
+export:
+
+```bat
+codepilot.exe state compact --prefix rasn/runtime rasn/state/runtime-mirror-export.chkpt
+codepilot.exe state migrate rasn/state/runtime-mirror-export.chkpt --prefix rasn/runtime
+codepilot.exe state migrate rasn/state/runtime-mirror-export.chkpt --prefix rasn/runtime --apply
+```
+
+Delete only a namespace that the owning module/operator has declared obsolete.
+The cutoff preserves any concurrently written newer record:
+
+```bat
+codepilot.exe state prune --prefix retired/runtime/namespace --max-sequence 42000
+codepilot.exe state prune --prefix retired/runtime/namespace --max-sequence 42000 --apply
+```
+
+Direct/one-shot local commands recover the configured checkpoint/journal once per
+service graph before any state read, write, prune, sequence barrier, or checkpoint.
+A recovery error is cached and all later local state operations fail closed, so a
+fresh CLI process cannot checkpoint or prune an empty in-memory store over durable
+state. RPC-client mode delegates this responsibility to the state-service process.
+
+If a mirror failure cannot be rolled back conclusively, the state store fail-stops
+and leaves quarantine evidence beside or in place of the configured journal
+(`.quarantine`, `.quarantined`, and, when possible, an in-journal marker). Stop the
+role, preserve those files for diagnosis, reconcile the primary and replica against
+a known-good checkpoint, and replace the journal with a verified recovery image
+before removing the external marker and restarting. There is intentionally no
+in-process "clear quarantine" path, and deleting only the sidecar is insufficient
+when the journal itself contains the marker.
 
 Hybrid (agents call most modules in-process; shared state on dedicated nodes):
 
@@ -863,15 +907,20 @@ codepilot.exe serve config.rasn.ini "rasn.state;resource_budget"
   multi-process ZooKeeper frontend-failover scenario in the Linux harness.
 - Multi-process integration tests for the distributed/hybrid RPC paths.
 - Generated typed RPC schemas per module (replace the generic envelope payload).
-- State-mirror compaction/watermarks promotion is partially complete: watermarks
-  are written and verified, and operators can run a watermark-verified checkpoint
-  compaction command; explicit watermark pruning and local-to-remote migration
-  tooling remain. **Prerequisite for pruning:** the state store keeps one record
-  per key in an in-memory `std::map` and exposes no delete — reclaiming keys that
-  are already folded below a verified watermark needs a new `RPC_RASN_STATE_DELETE`
-  op (store erase + journal tombstone + service-graph/client/provider routing).
-  Migration can reuse the existing `query_state`/`put_state` ops to replay a local
-  mirror onto a remote state service.
+- **State lifecycle tooling — DELIVERED:** watermarks are written and verified;
+  `state compact` checkpoints the configured recovery image and compacts only its
+  covered journal; custom checkpoint exports retain that journal; `state migrate`
+  preflights/resumes an exact-prefix, sequence-preserving checkpoint import into
+  the configured state service (destination-only keys are conflicts, including
+  when the source prefix is fully deleted); and cutoff-guarded
+  `RPC_RASN_STATE_DELETE_PREFIX` plus durable
+  journal tombstones support explicit obsolete-namespace deletion. Compaction
+  intentionally does not delete current logical mirror records because those
+  records remain the hydration query surface. `RPC_RASN_STATE_ADVANCE_SEQUENCE`
+  restores a migrated checkpoint's sequence floor even when deletion left no live
+  record at its last committed sequence. Standalone-state-to-native-module-table
+  migration and export-file transport between hosts remain separate work under
+  §13.15/the existing rDSN NFS operator workflow.
 - **Direct runtime-module replication — DELIVERED (§13.15):** eleven module-specific
  `replicated_service_app_type_1` app types, separate read/write task codes,
  deterministic replay, checkpointed bounded dedup, decree checkpoints, learning,
@@ -1570,10 +1619,13 @@ meta-server deployment.
 The application owns a journal-free `state_store`: rDSN's committed mutation log
 is the durability authority, so a second per-replica append journal would introduce
 filesystem-dependent divergence. `RPC_RASN_STATE_PUT` and
-`RPC_RASN_STATE_PUT_CONDITIONAL` are marked `rpc_request_is_write_operation`; the
-replication layer commits them before dispatching the same deterministic mutation
-on every replica. Ordered replay and checkpoint-restored `_last_sequence` make
-server-assigned sequences and conditional-write outcomes deterministic.
+`RPC_RASN_STATE_PUT_CONDITIONAL`, `RPC_RASN_STATE_DELETE_PREFIX`, and
+`RPC_RASN_STATE_ADVANCE_SEQUENCE` are marked
+`rpc_request_is_write_operation`; the replication layer commits them before
+dispatching the same deterministic mutation on every replica. Ordered replay and
+checkpoint-restored `_last_sequence` make server-assigned sequences,
+cutoff-guarded deletions, migration sequence barriers, and conditional-write
+outcomes deterministic.
 `RPC_RASN_STATE_RECOVER` is also classified as a write but is rejected by replicated
 instances: operators cannot replace one live replica from an arbitrary path.
 
@@ -1592,6 +1644,27 @@ needs an app-level decree/snapshot barrier rather than reusing this path directl
 Operator `RPC_RASN_STATE_CHECKPOINT` and `RPC_RASN_STATE_RECOVER` requests are
 rejected in replicated mode so files outside the framework lifecycle cannot be
 mistaken for durable replica checkpoints.
+
+The standalone state journal records PUTs, cutoff-guarded prefix tombstones, and
+sequence barriers in commit order. Recovery applies tombstones without deleting
+records newer than their cutoff and restores barriers even when no live record
+carries the checkpoint's final sequence. A checkpoint written to the configured
+recovery path removes its covered journal only when no concurrent mutation landed.
+An explicit custom export path never removes that recovery journal.
+Checkpoint/recovery/mutation lifecycles are serialized so a recovery image cannot
+resurrect a key deleted after its journal read. When local write-through mirroring
+is enabled, a mirror append failure rolls the primary append back before returning
+failure; inability to prove that rollback fail-stops instead of leaving a
+success-shaped or restart-visible partial mutation. It also persists quarantine
+evidence that blocks reads, mutations, imports, checkpoints, and recovery across
+restart until an operator installs a verified checkpoint/journal and removes the
+marker. Local service-graph access performs one fail-closed recovery before its
+first state operation, including checkpoints and prune mutations; an explicit
+successful or failed recovery becomes that graph's recorded recovery outcome. The
+detailed checkpoint RPC
+returns the server-resolved path and whether journal compaction actually occurred;
+mixed-version fallback keeps the old checkpoint RPC but reports that outcome as
+unknown.
 
 Checkpoint files are currently retained without automatic garbage collection.
 rDSN may still be transferring a path returned by `get_checkpoint()` after that

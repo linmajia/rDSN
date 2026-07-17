@@ -11,6 +11,7 @@
 #include <rasn/blackboard.h>
 #include <rasn/capability_directory.h>
 #include <rasn/circuit_breaker.h>
+#include <rasn/cli_app.h>
 #include <rasn/cli_support.h>
 #include <rasn/runtime_provider.h>
 #include <rasn/contract_verifier.h>
@@ -52,6 +53,7 @@
 #include <climits>
 #include <condition_variable>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -256,6 +258,19 @@ std::string read_text_file(const std::string &path)
     return content.str();
 }
 
+class scoped_cout_capture
+{
+public:
+    scoped_cout_capture() : _previous(std::cout.rdbuf(_output.rdbuf())) {}
+    ~scoped_cout_capture() { std::cout.rdbuf(_previous); }
+
+    std::string str() const { return _output.str(); }
+
+private:
+    std::ostringstream _output;
+    std::streambuf *_previous;
+};
+
 std::string lease_record_value(const std::string &run_id,
                                const std::string &workflow_id,
                                const std::string &owner,
@@ -438,6 +453,9 @@ TEST(rasn_agent_types, schema_manifest_exposes_core_contracts)
     EXPECT_NE(std::string::npos, manifest.find("[model_provider_descriptor]"));
     EXPECT_NE(std::string::npos, manifest.find("credential_ref"));
     EXPECT_NE(std::string::npos, manifest.find("[state_response]"));
+    EXPECT_NE(std::string::npos, manifest.find("[state_delete_prefix_request]"));
+    EXPECT_NE(std::string::npos, manifest.find("[state_sequence_barrier_request]"));
+    EXPECT_NE(std::string::npos, manifest.find("[state_checkpoint_result]"));
     EXPECT_NE(std::string::npos, manifest.find("[redaction_policy]"));
     EXPECT_NE(std::string::npos, manifest.find("[workflow_node]"));
 
@@ -466,6 +484,9 @@ TEST(rasn_agent_types, schema_manifest_exposes_core_contracts)
     const std::string cpp_clients = rasn_schema_manifest_cpp_clients();
     EXPECT_NE(std::string::npos, cpp_clients.find("class workflow_rpc_client"));
     EXPECT_NE(std::string::npos, cpp_clients.find("RPC_RASN_OBSERVABILITY_LOAD_REPLAY"));
+    EXPECT_NE(std::string::npos, cpp_clients.find("RPC_RASN_STATE_DELETE_PREFIX"));
+    EXPECT_NE(std::string::npos, cpp_clients.find("RPC_RASN_STATE_ADVANCE_SEQUENCE"));
+    EXPECT_NE(std::string::npos, cpp_clients.find("RPC_RASN_STATE_CHECKPOINT_DETAILED"));
     EXPECT_NE(std::string::npos, cpp_clients.find("std::pair< ::dsn::error_code, state_response>"));
 
     const std::string typescript = rasn_schema_manifest_typescript();
@@ -2856,6 +2877,430 @@ TEST(rasn_state, conditional_put_guards_create_and_expected_sequence)
     ASSERT_TRUE(read.ok) << read.error;
     EXPECT_EQ("updated", read.record.value);
     EXPECT_EQ(updated.record.sequence, read.record.sequence);
+
+    state_put_request replay = update;
+    replay.record = updated.record;
+    const state_response replayed = store.put(replay);
+    ASSERT_TRUE(replayed.ok) << replayed.error;
+    EXPECT_EQ(updated.record.sequence, replayed.record.sequence);
+    EXPECT_EQ(updated.last_sequence, replayed.last_sequence);
+}
+
+TEST(rasn_state, custom_checkpoint_export_preserves_recovery_journal)
+{
+    const std::string journal_path = configured_state_journal_path();
+    const std::string recovery_path = configured_state_checkpoint_path();
+    const std::string export_path =
+        temp_file_path("rasn-state-custom-export-unit.chkpt");
+    for (const std::string &path : {journal_path, recovery_path, export_path})
+    {
+        std::remove(path.c_str());
+        std::remove((path + ".tmp").c_str());
+        std::remove((path + ".bak").c_str());
+    }
+
+    state_store writer;
+    state_record record;
+    record.key = "unit/custom-export";
+    record.kind = "observation";
+    record.scope = "unit";
+    record.value = "journal-must-survive";
+    ASSERT_TRUE(writer.put(record).ok);
+
+    state_checkpoint_request export_request;
+    export_request.path = export_path;
+    const state_checkpoint_result exported =
+        writer.checkpoint_detailed(export_request);
+    ASSERT_TRUE(exported.response.ok) << exported.response.error;
+    EXPECT_TRUE(exported.details_available);
+    EXPECT_EQ(export_path, exported.checkpoint_path);
+    EXPECT_FALSE(exported.journal_compacted);
+    EXPECT_TRUE(::dsn::utils::filesystem::file_exists(journal_path));
+
+    state_store recovered;
+    const state_response response =
+        recovered.recover(state_checkpoint_request());
+    ASSERT_TRUE(response.ok) << response.error;
+    state_key_request key;
+    key.key = record.key;
+    const state_response read = recovered.get(key);
+    ASSERT_TRUE(read.ok) << read.error;
+    EXPECT_EQ(record.value, read.record.value);
+
+    for (const std::string &path : {journal_path, recovery_path, export_path})
+    {
+        std::remove(path.c_str());
+        std::remove((path + ".tmp").c_str());
+        std::remove((path + ".bak").c_str());
+    }
+}
+
+TEST(rasn_state, delete_prefix_replays_tombstone_and_preserves_newer_records)
+{
+    const std::string journal_path = configured_state_journal_path();
+    const std::string checkpoint_path = configured_state_checkpoint_path();
+    for (const std::string &path : {journal_path, checkpoint_path})
+    {
+        std::remove(path.c_str());
+        std::remove((path + ".tmp").c_str());
+        std::remove((path + ".bak").c_str());
+    }
+
+    state_store writer;
+    state_record old_record;
+    old_record.key = "unit/prune/old";
+    old_record.kind = "observation";
+    old_record.scope = "unit";
+    old_record.value = "old";
+    const state_response old_put = writer.put(old_record);
+    ASSERT_TRUE(old_put.ok) << old_put.error;
+
+    state_record newer_record = old_record;
+    newer_record.key = "unit/prune/newer";
+    newer_record.value = "newer";
+    const state_response newer_put = writer.put(newer_record);
+    ASSERT_TRUE(newer_put.ok) << newer_put.error;
+
+    state_delete_prefix_request deletion;
+    deletion.key_prefix = "unit/prune";
+    deletion.max_sequence = old_put.record.sequence;
+    const state_response deleted = writer.delete_prefix(deletion);
+    ASSERT_TRUE(deleted.ok) << deleted.error;
+    ASSERT_EQ(1u, deleted.records.size());
+    EXPECT_EQ(old_record.key, deleted.records[0].key);
+    EXPECT_GT(deleted.last_sequence, newer_put.last_sequence);
+
+    state_sequence_barrier_request barrier;
+    barrier.minimum_sequence = deleted.last_sequence + 10;
+    const state_response advanced = writer.advance_sequence(barrier);
+    ASSERT_TRUE(advanced.ok) << advanced.error;
+    EXPECT_EQ(barrier.minimum_sequence, advanced.last_sequence);
+
+    state_store recovered;
+    const state_response replayed =
+        recovered.recover(state_checkpoint_request());
+    ASSERT_TRUE(replayed.ok) << replayed.error;
+    EXPECT_EQ(barrier.minimum_sequence, replayed.last_sequence);
+    state_key_request old_key;
+    old_key.key = old_record.key;
+    EXPECT_FALSE(recovered.get(old_key).ok);
+    state_key_request newer_key;
+    newer_key.key = newer_record.key;
+    EXPECT_TRUE(recovered.get(newer_key).ok);
+
+    for (const std::string &path : {journal_path, checkpoint_path})
+    {
+        std::remove(path.c_str());
+        std::remove((path + ".tmp").c_str());
+        std::remove((path + ".bak").c_str());
+    }
+}
+
+TEST(rasn_state, quarantine_sidecar_blocks_state_lifecycle_operations)
+{
+    const std::string journal_path = configured_state_journal_path();
+    const std::string marker_path = journal_path + ".quarantine";
+    const std::string quarantined_path = journal_path + ".quarantined";
+    const std::string checkpoint_path =
+        temp_file_path("rasn-state-quarantine-unit.chkpt");
+    for (const std::string &path :
+         {marker_path, quarantined_path, checkpoint_path})
+    {
+        std::remove(path.c_str());
+        std::remove((path + ".tmp").c_str());
+        std::remove((path + ".bak").c_str());
+    }
+    write_text_file(marker_path, "unprovable mirror rollback\n");
+
+    state_store store;
+    state_record record;
+    record.key = "unit/quarantined";
+    record.kind = "observation";
+    record.scope = "unit";
+    record.value = "must-not-be-visible";
+    EXPECT_FALSE(store.put(record).ok);
+
+    state_key_request key;
+    key.key = record.key;
+    EXPECT_FALSE(store.get(key).ok);
+    EXPECT_FALSE(store.query(state_query_request()).ok);
+
+    state_delete_prefix_request deletion;
+    deletion.key_prefix = "unit/quarantined";
+    deletion.max_sequence = 1;
+    EXPECT_FALSE(store.delete_prefix(deletion).ok);
+
+    state_sequence_barrier_request barrier;
+    barrier.minimum_sequence = 1;
+    EXPECT_FALSE(store.advance_sequence(barrier).ok);
+
+    state_checkpoint_request checkpoint;
+    checkpoint.path = checkpoint_path;
+    EXPECT_FALSE(store.checkpoint(checkpoint).ok);
+    EXPECT_FALSE(store.copy_checkpoint(checkpoint, "").ok);
+    EXPECT_FALSE(store.recover(checkpoint).ok);
+    EXPECT_TRUE(store.has_recovery_state(state_checkpoint_request()));
+
+    std::remove(marker_path.c_str());
+    std::remove(quarantined_path.c_str());
+    std::remove(checkpoint_path.c_str());
+    std::remove((checkpoint_path + ".tmp").c_str());
+    std::remove((checkpoint_path + ".bak").c_str());
+}
+
+TEST(rasn_state, checkpoint_migration_is_dry_run_resumable_and_conflict_safe)
+{
+    const std::string checkpoint_path =
+        temp_file_path("rasn-state-migration-unit.chkpt");
+    std::remove(checkpoint_path.c_str());
+    std::remove((checkpoint_path + ".tmp").c_str());
+    std::remove((checkpoint_path + ".bak").c_str());
+
+    const std::string prefix = "unit/migration-" + make_trace_id();
+    state_store source(false);
+    state_record first;
+    first.key = prefix + "/first";
+    first.kind = "observation";
+    first.scope = "unit";
+    first.value = "one";
+    first.sequence = uint64_t{1} << 60;
+    ASSERT_TRUE(source.put(first).ok);
+    state_record second = first;
+    second.key = prefix + "/second";
+    second.value = "two";
+    second.sequence = 0;
+    const state_response source_second_put = source.put(second);
+    ASSERT_TRUE(source_second_put.ok) << source_second_put.error;
+    state_record third = second;
+    third.key = prefix + "/third";
+    third.value = "three";
+    ASSERT_TRUE(source.put(third).ok);
+
+    state_delete_prefix_request source_deletion;
+    source_deletion.key_prefix = first.key;
+    source_deletion.max_sequence = first.sequence;
+    ASSERT_TRUE(source.delete_prefix(source_deletion).ok);
+
+    state_checkpoint_request checkpoint;
+    checkpoint.path = checkpoint_path;
+    ASSERT_TRUE(source.checkpoint(checkpoint).ok);
+
+    rasn_service_graph services;
+    const state_migration_report dry_run =
+        migrate_state_checkpoint(services, checkpoint_path, prefix, false);
+    ASSERT_TRUE(dry_run.ok) << dry_run.error;
+    EXPECT_EQ(2u, dry_run.planned_records);
+    EXPECT_EQ(0u, dry_run.migrated_records);
+    state_query_request query;
+    query.key_prefix = prefix;
+    EXPECT_TRUE(services.query_state(query).records.empty());
+
+    const state_migration_report applied =
+        migrate_state_checkpoint(services, checkpoint_path, prefix, true);
+    ASSERT_TRUE(applied.ok) << applied.error;
+    EXPECT_EQ(2u, applied.migrated_records);
+    EXPECT_EQ(2u, applied.verified_records);
+    EXPECT_GE(applied.target_last_sequence, applied.source_last_sequence);
+
+    const state_migration_report resumed =
+        migrate_state_checkpoint(services, checkpoint_path, prefix, true);
+    ASSERT_TRUE(resumed.ok) << resumed.error;
+    EXPECT_EQ(0u, resumed.planned_records);
+    EXPECT_EQ(2u, resumed.unchanged_records);
+
+    state_record target_only = second;
+    target_only.key = prefix + "/target-only";
+    target_only.value = "stale";
+    const state_response target_only_put = services.put_state(target_only);
+    ASSERT_TRUE(target_only_put.ok) << target_only_put.error;
+    const state_migration_report target_only_conflict =
+        migrate_state_checkpoint(services, checkpoint_path, prefix, true);
+    EXPECT_FALSE(target_only_conflict.ok);
+    ASSERT_EQ(1u, target_only_conflict.conflict_keys.size());
+    EXPECT_EQ(target_only.key, target_only_conflict.conflict_keys[0]);
+    state_delete_prefix_request remove_target_only;
+    remove_target_only.key_prefix = target_only.key;
+    remove_target_only.max_sequence = target_only_put.record.sequence;
+    ASSERT_TRUE(services.delete_state_prefix(remove_target_only).ok);
+
+    state_record newer_same = source_second_put.record;
+    state_query_request all_target;
+    const state_response target_before_newer = services.query_state(all_target);
+    ASSERT_TRUE(target_before_newer.ok);
+    newer_same.sequence = target_before_newer.last_sequence + 1;
+    ASSERT_TRUE(services.put_state(newer_same).ok);
+    const state_migration_report newer_conflict =
+        migrate_state_checkpoint(services, checkpoint_path, prefix, true);
+    EXPECT_FALSE(newer_conflict.ok);
+    ASSERT_EQ(1u, newer_conflict.conflict_keys.size());
+    EXPECT_EQ(second.key, newer_conflict.conflict_keys[0]);
+
+    ASSERT_TRUE(services.put_state(source_second_put.record).ok);
+    state_record divergent = source_second_put.record;
+    divergent.sequence = source_second_put.record.sequence - 1;
+    divergent.value = "target-divergent";
+    ASSERT_TRUE(services.put_state(divergent).ok);
+    const state_migration_report conflict =
+        migrate_state_checkpoint(services, checkpoint_path, prefix, true);
+    EXPECT_FALSE(conflict.ok);
+    ASSERT_EQ(1u, conflict.conflict_keys.size());
+    EXPECT_EQ(second.key, conflict.conflict_keys[0]);
+
+    const std::string empty_checkpoint_path =
+        temp_file_path("rasn-state-empty-migration-unit.chkpt");
+    std::remove(empty_checkpoint_path.c_str());
+    const state_response target_before_empty = services.query_state(all_target);
+    ASSERT_TRUE(target_before_empty.ok);
+    state_store empty_source(false);
+    state_sequence_barrier_request empty_barrier;
+    empty_barrier.minimum_sequence = target_before_empty.last_sequence + 10;
+    ASSERT_TRUE(empty_source.advance_sequence(empty_barrier).ok);
+    state_checkpoint_request empty_checkpoint;
+    empty_checkpoint.path = empty_checkpoint_path;
+    ASSERT_TRUE(empty_source.checkpoint(empty_checkpoint).ok);
+    const std::string empty_prefix = prefix + "-empty";
+    const state_migration_report empty_migration =
+        migrate_state_checkpoint(
+            services, empty_checkpoint_path, empty_prefix, true);
+    ASSERT_TRUE(empty_migration.ok) << empty_migration.error;
+    EXPECT_EQ(0u, empty_migration.source_records);
+    EXPECT_GE(empty_migration.target_last_sequence,
+              empty_barrier.minimum_sequence);
+
+    std::remove(checkpoint_path.c_str());
+    std::remove((checkpoint_path + ".tmp").c_str());
+    std::remove((checkpoint_path + ".bak").c_str());
+    std::remove(empty_checkpoint_path.c_str());
+    std::remove((empty_checkpoint_path + ".tmp").c_str());
+    std::remove((empty_checkpoint_path + ".bak").c_str());
+}
+
+TEST(rasn_state, inline_lifecycle_commands_recover_before_checkpoint_and_prune)
+{
+    const std::string journal_path = configured_state_journal_path();
+    const std::string checkpoint_path = configured_state_checkpoint_path();
+    const std::string export_path =
+        temp_file_path("rasn-state-inline-lifecycle-unit.chkpt");
+    for (const std::string &path :
+         {journal_path,
+          journal_path + ".quarantine",
+          journal_path + ".quarantined",
+          checkpoint_path,
+          export_path})
+    {
+        std::remove(path.c_str());
+        std::remove((path + ".tmp").c_str());
+        std::remove((path + ".bak").c_str());
+    }
+
+    const state_response initial =
+        global_state_store().query(state_query_request());
+    ASSERT_TRUE(initial.ok) << initial.error;
+    ASSERT_LT(initial.last_sequence,
+              (std::numeric_limits<uint64_t>::max)() - 20);
+
+    const std::string prefix = "unit/inline-lifecycle-" + make_trace_id();
+    state_record checkpoint_record;
+    checkpoint_record.key = prefix + "/checkpoint";
+    checkpoint_record.kind = "observation";
+    checkpoint_record.scope = "unit";
+    checkpoint_record.value = "checkpoint-sensitive-value";
+    checkpoint_record.sequence = initial.last_sequence + 10;
+    state_store checkpoint_writer;
+    ASSERT_TRUE(checkpoint_writer.put(checkpoint_record).ok);
+
+    rasn_service_graph checkpoint_services;
+    int checkpoint_exit = -1;
+    std::string checkpoint_output;
+    {
+        scoped_cout_capture capture;
+        checkpoint_exit = run_rasn_state_command(
+            checkpoint_services, {"checkpoint", export_path});
+        checkpoint_output = capture.str();
+    }
+    EXPECT_EQ(0, checkpoint_exit);
+    EXPECT_NE(std::string::npos,
+              checkpoint_output.find("checkpointed records="));
+    EXPECT_EQ(std::string::npos,
+              checkpoint_output.find(checkpoint_record.value));
+
+    state_store exported(false);
+    state_checkpoint_request exported_request;
+    exported_request.path = export_path;
+    const state_response exported_records =
+        exported.copy_checkpoint(exported_request, "");
+    ASSERT_TRUE(exported_records.ok) << exported_records.error;
+    EXPECT_NE(exported_records.records.end(),
+              std::find_if(exported_records.records.begin(),
+                           exported_records.records.end(),
+                           [&](const state_record &record) {
+                               return record.key == checkpoint_record.key;
+                           }));
+
+    const state_response after_checkpoint =
+        global_state_store().query(state_query_request());
+    ASSERT_TRUE(after_checkpoint.ok) << after_checkpoint.error;
+    ASSERT_LT(after_checkpoint.last_sequence,
+              (std::numeric_limits<uint64_t>::max)() - 10);
+
+    state_record prune_record = checkpoint_record;
+    prune_record.key = prefix + "/prune";
+    prune_record.value = "prune-sensitive-value";
+    prune_record.sequence = after_checkpoint.last_sequence + 10;
+    state_store prune_writer;
+    ASSERT_TRUE(prune_writer.put(prune_record).ok);
+
+    rasn_service_graph prune_services;
+    int prune_exit = -1;
+    std::string prune_output;
+    {
+        scoped_cout_capture capture;
+        prune_exit = run_rasn_state_command(
+            prune_services,
+            {"prune",
+             "--prefix",
+             prune_record.key,
+             "--max-sequence",
+             std::to_string(prune_record.sequence),
+             "--apply"});
+        prune_output = capture.str();
+    }
+    EXPECT_EQ(0, prune_exit);
+    EXPECT_NE(std::string::npos, prune_output.find("deleted=1"));
+    EXPECT_EQ(std::string::npos, prune_output.find(prune_record.value));
+
+    state_key_request pruned_key;
+    pruned_key.key = prune_record.key;
+    EXPECT_FALSE(global_state_store().get(pruned_key).ok);
+
+    int query_exit = -1;
+    std::string query_output;
+    {
+        scoped_cout_capture capture;
+        query_exit = run_rasn_state_command(
+            checkpoint_services, {"query", checkpoint_record.key});
+        query_output = capture.str();
+    }
+    EXPECT_EQ(0, query_exit);
+    EXPECT_NE(std::string::npos, query_output.find(checkpoint_record.value));
+    EXPECT_NE(std::string::npos, query_output.find("records=1"));
+    EXPECT_NE(std::string::npos, query_output.find("last_sequence="));
+
+    const state_response before_cleanup =
+        global_state_store().query(state_query_request());
+    ASSERT_TRUE(before_cleanup.ok) << before_cleanup.error;
+    state_delete_prefix_request cleanup;
+    cleanup.key_prefix = checkpoint_record.key;
+    cleanup.max_sequence = before_cleanup.last_sequence;
+    EXPECT_TRUE(global_state_store().delete_prefix(cleanup).ok);
+
+    for (const std::string &path :
+         {journal_path, checkpoint_path, export_path})
+    {
+        std::remove(path.c_str());
+        std::remove((path + ".tmp").c_str());
+        std::remove((path + ".bak").c_str());
+    }
 }
 
 TEST(rasn_workflow_service, propagates_state_lookup_failures_when_recovering_run)
@@ -4800,6 +5245,8 @@ TEST(rasn_runtime, compacts_state_mirror_after_watermark_verification)
     EXPECT_EQ(1u, report.watermark_records);
     EXPECT_GE(report.checkpointed_records, report.runtime_records + report.watermark_records);
     EXPECT_GE(report.last_sequence, stored.record.sequence);
+    EXPECT_TRUE(report.compaction_details_available);
+    EXPECT_FALSE(report.recovery_journal_compacted);
 
     std::remove(checkpoint_path.c_str());
     std::remove((checkpoint_path + ".tmp").c_str());

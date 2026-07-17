@@ -49,6 +49,19 @@ struct state_query_request
     std::string key_prefix;
 };
 
+struct state_delete_prefix_request
+{
+    uint32_t schema_version = RASN_AGENT_SCHEMA_VERSION;
+    std::string key_prefix;
+    uint64_t max_sequence = 0;
+};
+
+struct state_sequence_barrier_request
+{
+    uint32_t schema_version = RASN_AGENT_SCHEMA_VERSION;
+    uint64_t minimum_sequence = 0;
+};
+
 struct state_checkpoint_request
 {
     uint32_t schema_version = RASN_AGENT_SCHEMA_VERSION;
@@ -63,6 +76,15 @@ struct state_response
     state_record record;
     std::vector<state_record> records;
     uint64_t last_sequence = 0;
+};
+
+struct state_checkpoint_result
+{
+    uint32_t schema_version = RASN_AGENT_SCHEMA_VERSION;
+    state_response response;
+    std::string checkpoint_path;
+    bool journal_compacted = false;
+    bool details_available = true;
 };
 
 inline void marshall(::dsn::binary_writer &writer, const state_record &value, ::dsn_msg_serialize_format fmt)
@@ -154,6 +176,40 @@ inline void unmarshall(::dsn::binary_reader &reader, state_query_request &value,
     reader.read(value.key_prefix);
 }
 
+inline void marshall(::dsn::binary_writer &writer,
+                     const state_delete_prefix_request &value,
+                     ::dsn_msg_serialize_format fmt)
+{
+    writer.write(value.schema_version);
+    writer.write(value.key_prefix);
+    writer.write(value.max_sequence);
+}
+
+inline void unmarshall(::dsn::binary_reader &reader,
+                       state_delete_prefix_request &value,
+                       ::dsn_msg_serialize_format fmt)
+{
+    reader.read(value.schema_version);
+    reader.read(value.key_prefix);
+    reader.read(value.max_sequence);
+}
+
+inline void marshall(::dsn::binary_writer &writer,
+                     const state_sequence_barrier_request &value,
+                     ::dsn_msg_serialize_format fmt)
+{
+    writer.write(value.schema_version);
+    writer.write(value.minimum_sequence);
+}
+
+inline void unmarshall(::dsn::binary_reader &reader,
+                       state_sequence_barrier_request &value,
+                       ::dsn_msg_serialize_format fmt)
+{
+    reader.read(value.schema_version);
+    reader.read(value.minimum_sequence);
+}
+
 inline void marshall(::dsn::binary_writer &writer, const state_checkpoint_request &value, ::dsn_msg_serialize_format fmt)
 {
     writer.write(value.schema_version);
@@ -186,6 +242,28 @@ inline void unmarshall(::dsn::binary_reader &reader, state_response &value, ::ds
     reader.read(value.last_sequence);
 }
 
+inline void marshall(::dsn::binary_writer &writer,
+                     const state_checkpoint_result &value,
+                     ::dsn_msg_serialize_format fmt)
+{
+    writer.write(value.schema_version);
+    marshall(writer, value.response, fmt);
+    writer.write(value.checkpoint_path);
+    writer.write(value.journal_compacted);
+    writer.write(value.details_available);
+}
+
+inline void unmarshall(::dsn::binary_reader &reader,
+                       state_checkpoint_result &value,
+                       ::dsn_msg_serialize_format fmt)
+{
+    reader.read(value.schema_version);
+    unmarshall(reader, value.response, fmt);
+    reader.read(value.checkpoint_path);
+    reader.read(value.journal_compacted);
+    reader.read(value.details_available);
+}
+
 class state_store
 {
 public:
@@ -195,7 +273,11 @@ public:
     state_response put(const state_put_request &request);
     state_response get(const state_key_request &request) const;
     state_response query(const state_query_request &request) const;
+    state_response delete_prefix(const state_delete_prefix_request &request);
+    state_response advance_sequence(const state_sequence_barrier_request &request);
     state_response checkpoint(const state_checkpoint_request &request) const;
+    state_checkpoint_result
+    checkpoint_detailed(const state_checkpoint_request &request) const;
     state_response copy_checkpoint(const state_checkpoint_request &request,
                                    const std::string &durable_path);
     state_response replace_from_checkpoint(const state_checkpoint_request &request,
@@ -210,17 +292,27 @@ private:
     state_response error_response(const std::string &error) const;
     std::string default_checkpoint_path() const;
     std::string default_journal_path() const;
+    bool journal_is_quarantined() const;
     bool append_journal_record(const state_record &record, std::string *error) const;
+    bool append_journal_delete_prefix(const state_delete_prefix_request &request,
+                                      uint64_t operation_sequence,
+                                      std::string *error) const;
+    bool append_journal_sequence_barrier(const state_sequence_barrier_request &request,
+                                         std::string *error) const;
 
+    // Serializes mutation/checkpoint/recovery lifecycles while _lock protects
+    // short in-memory map accesses and read queries.
+    mutable ::dsn::service::zlock _mutation_lock;
     mutable ::dsn::service::zlock _lock;
     std::map<std::string, state_record> _records;
     uint64_t _last_sequence = 0;
-    // Incremented on every successful put; lets checkpoint detect whether any
-    // write landed since it snapshotted so it can safely compact the journal.
+    // Incremented on every successful mutation; lets checkpoint detect whether
+    // any write landed since it snapshotted so it can safely compact the journal.
     uint64_t _write_epoch = 0;
     // Standalone stores journal before exposing writes. Type-1 replicated stores
     // disable this because rDSN's quorum mutation log is their durability source.
     const bool _journal_enabled;
+    mutable std::atomic<int> _quarantine_state{-1};
 };
 
 std::string configured_state_checkpoint_path();
@@ -247,7 +339,14 @@ protected:
     void on_put_conditional(const state_put_request &request, ::dsn::rpc_replier<state_response> &reply);
     void on_get(const state_key_request &request, ::dsn::rpc_replier<state_response> &reply);
     void on_query(const state_query_request &request, ::dsn::rpc_replier<state_response> &reply);
+    void on_delete_prefix(const state_delete_prefix_request &request,
+                          ::dsn::rpc_replier<state_response> &reply);
+    void on_advance_sequence(const state_sequence_barrier_request &request,
+                             ::dsn::rpc_replier<state_response> &reply);
     void on_checkpoint(const state_checkpoint_request &request, ::dsn::rpc_replier<state_response> &reply);
+    void on_checkpoint_detailed(
+        const state_checkpoint_request &request,
+        ::dsn::rpc_replier<state_checkpoint_result> &reply);
     void on_recover(const state_checkpoint_request &request, ::dsn::rpc_replier<state_response> &reply);
 
 private:
@@ -285,10 +384,29 @@ public:
                uint64_t partition_hash = 0);
 
     std::pair< ::dsn::error_code, state_response>
+    delete_prefix_sync(const state_delete_prefix_request &request,
+                       std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
+                       int thread_hash = 0,
+                       uint64_t partition_hash = 0);
+
+    std::pair< ::dsn::error_code, state_response>
+    advance_sequence_sync(const state_sequence_barrier_request &request,
+                          std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
+                          int thread_hash = 0,
+                          uint64_t partition_hash = 0);
+
+    std::pair< ::dsn::error_code, state_response>
     checkpoint_sync(const state_checkpoint_request &request,
                     std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                     int thread_hash = 0,
                     uint64_t partition_hash = 0);
+
+    std::pair< ::dsn::error_code, state_checkpoint_result>
+    checkpoint_detailed_sync(
+        const state_checkpoint_request &request,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
+        int thread_hash = 0,
+        uint64_t partition_hash = 0);
 
     std::pair< ::dsn::error_code, state_response>
     recover_sync(const state_checkpoint_request &request,

@@ -4982,7 +4982,6 @@ rasn_runtime_state_compaction_report compact_rasn_runtime_state_mirror(rasn_serv
 {
     rasn_runtime_state_compaction_report report;
     report.state_prefix = state_prefix.empty() ? load_rasn_runtime_config().state_prefix : state_prefix;
-    report.checkpoint_path = checkpoint_path;
 
     state_query_request query;
     query.key_prefix = rasn_runtime_state_prefix(report.state_prefix);
@@ -5024,16 +5023,22 @@ rasn_runtime_state_compaction_report compact_rasn_runtime_state_mirror(rasn_serv
 
     state_checkpoint_request checkpoint;
     checkpoint.path = checkpoint_path;
-    const state_response checkpointed = services.checkpoint_state(checkpoint);
-    if (!checkpointed.ok)
+    const state_checkpoint_result checkpointed =
+        services.checkpoint_state_detailed(checkpoint);
+    if (!checkpointed.response.ok)
     {
         report.ok = false;
-        report.error = checkpointed.error.empty() ? "failed to checkpoint rASN state mirror" : checkpointed.error;
+        report.error = checkpointed.response.error.empty()
+                           ? "failed to checkpoint rASN state mirror"
+                           : checkpointed.response.error;
         return report;
     }
 
-    report.checkpointed_records = checkpointed.records.size();
-    report.last_sequence = checkpointed.last_sequence;
+    report.checkpointed_records = checkpointed.response.records.size();
+    report.last_sequence = checkpointed.response.last_sequence;
+    report.checkpoint_path = checkpointed.checkpoint_path;
+    report.recovery_journal_compacted = checkpointed.journal_compacted;
+    report.compaction_details_available = checkpointed.details_available;
     return report;
 }
 
