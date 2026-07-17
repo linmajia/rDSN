@@ -7380,7 +7380,7 @@ rasn_replicated_runtime_app::rasn_replicated_runtime_app(::dsn_gpid gpid, std::s
         return ::dsn::ERR_CHECKPOINT_FAILED;
     }
 
-    state_store snapshot(false);
+    state_store snapshot(false, 0);
     for (const state_record &record : records)
     {
         const state_response written = snapshot.put(record);
@@ -7466,7 +7466,7 @@ int64_t rasn_replicated_runtime_app::get_last_checkpoint_decree()
 
     state_checkpoint_request request;
     request.path = state.files[0];
-    state_store imported(false);
+    state_store imported(false, 0);
     const state_response parsed = imported.copy_checkpoint(request, "");
     std::string error;
     if (!parsed.ok ||
@@ -7533,7 +7533,7 @@ int64_t rasn_replicated_runtime_app::get_last_checkpoint_decree()
     {
         state_checkpoint_request request;
         request.path = checkpoint.second;
-        state_store imported(false);
+        state_store imported(false, 0);
         const state_response parsed = imported.copy_checkpoint(request, "");
         std::string error;
         if (parsed.ok &&

@@ -3625,7 +3625,7 @@ state_migration_report migrate_state_checkpoint(rasn_service_graph &services,
         return report;
     }
 
-    state_store source(false);
+    state_store source(false, 0);
     state_checkpoint_request checkpoint;
     checkpoint.path = checkpoint_path;
     const state_response loaded = source.replace_from_checkpoint(checkpoint);

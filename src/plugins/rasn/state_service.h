@@ -18,6 +18,8 @@
 namespace dsn {
 namespace rasn {
 
+constexpr uint64_t k_default_quarantine_probe_interval_ms = 1000;
+
 struct state_record
 {
     uint32_t schema_version = RASN_AGENT_SCHEMA_VERSION;
@@ -295,7 +297,8 @@ inline void unmarshall(::dsn::binary_reader &reader,
 class state_store
 {
 public:
-    explicit state_store(bool journal_enabled = true);
+    // Journal-enabled callers must explicitly choose the read-side quarantine
+    // probe interval; journal-free replicated/checkpoint stores pass zero.
     state_store(bool journal_enabled, uint64_t quarantine_probe_interval_ms);
 
     state_response put(const state_record &record);
@@ -329,6 +332,7 @@ private:
     std::string default_journal_path() const;
     std::string quarantine_error() const;
     bool journal_is_quarantined(bool force_refresh) const;
+    bool validate_cached_storage_filesystem(std::string *error) const;
     bool append_journal_record(const state_record &record, std::string *error) const;
     bool append_journal_delete_prefix(const state_delete_prefix_request &request,
                                       uint64_t operation_sequence,
@@ -358,10 +362,10 @@ private:
     mutable std::atomic<bool> _quarantine_seen{false};
     mutable std::atomic<uint64_t> _next_quarantine_probe_ms{0};
     mutable ::dsn::service::zlock _quarantine_probe_lock;
-    mutable ::dsn::service::zlock _storage_validation_lock;
-    mutable bool _storage_validation_checked = false;
-    mutable bool _storage_validation_ok = false;
-    mutable std::string _storage_validation_error;
+    mutable ::dsn::service::zlock _storage_filesystem_validation_lock;
+    mutable bool _storage_filesystem_validation_checked = false;
+    mutable bool _storage_filesystem_validation_ok = false;
+    mutable std::string _storage_filesystem_validation_error;
 };
 
 std::string configured_state_checkpoint_path();

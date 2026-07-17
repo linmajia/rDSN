@@ -484,7 +484,8 @@ rDSN design:
   configured lifecycle volumes through the store's startup/lazy cache, rejects
   FAT/exFAT in favor of NTFS, ReFS, or CSVFS, and then relies on durable file
   flushes plus write-through moves without re-querying volume metadata for later
-  configured-path operations. A failed flush is an operation failure,
+  configured-path operations. Link and path-collision checks still run on each
+  configured checkpoint/recovery lifecycle. A failed flush is an operation failure,
   and an append whose rollback cannot be flushed enters fail-stop quarantine.
   Local copies use checked fixed-size reads and reject source shrink/growth or
   read failure before flushing the target. Retried deletion flushes the parent

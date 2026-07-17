@@ -3060,14 +3060,12 @@ uint64_t monotonic_state_time_ms()
             .count());
 }
 
-const uint64_t kDefaultStateQuarantineProbeIntervalMs = 1000;
-
 uint64_t configured_state_quarantine_probe_interval_ms()
 {
     return config_uint64(
         "rasn.state",
         "quarantine_probe_interval_ms",
-        kDefaultStateQuarantineProbeIntervalMs,
+        k_default_quarantine_probe_interval_ms,
         "Maximum healthy-cache interval for external state quarantine probes");
 }
 
@@ -3229,13 +3227,6 @@ bool configured_state_recovery_available(const state_checkpoint_request &request
 
     const nfs_state_import_config nfs = load_nfs_state_import_config(checkpoint, journal);
     return nfs.enabled;
-}
-
-state_store::state_store(bool journal_enabled)
-    : state_store(
-          journal_enabled,
-          journal_enabled ? kDefaultStateQuarantineProbeIntervalMs : 0)
-{
 }
 
 state_store::state_store(bool journal_enabled,
@@ -4211,23 +4202,53 @@ bool state_store::validate_storage_paths(std::string *error) const
     {
         return true;
     }
-    ::dsn::service::zauto_lock guard(_storage_validation_lock);
-    if (!_storage_validation_checked)
+    std::vector<named_state_path> paths;
+    if (!collect_state_storage_paths(
+            default_checkpoint_path(), true, &paths, error) ||
+        !validate_distinct_state_paths(paths, error))
     {
-        _storage_validation_ok = validate_state_checkpoint_target(
-            default_checkpoint_path(), true, &_storage_validation_error);
-        _storage_validation_checked = true;
+        return false;
     }
-    if (!_storage_validation_ok && error != nullptr)
+
+    ::dsn::service::zauto_lock guard(_storage_filesystem_validation_lock);
+    if (!_storage_filesystem_validation_checked)
     {
-        *error = _storage_validation_error;
+        _storage_filesystem_validation_ok =
+            validate_state_storage_filesystems(
+                paths, &_storage_filesystem_validation_error);
+        _storage_filesystem_validation_checked = true;
     }
-    return _storage_validation_ok;
+    if (!_storage_filesystem_validation_ok && error != nullptr)
+    {
+        *error = _storage_filesystem_validation_error;
+    }
+    return _storage_filesystem_validation_ok;
+}
+
+bool state_store::validate_cached_storage_filesystem(std::string *error) const
+{
+    if (!_journal_enabled)
+    {
+        return true;
+    }
+    {
+        ::dsn::service::zauto_lock guard(
+            _storage_filesystem_validation_lock);
+        if (_storage_filesystem_validation_checked)
+        {
+            if (!_storage_filesystem_validation_ok && error != nullptr)
+            {
+                *error = _storage_filesystem_validation_error;
+            }
+            return _storage_filesystem_validation_ok;
+        }
+    }
+    return validate_storage_paths(error);
 }
 
 bool state_store::append_journal_record(const state_record &record, std::string *error) const
 {
-    if (!validate_storage_paths(error))
+    if (!validate_cached_storage_filesystem(error))
     {
         return false;
     }
@@ -4262,7 +4283,7 @@ bool state_store::append_journal_delete_prefix(const state_delete_prefix_request
                                                uint64_t operation_sequence,
                                                std::string *error) const
 {
-    if (!validate_storage_paths(error))
+    if (!validate_cached_storage_filesystem(error))
     {
         return false;
     }
@@ -4300,7 +4321,7 @@ bool state_store::append_journal_sequence_barrier(
     const state_sequence_barrier_request &request,
     std::string *error) const
 {
-    if (!validate_storage_paths(error))
+    if (!validate_cached_storage_filesystem(error))
     {
         return false;
     }
@@ -4674,7 +4695,7 @@ rasn_state_client::recover_sync(const state_checkpoint_request &request,
 rasn_replicated_state_app::rasn_replicated_state_app(::dsn_gpid gpid)
     : ::dsn::replicated_service_app_type_1(gpid),
       _checkpoint_lock(true),
-      _store(false),
+      _store(false, 0),
       _rpc(&_store, true),
       _last_durable_decree(0)
 {

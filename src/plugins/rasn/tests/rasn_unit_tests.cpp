@@ -2552,7 +2552,7 @@ TEST(rasn_state, checkpoints_and_recovers_records)
     std::remove((checkpoint_path + ".tmp").c_str());
     std::remove((checkpoint_path + ".bak").c_str());
 
-    state_store writer;
+    state_store writer(true, k_default_quarantine_probe_interval_ms);
     state_record record;
     record.key = "unit/checkpoint";
     record.kind = "observation";
@@ -2568,7 +2568,7 @@ TEST(rasn_state, checkpoints_and_recovers_records)
     ASSERT_TRUE(checkpoint.ok) << checkpoint.error;
     EXPECT_EQ(1u, checkpoint.records.size());
 
-    state_store reader;
+    state_store reader(true, k_default_quarantine_probe_interval_ms);
     const state_response recovered = reader.recover(checkpoint_request);
     ASSERT_TRUE(recovered.ok) << recovered.error;
     ASSERT_EQ(1u, recovered.records.size());
@@ -2594,7 +2594,7 @@ TEST(rasn_state, replicated_checkpoint_copy_does_not_replace_live_state)
         std::remove((path + ".bak").c_str());
     }
 
-    state_store source(false);
+    state_store source(false, 0);
     state_record durable;
     durable.key = "unit/replicated";
     durable.kind = "observation";
@@ -2606,7 +2606,7 @@ TEST(rasn_state, replicated_checkpoint_copy_does_not_replace_live_state)
     checkpoint.path = source_path;
     ASSERT_TRUE(source.checkpoint(checkpoint).ok);
 
-    state_store live(false);
+    state_store live(false, 0);
     state_record current;
     current.key = "unit/live";
     current.kind = "observation";
@@ -2642,8 +2642,8 @@ TEST(rasn_state, replicated_checkpoint_copy_does_not_replace_live_state)
 
 TEST(rasn_state, replicated_stores_assign_deterministic_sequences)
 {
-    state_store first(false);
-    state_store second(false);
+    state_store first(false, 0);
+    state_store second(false, 0);
 
     state_record record;
     record.key = "unit/deterministic";
@@ -2706,7 +2706,7 @@ TEST(rasn_state, recovers_past_a_torn_trailing_journal_record)
     std::remove((checkpoint_path + ".bak").c_str());
     std::remove(journal_path.c_str());
 
-    state_store writer;
+    state_store writer(true, k_default_quarantine_probe_interval_ms);
     state_record first;
     first.key = "unit/torn-a";
     first.kind = "observation";
@@ -2739,7 +2739,7 @@ TEST(rasn_state, recovers_past_a_torn_trailing_journal_record)
     journal.resize(journal.size() - 3);
     write_text_file(journal_path, journal);
 
-    state_store reader;
+    state_store reader(true, k_default_quarantine_probe_interval_ms);
     state_checkpoint_request request;
     request.path = checkpoint_path;
     const state_response recovered = reader.recover(request);
@@ -2775,7 +2775,7 @@ TEST(rasn_state, recovers_past_a_torn_trailing_journal_record)
     const state_response appended = reader.put(fourth);
     ASSERT_TRUE(appended.ok) << appended.error;
 
-    state_store final_reader;
+    state_store final_reader(true, k_default_quarantine_probe_interval_ms);
     const state_response recovered_after_append = final_reader.recover(request);
     ASSERT_TRUE(recovered_after_append.ok) << recovered_after_append.error;
 
@@ -2825,7 +2825,7 @@ TEST(rasn_state, rejects_corrupt_newline_terminated_journal_record)
     std::remove((checkpoint_path + ".bak").c_str());
     std::remove(journal_path.c_str());
 
-    state_store writer;
+    state_store writer(true, k_default_quarantine_probe_interval_ms);
     state_record record;
     record.key = "unit/corrupt-a";
     record.kind = "observation";
@@ -2839,7 +2839,7 @@ TEST(rasn_state, rejects_corrupt_newline_terminated_journal_record)
         corrupt << "not-a-state-record\n";
     }
 
-    state_store reader;
+    state_store reader(true, k_default_quarantine_probe_interval_ms);
     state_checkpoint_request request;
     request.path = checkpoint_path;
     const state_response recovered = reader.recover(request);
@@ -2868,13 +2868,13 @@ TEST(rasn_state, recovers_past_an_interrupted_first_journal_append)
     request.path = checkpoint_path;
 
     write_text_file(journal_path, "");
-    state_store empty_reader;
+    state_store empty_reader(true, k_default_quarantine_probe_interval_ms);
     const state_response recovered_empty = empty_reader.recover(request);
     ASSERT_TRUE(recovered_empty.ok) << recovered_empty.error;
     EXPECT_TRUE(recovered_empty.records.empty());
 
     write_text_file(journal_path, "rasn-state-journ");
-    state_store torn_header_reader;
+    state_store torn_header_reader(true, k_default_quarantine_probe_interval_ms);
     const state_response recovered_torn_header = torn_header_reader.recover(request);
     ASSERT_TRUE(recovered_torn_header.ok) << recovered_torn_header.error;
     EXPECT_TRUE(recovered_torn_header.records.empty());
@@ -2887,7 +2887,7 @@ TEST(rasn_state, recovers_past_an_interrupted_first_journal_append)
 
 TEST(rasn_state, conditional_put_guards_create_and_expected_sequence)
 {
-    state_store store;
+    state_store store(true, k_default_quarantine_probe_interval_ms);
     state_record record;
     record.key = "unit/cas-" + make_trace_id();
     record.kind = "observation";
@@ -2952,7 +2952,7 @@ TEST(rasn_state, custom_checkpoint_export_preserves_recovery_journal)
         std::remove((path + ".bak").c_str());
     }
 
-    state_store writer;
+    state_store writer(true, k_default_quarantine_probe_interval_ms);
     state_record record;
     record.key = "unit/custom-export";
     record.kind = "observation";
@@ -2970,7 +2970,7 @@ TEST(rasn_state, custom_checkpoint_export_preserves_recovery_journal)
     EXPECT_FALSE(exported.journal_compacted);
     EXPECT_TRUE(::dsn::utils::filesystem::file_exists(journal_path));
 
-    state_store recovered;
+    state_store recovered(true, k_default_quarantine_probe_interval_ms);
     const state_response response =
         recovered.recover(state_checkpoint_request());
     ASSERT_TRUE(response.ok) << response.error;
@@ -3008,7 +3008,7 @@ TEST(rasn_state, equivalent_configured_checkpoint_path_compacts_journal)
         std::remove((path + ".bak").c_str());
     }
 
-    state_store store;
+    state_store store(true, k_default_quarantine_probe_interval_ms);
     state_record record;
     record.key = "unit/equivalent-checkpoint";
     record.kind = "observation";
@@ -3047,7 +3047,7 @@ TEST(rasn_state, hard_linked_checkpoint_alias_retains_recovery_journal)
         std::remove((path + ".bak").c_str());
     }
 
-    state_store store;
+    state_store store(true, k_default_quarantine_probe_interval_ms);
     state_record baseline;
     baseline.key = "unit/hard-link-alias/baseline";
     baseline.kind = "observation";
@@ -3078,7 +3078,7 @@ TEST(rasn_state, hard_linked_checkpoint_alias_retains_recovery_journal)
     EXPECT_FALSE(exported.journal_compacted);
     EXPECT_TRUE(::dsn::utils::filesystem::file_exists(journal_path));
 
-    state_store recovered;
+    state_store recovered(true, k_default_quarantine_probe_interval_ms);
     const state_response recovered_state =
         recovered.recover(state_checkpoint_request());
     ASSERT_TRUE(recovered_state.ok) << recovered_state.error;
@@ -3110,7 +3110,7 @@ TEST(rasn_state, journal_rejects_multiply_linked_live_file)
         std::remove((path + ".bak").c_str());
     }
 
-    state_store store;
+    state_store store(true, k_default_quarantine_probe_interval_ms);
     state_record record;
     record.key = "unit/hard-linked-live-journal/initial";
     record.kind = "observation";
@@ -3153,7 +3153,7 @@ TEST(rasn_state, recovery_rejects_multiply_linked_checkpoint)
         std::remove((path + ".bak").c_str());
     }
 
-    state_store writer(false);
+    state_store writer(false, 0);
     state_record record;
     record.key = "unit/hard-linked-recovery";
     record.kind = "observation";
@@ -3172,7 +3172,7 @@ TEST(rasn_state, recovery_rejects_multiply_linked_checkpoint)
     }
     ASSERT_TRUE(linked == hard_link_creation::created);
 
-    state_store recovered(false);
+    state_store recovered(false, 0);
     state_checkpoint_request recovery;
     recovery.path = alias_path;
     const state_response response = recovered.recover(recovery);
@@ -3200,7 +3200,7 @@ TEST(rasn_state, checkpoint_rejects_journal_lifecycle_paths)
         std::remove((path + ".bak").c_str());
     }
 
-    state_store store;
+    state_store store(true, k_default_quarantine_probe_interval_ms);
     state_record record;
     record.key = "unit/checkpoint-journal-collision";
     record.kind = "observation";
@@ -3251,7 +3251,7 @@ TEST(rasn_state, checkpoint_rejects_case_only_future_path_alias)
         std::remove((path + ".bak").c_str());
     }
 
-    state_store store;
+    state_store store(true, k_default_quarantine_probe_interval_ms);
     state_record record;
     record.key = "unit/case-only-path-alias";
     record.kind = "observation";
@@ -3305,7 +3305,7 @@ TEST(rasn_state, checkpoint_rejects_hard_linked_staging_path)
         std::remove(path.c_str());
     }
 
-    state_store store;
+    state_store store(true, k_default_quarantine_probe_interval_ms);
     state_record record;
     record.key = "unit/checkpoint-hard-link-collision";
     record.kind = "observation";
@@ -3336,6 +3336,48 @@ TEST(rasn_state, checkpoint_rejects_hard_linked_staging_path)
     std::remove(journal_path.c_str());
 }
 
+TEST(rasn_state, configured_checkpoint_rechecks_hard_links_after_cached_validation)
+{
+    const std::string journal_path = configured_state_journal_path();
+    const std::string checkpoint_path = configured_state_checkpoint_path();
+    const std::string staging_path = checkpoint_path + ".tmp";
+    for (const std::string &path :
+         {journal_path, checkpoint_path, staging_path})
+    {
+        std::remove(path.c_str());
+        std::remove((path + ".bak").c_str());
+    }
+
+    state_store store(true, k_default_quarantine_probe_interval_ms);
+    state_record record;
+    record.key = "unit/configured-hard-link-recheck";
+    record.kind = "observation";
+    record.scope = "unit";
+    record.value = "preserve-journal";
+    ASSERT_TRUE(store.put(record).ok);
+    const std::string journal_before = read_text_file(journal_path);
+
+    const hard_link_creation linked =
+        try_create_hard_link(journal_path, staging_path);
+    if (linked == hard_link_creation::unsupported)
+    {
+        std::remove(journal_path.c_str());
+        return;
+    }
+    ASSERT_TRUE(linked == hard_link_creation::created);
+
+    const state_response response =
+        store.checkpoint(state_checkpoint_request());
+    EXPECT_FALSE(response.ok);
+    EXPECT_NE(std::string::npos,
+              response.error.find("storage paths overlap"));
+    EXPECT_EQ(journal_before, read_text_file(journal_path));
+
+    std::remove(staging_path.c_str());
+    std::remove(checkpoint_path.c_str());
+    std::remove(journal_path.c_str());
+}
+
 TEST(rasn_state, custom_export_staging_cannot_alias_recovery_checkpoint)
 {
     const std::string journal_path = configured_state_journal_path();
@@ -3349,7 +3391,7 @@ TEST(rasn_state, custom_export_staging_cannot_alias_recovery_checkpoint)
         std::remove(path.c_str());
     }
 
-    state_store store;
+    state_store store(true, k_default_quarantine_probe_interval_ms);
     state_record record;
     record.key = "unit/export-recovery-collision";
     record.kind = "observation";
@@ -3410,7 +3452,7 @@ TEST(rasn_state, checkpoint_rejects_multiply_linked_staging_file)
     }
     ASSERT_TRUE(linked == hard_link_creation::created);
 
-    state_store store(false);
+    state_store store(false, 0);
     state_record record;
     record.key = "unit/multiply-linked-staging";
     record.kind = "observation";
@@ -3433,6 +3475,39 @@ TEST(rasn_state, checkpoint_rejects_multiply_linked_staging_file)
 }
 
 #if !defined(_WIN32)
+TEST(rasn_state, configured_checkpoint_rechecks_symlinks_after_cached_validation)
+{
+    const std::string journal_path = configured_state_journal_path();
+    const std::string checkpoint_path = configured_state_checkpoint_path();
+    const std::string protected_path =
+        temp_file_path("rasn-state-configured-link-protected.txt");
+    for (const std::string &path :
+         {journal_path, checkpoint_path, protected_path})
+    {
+        std::remove(path.c_str());
+        std::remove((path + ".tmp").c_str());
+        std::remove((path + ".bak").c_str());
+    }
+
+    state_store store(true, k_default_quarantine_probe_interval_ms);
+    std::string validation_error;
+    ASSERT_TRUE(store.validate_storage_paths(&validation_error))
+        << validation_error;
+    write_text_file(protected_path, "preserve");
+    ASSERT_EQ(0, ::symlink(protected_path.c_str(), checkpoint_path.c_str()));
+
+    const state_response response =
+        store.checkpoint(state_checkpoint_request());
+    EXPECT_FALSE(response.ok);
+    EXPECT_NE(std::string::npos,
+              response.error.find("link or reparse point"));
+    EXPECT_EQ("preserve", read_text_file(protected_path));
+
+    std::remove(checkpoint_path.c_str());
+    std::remove(protected_path.c_str());
+    std::remove(journal_path.c_str());
+}
+
 TEST(rasn_state, checkpoint_rejects_resolved_staging_symlink)
 {
     const std::string checkpoint_path =
@@ -3453,7 +3528,7 @@ TEST(rasn_state, checkpoint_rejects_resolved_staging_symlink)
     }
     ASSERT_EQ(0, ::symlink(protected_path.c_str(), staging_path.c_str()));
 
-    state_store store(false);
+    state_store store(false, 0);
     state_record record;
     record.key = "unit/resolved-staging-link";
     record.kind = "observation";
@@ -3488,7 +3563,7 @@ TEST(rasn_state, recovery_rejects_resolved_checkpoint_symlink)
         std::remove((path + ".bak").c_str());
     }
 
-    state_store writer(false);
+    state_store writer(false, 0);
     state_record record;
     record.key = "unit/resolved-recovery-link";
     record.kind = "observation";
@@ -3500,7 +3575,7 @@ TEST(rasn_state, recovery_rejects_resolved_checkpoint_symlink)
     ASSERT_TRUE(writer.checkpoint(checkpoint).ok);
     ASSERT_EQ(0, ::symlink(checkpoint_path.c_str(), alias_path.c_str()));
 
-    state_store recovered(false);
+    state_store recovered(false, 0);
     state_checkpoint_request recovery;
     recovery.path = alias_path;
     const state_response response = recovered.recover(recovery);
@@ -3520,7 +3595,7 @@ TEST(rasn_state, journal_rejects_dangling_symlink_alias)
     std::remove(checkpoint_path.c_str());
     ASSERT_EQ(0, ::symlink(checkpoint_path.c_str(), journal_path.c_str()));
 
-    state_store store;
+    state_store store(true, k_default_quarantine_probe_interval_ms);
     state_record record;
     record.key = "unit/dangling-journal-link";
     record.kind = "observation";
@@ -3545,7 +3620,7 @@ TEST(rasn_state, recovers_legacy_checkpoint_backup)
     std::remove(checkpoint_path.c_str());
     std::remove(backup_path.c_str());
 
-    state_store source(false);
+    state_store source(false, 0);
     state_record record;
     record.key = "unit/legacy-backup";
     record.kind = "observation";
@@ -3557,7 +3632,7 @@ TEST(rasn_state, recovers_legacy_checkpoint_backup)
     ASSERT_TRUE(source.checkpoint(checkpoint).ok);
     ASSERT_EQ(0, std::rename(checkpoint_path.c_str(), backup_path.c_str()));
 
-    state_store restored(false);
+    state_store restored(false, 0);
     const state_response recovered = restored.recover(checkpoint);
     ASSERT_TRUE(recovered.ok) << recovered.error;
     ASSERT_EQ(1u, recovered.records.size());
@@ -3577,7 +3652,7 @@ TEST(rasn_state, checkpoint_refreshes_stale_legacy_backup_before_cleanup)
     std::remove(checkpoint_path.c_str());
     std::remove(backup_path.c_str());
 
-    state_store stale(false);
+    state_store stale(false, 0);
     state_record old_record;
     old_record.key = "unit/stale-backup";
     old_record.kind = "observation";
@@ -3589,14 +3664,14 @@ TEST(rasn_state, checkpoint_refreshes_stale_legacy_backup_before_cleanup)
     ASSERT_TRUE(stale.checkpoint(checkpoint).ok);
     ASSERT_EQ(0, std::rename(checkpoint_path.c_str(), backup_path.c_str()));
 
-    state_store current(false);
+    state_store current(false, 0);
     state_record new_record = old_record;
     new_record.value = "current";
     ASSERT_TRUE(current.put(new_record).ok);
     ASSERT_TRUE(current.checkpoint(checkpoint).ok);
     EXPECT_FALSE(::dsn::utils::filesystem::file_exists(backup_path));
 
-    state_store restored(false);
+    state_store restored(false, 0);
     const state_response recovered = restored.recover(checkpoint);
     ASSERT_TRUE(recovered.ok) << recovered.error;
     ASSERT_EQ(1u, recovered.records.size());
@@ -3619,7 +3694,7 @@ TEST(rasn_state, recovery_discards_partial_nfs_files_and_keeps_marker)
         std::remove((path + ".tmp").c_str());
     }
 
-    state_store checkpoint_source(false);
+    state_store checkpoint_source(false, 0);
     state_record checkpoint_record;
     checkpoint_record.key = "unit/incomplete-nfs/checkpoint";
     checkpoint_record.kind = "observation";
@@ -3630,13 +3705,13 @@ TEST(rasn_state, recovery_discards_partial_nfs_files_and_keeps_marker)
     checkpoint.path = checkpoint_path;
     ASSERT_TRUE(checkpoint_source.checkpoint(checkpoint).ok);
 
-    state_store journal_source;
+    state_store journal_source(true, k_default_quarantine_probe_interval_ms);
     state_record journal_record = checkpoint_record;
     journal_record.key = "unit/incomplete-nfs/journal";
     ASSERT_TRUE(journal_source.put(journal_record).ok);
     write_text_file(marker_path, "rasn-state-nfs-import-v1\n");
 
-    state_store recovered;
+    state_store recovered(true, k_default_quarantine_probe_interval_ms);
     const state_response response =
         recovered.recover(state_checkpoint_request());
     EXPECT_FALSE(response.ok);
@@ -3660,7 +3735,7 @@ TEST(rasn_state, configured_recovery_detects_legacy_checkpoint_backup)
     std::remove(checkpoint_path.c_str());
     std::remove(backup_path.c_str());
     std::remove(journal_path.c_str());
-    state_store source(false);
+    state_store source(false, 0);
     state_record record;
     record.key = "unit/configured-legacy-backup";
     record.kind = "observation";
@@ -3687,7 +3762,7 @@ TEST(rasn_state, delete_prefix_replays_tombstone_and_preserves_newer_records)
         std::remove((path + ".bak").c_str());
     }
 
-    state_store writer;
+    state_store writer(true, k_default_quarantine_probe_interval_ms);
     state_record old_record;
     old_record.key = "unit/prune/old";
     old_record.kind = "observation";
@@ -3717,7 +3792,7 @@ TEST(rasn_state, delete_prefix_replays_tombstone_and_preserves_newer_records)
     ASSERT_TRUE(advanced.ok) << advanced.error;
     EXPECT_EQ(barrier.minimum_sequence, advanced.last_sequence);
 
-    state_store recovered;
+    state_store recovered(true, k_default_quarantine_probe_interval_ms);
     const state_response replayed =
         recovered.recover(state_checkpoint_request());
     ASSERT_TRUE(replayed.ok) << replayed.error;
@@ -3739,7 +3814,7 @@ TEST(rasn_state, delete_prefix_replays_tombstone_and_preserves_newer_records)
 
 TEST(rasn_state, detailed_delete_prefix_returns_bounded_count)
 {
-    state_store store(false);
+    state_store store(false, 0);
     const std::string prefix = "unit/bounded-delete";
     for (size_t i = 0; i < 128; ++i)
     {
@@ -3823,7 +3898,7 @@ TEST(rasn_state, quarantine_sidecar_blocks_state_lifecycle_operations)
     EXPECT_FALSE(store.copy_checkpoint(checkpoint, "").ok);
     EXPECT_FALSE(store.recover(checkpoint).ok);
 
-    state_store repaired_after_restart;
+    state_store repaired_after_restart(true, k_default_quarantine_probe_interval_ms);
     EXPECT_TRUE(repaired_after_restart.query(state_query_request()).ok);
 
     std::remove(marker_path.c_str());
@@ -3869,7 +3944,7 @@ TEST(rasn_state, checkpoint_migration_is_dry_run_resumable_and_conflict_safe)
     std::remove((checkpoint_path + ".bak").c_str());
 
     const std::string prefix = "unit/migration-" + make_trace_id();
-    state_store source(false);
+    state_store source(false, 0);
     state_record first;
     first.key = prefix + "/first";
     first.kind = "observation";
@@ -3963,7 +4038,7 @@ TEST(rasn_state, checkpoint_migration_is_dry_run_resumable_and_conflict_safe)
     std::remove(empty_checkpoint_path.c_str());
     const state_response target_before_empty = services.query_state(all_target);
     ASSERT_TRUE(target_before_empty.ok);
-    state_store empty_source(false);
+    state_store empty_source(false, 0);
     state_sequence_barrier_request empty_barrier;
     empty_barrier.minimum_sequence = target_before_empty.last_sequence + 10;
     ASSERT_TRUE(empty_source.advance_sequence(empty_barrier).ok);
@@ -4021,7 +4096,7 @@ TEST(rasn_state, inline_lifecycle_commands_recover_before_checkpoint_and_prune)
     checkpoint_record.scope = "unit";
     checkpoint_record.value = "checkpoint-sensitive-value";
     checkpoint_record.sequence = initial.last_sequence + 10;
-    state_store checkpoint_writer;
+    state_store checkpoint_writer(true, k_default_quarantine_probe_interval_ms);
     ASSERT_TRUE(checkpoint_writer.put(checkpoint_record).ok);
 
     rasn_service_graph checkpoint_services;
@@ -4039,7 +4114,7 @@ TEST(rasn_state, inline_lifecycle_commands_recover_before_checkpoint_and_prune)
     EXPECT_EQ(std::string::npos,
               checkpoint_output.find(checkpoint_record.value));
 
-    state_store exported(false);
+    state_store exported(false, 0);
     state_checkpoint_request exported_request;
     exported_request.path = export_path;
     const state_response exported_records =
@@ -4062,7 +4137,7 @@ TEST(rasn_state, inline_lifecycle_commands_recover_before_checkpoint_and_prune)
     prune_record.key = prefix + "/prune";
     prune_record.value = "prune-sensitive-value";
     prune_record.sequence = after_checkpoint.last_sequence + 10;
-    state_store prune_writer;
+    state_store prune_writer(true, k_default_quarantine_probe_interval_ms);
     ASSERT_TRUE(prune_writer.put(prune_record).ok);
 
     rasn_service_graph prune_services;

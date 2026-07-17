@@ -1671,6 +1671,8 @@ durability. Windows state storage fails closed on FAT/exFAT and requires NTFS,
 ReFS, or CSVFS rather than claiming equivalent directory durability. The volume
 capability check happens during lifecycle-path validation; individual mutations
 do not re-query volume metadata and rely on file flushes plus write-through moves.
+Configured checkpoint/recovery calls still re-check links and path collisions on
+every lifecycle operation while reusing only the filesystem-capability result.
 Checkpoint/export targets and their `.tmp`/`.bak` staging names are rejected when
 they alias either the primary or configured-replica journal lifecycle paths.
 Validation covers effective replica basenames and `.nfs.tmp` copy staging, uses
