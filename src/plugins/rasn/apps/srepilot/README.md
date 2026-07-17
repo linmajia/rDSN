@@ -50,7 +50,8 @@ srepilot.exe C:\path\to\incident.log
 ```
 
 State keys are stored as `<scope>/<id>`; a bare SREPilot `state put|get` key is
-resolved as `srepilot/<key>`, and put records use `scope=srepilot` metadata.
+resolved as `srepilot/<key>`. Put records derive `scope` metadata from the
+resulting key, including explicitly namespaced cross-scope keys.
 
 ```sh
 ./srepilot ~/src/service-repo

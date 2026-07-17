@@ -474,11 +474,15 @@ rDSN design:
   source, is treated as a blocking error rather than a reason to checkpoint an
   empty in-memory store over durable state.
 - Files and directories use `dsn::utils::filesystem`.
-- Standalone mutation acknowledgement follows durable journal flush (`fsync` on
-  POSIX, `F_FULLFSYNC` for regular files on macOS, and `_commit` on Windows).
+- Standalone mutation acknowledgement follows one durable journal flush per
+  mutation (`fdatasync` for regular files on Linux, `F_FULLFSYNC` on macOS, and
+  `_commit` on Windows). This intentionally favors crash durability over
+  standalone throughput; production write-heavy deployments use the native
+  `rasn.state.replicated` profile so rDSN owns log batching and quorum durability.
   Checkpoint and replica copies flush the temporary file before replacement; POSIX
-  replacements/removals also flush the containing directory, while Windows
-  replacements use write-through moves. A failed flush is an operation failure,
+  replacements/removals also flush the containing directory, while Windows uses
+  write-through moves and rejects FAT/exFAT state volumes in favor of NTFS, ReFS,
+  or CSVFS. A failed flush is an operation failure,
   and an append whose rollback cannot be flushed enters fail-stop quarantine.
   Local copies use checked fixed-size reads and reject source shrink/growth or
   read failure before flushing the target. Retried deletion flushes the parent
@@ -523,8 +527,10 @@ Correctness and robustness requirements:
   imports, checkpoints, and recovery fail closed across restart. Repair is an
   offline operator action: preserve the evidence, reconcile both journal copies,
   install known-good checkpoint/journal images, remove the external markers, and
-  restart. Quarantine observation across both copies is monotonic for a live store,
-  so there is no in-process quarantine bypass.
+  restart. Quarantine observation across both copies is monotonic for a live
+  store. Mutations and lifecycle calls probe immediately; healthy reads cache a
+  negative probe for the configured bounded interval to avoid per-read filesystem
+  I/O, and latch permanently once any evidence is observed.
 - Replicated state startup validates every mutating task's
   `rpc_request_is_write_operation` flag and refuses stale/custom configs that
   would dispatch a write directly to one replica.
@@ -1292,6 +1298,9 @@ rDSN design:
 Correctness and robustness requirements:
 
 - A state write fails explicitly if the journal cannot be appended.
+- Each standalone write waits for its own durable flush. This path does not weaken
+  acknowledgements with delayed/group sync; use native replicated state when
+  rDSN-managed batching is required for sustained write throughput.
 - Conditional state writes compare against the currently visible sequence while
   holding the store lock, then append the committed record to the journal before
   publishing it.

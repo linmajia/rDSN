@@ -822,10 +822,7 @@ int run_rasn_state_command(rasn_service_graph &services,
         record.key = normalize_cli_state_key(args[1], default_scope);
         record.value = join_args(args, 2);
         record.kind = "memory";
-        record.scope =
-            default_scope.empty()
-                ? record.key.substr(0, record.key.find('/'))
-                : default_scope;
+        record.scope = record.key.substr(0, record.key.find('/'));
         response = services.put_state(record);
     }
     else if (args[0] == "get")

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
@@ -502,6 +503,10 @@ bool sync_state_file_descriptor(int fd, bool regular_file = true)
         result = ::_commit(fd);
 #elif defined(__APPLE__)
         result = regular_file ? ::fcntl(fd, F_FULLFSYNC) : ::fsync(fd);
+#elif defined(__linux__)
+        // fdatasync persists file data plus metadata required to retrieve it
+        // (including an appended file size) without forcing unrelated metadata.
+        result = regular_file ? ::fdatasync(fd) : ::fsync(fd);
 #else
         result = ::fsync(fd);
 #endif
@@ -532,17 +537,86 @@ bool sync_state_file(const std::string &path,
     return synced;
 }
 
+#if defined(_WIN32)
+bool windows_state_directory_has_durable_metadata(
+    const std::string &directory,
+    const std::string &description,
+    std::string *error)
+{
+    const DWORD required =
+        ::GetFullPathNameA(directory.c_str(), 0, nullptr, nullptr);
+    std::vector<char> absolute_path(
+        required == 0 ? 1 : static_cast<size_t>(required) + 1, '\0');
+    if (required == 0 ||
+        ::GetFullPathNameA(directory.c_str(),
+                           static_cast<DWORD>(absolute_path.size()),
+                           absolute_path.data(),
+                           nullptr) == 0)
+    {
+        if (error != nullptr)
+        {
+            *error = "failed to resolve " + description +
+                     " directory for Windows durability validation: " +
+                     directory;
+        }
+        return false;
+    }
+
+    std::vector<char> volume_path(32768, '\0');
+    if (::GetVolumePathNameA(absolute_path.data(),
+                             volume_path.data(),
+                             static_cast<DWORD>(volume_path.size())) == 0)
+    {
+        if (error != nullptr)
+        {
+            *error = "failed to resolve the Windows volume for " +
+                     description + " directory: " + directory;
+        }
+        return false;
+    }
+
+    std::vector<char> filesystem_name(256, '\0');
+    if (::GetVolumeInformationA(volume_path.data(),
+                                nullptr,
+                                0,
+                                nullptr,
+                                nullptr,
+                                nullptr,
+                                filesystem_name.data(),
+                                static_cast<DWORD>(filesystem_name.size())) == 0)
+    {
+        if (error != nullptr)
+        {
+            *error = "failed to identify the Windows filesystem for " +
+                     description + " directory: " + directory;
+        }
+        return false;
+    }
+
+    const char *name = filesystem_name.data();
+    const bool durable = ::_stricmp(name, "NTFS") == 0 ||
+                         ::_stricmp(name, "ReFS") == 0 ||
+                         ::_stricmp(name, "CSVFS") == 0;
+    if (!durable && error != nullptr)
+    {
+        *error = "unsupported Windows filesystem for durable " + description +
+                 " metadata: " + name +
+                 "; use NTFS, ReFS, or CSVFS instead of FAT/exFAT";
+    }
+    return durable;
+}
+#endif
+
 bool sync_state_directory(const std::string &directory,
                           const std::string &description,
                           std::string *error)
 {
 #if defined(_WIN32)
-    // File replacement uses MOVEFILE_WRITE_THROUGH below. Windows has no
-    // portable CRT directory-fsync equivalent, so no second flush is required.
-    (void)directory;
-    (void)description;
-    (void)error;
-    return true;
+    // Windows has no portable directory-fsync primitive. File flushes and
+    // MOVEFILE_WRITE_THROUGH provide the required ordering on journaled local
+    // filesystems; reject FAT-family volumes rather than claiming equal safety.
+    return windows_state_directory_has_durable_metadata(
+        directory, description, error);
 #else
     int flags = O_RDONLY;
 #if defined(O_DIRECTORY)
@@ -1927,6 +2001,34 @@ bool validate_distinct_state_paths(const std::vector<named_state_path> &paths,
     return true;
 }
 
+bool validate_state_storage_filesystems(
+    const std::vector<named_state_path> &paths, std::string *error)
+{
+#if defined(_WIN32)
+    std::vector<std::string> checked_directories;
+    for (const named_state_path &path : paths)
+    {
+        const std::string directory = path_parent_or_current(path.path);
+        if (std::find(checked_directories.begin(),
+                      checked_directories.end(),
+                      directory) != checked_directories.end())
+        {
+            continue;
+        }
+        if (!windows_state_directory_has_durable_metadata(
+                directory, path.description, error))
+        {
+            return false;
+        }
+        checked_directories.push_back(directory);
+    }
+#else
+    (void)paths;
+    (void)error;
+#endif
+    return true;
+}
+
 bool validate_checkpoint_lifecycle_target(const std::string &checkpoint_path,
                                           std::string *error)
 {
@@ -1937,7 +2039,8 @@ bool validate_checkpoint_lifecycle_target(const std::string &checkpoint_path,
     std::vector<named_state_path> paths;
     add_checkpoint_lifecycle_paths(
         checkpoint_path, "checkpoint", false, &paths);
-    return validate_distinct_state_paths(paths, error);
+    return validate_distinct_state_paths(paths, error) &&
+           validate_state_storage_filesystems(paths, error);
 }
 
 bool collect_state_storage_paths(const std::string &checkpoint_path,
@@ -1995,7 +2098,8 @@ bool validate_state_checkpoint_target(const std::string &checkpoint_path,
     std::vector<named_state_path> paths;
     return collect_state_storage_paths(
                checkpoint_path, include_replica_checkpoint, &paths, error) &&
-           validate_distinct_state_paths(paths, error);
+           validate_distinct_state_paths(paths, error) &&
+           validate_state_storage_filesystems(paths, error);
 }
 
 bool validate_custom_checkpoint_target(const std::string &checkpoint_path,
@@ -2946,6 +3050,14 @@ bool valid_schema(uint32_t schema_version)
     return schema_version == RASN_AGENT_SCHEMA_VERSION;
 }
 
+uint64_t monotonic_state_time_ms()
+{
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
 bool valid_state_key(const std::string &key)
 {
     const std::string::size_type separator = key.find('/');
@@ -3106,6 +3218,26 @@ bool configured_state_recovery_available(const state_checkpoint_request &request
     return nfs.enabled;
 }
 
+state_store::state_store(bool journal_enabled)
+    : state_store(
+          journal_enabled,
+          journal_enabled
+              ? config_uint64(
+                    "rasn.state",
+                    "quarantine_probe_interval_ms",
+                    1000,
+                    "Maximum healthy-cache interval for external state quarantine probes")
+              : 0)
+{
+}
+
+state_store::state_store(bool journal_enabled,
+                         uint64_t quarantine_probe_interval_ms)
+    : _journal_enabled(journal_enabled),
+      _quarantine_probe_interval_ms(quarantine_probe_interval_ms)
+{
+}
+
 state_response state_store::put(const state_record &record)
 {
     state_put_request request;
@@ -3137,7 +3269,7 @@ state_response state_store::put(const state_put_request &request)
     }
 
     ::dsn::service::zauto_lock mutation_guard(_mutation_lock);
-    if (journal_is_quarantined())
+    if (journal_is_quarantined(true))
     {
         return error_response(quarantine_error());
     }
@@ -3239,7 +3371,7 @@ state_response state_store::get(const state_key_request &request) const
     {
         return error_response("state key must be namespaced as <scope>/<id>");
     }
-    if (journal_is_quarantined())
+    if (journal_is_quarantined(false))
     {
         return error_response(quarantine_error());
     }
@@ -3264,7 +3396,7 @@ state_response state_store::query(const state_query_request &request) const
     {
         return error_response("state query request has unsupported schema version");
     }
-    if (journal_is_quarantined())
+    if (journal_is_quarantined(false))
     {
         return error_response(quarantine_error());
     }
@@ -3324,7 +3456,7 @@ state_store::delete_prefix_impl(const state_delete_prefix_request &request,
     }
 
     ::dsn::service::zauto_lock mutation_guard(_mutation_lock);
-    if (journal_is_quarantined())
+    if (journal_is_quarantined(true))
     {
         result.response = error_response(quarantine_error());
         return result;
@@ -3420,7 +3552,7 @@ state_store::advance_sequence(const state_sequence_barrier_request &request)
     }
 
     ::dsn::service::zauto_lock mutation_guard(_mutation_lock);
-    if (journal_is_quarantined())
+    if (journal_is_quarantined(true))
     {
         return error_response(quarantine_error());
     }
@@ -3450,13 +3582,13 @@ state_store::advance_sequence(const state_sequence_barrier_request &request)
     return response;
 }
 
-state_response state_store::checkpoint(const state_checkpoint_request &request) const
+state_response state_store::checkpoint(const state_checkpoint_request &request)
 {
     return checkpoint_detailed(request).response;
 }
 
 state_checkpoint_result
-state_store::checkpoint_detailed(const state_checkpoint_request &request) const
+state_store::checkpoint_detailed(const state_checkpoint_request &request)
 {
     state_checkpoint_result result;
     if (!valid_schema(request.schema_version))
@@ -3492,7 +3624,7 @@ state_store::checkpoint_detailed(const state_checkpoint_request &request) const
     uint64_t snapshot_epoch = 0;
     {
         ::dsn::service::zauto_lock mutation_guard(_mutation_lock);
-        if (journal_is_quarantined())
+        if (journal_is_quarantined(true))
         {
             result.response = error_response(quarantine_error());
             return result;
@@ -3533,7 +3665,7 @@ state_store::checkpoint_detailed(const state_checkpoint_request &request) const
         // removal without holding the read lock across filesystem I/O.
         {
             ::dsn::service::zauto_lock mutation_guard(_mutation_lock);
-            if (journal_is_quarantined())
+            if (journal_is_quarantined(true))
             {
                 result.response = error_response(quarantine_error());
                 return result;
@@ -3602,7 +3734,7 @@ state_response state_store::import_checkpoint(const state_checkpoint_request &re
 
     ::dsn::service::zauto_lock checkpoint_guard(_checkpoint_lock);
     ::dsn::service::zauto_lock mutation_guard(_mutation_lock);
-    if (journal_is_quarantined())
+    if (journal_is_quarantined(true))
     {
         return error_response(quarantine_error());
     }
@@ -3670,7 +3802,7 @@ state_response state_store::recover(const state_checkpoint_request &request)
     const std::string path = request.path.empty() ? default_checkpoint_path() : request.path;
     const std::string journal_path =
         _journal_enabled ? default_journal_path() : "";
-    if (journal_is_quarantined())
+    if (journal_is_quarantined(true))
     {
         return error_response(quarantine_error());
     }
@@ -4012,7 +4144,7 @@ std::string state_store::quarantine_error() const
            default_journal_path();
 }
 
-bool state_store::journal_is_quarantined() const
+bool state_store::journal_is_quarantined(bool force_refresh) const
 {
     if (!_journal_enabled)
     {
@@ -4022,12 +4154,40 @@ bool state_store::journal_is_quarantined() const
     {
         return true;
     }
+    uint64_t now_ms = monotonic_state_time_ms();
+    if (!force_refresh && _quarantine_probe_interval_ms != 0 &&
+        now_ms < _next_quarantine_probe_ms.load(std::memory_order_acquire))
+    {
+        return false;
+    }
+
+    ::dsn::service::zauto_lock guard(_quarantine_probe_lock);
+    if (_quarantine_seen.load(std::memory_order_acquire))
+    {
+        return true;
+    }
+    now_ms = monotonic_state_time_ms();
+    if (!force_refresh && _quarantine_probe_interval_ms != 0 &&
+        now_ms < _next_quarantine_probe_ms.load(std::memory_order_relaxed))
+    {
+        return false;
+    }
+
     const bool quarantined =
         state_journal_is_quarantined(default_journal_path()) ||
         state_replica_journal_is_quarantined(default_journal_path());
     if (quarantined)
     {
         _quarantine_seen.store(true, std::memory_order_release);
+    }
+    else
+    {
+        const uint64_t next_probe =
+            _quarantine_probe_interval_ms >
+                    (std::numeric_limits<uint64_t>::max)() - now_ms
+                ? (std::numeric_limits<uint64_t>::max)()
+                : now_ms + _quarantine_probe_interval_ms;
+        _next_quarantine_probe_ms.store(next_probe, std::memory_order_release);
     }
     return quarantined;
 }

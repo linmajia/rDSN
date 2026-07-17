@@ -1663,7 +1663,12 @@ symlinks/reparse points are rejected; distinct hard-link aliases and explicit
 custom export paths never remove that recovery journal. Journal records are flushed before
 acknowledgement; checkpoint/replica temporary files are flushed before atomic
 replacement, with directory metadata flush, macOS `F_FULLFSYNC` for regular files,
-or Windows write-through replacement.
+or Windows write-through replacement. Linux regular files use `fdatasync` so
+unrelated metadata is not forced. Standalone mode deliberately performs one
+durable sync per mutation; write-heavy production placement should use
+`rasn.state.replicated`, where rDSN owns mutation-log batching and quorum
+durability. Windows state storage fails closed on FAT/exFAT and requires NTFS,
+ReFS, or CSVFS rather than claiming equivalent directory durability.
 Checkpoint/export targets and their `.tmp`/`.bak` staging names are rejected when
 they alias either the primary or configured-replica journal lifecycle paths.
 Validation covers effective replica basenames and `.nfs.tmp` copy staging, uses
@@ -1697,7 +1702,10 @@ failure; inability to prove that rollback fail-stops instead of leaving a
 success-shaped or restart-visible partial mutation. It also persists quarantine
 evidence that blocks reads, mutations, imports, checkpoints, and recovery across
 restart until an operator installs a verified checkpoint/journal and removes the
-marker. Local service-graph access performs one fail-closed recovery before its
+marker. Mutations and lifecycle calls refresh external quarantine evidence
+immediately; healthy GET/QUERY calls cache only a negative probe for
+`quarantine_probe_interval_ms` (default `1000`) and latch permanently once
+evidence is observed. Local service-graph access performs one fail-closed recovery before its
 first state operation, including checkpoints and prune mutations; an explicit
 successful or failed recovery becomes that graph's recorded recovery outcome. The
 detailed checkpoint RPC

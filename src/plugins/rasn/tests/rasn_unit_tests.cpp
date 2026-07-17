@@ -3787,7 +3787,7 @@ TEST(rasn_state, quarantine_sidecar_blocks_state_lifecycle_operations)
         std::remove((path + ".tmp").c_str());
         std::remove((path + ".bak").c_str());
     }
-    state_store store;
+    state_store store(true, 0);
     ASSERT_TRUE(store.query(state_query_request()).ok);
     write_text_file(marker_path, "unprovable mirror rollback\n");
     EXPECT_FALSE(store.query(state_query_request()).ok);
@@ -3832,6 +3832,32 @@ TEST(rasn_state, quarantine_sidecar_blocks_state_lifecycle_operations)
     std::remove(checkpoint_path.c_str());
     std::remove((checkpoint_path + ".tmp").c_str());
     std::remove((checkpoint_path + ".bak").c_str());
+}
+
+TEST(rasn_state, quarantine_negative_reads_are_cached_but_mutations_refresh)
+{
+    const std::string marker_path =
+        configured_state_journal_path() + ".quarantine";
+    std::remove(marker_path.c_str());
+    std::remove((marker_path + ".tmp").c_str());
+
+    state_store store(
+        true, (std::numeric_limits<uint64_t>::max)());
+    ASSERT_TRUE(store.query(state_query_request()).ok);
+    write_text_file(marker_path, "external quarantine evidence\n");
+
+    // Healthy reads avoid another filesystem probe, but the next mutation must
+    // refresh immediately and latch the observed evidence.
+    EXPECT_TRUE(store.query(state_query_request()).ok);
+    state_record record;
+    record.key = "unit/quarantine-refresh";
+    record.kind = "observation";
+    record.scope = "unit";
+    record.value = "must-not-be-written";
+    EXPECT_FALSE(store.put(record).ok);
+
+    std::remove(marker_path.c_str());
+    EXPECT_FALSE(store.query(state_query_request()).ok);
 }
 
 TEST(rasn_state, checkpoint_migration_is_dry_run_resumable_and_conflict_safe)
@@ -4131,6 +4157,24 @@ TEST(rasn_state, inline_lifecycle_commands_recover_before_checkpoint_and_prune)
     ASSERT_TRUE(scoped.ok) << scoped.error;
     EXPECT_EQ("codepilot", scoped.record.scope);
 
+    const std::string cross_scope_key =
+        "other/inline-lifecycle-" + make_trace_id();
+    {
+        scoped_cout_capture capture;
+        EXPECT_EQ(0,
+                  run_rasn_state_command(checkpoint_services,
+                                         {"put",
+                                          cross_scope_key,
+                                          "cross-scope-value"},
+                                         "codepilot"));
+    }
+    state_key_request cross_scope_request;
+    cross_scope_request.key = cross_scope_key;
+    const state_response cross_scope =
+        global_state_store().get(cross_scope_request);
+    ASSERT_TRUE(cross_scope.ok) << cross_scope.error;
+    EXPECT_EQ("other", cross_scope.record.scope);
+
     const std::string bare_key = "inline-lifecycle-" + make_trace_id();
     {
         scoped_cout_capture capture;
@@ -4193,6 +4237,13 @@ TEST(rasn_state, inline_lifecycle_commands_recover_before_checkpoint_and_prune)
     ASSERT_TRUE(before_bare_cleanup.ok) << before_bare_cleanup.error;
     cleanup.key_prefix = bare_request.key;
     cleanup.max_sequence = before_bare_cleanup.last_sequence;
+    EXPECT_TRUE(global_state_store().delete_prefix(cleanup).ok);
+    const state_response before_cross_scope_cleanup =
+        global_state_store().query(state_query_request());
+    ASSERT_TRUE(before_cross_scope_cleanup.ok)
+        << before_cross_scope_cleanup.error;
+    cleanup.key_prefix = cross_scope_request.key;
+    cleanup.max_sequence = before_cross_scope_cleanup.last_sequence;
     EXPECT_TRUE(global_state_store().delete_prefix(cleanup).ok);
 
     for (const std::string &path :

@@ -295,7 +295,8 @@ inline void unmarshall(::dsn::binary_reader &reader,
 class state_store
 {
 public:
-    explicit state_store(bool journal_enabled = true) : _journal_enabled(journal_enabled) {}
+    explicit state_store(bool journal_enabled = true);
+    state_store(bool journal_enabled, uint64_t quarantine_probe_interval_ms);
 
     state_response put(const state_record &record);
     state_response put(const state_put_request &request);
@@ -305,9 +306,9 @@ public:
     state_delete_prefix_result
     delete_prefix_detailed(const state_delete_prefix_request &request);
     state_response advance_sequence(const state_sequence_barrier_request &request);
-    state_response checkpoint(const state_checkpoint_request &request) const;
+    state_response checkpoint(const state_checkpoint_request &request);
     state_checkpoint_result
-    checkpoint_detailed(const state_checkpoint_request &request) const;
+    checkpoint_detailed(const state_checkpoint_request &request);
     state_response copy_checkpoint(const state_checkpoint_request &request,
                                    const std::string &durable_path);
     state_response replace_from_checkpoint(const state_checkpoint_request &request,
@@ -326,7 +327,7 @@ private:
     std::string default_checkpoint_path() const;
     std::string default_journal_path() const;
     std::string quarantine_error() const;
-    bool journal_is_quarantined() const;
+    bool journal_is_quarantined(bool force_refresh) const;
     bool validate_default_storage_paths(std::string *error) const;
     bool append_journal_record(const state_record &record, std::string *error) const;
     bool append_journal_delete_prefix(const state_delete_prefix_request &request,
@@ -338,8 +339,8 @@ private:
     // Checkpoint/import/recovery file lifecycles serialize independently from
     // mutations. Mutations may continue while a checkpoint snapshot is written;
     // the epoch guard then keeps the journal when the snapshot was superseded.
-    mutable ::dsn::service::zlock _checkpoint_lock;
-    mutable ::dsn::service::zlock _mutation_lock;
+    ::dsn::service::zlock _checkpoint_lock;
+    ::dsn::service::zlock _mutation_lock;
     // Protects only short in-memory map accesses and read queries. No disk or
     // replica-mirror I/O is performed while this lock is held.
     mutable ::dsn::service::zlock _lock;
@@ -351,9 +352,12 @@ private:
     // Standalone stores journal before exposing writes. Type-1 replicated stores
     // disable this because rDSN's quorum mutation log is their durability source.
     const bool _journal_enabled;
-    // Quarantine is monotonic for a live store: check disk until evidence is
-    // observed, then require offline repair plus restart before serving again.
+    const uint64_t _quarantine_probe_interval_ms;
+    // Quarantine is monotonic for a live store. Reads use a bounded disk-probe
+    // interval; mutations and lifecycle operations force a refresh.
     mutable std::atomic<bool> _quarantine_seen{false};
+    mutable std::atomic<uint64_t> _next_quarantine_probe_ms{0};
+    mutable ::dsn::service::zlock _quarantine_probe_lock;
     mutable ::dsn::service::zlock _storage_validation_lock;
     mutable bool _storage_validation_checked = false;
     mutable bool _storage_validation_ok = false;

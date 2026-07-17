@@ -46,8 +46,8 @@ codepilot.exe C:\path\to\file.cpp
 
 State keys are stored as `<scope>/<id>`. For CLI compatibility, a bare CodePilot
 `state put|get` key is resolved as `codepilot/<key>`; explicit namespaced keys stay
-unchanged. `state put` retains historical `scope=codepilot` record metadata even
-when the key uses another explicit namespace.
+unchanged. `state put` derives record `scope` metadata from the resulting key, so
+`state put other/foo value` stores `key=other/foo` and `scope=other`.
 
 ```sh
 ./codepilot ~/src/repo
