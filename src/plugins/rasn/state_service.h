@@ -315,6 +315,7 @@ public:
                                            const std::string &durable_path = "");
     state_response recover(const state_checkpoint_request &request);
     bool has_recovery_state(const state_checkpoint_request &request) const;
+    bool validate_storage_paths(std::string *error) const;
 
 private:
     state_delete_prefix_result
@@ -328,7 +329,6 @@ private:
     std::string default_journal_path() const;
     std::string quarantine_error() const;
     bool journal_is_quarantined(bool force_refresh) const;
-    bool validate_default_storage_paths(std::string *error) const;
     bool append_journal_record(const state_record &record, std::string *error) const;
     bool append_journal_delete_prefix(const state_delete_prefix_request &request,
                                       uint64_t operation_sequence,

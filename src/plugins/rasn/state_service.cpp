@@ -538,7 +538,7 @@ bool sync_state_file(const std::string &path,
 }
 
 #if defined(_WIN32)
-bool windows_state_directory_has_durable_metadata(
+bool validate_windows_state_directory_filesystem(
     const std::string &directory,
     const std::string &description,
     std::string *error)
@@ -612,11 +612,13 @@ bool sync_state_directory(const std::string &directory,
                           std::string *error)
 {
 #if defined(_WIN32)
-    // Windows has no portable directory-fsync primitive. File flushes and
-    // MOVEFILE_WRITE_THROUGH provide the required ordering on journaled local
-    // filesystems; reject FAT-family volumes rather than claiming equal safety.
-    return windows_state_directory_has_durable_metadata(
-        directory, description, error);
+    // Windows has no portable directory-fsync primitive. Supported filesystem
+    // capabilities are validated before lifecycle I/O; durable file flushes and
+    // MOVEFILE_WRITE_THROUGH provide the per-operation ordering.
+    (void)directory;
+    (void)description;
+    (void)error;
+    return true;
 #else
     int flags = O_RDONLY;
 #if defined(O_DIRECTORY)
@@ -2015,7 +2017,7 @@ bool validate_state_storage_filesystems(
         {
             continue;
         }
-        if (!windows_state_directory_has_durable_metadata(
+        if (!validate_windows_state_directory_filesystem(
                 directory, path.description, error))
         {
             return false;
@@ -3058,6 +3060,17 @@ uint64_t monotonic_state_time_ms()
             .count());
 }
 
+const uint64_t kDefaultStateQuarantineProbeIntervalMs = 1000;
+
+uint64_t configured_state_quarantine_probe_interval_ms()
+{
+    return config_uint64(
+        "rasn.state",
+        "quarantine_probe_interval_ms",
+        kDefaultStateQuarantineProbeIntervalMs,
+        "Maximum healthy-cache interval for external state quarantine probes");
+}
+
 bool valid_state_key(const std::string &key)
 {
     const std::string::size_type separator = key.find('/');
@@ -3221,13 +3234,7 @@ bool configured_state_recovery_available(const state_checkpoint_request &request
 state_store::state_store(bool journal_enabled)
     : state_store(
           journal_enabled,
-          journal_enabled
-              ? config_uint64(
-                    "rasn.state",
-                    "quarantine_probe_interval_ms",
-                    1000,
-                    "Maximum healthy-cache interval for external state quarantine probes")
-              : 0)
+          journal_enabled ? kDefaultStateQuarantineProbeIntervalMs : 0)
 {
 }
 
@@ -3609,8 +3616,7 @@ state_store::checkpoint_detailed(const state_checkpoint_request &request)
     const bool checkpoint_path_valid =
         _journal_enabled
             ? (recovery_checkpoint
-                   ? validate_state_checkpoint_target(
-                         path, true, &checkpoint_error)
+                   ? validate_storage_paths(&checkpoint_error)
                    : validate_custom_checkpoint_target(
                          path, &checkpoint_error))
             : validate_checkpoint_lifecycle_target(path, &checkpoint_error);
@@ -3802,6 +3808,10 @@ state_response state_store::recover(const state_checkpoint_request &request)
     const std::string path = request.path.empty() ? default_checkpoint_path() : request.path;
     const std::string journal_path =
         _journal_enabled ? default_journal_path() : "";
+    const bool configured_recovery =
+        request.path.empty() ||
+        state_path_entries_refer_to_same_file(
+            path, default_checkpoint_path());
     if (journal_is_quarantined(true))
     {
         return error_response(quarantine_error());
@@ -3809,7 +3819,10 @@ state_response state_store::recover(const state_checkpoint_request &request)
     std::string storage_error;
     const bool storage_paths_valid =
         _journal_enabled
-            ? validate_state_checkpoint_target(path, true, &storage_error)
+            ? (configured_recovery
+                   ? validate_storage_paths(&storage_error)
+                   : validate_state_checkpoint_target(
+                         path, true, &storage_error))
             : validate_checkpoint_lifecycle_target(path, &storage_error);
     if (!storage_paths_valid)
     {
@@ -4192,7 +4205,7 @@ bool state_store::journal_is_quarantined(bool force_refresh) const
     return quarantined;
 }
 
-bool state_store::validate_default_storage_paths(std::string *error) const
+bool state_store::validate_storage_paths(std::string *error) const
 {
     if (!_journal_enabled)
     {
@@ -4214,7 +4227,7 @@ bool state_store::validate_default_storage_paths(std::string *error) const
 
 bool state_store::append_journal_record(const state_record &record, std::string *error) const
 {
-    if (!validate_default_storage_paths(error))
+    if (!validate_storage_paths(error))
     {
         return false;
     }
@@ -4249,7 +4262,7 @@ bool state_store::append_journal_delete_prefix(const state_delete_prefix_request
                                                uint64_t operation_sequence,
                                                std::string *error) const
 {
-    if (!validate_default_storage_paths(error))
+    if (!validate_storage_paths(error))
     {
         return false;
     }
@@ -4287,7 +4300,7 @@ bool state_store::append_journal_sequence_barrier(
     const state_sequence_barrier_request &request,
     std::string *error) const
 {
-    if (!validate_default_storage_paths(error))
+    if (!validate_storage_paths(error))
     {
         return false;
     }
@@ -4322,7 +4335,8 @@ bool state_store::append_journal_sequence_barrier(
 
 state_store &global_state_store()
 {
-    static state_store store;
+    static state_store store(
+        true, configured_state_quarantine_probe_interval_ms());
     return store;
 }
 
@@ -4608,8 +4622,7 @@ rasn_state_client::recover_sync(const state_checkpoint_request &request,
 ::dsn::error_code rasn_state_app::start(int argc, char **argv)
 {
     std::string storage_error;
-    if (!validate_state_checkpoint_target(
-            configured_state_checkpoint_path(), true, &storage_error))
+    if (!global_state_store().validate_storage_paths(&storage_error))
     {
         derror("refusing to start rasn.state with unsafe storage paths: %s",
                storage_error.c_str());

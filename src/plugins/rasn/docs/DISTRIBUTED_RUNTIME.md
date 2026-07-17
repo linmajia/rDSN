@@ -1668,7 +1668,9 @@ unrelated metadata is not forced. Standalone mode deliberately performs one
 durable sync per mutation; write-heavy production placement should use
 `rasn.state.replicated`, where rDSN owns mutation-log batching and quorum
 durability. Windows state storage fails closed on FAT/exFAT and requires NTFS,
-ReFS, or CSVFS rather than claiming equivalent directory durability.
+ReFS, or CSVFS rather than claiming equivalent directory durability. The volume
+capability check happens during lifecycle-path validation; individual mutations
+do not re-query volume metadata and rely on file flushes plus write-through moves.
 Checkpoint/export targets and their `.tmp`/`.bak` staging names are rejected when
 they alias either the primary or configured-replica journal lifecycle paths.
 Validation covers effective replica basenames and `.nfs.tmp` copy staging, uses
@@ -1704,8 +1706,10 @@ evidence that blocks reads, mutations, imports, checkpoints, and recovery across
 restart until an operator installs a verified checkpoint/journal and removes the
 marker. Mutations and lifecycle calls refresh external quarantine evidence
 immediately; healthy GET/QUERY calls cache only a negative probe for
-`quarantine_probe_interval_ms` (default `1000`) and latch permanently once
-evidence is observed. Local service-graph access performs one fail-closed recovery before its
+`quarantine_probe_interval_ms` (default `1000`), may serve the last in-memory
+image until that interval expires after an external marker appears, and latch
+permanently once evidence is observed. Set the interval to `0` to probe on every
+read. Local service-graph access performs one fail-closed recovery before its
 first state operation, including checkpoints and prune mutations; an explicit
 successful or failed recovery becomes that graph's recorded recovery outcome. The
 detailed checkpoint RPC

@@ -480,9 +480,11 @@ rDSN design:
   standalone throughput; production write-heavy deployments use the native
   `rasn.state.replicated` profile so rDSN owns log batching and quorum durability.
   Checkpoint and replica copies flush the temporary file before replacement; POSIX
-  replacements/removals also flush the containing directory, while Windows uses
-  write-through moves and rejects FAT/exFAT state volumes in favor of NTFS, ReFS,
-  or CSVFS. A failed flush is an operation failure,
+  replacements/removals also flush the containing directory. Windows validates
+  configured lifecycle volumes through the store's startup/lazy cache, rejects
+  FAT/exFAT in favor of NTFS, ReFS, or CSVFS, and then relies on durable file
+  flushes plus write-through moves without re-querying volume metadata for later
+  configured-path operations. A failed flush is an operation failure,
   and an append whose rollback cannot be flushed enters fail-stop quarantine.
   Local copies use checked fixed-size reads and reject source shrink/growth or
   read failure before flushing the target. Retried deletion flushes the parent
@@ -530,7 +532,9 @@ Correctness and robustness requirements:
   restart. Quarantine observation across both copies is monotonic for a live
   store. Mutations and lifecycle calls probe immediately; healthy reads cache a
   negative probe for the configured bounded interval to avoid per-read filesystem
-  I/O, and latch permanently once any evidence is observed.
+  I/O, may serve the last in-memory image until that interval expires, and latch
+  permanently once any evidence is observed. Set the interval to `0` when every
+  read must probe for out-of-process quarantine evidence.
 - Replicated state startup validates every mutating task's
   `rpc_request_is_write_operation` flag and refuses stale/custom configs that
   would dispatch a write directly to one replica.
