@@ -36,12 +36,18 @@ codepilot.exe plan "Add a retry budget to an rASN workflow"
 codepilot.exe agent "Inspect the rASN state service and suggest tests"
 codepilot.exe tools
 codepilot.exe observe resilience
+codepilot.exe state put codepilot/example "value"
 codepilot.exe state query rasn/runtime
 codepilot.exe state migrate rasn/state/export.chkpt --prefix rasn/runtime
 codepilot.exe interactive
 codepilot.exe C:\path\to\repo
 codepilot.exe C:\path\to\file.cpp
 ```
+
+State keys are stored as `<scope>/<id>`. For CLI compatibility, a bare CodePilot
+`state put|get` key is resolved as `codepilot/<key>`; explicit namespaced keys stay
+unchanged. `state put` retains historical `scope=codepilot` record metadata even
+when the key uses another explicit namespace.
 
 ```sh
 ./codepilot ~/src/repo

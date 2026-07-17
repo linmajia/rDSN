@@ -436,10 +436,13 @@ rDSN design:
   The conditional path is exposed as `RPC_RASN_STATE_PUT_CONDITIONAL` and is used
   by workflow ownership leases.
 - Explicitly obsolete namespaces can be removed through a sequence-cutoff
-  `RPC_RASN_STATE_DELETE_PREFIX` mutation. Standalone journals persist the
-  tombstone; native replicas commit it through the type-1 log. Migration uses an
-  idempotent sequence-barrier mutation so a checkpoint's historical sequence floor
-  is retained even when its highest mutation deleted the last live record.
+  `RPC_RASN_STATE_DELETE_PREFIX` mutation. New clients prefer the bounded
+  `RPC_RASN_STATE_DELETE_PREFIX_DETAILED` result (count only) and fall back to the
+  legacy record-carrying response for mixed-version servers. Standalone journals
+  persist the tombstone; native replicas commit it through the type-1 log.
+  Migration uses an idempotent sequence-barrier mutation so a checkpoint's
+  historical sequence floor is retained even when its highest mutation deleted
+  the last live record.
 - If `[rasn.state] recover_on_start` is configured, service startup recovers that
   explicit path and fails on recovery errors. If it is empty, startup
   auto-recovers the configured default checkpoint/journal when one exists and
@@ -449,8 +452,15 @@ rDSN design:
   fail-closed for the graph, preventing a fresh one-shot CLI process from
   checkpointing an empty store over persisted state. RPC clients leave recovery
   to the state-service process.
-- Optional `[rasn.state.nfs]` settings let recovery first pull checkpoint files
-  from an existing `dsn.tools.nfs` source when local state is absent. This reuses
+- Optional `[rasn.state.nfs]` settings let recovery cold-seed checkpoint/journal
+  files from an existing `dsn.tools.nfs` source only when both local artifacts are
+  absent after local-replica recovery. It never combines unversioned remote and
+  local generations. Every download attempt lands in a fresh staging subdirectory,
+  so a shorter or timed-out transfer cannot contaminate the next attempt. A durable
+  pending marker remains authoritative while partial destinations are discarded
+  and sources are retried; it is removed only after parsing succeeds. Completed
+  failed attempts are cleaned, while a possibly active timed-out directory is
+  orphaned and never reused. This reuses
   rDSN's NFS module for remote state seeding without making the default local
   checkpoint path depend on a network service. The import timeout defaults to
   `20000` ms; production or remote recovery paths should keep that conservative
@@ -458,12 +468,28 @@ rDSN design:
   `5000` ms for faster fail-safe errors.
 - Optional `[rasn.state.replica]` settings mirror checkpoint and journal files to
   a local replica directory. When enabled, state writes fail explicitly if the
-  mirror cannot be updated, and recovery can seed missing primary checkpoint or
-  journal files from the replica before attempting NFS import. A configured but
+  mirror cannot be updated, and recovery restores each missing primary checkpoint
+  or journal independently from the replica before attempting NFS import. A configured but
   invalid recovery source, such as an empty replica directory or unreachable NFS
   source, is treated as a blocking error rather than a reason to checkpoint an
   empty in-memory store over durable state.
 - Files and directories use `dsn::utils::filesystem`.
+- Standalone mutation acknowledgement follows durable journal flush (`fsync` on
+  POSIX, `F_FULLFSYNC` for regular files on macOS, and `_commit` on Windows).
+  Checkpoint and replica copies flush the temporary file before replacement; POSIX
+  replacements/removals also flush the containing directory, while Windows
+  replacements use write-through moves. A failed flush is an operation failure,
+  and an append whose rollback cannot be flushed enters fail-stop quarantine.
+  Local copies use checked fixed-size reads and reject source shrink/growth or
+  read failure before flushing the target. Retried deletion flushes the parent
+  directory even when the name is already absent.
+  Before replacing a checkpoint, any legacy `.bak` is refreshed from the flushed
+  new image; compaction is refused unless that recovery alias is durably removed.
+- The mutation lock preserves journal/map order, but journal and replica I/O runs
+  outside the read lock so GET/QUERY can continue against the last committed
+  in-memory image. Checkpoint writing has its own lifecycle lock: it snapshots
+  briefly under the mutation lock, permits later mutations, and compacts journals
+  only if the write epoch is still unchanged.
 - The optional `rasn.state.replicated` app follows
   `replicated_service_app_type_1` directly: PUT/conditional PUT, cutoff deletion,
   and sequence barriers are quorum writes; each replica applies the ordered
@@ -475,15 +501,33 @@ Correctness and robustness requirements:
 
 - Writes are atomic at the logical operation level.
 - Checkpoints include schema version and last committed event sequence.
+- Primary/replica checkpoint and journal destinations plus every staging or
+  quarantine name must be pairwise distinct. Validation follows native file
+  identity (including hard links), canonical parent paths, and the parent
+  filesystem's case semantics before the first journal append and before
+  checkpoint, import, or recovery I/O. Leaf symlinks/reparse points are rejected,
+  recovery reads are opened no-follow, and live journals, trusted recovery inputs,
+  and replaceable staging must be regular single-link files. Journal compaction requires the configured
+  checkpoint directory entry; a distinct hard-link alias is treated as a custom
+  export because atomic replacement detaches that alias before writing. Custom
+  export staging paths are still checked against every configured
+  primary/replica checkpoint lifecycle name. Ancestor directories are a deployment
+  trust boundary and must not be writable by untrusted users; parent symlinks and
+  mount indirections remain supported for normal install and NFS layouts.
 - Replica mirrors are write-through rather than best-effort; mirror failures are
   rolled back from the primary journal before being surfaced. If rollback cannot
   be proven, the process fail-stops rather than replaying a mutation reported as
   failed. The store persists an in-journal marker plus an external sidecar or
-  quarantined-journal rename where possible; subsequent reads, mutations,
+  quarantined-journal rename beside the affected primary or replica journal where
+  possible; startup and subsequent reads, mutations,
   imports, checkpoints, and recovery fail closed across restart. Repair is an
-  offline operator action: preserve the evidence, reconcile primary and replica,
-  install a known-good checkpoint/journal, remove the external marker, and restart.
-  There is no in-process quarantine bypass.
+  offline operator action: preserve the evidence, reconcile both journal copies,
+  install known-good checkpoint/journal images, remove the external markers, and
+  restart. Quarantine observation across both copies is monotonic for a live store,
+  so there is no in-process quarantine bypass.
+- Replicated state startup validates every mutating task's
+  `rpc_request_is_write_operation` flag and refuses stale/custom configs that
+  would dispatch a write directly to one replica.
 - Recovery validates checkpoint integrity and refuses corrupt state unless
   configured for best-effort diagnosis.
 

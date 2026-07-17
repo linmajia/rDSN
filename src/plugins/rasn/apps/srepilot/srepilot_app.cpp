@@ -231,7 +231,9 @@ int srepilot_cli::run_command(const std::vector<std::string> &args, bool interac
     if (args[0] == "state")
     {
         return run_rasn_state_command(
-            _services, std::vector<std::string>(args.begin() + 1, args.end()));
+            _services,
+            std::vector<std::string>(args.begin() + 1, args.end()),
+            "srepilot");
     }
     if (args[0] == "selftest")
     {

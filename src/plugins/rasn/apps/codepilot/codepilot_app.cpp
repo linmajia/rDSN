@@ -1386,7 +1386,7 @@ void codepilot_cli::configure_sandbox_profile(const std::string &workspace_root)
 
 int codepilot_cli::run_state(const std::vector<std::string> &args)
 {
-    return run_rasn_state_command(_services, args);
+    return run_rasn_state_command(_services, args, "codepilot");
 }
 
 int codepilot_cli::run_registry(const std::vector<std::string> &args)

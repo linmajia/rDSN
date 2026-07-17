@@ -397,6 +397,8 @@ public:
     state_response get_state(const state_key_request &request);
     state_response query_state(const state_query_request &request);
     state_response delete_state_prefix(const state_delete_prefix_request &request);
+    state_delete_prefix_result
+    delete_state_prefix_detailed(const state_delete_prefix_request &request);
     state_response
     advance_state_sequence(const state_sequence_barrier_request &request);
     state_response checkpoint_state(const state_checkpoint_request &request);

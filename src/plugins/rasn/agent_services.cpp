@@ -3371,6 +3371,62 @@ rasn_service_graph::delete_state_prefix(const state_delete_prefix_request &reque
     return global_state_store().delete_prefix(request);
 }
 
+state_delete_prefix_result rasn_service_graph::delete_state_prefix_detailed(
+    const state_delete_prefix_request &request)
+{
+    start();
+    if (_rpc_clients_enabled)
+    {
+        rasn_state_client client(_state_address);
+        ::dsn::error_code err;
+        state_delete_prefix_result result;
+        std::tie(err, result) =
+            core_rpc_with_resilience<state_delete_prefix_result>(
+                "state.delete_prefix_detailed",
+                _state_address,
+                /*idempotent=*/false,
+                [&](std::chrono::milliseconds timeout)
+                    -> std::pair< ::dsn::error_code,
+                                  state_delete_prefix_result> {
+                    const std::pair< ::dsn::error_code,
+                                     state_delete_prefix_result>
+                        detailed =
+                            client.delete_prefix_detailed_sync(request, timeout);
+                    if (detailed.first != ::dsn::ERR_HANDLER_NOT_FOUND)
+                    {
+                        return detailed;
+                    }
+
+                    const std::pair< ::dsn::error_code, state_response> legacy =
+                        client.delete_prefix_sync(request, timeout);
+                    state_delete_prefix_result compatible;
+                    compatible.response = legacy.second;
+                    compatible.deleted_records =
+                        legacy.second.records.size();
+                    compatible.details_available = false;
+                    return std::make_pair(legacy.first, compatible);
+                });
+        if (err == ::dsn::ERR_OK)
+        {
+            return result;
+        }
+        result.response.ok = false;
+        result.response.error =
+            std::string("RPC_RASN_STATE_DELETE_PREFIX_DETAILED failed: ") +
+            err.to_string();
+        return result;
+    }
+    std::string recovery_error;
+    if (!ensure_inline_state_recovered(&recovery_error))
+    {
+        state_delete_prefix_result failure;
+        failure.response.ok = false;
+        failure.response.error = recovery_error;
+        return failure;
+    }
+    return global_state_store().delete_prefix_detailed(request);
+}
+
 state_response rasn_service_graph::advance_state_sequence(
     const state_sequence_barrier_request &request)
 {
@@ -3666,6 +3722,69 @@ state_migration_report migrate_state_checkpoint(rasn_service_graph &services,
         return report;
     }
 
+    const auto verify_destination =
+        [&](const std::map<std::string, state_record> &expected_records,
+            uint64_t expected_sequence,
+            const std::string &phase,
+            state_response *verified_response) {
+            const state_response current = services.query_state(query);
+            if (!current.ok)
+            {
+                report.error =
+                    "state migration " + phase + " failed: " + current.error;
+                return false;
+            }
+
+            std::map<std::string, state_record> current_records;
+            for (const state_record &record : current.records)
+            {
+                current_records[record.key] = record;
+            }
+            bool matches =
+                current.last_sequence == expected_sequence &&
+                current_records.size() == expected_records.size();
+            if (matches)
+            {
+                for (const std::map<std::string, state_record>::value_type
+                         &expected : expected_records)
+                {
+                    const std::map<std::string, state_record>::const_iterator
+                        actual = current_records.find(expected.first);
+                    if (actual == current_records.end() ||
+                        !same_state_record_content(actual->second,
+                                                   expected.second) ||
+                        actual->second.sequence != expected.second.sequence)
+                    {
+                        matches = false;
+                        break;
+                    }
+                }
+            }
+            if (!matches)
+            {
+                report.error =
+                    "state migration destination changed " + phase +
+                    "; quiesce all destination state-service writers and retry";
+                return false;
+            }
+            report.target_records = current.records.size();
+            report.target_last_sequence = current.last_sequence;
+            if (verified_response != nullptr)
+            {
+                *verified_response = current;
+            }
+            return true;
+        };
+
+    uint64_t expected_target_sequence = target_state.last_sequence;
+    if (!verify_destination(target_records,
+                            expected_target_sequence,
+                            "after preflight",
+                            nullptr))
+    {
+        return report;
+    }
+
     if (report.target_last_sequence < report.source_last_sequence)
     {
         state_sequence_barrier_request barrier;
@@ -3678,6 +3797,16 @@ state_migration_report migrate_state_checkpoint(rasn_service_graph &services,
             return report;
         }
         report.target_last_sequence = advanced.last_sequence;
+    }
+
+    expected_target_sequence =
+        (std::max)(target_state.last_sequence, source_state.last_sequence);
+    if (!verify_destination(target_records,
+                            expected_target_sequence,
+                            "after the sequence barrier",
+                            nullptr))
+    {
+        return report;
     }
 
     for (const state_record &record : planned)
@@ -3706,16 +3835,27 @@ state_migration_report migrate_state_checkpoint(rasn_service_graph &services,
             }
             stored = reconciled;
         }
+        if (!same_state_record_content(stored.record, record) ||
+            stored.record.sequence != record.sequence ||
+            stored.last_sequence != expected_target_sequence)
+        {
+            report.error =
+                "state migration destination changed while writing " +
+                record.key +
+                "; quiesce all destination state-service writers and retry";
+            return report;
+        }
         target_records[record.key] = stored.record;
-        report.target_last_sequence =
-            (std::max)(report.target_last_sequence, stored.last_sequence);
+        report.target_last_sequence = stored.last_sequence;
         ++report.migrated_records;
     }
 
-    const state_response verified = services.query_state(query);
-    if (!verified.ok)
+    state_response verified;
+    if (!verify_destination(target_records,
+                            expected_target_sequence,
+                            "during final verification",
+                            &verified))
     {
-        report.error = "state migration verification failed: " + verified.error;
         return report;
     }
     report.target_records = verified.records.size();

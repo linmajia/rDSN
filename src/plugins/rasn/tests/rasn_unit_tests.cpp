@@ -46,6 +46,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <atomic>
@@ -62,6 +63,18 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace dsn {
 namespace rasn {
@@ -220,6 +233,43 @@ std::string temp_file_path(const std::string &name)
 std::string workspace_temp_file_path(const std::string &name)
 {
     return normalize_platform_path(name);
+}
+
+enum class hard_link_creation
+{
+    created,
+    unsupported,
+    failed
+};
+
+hard_link_creation try_create_hard_link(const std::string &source,
+                                        const std::string &alias)
+{
+#if defined(_WIN32)
+    if (::CreateHardLinkA(alias.c_str(), source.c_str(), nullptr) != 0)
+    {
+        return hard_link_creation::created;
+    }
+    const DWORD error = ::GetLastError();
+    return error == ERROR_NOT_SUPPORTED ||
+                   error == ERROR_INVALID_FUNCTION ||
+                   error == ERROR_PRIVILEGE_NOT_HELD ||
+                   error == ERROR_ACCESS_DENIED ||
+                   error == ERROR_NOT_SAME_DEVICE
+               ? hard_link_creation::unsupported
+               : hard_link_creation::failed;
+#else
+    if (::link(source.c_str(), alias.c_str()) == 0)
+    {
+        return hard_link_creation::created;
+    }
+    const int error = errno;
+    return error == EPERM || error == EACCES || error == EROFS ||
+                   error == EXDEV || error == ENOSYS ||
+                   error == EOPNOTSUPP || error == ENOTSUP
+               ? hard_link_creation::unsupported
+               : hard_link_creation::failed;
+#endif
 }
 
 agent_descriptor make_unit_agent_descriptor(const std::string &agent_id,
@@ -454,6 +504,7 @@ TEST(rasn_agent_types, schema_manifest_exposes_core_contracts)
     EXPECT_NE(std::string::npos, manifest.find("credential_ref"));
     EXPECT_NE(std::string::npos, manifest.find("[state_response]"));
     EXPECT_NE(std::string::npos, manifest.find("[state_delete_prefix_request]"));
+    EXPECT_NE(std::string::npos, manifest.find("[state_delete_prefix_result]"));
     EXPECT_NE(std::string::npos, manifest.find("[state_sequence_barrier_request]"));
     EXPECT_NE(std::string::npos, manifest.find("[state_checkpoint_result]"));
     EXPECT_NE(std::string::npos, manifest.find("[redaction_policy]"));
@@ -485,6 +536,8 @@ TEST(rasn_agent_types, schema_manifest_exposes_core_contracts)
     EXPECT_NE(std::string::npos, cpp_clients.find("class workflow_rpc_client"));
     EXPECT_NE(std::string::npos, cpp_clients.find("RPC_RASN_OBSERVABILITY_LOAD_REPLAY"));
     EXPECT_NE(std::string::npos, cpp_clients.find("RPC_RASN_STATE_DELETE_PREFIX"));
+    EXPECT_NE(std::string::npos,
+              cpp_clients.find("RPC_RASN_STATE_DELETE_PREFIX_DETAILED"));
     EXPECT_NE(std::string::npos, cpp_clients.find("RPC_RASN_STATE_ADVANCE_SEQUENCE"));
     EXPECT_NE(std::string::npos, cpp_clients.find("RPC_RASN_STATE_CHECKPOINT_DETAILED"));
     EXPECT_NE(std::string::npos, cpp_clients.find("std::pair< ::dsn::error_code, state_response>"));
@@ -2935,6 +2988,694 @@ TEST(rasn_state, custom_checkpoint_export_preserves_recovery_journal)
     }
 }
 
+TEST(rasn_state, equivalent_configured_checkpoint_path_compacts_journal)
+{
+    const std::string journal_path = configured_state_journal_path();
+    const std::string checkpoint_path = configured_state_checkpoint_path();
+    const std::string checkpoint_directory =
+        ::dsn::utils::filesystem::remove_file_name(checkpoint_path);
+    const std::string checkpoint_name =
+        ::dsn::utils::filesystem::get_file_name(checkpoint_path);
+    const std::string equivalent_path =
+        checkpoint_directory.empty()
+            ? "./" + checkpoint_name
+            : checkpoint_directory + "/./" + checkpoint_name;
+    for (const std::string &path :
+         {journal_path, checkpoint_path, equivalent_path})
+    {
+        std::remove(path.c_str());
+        std::remove((path + ".tmp").c_str());
+        std::remove((path + ".bak").c_str());
+    }
+
+    state_store store;
+    state_record record;
+    record.key = "unit/equivalent-checkpoint";
+    record.kind = "observation";
+    record.scope = "unit";
+    record.value = "durable";
+    ASSERT_TRUE(store.put(record).ok);
+    ASSERT_TRUE(::dsn::utils::filesystem::file_exists(journal_path));
+
+    state_checkpoint_request checkpoint;
+    checkpoint.path = equivalent_path;
+    const state_checkpoint_result result =
+        store.checkpoint_detailed(checkpoint);
+    ASSERT_TRUE(result.response.ok) << result.response.error;
+    EXPECT_TRUE(result.journal_compacted);
+    EXPECT_FALSE(::dsn::utils::filesystem::file_exists(journal_path));
+
+    for (const std::string &path :
+         {journal_path, checkpoint_path, equivalent_path})
+    {
+        std::remove(path.c_str());
+        std::remove((path + ".tmp").c_str());
+        std::remove((path + ".bak").c_str());
+    }
+}
+
+TEST(rasn_state, hard_linked_checkpoint_alias_retains_recovery_journal)
+{
+    const std::string journal_path = configured_state_journal_path();
+    const std::string checkpoint_path = configured_state_checkpoint_path();
+    const std::string alias_path = checkpoint_path + ".hard-link-alias";
+    for (const std::string &path :
+         {journal_path, checkpoint_path, alias_path})
+    {
+        std::remove(path.c_str());
+        std::remove((path + ".tmp").c_str());
+        std::remove((path + ".bak").c_str());
+    }
+
+    state_store store;
+    state_record baseline;
+    baseline.key = "unit/hard-link-alias/baseline";
+    baseline.kind = "observation";
+    baseline.scope = "unit";
+    baseline.value = "baseline";
+    ASSERT_TRUE(store.put(baseline).ok);
+    ASSERT_TRUE(store.checkpoint(state_checkpoint_request()).ok);
+
+    state_record delta = baseline;
+    delta.key = "unit/hard-link-alias/delta";
+    delta.value = "journal";
+    ASSERT_TRUE(store.put(delta).ok);
+    const hard_link_creation linked =
+        try_create_hard_link(checkpoint_path, alias_path);
+    if (linked == hard_link_creation::unsupported)
+    {
+        std::remove(journal_path.c_str());
+        std::remove(checkpoint_path.c_str());
+        return;
+    }
+    ASSERT_TRUE(linked == hard_link_creation::created);
+
+    state_checkpoint_request alias_checkpoint;
+    alias_checkpoint.path = alias_path;
+    const state_checkpoint_result exported =
+        store.checkpoint_detailed(alias_checkpoint);
+    ASSERT_TRUE(exported.response.ok) << exported.response.error;
+    EXPECT_FALSE(exported.journal_compacted);
+    EXPECT_TRUE(::dsn::utils::filesystem::file_exists(journal_path));
+
+    state_store recovered;
+    const state_response recovered_state =
+        recovered.recover(state_checkpoint_request());
+    ASSERT_TRUE(recovered_state.ok) << recovered_state.error;
+    state_key_request delta_key;
+    delta_key.key = delta.key;
+    const state_response recovered_delta = recovered.get(delta_key);
+    ASSERT_TRUE(recovered_delta.ok) << recovered_delta.error;
+    EXPECT_EQ(delta.value, recovered_delta.record.value);
+
+    for (const std::string &path :
+         {journal_path, checkpoint_path, alias_path})
+    {
+        std::remove(path.c_str());
+        std::remove((path + ".tmp").c_str());
+        std::remove((path + ".bak").c_str());
+    }
+}
+
+TEST(rasn_state, journal_rejects_multiply_linked_live_file)
+{
+    const std::string journal_path = configured_state_journal_path();
+    const std::string checkpoint_path = configured_state_checkpoint_path();
+    const std::string alias_path = journal_path + ".hard-link-alias";
+    for (const std::string &path :
+         {journal_path, checkpoint_path, alias_path})
+    {
+        std::remove(path.c_str());
+        std::remove((path + ".tmp").c_str());
+        std::remove((path + ".bak").c_str());
+    }
+
+    state_store store;
+    state_record record;
+    record.key = "unit/hard-linked-live-journal/initial";
+    record.kind = "observation";
+    record.scope = "unit";
+    record.value = "initial";
+    ASSERT_TRUE(store.put(record).ok);
+    const hard_link_creation linked =
+        try_create_hard_link(journal_path, alias_path);
+    if (linked == hard_link_creation::unsupported)
+    {
+        std::remove(journal_path.c_str());
+        return;
+    }
+    ASSERT_TRUE(linked == hard_link_creation::created);
+    const std::string journal_before = read_text_file(journal_path);
+
+    record.key = "unit/hard-linked-live-journal/rejected";
+    record.value = "rejected";
+    const state_response rejected = store.put(record);
+    EXPECT_FALSE(rejected.ok);
+    EXPECT_NE(std::string::npos,
+              rejected.error.find("failed to open state journal"));
+    EXPECT_EQ(journal_before, read_text_file(journal_path));
+
+    std::remove(alias_path.c_str());
+    std::remove(journal_path.c_str());
+    std::remove(checkpoint_path.c_str());
+}
+
+TEST(rasn_state, recovery_rejects_multiply_linked_checkpoint)
+{
+    const std::string checkpoint_path =
+        workspace_temp_file_path("rasn-state-hard-link-source.chkpt");
+    const std::string alias_path =
+        checkpoint_path + ".hard-link-recovery";
+    for (const std::string &path : {checkpoint_path, alias_path})
+    {
+        std::remove(path.c_str());
+        std::remove((path + ".tmp").c_str());
+        std::remove((path + ".bak").c_str());
+    }
+
+    state_store writer(false);
+    state_record record;
+    record.key = "unit/hard-linked-recovery";
+    record.kind = "observation";
+    record.scope = "unit";
+    record.value = "checkpoint";
+    ASSERT_TRUE(writer.put(record).ok);
+    state_checkpoint_request checkpoint;
+    checkpoint.path = checkpoint_path;
+    ASSERT_TRUE(writer.checkpoint(checkpoint).ok);
+    const hard_link_creation linked =
+        try_create_hard_link(checkpoint_path, alias_path);
+    if (linked == hard_link_creation::unsupported)
+    {
+        std::remove(checkpoint_path.c_str());
+        return;
+    }
+    ASSERT_TRUE(linked == hard_link_creation::created);
+
+    state_store recovered(false);
+    state_checkpoint_request recovery;
+    recovery.path = alias_path;
+    const state_response response = recovered.recover(recovery);
+    EXPECT_FALSE(response.ok);
+    EXPECT_NE(std::string::npos,
+              response.error.find("failed to open checkpoint for recovery"));
+
+    std::remove(alias_path.c_str());
+    std::remove(checkpoint_path.c_str());
+}
+
+TEST(rasn_state, checkpoint_rejects_journal_lifecycle_paths)
+{
+    const std::string journal_path = configured_state_journal_path();
+    const std::string checkpoint_path = configured_state_checkpoint_path();
+    for (const std::string &path :
+         {journal_path,
+          journal_path + ".quarantine",
+          journal_path + ".quarantine.tmp",
+          journal_path + ".quarantined",
+          checkpoint_path})
+    {
+        std::remove(path.c_str());
+        std::remove((path + ".tmp").c_str());
+        std::remove((path + ".bak").c_str());
+    }
+
+    state_store store;
+    state_record record;
+    record.key = "unit/checkpoint-journal-collision";
+    record.kind = "observation";
+    record.scope = "unit";
+    record.value = "preserve-journal";
+    ASSERT_TRUE(store.put(record).ok);
+    const std::string journal_before = read_text_file(journal_path);
+
+    const std::string journal_directory =
+        ::dsn::utils::filesystem::remove_file_name(journal_path);
+    const std::string journal_name =
+        ::dsn::utils::filesystem::get_file_name(journal_path);
+    state_checkpoint_request checkpoint;
+    checkpoint.path =
+        journal_directory.empty()
+            ? "./" + journal_name
+            : journal_directory + "/./" + journal_name;
+    const state_response journal_collision = store.checkpoint(checkpoint);
+    EXPECT_FALSE(journal_collision.ok);
+    EXPECT_NE(std::string::npos,
+              journal_collision.error.find("storage paths overlap"));
+    EXPECT_EQ(journal_before, read_text_file(journal_path));
+
+    checkpoint.path = journal_path + ".quarantine";
+    const state_response marker_collision = store.checkpoint(checkpoint);
+    EXPECT_FALSE(marker_collision.ok);
+    EXPECT_NE(std::string::npos,
+              marker_collision.error.find("storage paths overlap"));
+    EXPECT_FALSE(::dsn::utils::filesystem::file_exists(checkpoint.path));
+
+    std::remove(journal_path.c_str());
+    std::remove(checkpoint_path.c_str());
+}
+
+#if defined(__APPLE__) && defined(_PC_CASE_SENSITIVE)
+TEST(rasn_state, checkpoint_rejects_case_only_future_path_alias)
+{
+    const std::string journal_path = configured_state_journal_path();
+    const std::string checkpoint_path = configured_state_checkpoint_path();
+    const std::string marker_path = journal_path + ".quarantine";
+    const std::string parent =
+        ::dsn::utils::filesystem::remove_file_name(marker_path);
+    for (const std::string &path :
+         {journal_path, checkpoint_path, marker_path})
+    {
+        std::remove(path.c_str());
+        std::remove((path + ".tmp").c_str());
+        std::remove((path + ".bak").c_str());
+    }
+
+    state_store store;
+    state_record record;
+    record.key = "unit/case-only-path-alias";
+    record.kind = "observation";
+    record.scope = "unit";
+    record.value = "preserve";
+    ASSERT_TRUE(store.put(record).ok);
+    if (::pathconf((parent.empty() ? "." : parent).c_str(),
+                   _PC_CASE_SENSITIVE) != 0)
+    {
+        std::remove(journal_path.c_str());
+        return;
+    }
+    std::string alias_name =
+        ::dsn::utils::filesystem::get_file_name(marker_path);
+    for (char &character : alias_name)
+    {
+        if (character >= 'a' && character <= 'z')
+        {
+            character = static_cast<char>(character - 'a' + 'A');
+        }
+    }
+    const std::string alias_path =
+        parent.empty()
+            ? alias_name
+            : ::dsn::utils::filesystem::path_combine(parent, alias_name);
+    ASSERT_NE(marker_path, alias_path);
+    state_checkpoint_request checkpoint;
+    checkpoint.path = alias_path;
+    const state_response response = store.checkpoint(checkpoint);
+    EXPECT_FALSE(response.ok);
+    EXPECT_NE(std::string::npos,
+              response.error.find("storage paths overlap"));
+    EXPECT_FALSE(
+        ::dsn::utils::filesystem::file_exists(marker_path));
+
+    std::remove(journal_path.c_str());
+    std::remove(checkpoint_path.c_str());
+    std::remove(marker_path.c_str());
+}
+#endif
+
+TEST(rasn_state, checkpoint_rejects_hard_linked_staging_path)
+{
+    const std::string journal_path = configured_state_journal_path();
+    const std::string checkpoint_path =
+        journal_path + ".hard-link-collision.chkpt";
+    const std::string staging_path = checkpoint_path + ".tmp";
+    for (const std::string &path :
+         {journal_path, checkpoint_path, staging_path})
+    {
+        std::remove(path.c_str());
+    }
+
+    state_store store;
+    state_record record;
+    record.key = "unit/checkpoint-hard-link-collision";
+    record.kind = "observation";
+    record.scope = "unit";
+    record.value = "preserve-journal";
+    ASSERT_TRUE(store.put(record).ok);
+    const hard_link_creation linked =
+        try_create_hard_link(journal_path, staging_path);
+    if (linked == hard_link_creation::unsupported)
+    {
+        std::remove(journal_path.c_str());
+        return;
+    }
+    ASSERT_TRUE(linked == hard_link_creation::created);
+
+    state_checkpoint_request checkpoint;
+    checkpoint.path = checkpoint_path;
+    const state_response collision = store.checkpoint(checkpoint);
+    EXPECT_FALSE(collision.ok);
+    EXPECT_NE(std::string::npos,
+              collision.error.find("storage paths overlap"));
+    EXPECT_EQ("rasn-state-journal-v1\n",
+              read_text_file(journal_path).substr(
+                  0, std::strlen("rasn-state-journal-v1\n")));
+
+    std::remove(staging_path.c_str());
+    std::remove(checkpoint_path.c_str());
+    std::remove(journal_path.c_str());
+}
+
+TEST(rasn_state, custom_export_staging_cannot_alias_recovery_checkpoint)
+{
+    const std::string journal_path = configured_state_journal_path();
+    const std::string checkpoint_path = configured_state_checkpoint_path();
+    const std::string export_path =
+        checkpoint_path + ".hard-link-export";
+    const std::string export_staging = export_path + ".tmp";
+    for (const std::string &path :
+         {journal_path, checkpoint_path, export_path, export_staging})
+    {
+        std::remove(path.c_str());
+    }
+
+    state_store store;
+    state_record record;
+    record.key = "unit/export-recovery-collision";
+    record.kind = "observation";
+    record.scope = "unit";
+    record.value = "preserve-recovery";
+    ASSERT_TRUE(store.put(record).ok);
+    ASSERT_TRUE(store.checkpoint(state_checkpoint_request()).ok);
+    const std::string checkpoint_before = read_text_file(checkpoint_path);
+    const hard_link_creation linked =
+        try_create_hard_link(checkpoint_path, export_staging);
+    if (linked == hard_link_creation::unsupported)
+    {
+        std::remove(journal_path.c_str());
+        std::remove(checkpoint_path.c_str());
+        return;
+    }
+    ASSERT_TRUE(linked == hard_link_creation::created);
+
+    state_checkpoint_request export_request;
+    export_request.path = export_path;
+    const state_response exported = store.checkpoint(export_request);
+    EXPECT_FALSE(exported.ok);
+    EXPECT_NE(std::string::npos,
+              exported.error.find("overlaps recovery checkpoint"));
+    EXPECT_EQ(checkpoint_before, read_text_file(checkpoint_path));
+
+    for (const std::string &path :
+         {journal_path, checkpoint_path, export_path, export_staging})
+    {
+        std::remove(path.c_str());
+    }
+}
+
+TEST(rasn_state, checkpoint_rejects_multiply_linked_staging_file)
+{
+    const std::string checkpoint_path =
+        workspace_temp_file_path("rasn-state-hard-link-staging.chkpt");
+    const std::string staging_path = checkpoint_path + ".tmp";
+    const std::string protected_path =
+        workspace_temp_file_path("rasn-state-hard-link-protected.txt");
+    for (const std::string &path :
+         {checkpoint_path, staging_path, protected_path})
+    {
+        std::remove(path.c_str());
+    }
+    {
+        std::ofstream protected_output(protected_path.c_str(),
+                                       std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(protected_output.good());
+        protected_output << "preserve";
+    }
+    const hard_link_creation linked =
+        try_create_hard_link(protected_path, staging_path);
+    if (linked == hard_link_creation::unsupported)
+    {
+        std::remove(protected_path.c_str());
+        return;
+    }
+    ASSERT_TRUE(linked == hard_link_creation::created);
+
+    state_store store(false);
+    state_record record;
+    record.key = "unit/multiply-linked-staging";
+    record.kind = "observation";
+    record.scope = "unit";
+    record.value = "checkpoint";
+    ASSERT_TRUE(store.put(record).ok);
+    state_checkpoint_request checkpoint;
+    checkpoint.path = checkpoint_path;
+    const state_response response = store.checkpoint(checkpoint);
+    EXPECT_FALSE(response.ok);
+    EXPECT_NE(std::string::npos,
+              response.error.find("unsafe or uninspectable"));
+    EXPECT_EQ("preserve", read_text_file(protected_path));
+    EXPECT_FALSE(
+        ::dsn::utils::filesystem::file_exists(checkpoint_path));
+
+    std::remove(staging_path.c_str());
+    std::remove(protected_path.c_str());
+    std::remove(checkpoint_path.c_str());
+}
+
+#if !defined(_WIN32)
+TEST(rasn_state, checkpoint_rejects_resolved_staging_symlink)
+{
+    const std::string checkpoint_path =
+        workspace_temp_file_path("rasn-state-symlink-staging.chkpt");
+    const std::string staging_path = checkpoint_path + ".tmp";
+    const std::string protected_path =
+        workspace_temp_file_path("rasn-state-symlink-protected.txt");
+    for (const std::string &path :
+         {checkpoint_path, staging_path, protected_path})
+    {
+        std::remove(path.c_str());
+    }
+    {
+        std::ofstream protected_output(protected_path.c_str(),
+                                       std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(protected_output.good());
+        protected_output << "preserve";
+    }
+    ASSERT_EQ(0, ::symlink(protected_path.c_str(), staging_path.c_str()));
+
+    state_store store(false);
+    state_record record;
+    record.key = "unit/resolved-staging-link";
+    record.kind = "observation";
+    record.scope = "unit";
+    record.value = "checkpoint";
+    ASSERT_TRUE(store.put(record).ok);
+    state_checkpoint_request checkpoint;
+    checkpoint.path = checkpoint_path;
+    const state_response response = store.checkpoint(checkpoint);
+    EXPECT_FALSE(response.ok);
+    EXPECT_NE(std::string::npos,
+              response.error.find("link or reparse point"));
+    EXPECT_EQ("preserve", read_text_file(protected_path));
+    EXPECT_FALSE(
+        ::dsn::utils::filesystem::file_exists(checkpoint_path));
+
+    std::remove(staging_path.c_str());
+    std::remove(protected_path.c_str());
+    std::remove(checkpoint_path.c_str());
+}
+
+TEST(rasn_state, recovery_rejects_resolved_checkpoint_symlink)
+{
+    const std::string checkpoint_path =
+        workspace_temp_file_path("rasn-state-symlink-source.chkpt");
+    const std::string alias_path =
+        workspace_temp_file_path("rasn-state-symlink-recovery.chkpt");
+    for (const std::string &path : {checkpoint_path, alias_path})
+    {
+        std::remove(path.c_str());
+        std::remove((path + ".tmp").c_str());
+        std::remove((path + ".bak").c_str());
+    }
+
+    state_store writer(false);
+    state_record record;
+    record.key = "unit/resolved-recovery-link";
+    record.kind = "observation";
+    record.scope = "unit";
+    record.value = "checkpoint";
+    ASSERT_TRUE(writer.put(record).ok);
+    state_checkpoint_request checkpoint;
+    checkpoint.path = checkpoint_path;
+    ASSERT_TRUE(writer.checkpoint(checkpoint).ok);
+    ASSERT_EQ(0, ::symlink(checkpoint_path.c_str(), alias_path.c_str()));
+
+    state_store recovered(false);
+    state_checkpoint_request recovery;
+    recovery.path = alias_path;
+    const state_response response = recovered.recover(recovery);
+    EXPECT_FALSE(response.ok);
+    EXPECT_NE(std::string::npos,
+              response.error.find("link or reparse point"));
+
+    std::remove(alias_path.c_str());
+    std::remove(checkpoint_path.c_str());
+}
+
+TEST(rasn_state, journal_rejects_dangling_symlink_alias)
+{
+    const std::string journal_path = configured_state_journal_path();
+    const std::string checkpoint_path = configured_state_checkpoint_path();
+    std::remove(journal_path.c_str());
+    std::remove(checkpoint_path.c_str());
+    ASSERT_EQ(0, ::symlink(checkpoint_path.c_str(), journal_path.c_str()));
+
+    state_store store;
+    state_record record;
+    record.key = "unit/dangling-journal-link";
+    record.kind = "observation";
+    record.scope = "unit";
+    record.value = "rejected";
+    const state_response stored = store.put(record);
+    EXPECT_FALSE(stored.ok);
+    EXPECT_NE(std::string::npos,
+              stored.error.find("link or reparse point"));
+    EXPECT_FALSE(::dsn::utils::filesystem::file_exists(checkpoint_path));
+
+    std::remove(journal_path.c_str());
+    std::remove(checkpoint_path.c_str());
+}
+#endif
+
+TEST(rasn_state, recovers_legacy_checkpoint_backup)
+{
+    const std::string checkpoint_path =
+        temp_file_path("rasn-state-legacy-backup.chkpt");
+    const std::string backup_path = checkpoint_path + ".bak";
+    std::remove(checkpoint_path.c_str());
+    std::remove(backup_path.c_str());
+
+    state_store source(false);
+    state_record record;
+    record.key = "unit/legacy-backup";
+    record.kind = "observation";
+    record.scope = "unit";
+    record.value = "recoverable";
+    ASSERT_TRUE(source.put(record).ok);
+    state_checkpoint_request checkpoint;
+    checkpoint.path = checkpoint_path;
+    ASSERT_TRUE(source.checkpoint(checkpoint).ok);
+    ASSERT_EQ(0, std::rename(checkpoint_path.c_str(), backup_path.c_str()));
+
+    state_store restored(false);
+    const state_response recovered = restored.recover(checkpoint);
+    ASSERT_TRUE(recovered.ok) << recovered.error;
+    ASSERT_EQ(1u, recovered.records.size());
+    EXPECT_EQ(record.key, recovered.records.front().key);
+    EXPECT_TRUE(::dsn::utils::filesystem::file_exists(checkpoint_path));
+    EXPECT_FALSE(::dsn::utils::filesystem::file_exists(backup_path));
+
+    std::remove(checkpoint_path.c_str());
+    std::remove(backup_path.c_str());
+}
+
+TEST(rasn_state, checkpoint_refreshes_stale_legacy_backup_before_cleanup)
+{
+    const std::string checkpoint_path =
+        temp_file_path("rasn-state-stale-backup.chkpt");
+    const std::string backup_path = checkpoint_path + ".bak";
+    std::remove(checkpoint_path.c_str());
+    std::remove(backup_path.c_str());
+
+    state_store stale(false);
+    state_record old_record;
+    old_record.key = "unit/stale-backup";
+    old_record.kind = "observation";
+    old_record.scope = "unit";
+    old_record.value = "old";
+    ASSERT_TRUE(stale.put(old_record).ok);
+    state_checkpoint_request checkpoint;
+    checkpoint.path = checkpoint_path;
+    ASSERT_TRUE(stale.checkpoint(checkpoint).ok);
+    ASSERT_EQ(0, std::rename(checkpoint_path.c_str(), backup_path.c_str()));
+
+    state_store current(false);
+    state_record new_record = old_record;
+    new_record.value = "current";
+    ASSERT_TRUE(current.put(new_record).ok);
+    ASSERT_TRUE(current.checkpoint(checkpoint).ok);
+    EXPECT_FALSE(::dsn::utils::filesystem::file_exists(backup_path));
+
+    state_store restored(false);
+    const state_response recovered = restored.recover(checkpoint);
+    ASSERT_TRUE(recovered.ok) << recovered.error;
+    ASSERT_EQ(1u, recovered.records.size());
+    EXPECT_EQ("current", recovered.records.front().value);
+
+    std::remove(checkpoint_path.c_str());
+    std::remove(backup_path.c_str());
+}
+
+TEST(rasn_state, recovery_discards_partial_nfs_files_and_keeps_marker)
+{
+    const std::string checkpoint_path = configured_state_checkpoint_path();
+    const std::string journal_path = configured_state_journal_path();
+    const std::string marker_path =
+        checkpoint_path + ".nfs-import.pending";
+    for (const std::string &path :
+         {checkpoint_path, journal_path, marker_path})
+    {
+        std::remove(path.c_str());
+        std::remove((path + ".tmp").c_str());
+    }
+
+    state_store checkpoint_source(false);
+    state_record checkpoint_record;
+    checkpoint_record.key = "unit/incomplete-nfs/checkpoint";
+    checkpoint_record.kind = "observation";
+    checkpoint_record.scope = "unit";
+    checkpoint_record.value = "partial";
+    ASSERT_TRUE(checkpoint_source.put(checkpoint_record).ok);
+    state_checkpoint_request checkpoint;
+    checkpoint.path = checkpoint_path;
+    ASSERT_TRUE(checkpoint_source.checkpoint(checkpoint).ok);
+
+    state_store journal_source;
+    state_record journal_record = checkpoint_record;
+    journal_record.key = "unit/incomplete-nfs/journal";
+    ASSERT_TRUE(journal_source.put(journal_record).ok);
+    write_text_file(marker_path, "rasn-state-nfs-import-v1\n");
+
+    state_store recovered;
+    const state_response response =
+        recovered.recover(state_checkpoint_request());
+    EXPECT_FALSE(response.ok);
+    EXPECT_FALSE(::dsn::utils::filesystem::file_exists(checkpoint_path));
+    EXPECT_FALSE(::dsn::utils::filesystem::file_exists(journal_path));
+    EXPECT_TRUE(::dsn::utils::filesystem::file_exists(marker_path));
+
+    for (const std::string &path :
+         {checkpoint_path, journal_path, marker_path})
+    {
+        std::remove(path.c_str());
+        std::remove((path + ".tmp").c_str());
+    }
+}
+
+TEST(rasn_state, configured_recovery_detects_legacy_checkpoint_backup)
+{
+    const std::string checkpoint_path = configured_state_checkpoint_path();
+    const std::string backup_path = checkpoint_path + ".bak";
+    const std::string journal_path = configured_state_journal_path();
+    std::remove(checkpoint_path.c_str());
+    std::remove(backup_path.c_str());
+    std::remove(journal_path.c_str());
+    state_store source(false);
+    state_record record;
+    record.key = "unit/configured-legacy-backup";
+    record.kind = "observation";
+    record.scope = "unit";
+    record.value = "recoverable";
+    ASSERT_TRUE(source.put(record).ok);
+    ASSERT_TRUE(source.checkpoint(state_checkpoint_request()).ok);
+    ASSERT_EQ(0, std::rename(checkpoint_path.c_str(), backup_path.c_str()));
+
+    EXPECT_TRUE(
+        configured_state_recovery_available(state_checkpoint_request()));
+
+    std::remove(backup_path.c_str());
+}
+
 TEST(rasn_state, delete_prefix_replays_tombstone_and_preserves_newer_records)
 {
     const std::string journal_path = configured_state_journal_path();
@@ -2996,6 +3737,42 @@ TEST(rasn_state, delete_prefix_replays_tombstone_and_preserves_newer_records)
     }
 }
 
+TEST(rasn_state, detailed_delete_prefix_returns_bounded_count)
+{
+    state_store store(false);
+    const std::string prefix = "unit/bounded-delete";
+    for (size_t i = 0; i < 128; ++i)
+    {
+        state_record record;
+        record.key = prefix + "/" + std::to_string(i);
+        record.kind = "observation";
+        record.scope = "unit";
+        record.value = std::string(1024, 'x');
+        ASSERT_TRUE(store.put(record).ok);
+    }
+
+    const state_response before = store.query(state_query_request());
+    ASSERT_TRUE(before.ok);
+    state_delete_prefix_request deletion;
+    deletion.key_prefix = prefix;
+    deletion.max_sequence = before.last_sequence;
+    const state_delete_prefix_result result =
+        store.delete_prefix_detailed(deletion);
+    ASSERT_TRUE(result.response.ok) << result.response.error;
+    EXPECT_EQ(128u, result.deleted_records);
+    EXPECT_TRUE(result.response.records.empty());
+    EXPECT_TRUE(store.query(state_query_request()).records.empty());
+
+    ::dsn::binary_writer writer;
+    marshall(writer, result, DSF_THRIFT_BINARY);
+    ::dsn::binary_reader reader(writer.get_buffer());
+    state_delete_prefix_result decoded;
+    unmarshall(reader, decoded, DSF_THRIFT_BINARY);
+    EXPECT_EQ(result.deleted_records, decoded.deleted_records);
+    EXPECT_EQ(result.response.last_sequence, decoded.response.last_sequence);
+    EXPECT_EQ(result.details_available, decoded.details_available);
+}
+
 TEST(rasn_state, quarantine_sidecar_blocks_state_lifecycle_operations)
 {
     const std::string journal_path = configured_state_journal_path();
@@ -3010,9 +3787,15 @@ TEST(rasn_state, quarantine_sidecar_blocks_state_lifecycle_operations)
         std::remove((path + ".tmp").c_str());
         std::remove((path + ".bak").c_str());
     }
-    write_text_file(marker_path, "unprovable mirror rollback\n");
-
     state_store store;
+    ASSERT_TRUE(store.query(state_query_request()).ok);
+    write_text_file(marker_path, "unprovable mirror rollback\n");
+    EXPECT_FALSE(store.query(state_query_request()).ok);
+    EXPECT_TRUE(store.has_recovery_state(state_checkpoint_request()));
+    std::remove(marker_path.c_str());
+    EXPECT_FALSE(store.query(state_query_request()).ok);
+    EXPECT_TRUE(store.has_recovery_state(state_checkpoint_request()));
+
     state_record record;
     record.key = "unit/quarantined";
     record.kind = "observation";
@@ -3039,9 +3822,12 @@ TEST(rasn_state, quarantine_sidecar_blocks_state_lifecycle_operations)
     EXPECT_FALSE(store.checkpoint(checkpoint).ok);
     EXPECT_FALSE(store.copy_checkpoint(checkpoint, "").ok);
     EXPECT_FALSE(store.recover(checkpoint).ok);
-    EXPECT_TRUE(store.has_recovery_state(state_checkpoint_request()));
+
+    state_store repaired_after_restart;
+    EXPECT_TRUE(repaired_after_restart.query(state_query_request()).ok);
 
     std::remove(marker_path.c_str());
+    std::remove((marker_path + ".tmp").c_str());
     std::remove(quarantined_path.c_str());
     std::remove(checkpoint_path.c_str());
     std::remove((checkpoint_path + ".tmp").c_str());
@@ -3181,12 +3967,15 @@ TEST(rasn_state, inline_lifecycle_commands_recover_before_checkpoint_and_prune)
     const std::string checkpoint_path = configured_state_checkpoint_path();
     const std::string export_path =
         temp_file_path("rasn-state-inline-lifecycle-unit.chkpt");
+    const std::string dash_checkpoint_path =
+        "-rasn-state-cli-" + make_trace_id() + ".chkpt";
     for (const std::string &path :
          {journal_path,
           journal_path + ".quarantine",
           journal_path + ".quarantined",
           checkpoint_path,
-          export_path})
+          export_path,
+          dash_checkpoint_path})
     {
         std::remove(path.c_str());
         std::remove((path + ".tmp").c_str());
@@ -3258,15 +4047,14 @@ TEST(rasn_state, inline_lifecycle_commands_recover_before_checkpoint_and_prune)
         prune_exit = run_rasn_state_command(
             prune_services,
             {"prune",
-             "--prefix",
-             prune_record.key,
-             "--max-sequence",
-             std::to_string(prune_record.sequence),
+             "--prefix=" + prune_record.key,
+             "--max-sequence=" + std::to_string(prune_record.sequence),
              "--apply"});
         prune_output = capture.str();
     }
     EXPECT_EQ(0, prune_exit);
     EXPECT_NE(std::string::npos, prune_output.find("deleted=1"));
+    EXPECT_NE(std::string::npos, prune_output.find("bounded_response=yes"));
     EXPECT_EQ(std::string::npos, prune_output.find(prune_record.value));
 
     state_key_request pruned_key;
@@ -3286,16 +4074,129 @@ TEST(rasn_state, inline_lifecycle_commands_recover_before_checkpoint_and_prune)
     EXPECT_NE(std::string::npos, query_output.find("records=1"));
     EXPECT_NE(std::string::npos, query_output.find("last_sequence="));
 
+    {
+        scoped_cout_capture capture;
+        EXPECT_EQ(0,
+                  run_rasn_state_command(
+                      checkpoint_services,
+                      {"checkpoint", "--", dash_checkpoint_path}));
+        EXPECT_EQ(0,
+                  run_rasn_state_command(
+                      checkpoint_services,
+                      {"recover", "--", dash_checkpoint_path}));
+    }
+
+    state_record dash_record;
+    dash_record.key = "-tenant/" + make_trace_id();
+    dash_record.kind = "observation";
+    dash_record.scope = "-tenant";
+    dash_record.value = "leading-dash-prefix";
+    const state_response dash_stored =
+        checkpoint_services.put_state(dash_record);
+    ASSERT_TRUE(dash_stored.ok) << dash_stored.error;
+    {
+        scoped_cout_capture capture;
+        EXPECT_EQ(0,
+                  run_rasn_state_command(
+                      checkpoint_services,
+                      {"query", "--", dash_record.key}));
+        EXPECT_NE(std::string::npos,
+                  capture.str().find(dash_record.value));
+    }
+    {
+        scoped_cout_capture capture;
+        EXPECT_EQ(
+            0,
+            run_rasn_state_command(
+                checkpoint_services,
+                {"prune",
+                 "--prefix=" + dash_record.key,
+                 "--max-sequence=" +
+                     std::to_string(dash_stored.record.sequence),
+                 "--apply"}));
+    }
+
+    const std::string scoped_key = prefix + "/scope";
+    {
+        scoped_cout_capture capture;
+        EXPECT_EQ(0,
+                  run_rasn_state_command(checkpoint_services,
+                                         {"put", scoped_key, "value"},
+                                         "codepilot"));
+    }
+    state_key_request scoped_request;
+    scoped_request.key = scoped_key;
+    const state_response scoped =
+        global_state_store().get(scoped_request);
+    ASSERT_TRUE(scoped.ok) << scoped.error;
+    EXPECT_EQ("codepilot", scoped.record.scope);
+
+    const std::string bare_key = "inline-lifecycle-" + make_trace_id();
+    {
+        scoped_cout_capture capture;
+        EXPECT_EQ(0,
+                  run_rasn_state_command(checkpoint_services,
+                                         {"put", bare_key, "legacy-value"},
+                                         "codepilot"));
+    }
+    state_key_request bare_request;
+    bare_request.key = "codepilot/" + bare_key;
+    const state_response bare =
+        global_state_store().get(bare_request);
+    ASSERT_TRUE(bare.ok) << bare.error;
+    EXPECT_EQ("codepilot", bare.record.scope);
+    EXPECT_EQ("legacy-value", bare.record.value);
+    {
+        scoped_cout_capture capture;
+        EXPECT_EQ(0,
+                  run_rasn_state_command(
+                      checkpoint_services,
+                      {"get", bare_key},
+                      "codepilot"));
+        EXPECT_NE(std::string::npos, capture.str().find("legacy-value"));
+    }
+
+    {
+        scoped_cout_capture capture;
+        EXPECT_EQ(1,
+                  run_rasn_state_command(
+                      checkpoint_services,
+                      {"migrate",
+                       export_path,
+                       "--prefix=" + prefix,
+                       "--prefix",
+                       prefix}));
+    }
+
+    const std::vector<std::vector<std::string>> invalid_trailing_arguments{
+        {"query", prefix, "ignored"},
+        {"checkpoint", export_path, "ignored"},
+        {"recover", export_path, "--dry-run"},
+        {"query", "--unknown"}};
+    for (const std::vector<std::string> &invalid :
+         invalid_trailing_arguments)
+    {
+        scoped_cout_capture capture;
+        EXPECT_EQ(
+            1, run_rasn_state_command(checkpoint_services, invalid));
+    }
+
     const state_response before_cleanup =
         global_state_store().query(state_query_request());
     ASSERT_TRUE(before_cleanup.ok) << before_cleanup.error;
     state_delete_prefix_request cleanup;
-    cleanup.key_prefix = checkpoint_record.key;
+    cleanup.key_prefix = prefix;
     cleanup.max_sequence = before_cleanup.last_sequence;
+    EXPECT_TRUE(global_state_store().delete_prefix(cleanup).ok);
+    const state_response before_bare_cleanup =
+        global_state_store().query(state_query_request());
+    ASSERT_TRUE(before_bare_cleanup.ok) << before_bare_cleanup.error;
+    cleanup.key_prefix = bare_request.key;
+    cleanup.max_sequence = before_bare_cleanup.last_sequence;
     EXPECT_TRUE(global_state_store().delete_prefix(cleanup).ok);
 
     for (const std::string &path :
-         {journal_path, checkpoint_path, export_path})
+         {journal_path, checkpoint_path, export_path, dash_checkpoint_path})
     {
         std::remove(path.c_str());
         std::remove((path + ".tmp").c_str());

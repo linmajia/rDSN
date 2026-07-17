@@ -840,8 +840,8 @@ rasn/
 | `[rasn.workflow] execution_lease_renew_ms` | Lease renewal interval for active workflow runs. `0` derives a safe interval from the lease TTL. |
 | `[rasn.registry] dynamic_registration/heartbeat_ms/lease_ms/sweep_interval_ms/registration_timeout_ms` | Enables best-effort RPC registration of built-in agents plus rDSN timer-driven heartbeats and lease cleanup. `lease_ms = 0` disables TTL filtering; `sweep_interval_ms = 0` disables active cleanup. |
 | `[rasn.state] checkpoint_dir/checkpoint_file/journal_file/recover_on_start` | Durable state checkpoint and append-only mutation-journal paths. Defaults place checkpoints and journals under `rasn/state`. `recover_on_start` names an explicit recovery checkpoint; if set, recovery failures are surfaced instead of falling back to an empty store. State writes support create-only/expected-sequence conditions, cutoff-guarded prefix deletion with durable tombstones, and migration sequence barriers. A custom checkpoint export retains the configured recovery journal; only checkpointing the configured recovery path can compact it. |
-| `[rasn.state.nfs] enabled/remote_host/remote_port/remote_checkpoint_dir/timeout_ms` | Optional rDSN NFS import source used before state recovery when no local checkpoint or journal exists. Enable `[core] start_nfs` on the importing process and run `dsn.tools.nfs` on the source process. `timeout_ms` defaults to `20000` (20 seconds); use about `5000` for local/LAN interactive CLI fail-fast behavior, and keep `20000` or higher when remote recovery success is more important than command latency. |
-| `[rasn.state.replica] enabled/directory/recover` | Optional local mirror for state checkpoints and journals. When enabled, writes fail explicitly if the mirror cannot be updated, and recovery can seed missing primary state from the replica directory. The default mirror path is `rasn/state/replica`. Keep `directory` non-empty; an empty directory is a configuration error and should block persistence rather than silently disabling recovery protection. |
+| `[rasn.state.nfs] enabled/remote_host/remote_port/remote_checkpoint_dir/timeout_ms` | Optional rDSN NFS cold-seed source used only when both local checkpoint and journal are absent after local-replica recovery. It never mixes an unversioned remote artifact with a local generation. Every attempt gets a fresh staging subdirectory, so shorter files and a timed-out copy cannot contaminate a retry; completed failed attempts are removed, while a possibly active timed-out directory is never reused. A durable pending marker remains through cleanup/retry and is removed only after recovery parsing succeeds. Enable `[core] start_nfs` on the importing process and run `dsn.tools.nfs` on the source process. `timeout_ms` defaults to `20000` (20 seconds); use about `5000` for local/LAN interactive CLI fail-fast behavior, and keep `20000` or higher when remote recovery success is more important than command latency. |
+| `[rasn.state.replica] enabled/directory/recover` | Optional local mirror for state checkpoints and journals. When enabled, writes fail explicitly if the mirror cannot be updated, and recovery restores each missing primary artifact independently from the replica directory. The default mirror path is `rasn/state/replica`. Keep `directory` non-empty and distinct from primary storage; startup rejects any primary/replica destination, staging name, case alias, link, or shared basename mapping that could overlap. |
 | `[rasn.runtime] trace_file` | JSONL file for runtime traces. Defaults use `rasn/traces/<app>.trace.jsonl`; the trace writer creates parent directories. |
 | `[rasn.runtime] temp_dir` | Optional temporary directory for request bodies and curl config files. Empty or `.` uses the OS temp directory under `rasn-provider`. |
 | `[rasn.metrics] enabled` | Enables rDSN `perf_counter`-backed runtime metrics (event counters and task/model/tool latency percentiles in section `rasn`). Default `true`; `false` makes every counter update a no-op. Surface them with `observe metrics [text|prometheus|json]` or the `rasn.metrics` rDSN command. |
@@ -1174,6 +1174,8 @@ three-replica `rasn.state.replicated` development cluster. Point runtime hosts a
 `state_uri = dsn://rasn-cluster/rasn-state`; applications and runtime modules keep
 the same state API. The single-machine profile validates quorum behavior but must
 be split into independently supervised replica nodes for host-failure tolerance.
+Replicated state startup also verifies that every mutating RPC is classified as an
+rDSN write, so an older/custom profile cannot silently bypass quorum after upgrade.
 
 For direct runtime-module replication, launch
 `config.rasn.runtime.replicated.ini` instead. It creates eleven native rDSN
@@ -1491,7 +1493,10 @@ replicated placement.
 > resumable, sequence-preserving import into the configured state service, and
 > `state prune --prefix ... --max-sequence ... [--apply]` for cutoff-guarded
 > **logical deletion of an explicitly obsolete namespace**. Compaction never
-> deletes active mirror keys: module hydration still queries them. When hydration is enabled, a module
+> deletes active mirror keys: module hydration still queries them.
+> Prefixes beginning with `-` use the unambiguous `--prefix=-tenant/...`
+> form; use `--` before a leading-dash query prefix or checkpoint/recovery path.
+> When hydration is enabled, a module
 > service refuses to open its RPC API if the configured state service cannot be
 > queried; disable hydration only for intentionally cold local experiments. In `hybrid` mode,
 > flipping a module from `local` to `remote` is still a cold migration:
@@ -1499,11 +1504,32 @@ replicated placement.
 > previously local state unless the operator explicitly migrates it.
 > For cross-host state-service migration, create/copy the export where the CLI can
 > read it, then repoint `[rasn.service]` to the destination before the dry run.
+> Quiesce all destination state-service writers for `--apply`; migration detects
+> sequence/prefix changes and fails resumably rather than claiming an atomic import.
+> It checks each CAS response/sequence inline and performs full-prefix comparison
+> at preflight, after the sequence barrier, and at completion, keeping transfer
+> cost linear in checkpoint size.
 > Direct local state commands recover configured durable state once before any
 > read, mutation, checkpoint, or prune and cache recovery failures fail-closed.
 > An unprovable primary/replica journal rollback fail-stops and leaves quarantine
-> evidence; repair it offline from a verified checkpoint/journal and restart.
+> evidence beside the affected primary or replica journal; repair both sides
+> offline from a verified checkpoint/journal and restart.
 > Removing only a sidecar must not be used to bypass an in-journal quarantine marker.
+> Standalone journals flush before mutation acknowledgement, checkpoint/replica
+> files flush before replacement, and apply-mode prune avoids a full-value preflight
+> and uses a bounded count-only response when the state service supports the detailed
+> RPC. Checkpoint replacement refreshes any legacy `.bak` before installing the
+> new image and refuses journal compaction unless that alias is durably removed.
+> Storage validation rejects leaf symlinks/reparse points, recovery reads use
+> no-follow opens, and live journals, trusted recovery inputs, and stale staging
+> must be regular single-link files. Keep every ancestor directory operator-owned
+> and non-writable by untrusted users; parent symlinks and mounts remain supported.
+> Local file copies use
+> checked, size-bounded reads before flush/replacement, and deletion retries flush
+> the parent directory even when the target name is already absent. Custom export
+> staging is also checked against configured primary/replica checkpoint lifecycles;
+> only a distinct live hard-link export entry itself may alias the source because
+> replacement detaches that entry before writing.
 
 For the full architecture, provider model, resilience contracts, consistency
 models, and the multi-node roadmap, see

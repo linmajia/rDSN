@@ -639,6 +639,15 @@ std::vector<schema_type_descriptor> rasn_schema_manifest()
             field("journal_compacted", "bool", false),
             field("details_available", "bool", true)}));
     manifest.push_back(schema(
+        "state_delete_prefix_result",
+        RASN_AGENT_SCHEMA_VERSION,
+        "Bounded delete-prefix response carrying the affected-record count.",
+        std::vector<schema_field_descriptor>{
+            field("schema_version", "uint32", true),
+            field("response", "state_response", true),
+            field("deleted_records", "uint64", true),
+            field("details_available", "bool", true)}));
+    manifest.push_back(schema(
         "workflow_node",
         RASN_AGENT_SCHEMA_VERSION,
         "Declarative workflow node compiled into an executable agent graph.",
@@ -699,6 +708,7 @@ std::vector<rpc_operation_descriptor> rasn_rpc_operation_manifest()
     operations.push_back(operation("rasn.state", "state_rpc_client", "get", "RPC_RASN_STATE_GET", "state_key_request", "state_response"));
     operations.push_back(operation("rasn.state", "state_rpc_client", "query", "RPC_RASN_STATE_QUERY", "state_query_request", "state_response"));
     operations.push_back(operation("rasn.state", "state_rpc_client", "delete_prefix", "RPC_RASN_STATE_DELETE_PREFIX", "state_delete_prefix_request", "state_response"));
+    operations.push_back(operation("rasn.state", "state_rpc_client", "delete_prefix_detailed", "RPC_RASN_STATE_DELETE_PREFIX_DETAILED", "state_delete_prefix_request", "state_delete_prefix_result"));
     operations.push_back(operation("rasn.state", "state_rpc_client", "advance_sequence", "RPC_RASN_STATE_ADVANCE_SEQUENCE", "state_sequence_barrier_request", "state_response"));
     operations.push_back(operation("rasn.state", "state_rpc_client", "checkpoint", "RPC_RASN_STATE_CHECKPOINT", "state_checkpoint_request", "state_response"));
     operations.push_back(operation("rasn.state", "state_rpc_client", "checkpoint_detailed", "RPC_RASN_STATE_CHECKPOINT_DETAILED", "state_checkpoint_request", "state_checkpoint_result"));

@@ -87,6 +87,14 @@ struct state_checkpoint_result
     bool details_available = true;
 };
 
+struct state_delete_prefix_result
+{
+    uint32_t schema_version = RASN_AGENT_SCHEMA_VERSION;
+    state_response response;
+    uint64_t deleted_records = 0;
+    bool details_available = true;
+};
+
 inline void marshall(::dsn::binary_writer &writer, const state_record &value, ::dsn_msg_serialize_format fmt)
 {
     writer.write(value.schema_version);
@@ -264,6 +272,26 @@ inline void unmarshall(::dsn::binary_reader &reader,
     reader.read(value.details_available);
 }
 
+inline void marshall(::dsn::binary_writer &writer,
+                     const state_delete_prefix_result &value,
+                     ::dsn_msg_serialize_format fmt)
+{
+    writer.write(value.schema_version);
+    marshall(writer, value.response, fmt);
+    writer.write(value.deleted_records);
+    writer.write(value.details_available);
+}
+
+inline void unmarshall(::dsn::binary_reader &reader,
+                       state_delete_prefix_result &value,
+                       ::dsn_msg_serialize_format fmt)
+{
+    reader.read(value.schema_version);
+    unmarshall(reader, value.response, fmt);
+    reader.read(value.deleted_records);
+    reader.read(value.details_available);
+}
+
 class state_store
 {
 public:
@@ -274,6 +302,8 @@ public:
     state_response get(const state_key_request &request) const;
     state_response query(const state_query_request &request) const;
     state_response delete_prefix(const state_delete_prefix_request &request);
+    state_delete_prefix_result
+    delete_prefix_detailed(const state_delete_prefix_request &request);
     state_response advance_sequence(const state_sequence_barrier_request &request);
     state_response checkpoint(const state_checkpoint_request &request) const;
     state_checkpoint_result
@@ -286,13 +316,18 @@ public:
     bool has_recovery_state(const state_checkpoint_request &request) const;
 
 private:
+    state_delete_prefix_result
+    delete_prefix_impl(const state_delete_prefix_request &request,
+                       bool include_deleted_records);
     state_response import_checkpoint(const state_checkpoint_request &request,
                                      const std::string &durable_path,
                                      bool replace);
     state_response error_response(const std::string &error) const;
     std::string default_checkpoint_path() const;
     std::string default_journal_path() const;
+    std::string quarantine_error() const;
     bool journal_is_quarantined() const;
+    bool validate_default_storage_paths(std::string *error) const;
     bool append_journal_record(const state_record &record, std::string *error) const;
     bool append_journal_delete_prefix(const state_delete_prefix_request &request,
                                       uint64_t operation_sequence,
@@ -300,9 +335,13 @@ private:
     bool append_journal_sequence_barrier(const state_sequence_barrier_request &request,
                                          std::string *error) const;
 
-    // Serializes mutation/checkpoint/recovery lifecycles while _lock protects
-    // short in-memory map accesses and read queries.
+    // Checkpoint/import/recovery file lifecycles serialize independently from
+    // mutations. Mutations may continue while a checkpoint snapshot is written;
+    // the epoch guard then keeps the journal when the snapshot was superseded.
+    mutable ::dsn::service::zlock _checkpoint_lock;
     mutable ::dsn::service::zlock _mutation_lock;
+    // Protects only short in-memory map accesses and read queries. No disk or
+    // replica-mirror I/O is performed while this lock is held.
     mutable ::dsn::service::zlock _lock;
     std::map<std::string, state_record> _records;
     uint64_t _last_sequence = 0;
@@ -312,7 +351,13 @@ private:
     // Standalone stores journal before exposing writes. Type-1 replicated stores
     // disable this because rDSN's quorum mutation log is their durability source.
     const bool _journal_enabled;
-    mutable std::atomic<int> _quarantine_state{-1};
+    // Quarantine is monotonic for a live store: check disk until evidence is
+    // observed, then require offline repair plus restart before serving again.
+    mutable std::atomic<bool> _quarantine_seen{false};
+    mutable ::dsn::service::zlock _storage_validation_lock;
+    mutable bool _storage_validation_checked = false;
+    mutable bool _storage_validation_ok = false;
+    mutable std::string _storage_validation_error;
 };
 
 std::string configured_state_checkpoint_path();
@@ -341,6 +386,9 @@ protected:
     void on_query(const state_query_request &request, ::dsn::rpc_replier<state_response> &reply);
     void on_delete_prefix(const state_delete_prefix_request &request,
                           ::dsn::rpc_replier<state_response> &reply);
+    void on_delete_prefix_detailed(
+        const state_delete_prefix_request &request,
+        ::dsn::rpc_replier<state_delete_prefix_result> &reply);
     void on_advance_sequence(const state_sequence_barrier_request &request,
                              ::dsn::rpc_replier<state_response> &reply);
     void on_checkpoint(const state_checkpoint_request &request, ::dsn::rpc_replier<state_response> &reply);
@@ -388,6 +436,13 @@ public:
                        std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
                        int thread_hash = 0,
                        uint64_t partition_hash = 0);
+
+    std::pair< ::dsn::error_code, state_delete_prefix_result>
+    delete_prefix_detailed_sync(
+        const state_delete_prefix_request &request,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
+        int thread_hash = 0,
+        uint64_t partition_hash = 0);
 
     std::pair< ::dsn::error_code, state_response>
     advance_sequence_sync(const state_sequence_barrier_request &request,

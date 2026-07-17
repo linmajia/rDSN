@@ -3,19 +3,27 @@
 #include <dsn/cpp/clientlet.h>
 #include <dsn/cpp/utils.h>
 #include <dsn/service_api_cpp.h>
+#include <dsn/tool-api/task_spec.h>
 
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
-#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <memory>
 #include <sstream>
 
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #include <fcntl.h>
 #include <io.h>
 #include <share.h>
@@ -53,6 +61,32 @@ struct nfs_copy_result
     size_t size = 0;
 };
 
+class nfs_attempt_directory_cleanup
+{
+public:
+    explicit nfs_attempt_directory_cleanup(std::string path)
+        : _path(std::move(path))
+    {
+    }
+
+    ~nfs_attempt_directory_cleanup()
+    {
+        if (!_preserve &&
+            ::dsn::utils::filesystem::path_exists(_path) &&
+            !::dsn::utils::filesystem::remove_path(_path))
+        {
+            dwarn("could not remove completed rASN NFS import staging directory: %s",
+                  _path.c_str());
+        }
+    }
+
+    void preserve() { _preserve = true; }
+
+private:
+    std::string _path;
+    bool _preserve = false;
+};
+
 struct state_replica_config
 {
     bool enabled = false;
@@ -75,6 +109,11 @@ struct state_journal_append_token
 };
 
 bool ensure_parent_directory(const std::string &path, std::string *error);
+std::string path_parent_or_current(const std::string &path);
+bool write_durable_state_text_file(const std::string &path,
+                                   const std::string &content,
+                                   const std::string &description,
+                                   std::string *error);
 void write_state_record_line(std::ostream &output, const state_record &record);
 std::string hex_encode(const std::string &value);
 bool valid_state_key(const std::string &key);
@@ -92,10 +131,16 @@ std::string state_journal_quarantined_file(const std::string &path)
     return path + ".quarantined";
 }
 
+std::string state_nfs_import_marker(const std::string &checkpoint_path)
+{
+    return checkpoint_path + ".nfs-import.pending";
+}
+
 bool state_journal_is_quarantined(const std::string &path)
 {
-    return ::dsn::utils::filesystem::file_exists(
-               state_journal_quarantine_marker(path)) ||
+    const std::string marker = state_journal_quarantine_marker(path);
+    return ::dsn::utils::filesystem::file_exists(marker) ||
+           ::dsn::utils::filesystem::file_exists(marker + ".tmp") ||
            ::dsn::utils::filesystem::file_exists(
                state_journal_quarantined_file(path));
 }
@@ -103,17 +148,81 @@ bool state_journal_is_quarantined(const std::string &path)
 int open_state_journal(const std::string &path)
 {
 #if defined(_WIN32)
+    const HANDLE handle = ::CreateFileA(
+        path.c_str(),
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+        nullptr);
+    if (handle == INVALID_HANDLE_VALUE)
+    {
+        return -1;
+    }
+    BY_HANDLE_FILE_INFORMATION info;
+    if (::GetFileInformationByHandle(handle, &info) == 0 ||
+        (info.dwFileAttributes &
+         (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) != 0 ||
+        info.nNumberOfLinks != 1)
+    {
+        ::CloseHandle(handle);
+        return -1;
+    }
+    const int fd = ::_open_osfhandle(
+        reinterpret_cast<intptr_t>(handle),
+        _O_BINARY | _O_RDWR | _O_APPEND);
+    if (fd < 0)
+    {
+        ::CloseHandle(handle);
+    }
+    return fd;
+#else
+    int flags = O_CREAT | O_RDWR | O_APPEND;
+#if defined(O_NOFOLLOW)
+    flags |= O_NOFOLLOW;
+#endif
+    const int fd = ::open(
+        path.c_str(),
+        flags,
+        S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
+    if (fd < 0)
+    {
+        return -1;
+    }
+    struct stat info;
+    struct stat path_info;
+    if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) ||
+        info.st_nlink != 1 ||
+        ::lstat(path.c_str(), &path_info) != 0 ||
+        S_ISLNK(path_info.st_mode) || path_info.st_dev != info.st_dev ||
+        path_info.st_ino != info.st_ino)
+    {
+        (void)::close(fd);
+        return -1;
+    }
+    return fd;
+#endif
+}
+
+int open_exclusive_state_file(const std::string &path)
+{
+#if defined(_WIN32)
     int fd = -1;
-    const errno_t result = _sopen_s(&fd,
-                                    path.c_str(),
-                                    _O_BINARY | _O_CREAT | _O_RDWR | _O_APPEND,
-                                    _SH_DENYNO,
-                                    _S_IREAD | _S_IWRITE);
+    const errno_t result = ::_sopen_s(&fd,
+                                      path.c_str(),
+                                      _O_BINARY | _O_CREAT | _O_EXCL | _O_WRONLY,
+                                      _SH_DENYRW,
+                                      _S_IREAD | _S_IWRITE);
     return result == 0 ? fd : -1;
 #else
+    int flags = O_CREAT | O_EXCL | O_WRONLY;
+#if defined(O_NOFOLLOW)
+    flags |= O_NOFOLLOW;
+#endif
     return ::open(path.c_str(),
-                  O_CREAT | O_RDWR | O_APPEND,
-                  S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
+                  flags,
+                  S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
 #endif
 }
 
@@ -158,6 +267,33 @@ int64_t write_state_journal(int fd, const char *data, size_t size)
 #endif
 }
 
+bool write_all_state_file(int fd, const char *data, size_t size)
+{
+    size_t written_total = 0;
+    while (written_total < size)
+    {
+#if defined(_WIN32)
+        const size_t chunk =
+            (std::min)(size - written_total,
+                       static_cast<size_t>((std::numeric_limits<int>::max)()));
+#else
+        const size_t chunk = size - written_total;
+#endif
+        int64_t written = -1;
+        do
+        {
+            written = write_state_journal(
+                fd, data + written_total, chunk);
+        } while (written < 0 && errno == EINTR);
+        if (written <= 0)
+        {
+            return false;
+        }
+        written_total += static_cast<size_t>(written);
+    }
+    return true;
+}
+
 bool truncate_state_journal(int fd, int64_t size)
 {
 #if defined(_WIN32)
@@ -174,6 +310,769 @@ void close_state_journal(int fd)
 #else
     (void)::close(fd);
 #endif
+}
+
+int open_state_file_read_only(const std::string &path, int64_t *size)
+{
+#if defined(_WIN32)
+    const HANDLE handle = ::CreateFileA(
+        path.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+        nullptr);
+    if (handle == INVALID_HANDLE_VALUE)
+    {
+        return -1;
+    }
+    BY_HANDLE_FILE_INFORMATION info;
+    LARGE_INTEGER file_size;
+    if (::GetFileInformationByHandle(handle, &info) == 0 ||
+        (info.dwFileAttributes &
+         (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) != 0 ||
+        info.nNumberOfLinks != 1 ||
+        ::GetFileSizeEx(handle, &file_size) == 0)
+    {
+        ::CloseHandle(handle);
+        return -1;
+    }
+    const int fd = ::_open_osfhandle(
+        reinterpret_cast<intptr_t>(handle), _O_BINARY | _O_RDONLY);
+    if (fd < 0)
+    {
+        ::CloseHandle(handle);
+        return -1;
+    }
+    if (size != nullptr)
+    {
+        *size = static_cast<int64_t>(file_size.QuadPart);
+    }
+    return fd;
+#else
+    int flags = O_RDONLY;
+#if defined(O_CLOEXEC)
+    flags |= O_CLOEXEC;
+#endif
+#if defined(O_NOFOLLOW)
+    flags |= O_NOFOLLOW;
+#endif
+    const int fd = ::open(path.c_str(), flags);
+    if (fd < 0)
+    {
+        return -1;
+    }
+    struct stat info;
+    struct stat path_info;
+    if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) ||
+        info.st_nlink != 1 ||
+        ::lstat(path.c_str(), &path_info) != 0 ||
+        S_ISLNK(path_info.st_mode) || path_info.st_dev != info.st_dev ||
+        path_info.st_ino != info.st_ino)
+    {
+        close_state_journal(fd);
+        return -1;
+    }
+    if (size != nullptr)
+    {
+        *size = static_cast<int64_t>(info.st_size);
+    }
+    return fd;
+#endif
+}
+
+int open_state_file_for_sync(const std::string &path)
+{
+#if defined(_WIN32)
+    const HANDLE handle = ::CreateFileA(
+        path.c_str(),
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+        nullptr);
+    if (handle == INVALID_HANDLE_VALUE)
+    {
+        return -1;
+    }
+    BY_HANDLE_FILE_INFORMATION info;
+    if (::GetFileInformationByHandle(handle, &info) == 0 ||
+        (info.dwFileAttributes &
+         (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) != 0 ||
+        info.nNumberOfLinks != 1)
+    {
+        ::CloseHandle(handle);
+        return -1;
+    }
+    const int fd = ::_open_osfhandle(
+        reinterpret_cast<intptr_t>(handle), _O_BINARY | _O_RDWR);
+    if (fd < 0)
+    {
+        ::CloseHandle(handle);
+    }
+    return fd;
+#else
+    int flags = O_RDWR;
+#if defined(O_CLOEXEC)
+    flags |= O_CLOEXEC;
+#endif
+#if defined(O_NOFOLLOW)
+    flags |= O_NOFOLLOW;
+#endif
+    const int fd = ::open(path.c_str(), flags);
+    if (fd < 0)
+    {
+        return -1;
+    }
+    struct stat info;
+    struct stat path_info;
+    if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) ||
+        info.st_nlink != 1 ||
+        ::lstat(path.c_str(), &path_info) != 0 ||
+        S_ISLNK(path_info.st_mode) || path_info.st_dev != info.st_dev ||
+        path_info.st_ino != info.st_ino)
+    {
+        close_state_journal(fd);
+        return -1;
+    }
+    return fd;
+#endif
+}
+
+FILE *open_state_file_stream(const std::string &path)
+{
+    const int fd = open_state_file_read_only(path, nullptr);
+    if (fd < 0)
+    {
+        return nullptr;
+    }
+#if defined(_WIN32)
+    FILE *stream = ::_fdopen(fd, "rb");
+#else
+    FILE *stream = ::fdopen(fd, "rb");
+#endif
+    if (stream == nullptr)
+    {
+        close_state_journal(fd);
+    }
+    return stream;
+}
+
+enum class state_file_line_result
+{
+    complete,
+    unterminated,
+    end,
+    error
+};
+
+state_file_line_result read_state_file_line(FILE *stream, std::string *line)
+{
+    line->clear();
+    while (true)
+    {
+        const int character = std::fgetc(stream);
+        if (character == '\n')
+        {
+            return state_file_line_result::complete;
+        }
+        if (character == EOF)
+        {
+            if (std::ferror(stream) != 0)
+            {
+                return state_file_line_result::error;
+            }
+            return line->empty() ? state_file_line_result::end
+                                 : state_file_line_result::unterminated;
+        }
+        line->push_back(static_cast<char>(character));
+    }
+}
+
+bool sync_state_file_descriptor(int fd, bool regular_file = true)
+{
+    (void)regular_file;
+    int result = -1;
+    do
+    {
+#if defined(_WIN32)
+        // _commit delegates to the Windows durable-file flush primitive.
+        result = ::_commit(fd);
+#elif defined(__APPLE__)
+        result = regular_file ? ::fcntl(fd, F_FULLFSYNC) : ::fsync(fd);
+#else
+        result = ::fsync(fd);
+#endif
+    } while (result != 0 && errno == EINTR);
+    return result == 0;
+}
+
+bool sync_state_file(const std::string &path,
+                     const std::string &description,
+                     std::string *error)
+{
+    const int fd = open_state_file_for_sync(path);
+    if (fd < 0)
+    {
+        if (error != nullptr)
+        {
+            *error = "failed to open " + description + " for durable flush: " +
+                     path;
+        }
+        return false;
+    }
+    const bool synced = sync_state_file_descriptor(fd);
+    close_state_journal(fd);
+    if (!synced && error != nullptr)
+    {
+        *error = "failed to durably flush " + description + ": " + path;
+    }
+    return synced;
+}
+
+bool sync_state_directory(const std::string &directory,
+                          const std::string &description,
+                          std::string *error)
+{
+#if defined(_WIN32)
+    // File replacement uses MOVEFILE_WRITE_THROUGH below. Windows has no
+    // portable CRT directory-fsync equivalent, so no second flush is required.
+    (void)directory;
+    (void)description;
+    (void)error;
+    return true;
+#else
+    int flags = O_RDONLY;
+#if defined(O_DIRECTORY)
+    flags |= O_DIRECTORY;
+#endif
+    const int fd = ::open(directory.c_str(), flags);
+    if (fd < 0)
+    {
+        if (error != nullptr)
+        {
+            *error = "failed to open " + description +
+                     " directory for durable flush: " + directory;
+        }
+        return false;
+    }
+    const bool synced = sync_state_file_descriptor(fd, false);
+    close_state_journal(fd);
+    if (!synced && error != nullptr)
+    {
+        *error = "failed to durably flush " + description +
+                 " directory: " + directory;
+    }
+    return synced;
+#endif
+}
+
+bool durable_rename_state_path(const std::string &source,
+                               const std::string &destination,
+                               const std::string &description,
+                               std::string *error)
+{
+    if (source == destination)
+    {
+        return true;
+    }
+#if defined(_WIN32)
+    if (::MoveFileExA(source.c_str(),
+                      destination.c_str(),
+                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0)
+    {
+        if (error != nullptr)
+        {
+            *error = "failed to durably move " + description + " into place: " +
+                     destination + " (win32=" +
+                     std::to_string(static_cast<unsigned long>(::GetLastError())) +
+                     ")";
+        }
+        return false;
+    }
+    return true;
+#else
+    if (!::dsn::utils::filesystem::rename_path(source, destination))
+    {
+        if (error != nullptr)
+        {
+            *error = "failed to move " + description + " into place: " +
+                     destination;
+        }
+        return false;
+    }
+    const std::string source_directory = path_parent_or_current(source);
+    const std::string destination_directory =
+        path_parent_or_current(destination);
+    if (!sync_state_directory(destination_directory, description, error))
+    {
+        return false;
+    }
+    return source_directory == destination_directory ||
+           sync_state_directory(source_directory, description, error);
+#endif
+}
+
+bool durable_remove_state_path(const std::string &path,
+                               const std::string &description,
+                               std::string *error)
+{
+    if (!::dsn::utils::filesystem::path_exists(path))
+    {
+#if !defined(_WIN32)
+        const std::string parent = path_parent_or_current(path);
+        if (::dsn::utils::filesystem::directory_exists(parent))
+        {
+            return sync_state_directory(parent, description, error);
+        }
+#endif
+        return true;
+    }
+#if defined(_WIN32)
+    // Persist removal of the live name first. A crash may leave the ignored
+    // delete staging file, but can never resurrect the original journal name.
+    const std::string delete_path = path + ".delete.tmp";
+    if (::MoveFileExA(path.c_str(),
+                      delete_path.c_str(),
+                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0)
+    {
+        if (error != nullptr)
+        {
+            *error = "failed to durably remove " + description + ": " + path +
+                     " (win32=" +
+                     std::to_string(static_cast<unsigned long>(::GetLastError())) +
+                     ")";
+        }
+        return false;
+    }
+    (void)::DeleteFileA(delete_path.c_str());
+    return true;
+#else
+    if (!::dsn::utils::filesystem::remove_path(path))
+    {
+        if (error != nullptr)
+        {
+            *error = "failed to remove " + description + ": " + path;
+        }
+        return false;
+    }
+    return sync_state_directory(
+        path_parent_or_current(path), description, error);
+#endif
+}
+
+bool prepare_exclusive_state_staging_file(const std::string &path,
+                                          const std::string &description,
+                                          int *fd,
+                                          std::string *error)
+{
+#if defined(_WIN32)
+    const DWORD attributes = ::GetFileAttributesA(path.c_str());
+    bool unsafe_entry = false;
+    if (attributes != INVALID_FILE_ATTRIBUTES)
+    {
+        const HANDLE handle = ::CreateFileA(
+            path.c_str(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            nullptr);
+        BY_HANDLE_FILE_INFORMATION info;
+        unsafe_entry =
+            handle == INVALID_HANDLE_VALUE ||
+            ::GetFileInformationByHandle(handle, &info) == 0 ||
+            (info.dwFileAttributes &
+             (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) != 0 ||
+            info.nNumberOfLinks != 1;
+        if (handle != INVALID_HANDLE_VALUE)
+        {
+            ::CloseHandle(handle);
+        }
+    }
+    else
+    {
+        const DWORD open_error = ::GetLastError();
+        unsafe_entry = open_error != ERROR_FILE_NOT_FOUND &&
+                       open_error != ERROR_PATH_NOT_FOUND;
+    }
+#else
+    struct stat entry;
+    const int status = ::lstat(path.c_str(), &entry);
+    const bool unsafe_entry =
+        status == 0 ? (!S_ISREG(entry.st_mode) || entry.st_nlink != 1)
+                    : errno != ENOENT;
+#endif
+    if (unsafe_entry)
+    {
+        if (error != nullptr)
+        {
+            *error = "refusing to replace unsafe or uninspectable " +
+                     description + " staging path: " + path;
+        }
+        return false;
+    }
+#if defined(_WIN32)
+    const bool removed = ::DeleteFileA(path.c_str()) != 0;
+    const DWORD remove_error = removed ? ERROR_SUCCESS : ::GetLastError();
+    const bool absent = remove_error == ERROR_FILE_NOT_FOUND ||
+                        remove_error == ERROR_PATH_NOT_FOUND;
+#else
+    int remove_result = -1;
+    do
+    {
+        remove_result = ::unlink(path.c_str());
+    } while (remove_result != 0 && errno == EINTR);
+    const bool removed = remove_result == 0;
+    const bool absent = !removed && errno == ENOENT;
+#endif
+    if ((!removed && !absent) ||
+        !sync_state_directory(path_parent_or_current(path),
+                              description + " stale staging removal",
+                              error))
+    {
+        if (!removed && !absent && error != nullptr)
+        {
+            *error = "failed to safely remove " + description +
+                     " stale staging file: " + path;
+        }
+        return false;
+    }
+    const int opened = open_exclusive_state_file(path);
+    if (opened < 0)
+    {
+        if (error != nullptr)
+        {
+            *error = "failed to exclusively create " + description +
+                     " staging file: " + path;
+        }
+        return false;
+    }
+    if (fd != nullptr)
+    {
+        *fd = opened;
+    }
+    else
+    {
+        close_state_journal(opened);
+    }
+    return true;
+}
+
+bool cleanup_pending_nfs_state_import(const std::string &checkpoint_path,
+                                      const std::string &journal_path,
+                                      std::string *error)
+{
+    const std::string marker = state_nfs_import_marker(checkpoint_path);
+    const std::string marker_temp = marker + ".tmp";
+    if (!::dsn::utils::filesystem::file_exists(marker) &&
+        !::dsn::utils::filesystem::file_exists(marker_temp))
+    {
+        const std::string checkpoint_parent =
+            path_parent_or_current(checkpoint_path);
+        const std::string journal_parent =
+            path_parent_or_current(journal_path);
+        return sync_state_directory(
+                   checkpoint_parent, "NFS recovery cleanup", error) &&
+               (checkpoint_parent == journal_parent ||
+                sync_state_directory(
+                    journal_parent, "NFS recovery cleanup", error));
+    }
+
+    // Refresh the canonical marker before deleting any partial destination. It
+    // remains authoritative across replica/NFS retry and is removed only after
+    // the recovered image has parsed successfully.
+    if (!write_durable_state_text_file(marker,
+                                       "rasn-state-nfs-import-v1\n",
+                                       "pending NFS state import marker",
+                                       error) ||
+        !durable_remove_state_path(
+            checkpoint_path, "partial NFS checkpoint import", error) ||
+        !durable_remove_state_path(
+            journal_path, "partial NFS journal import", error) ||
+        !sync_state_directory(path_parent_or_current(marker),
+                              "pending NFS state import marker",
+                              error))
+    {
+        return false;
+    }
+    dwarn("discarded incomplete rASN NFS recovery import checkpoint=%s",
+          checkpoint_path.c_str());
+    return true;
+}
+
+bool resolve_state_path_entry_identity(const std::string &path,
+                                       std::string *identity)
+{
+    const std::string file_name =
+        ::dsn::utils::filesystem::get_file_name(path);
+    const std::string parent = path_parent_or_current(path);
+#if defined(_WIN32)
+    const HANDLE parent_handle = ::CreateFileA(
+        parent.c_str(),
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        nullptr);
+    if (!file_name.empty() && parent_handle != INVALID_HANDLE_VALUE)
+    {
+        std::vector<char> resolved(32768, '\0');
+        const DWORD length = ::GetFinalPathNameByHandleA(
+            parent_handle,
+            resolved.data(),
+            static_cast<DWORD>(resolved.size()),
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        ::CloseHandle(parent_handle);
+        if (length > 0 && length < resolved.size())
+        {
+            if (identity != nullptr)
+            {
+                *identity = ::dsn::utils::filesystem::path_combine(
+                    std::string(resolved.data(), length), file_name);
+            }
+            return true;
+        }
+    }
+    else if (parent_handle != INVALID_HANDLE_VALUE)
+    {
+        ::CloseHandle(parent_handle);
+    }
+#endif
+    std::string absolute_parent;
+#if !defined(_WIN32)
+    char *resolved_parent = ::realpath(parent.c_str(), nullptr);
+    if (resolved_parent != nullptr)
+    {
+        absolute_parent.assign(resolved_parent);
+        std::free(resolved_parent);
+    }
+#endif
+    if (file_name.empty() ||
+        (absolute_parent.empty() &&
+         !::dsn::utils::filesystem::get_absolute_path(
+             parent, absolute_parent)))
+    {
+        return false;
+    }
+    if (identity != nullptr)
+    {
+        *identity =
+            ::dsn::utils::filesystem::path_combine(absolute_parent, file_name);
+    }
+    return true;
+}
+
+#if defined(__APPLE__)
+std::string fold_ascii_state_path_component(std::string value)
+{
+    for (char &character : value)
+    {
+        if (character >= 'A' && character <= 'Z')
+        {
+            character = static_cast<char>(character - 'A' + 'a');
+        }
+    }
+    return value;
+}
+
+bool state_parent_directory_is_case_sensitive(const std::string &parent)
+{
+#if defined(_PC_CASE_SENSITIVE)
+    errno = 0;
+    const long result = ::pathconf(parent.c_str(), _PC_CASE_SENSITIVE);
+    return result != 0;
+#else
+    (void)parent;
+    return true;
+#endif
+}
+#endif
+
+bool state_path_entries_refer_to_same_file(const std::string &left,
+                                           const std::string &right)
+{
+    if (left == right)
+    {
+        return true;
+    }
+    std::string absolute_left;
+    std::string absolute_right;
+    if (!resolve_state_path_entry_identity(left, &absolute_left) ||
+        !resolve_state_path_entry_identity(right, &absolute_right))
+    {
+        return false;
+    }
+#if defined(_WIN32)
+    return ::_stricmp(absolute_left.c_str(), absolute_right.c_str()) == 0;
+#elif defined(__APPLE__)
+    if (absolute_left == absolute_right)
+    {
+        return true;
+    }
+    const std::string left_parent = path_parent_or_current(absolute_left);
+    const std::string right_parent = path_parent_or_current(absolute_right);
+    return left_parent == right_parent &&
+           !state_parent_directory_is_case_sensitive(left_parent) &&
+           fold_ascii_state_path_component(
+               ::dsn::utils::filesystem::get_file_name(absolute_left)) ==
+               fold_ascii_state_path_component(
+                   ::dsn::utils::filesystem::get_file_name(absolute_right));
+#else
+    return absolute_left == absolute_right;
+#endif
+}
+
+bool state_paths_refer_to_same_file(const std::string &left,
+                                    const std::string &right)
+{
+    if (left == right)
+    {
+        return true;
+    }
+
+#if defined(_WIN32)
+    const DWORD share_mode =
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    const HANDLE left_handle = ::CreateFileA(left.c_str(),
+                                             0,
+                                             share_mode,
+                                             nullptr,
+                                             OPEN_EXISTING,
+                                             FILE_FLAG_BACKUP_SEMANTICS,
+                                             nullptr);
+    const HANDLE right_handle = ::CreateFileA(right.c_str(),
+                                              0,
+                                              share_mode,
+                                              nullptr,
+                                              OPEN_EXISTING,
+                                              FILE_FLAG_BACKUP_SEMANTICS,
+                                              nullptr);
+    if (left_handle != INVALID_HANDLE_VALUE &&
+        right_handle != INVALID_HANDLE_VALUE)
+    {
+        BY_HANDLE_FILE_INFORMATION left_info;
+        BY_HANDLE_FILE_INFORMATION right_info;
+        const bool same =
+            ::GetFileInformationByHandle(left_handle, &left_info) != 0 &&
+            ::GetFileInformationByHandle(right_handle, &right_info) != 0 &&
+            left_info.dwVolumeSerialNumber == right_info.dwVolumeSerialNumber &&
+            left_info.nFileIndexHigh == right_info.nFileIndexHigh &&
+            left_info.nFileIndexLow == right_info.nFileIndexLow;
+        ::CloseHandle(left_handle);
+        ::CloseHandle(right_handle);
+        if (same)
+        {
+            return true;
+        }
+    }
+    else
+    {
+        if (left_handle != INVALID_HANDLE_VALUE)
+        {
+            ::CloseHandle(left_handle);
+        }
+        if (right_handle != INVALID_HANDLE_VALUE)
+        {
+            ::CloseHandle(right_handle);
+        }
+    }
+#else
+    struct stat left_info;
+    struct stat right_info;
+    if (::stat(left.c_str(), &left_info) == 0 &&
+        ::stat(right.c_str(), &right_info) == 0 &&
+        left_info.st_dev == right_info.st_dev &&
+        left_info.st_ino == right_info.st_ino)
+    {
+        return true;
+    }
+#endif
+
+    return state_path_entries_refer_to_same_file(left, right);
+}
+
+bool write_durable_state_text_file(const std::string &path,
+                                   const std::string &content,
+                                   const std::string &description,
+                                   std::string *error)
+{
+    if (!ensure_parent_directory(path, error))
+    {
+        return false;
+    }
+    const std::string temp_path = path + ".tmp";
+    int fd = -1;
+    if (!prepare_exclusive_state_staging_file(
+            temp_path, description, &fd, error))
+    {
+        return false;
+    }
+    const bool written =
+        write_all_state_file(fd, content.data(), content.size());
+    const bool synced = written && sync_state_file_descriptor(fd);
+    close_state_journal(fd);
+    if (!synced)
+    {
+        ::dsn::utils::filesystem::remove_path(temp_path);
+        if (error != nullptr && error->empty())
+        {
+            *error = written ? "failed to flush " + description + ": " + temp_path
+                             : "failed to write " + description + ": " + temp_path;
+        }
+        return false;
+    }
+    if (!durable_rename_state_path(
+            temp_path, path, description, error))
+    {
+        ::dsn::utils::filesystem::remove_path(temp_path);
+        return false;
+    }
+    return true;
+}
+
+bool persist_external_state_journal_quarantine(
+    const std::string &journal_path,
+    const std::string &reason,
+    std::string *error)
+{
+    const std::string marker =
+        state_journal_quarantine_marker(journal_path);
+    if (write_durable_state_text_file(
+            marker, reason + "\n", "state journal quarantine marker", error))
+    {
+        return true;
+    }
+    if (::dsn::utils::filesystem::file_exists(journal_path))
+    {
+        return durable_rename_state_path(
+            journal_path,
+            state_journal_quarantined_file(journal_path),
+            "quarantined state journal",
+            error);
+    }
+    return false;
+}
+
+void fail_stop_quarantined_state_journal(const std::string &journal_path,
+                                         const std::string &reason)
+{
+    std::string quarantine_error;
+    if (!persist_external_state_journal_quarantine(
+            journal_path, reason, &quarantine_error))
+    {
+        derror("failed to persist state journal quarantine path=%s error=%s",
+               journal_path.c_str(),
+               quarantine_error.c_str());
+    }
+    derror("state journal entered fail-stop quarantine path=%s reason=%s",
+           journal_path.c_str(),
+           reason.c_str());
+    ::dsn_exit(1);
 }
 
 bool read_state_journal_at(int fd, int64_t offset, char *data, size_t size)
@@ -290,10 +1189,15 @@ bool append_state_journal_line(const std::string &path,
                                const std::string &record_line,
                                const std::string &description,
                                std::string *error,
-                               state_journal_append_token *token = nullptr)
+                               state_journal_append_token *token = nullptr,
+                               std::atomic<bool> *quarantine_latch = nullptr)
 {
     if (state_journal_is_quarantined(path))
     {
+        if (quarantine_latch != nullptr)
+        {
+            quarantine_latch->store(true, std::memory_order_release);
+        }
         if (error != nullptr)
         {
             *error = "state journal is quarantined and requires operator repair: " +
@@ -335,6 +1239,20 @@ bool append_state_journal_line(const std::string &path,
         }
         return false;
     }
+    if (state_journal_is_quarantined(path))
+    {
+        if (quarantine_latch != nullptr)
+        {
+            quarantine_latch->store(true, std::memory_order_release);
+        }
+        close_state_journal(fd);
+        if (error != nullptr)
+        {
+            *error = "state journal is quarantined and requires operator repair: " +
+                     path;
+        }
+        return false;
+    }
 
     const int64_t file_size = seek_state_journal(fd, 0, SEEK_END);
     int64_t append_offset = 0;
@@ -369,24 +1287,79 @@ bool append_state_journal_line(const std::string &path,
         payload.append(kStateJournalHeader, header_size);
     }
     payload.append(record_line);
-
-    int64_t written = -1;
-    do
+    if (append_offset >
+        (std::numeric_limits<int64_t>::max)() -
+            static_cast<int64_t>(payload.size()))
     {
-        written = write_state_journal(fd, payload.data(), payload.size());
-    } while (written < 0 && errno == EINTR);
-
-    if (written != static_cast<int64_t>(payload.size()))
-    {
-        const bool rolled_back = truncate_state_journal(fd, append_offset);
         close_state_journal(fd);
         if (error != nullptr)
         {
+            *error = description + " exceeds the supported journal size: " + path;
+        }
+        return false;
+    }
+
+    size_t written_total = 0;
+    while (written_total < payload.size())
+    {
+        int64_t written = -1;
+        do
+        {
+            written = write_state_journal(
+                fd,
+                payload.data() + written_total,
+                payload.size() - written_total);
+        } while (written < 0 && errno == EINTR);
+        if (written <= 0)
+        {
+            break;
+        }
+        written_total += static_cast<size_t>(written);
+    }
+
+    if (written_total != payload.size())
+    {
+        const bool rolled_back =
+            truncate_state_journal(fd, append_offset) &&
+            sync_state_file_descriptor(fd);
+        close_state_journal(fd);
+        if (!rolled_back)
+        {
+            fail_stop_quarantined_state_journal(
+                path,
+                "partial " + description +
+                    " append could not be durably rolled back");
+            return false;
+        }
+        if (error != nullptr)
+        {
             *error = "failed to append " + description + ": " + path;
-            if (!rolled_back)
-            {
-                *error += " (partial record could not be rolled back)";
-            }
+        }
+        return false;
+    }
+
+    bool durable = sync_state_file_descriptor(fd);
+    if (durable && append_offset == 0)
+    {
+        durable = sync_state_directory(
+            path_parent_or_current(path), description, error);
+    }
+    if (!durable)
+    {
+        const bool rolled_back =
+            truncate_state_journal(fd, append_offset) &&
+            sync_state_file_descriptor(fd);
+        close_state_journal(fd);
+        if (!rolled_back)
+        {
+            fail_stop_quarantined_state_journal(
+                path,
+                description + " durable flush failed and rollback was unprovable");
+            return false;
+        }
+        if (error != nullptr && error->empty())
+        {
+            *error = "failed to durably append " + description + ": " + path;
         }
         return false;
     }
@@ -431,7 +1404,8 @@ bool rollback_state_journal_append(const std::string &path,
 
     const int64_t current_size = seek_state_journal(fd, 0, SEEK_END);
     if (current_size != token.end_offset ||
-        !truncate_state_journal(fd, token.begin_offset))
+        !truncate_state_journal(fd, token.begin_offset) ||
+        !sync_state_file_descriptor(fd))
     {
         close_state_journal(fd);
         if (error != nullptr)
@@ -449,7 +1423,8 @@ bool append_state_journal_file(const std::string &path,
                                const state_record &record,
                                const std::string &description,
                                std::string *error,
-                               state_journal_append_token *token = nullptr)
+                               state_journal_append_token *token = nullptr,
+                               std::atomic<bool> *quarantine_latch = nullptr)
 {
     std::ostringstream encoded;
     write_state_record_line(encoded, record);
@@ -462,7 +1437,12 @@ bool append_state_journal_file(const std::string &path,
         return false;
     }
     return append_state_journal_line(
-        path, encoded.str(), description, error, token);
+        path,
+        encoded.str(),
+        description,
+        error,
+        token,
+        quarantine_latch);
 }
 
 bool append_state_delete_prefix_file(const std::string &path,
@@ -470,7 +1450,8 @@ bool append_state_delete_prefix_file(const std::string &path,
                                      uint64_t operation_sequence,
                                      const std::string &description,
                                      std::string *error,
-                                     state_journal_append_token *token = nullptr)
+                                     state_journal_append_token *token = nullptr,
+                                     std::atomic<bool> *quarantine_latch = nullptr)
 {
     std::ostringstream encoded;
     encoded << "delete-prefix\t" << operation_sequence << "\t" << request.max_sequence
@@ -484,7 +1465,12 @@ bool append_state_delete_prefix_file(const std::string &path,
         return false;
     }
     return append_state_journal_line(
-        path, encoded.str(), description, error, token);
+        path,
+        encoded.str(),
+        description,
+        error,
+        token,
+        quarantine_latch);
 }
 
 bool append_state_sequence_barrier_file(
@@ -492,7 +1478,8 @@ bool append_state_sequence_barrier_file(
     const state_sequence_barrier_request &request,
     const std::string &description,
     std::string *error,
-    state_journal_append_token *token = nullptr)
+    state_journal_append_token *token = nullptr,
+    std::atomic<bool> *quarantine_latch = nullptr)
 {
     std::ostringstream encoded;
     encoded << "sequence-barrier\t" << request.minimum_sequence << "\n";
@@ -505,7 +1492,12 @@ bool append_state_sequence_barrier_file(
         return false;
     }
     return append_state_journal_line(
-        path, encoded.str(), description, error, token);
+        path,
+        encoded.str(),
+        description,
+        error,
+        token,
+        quarantine_latch);
 }
 
 bool rollback_primary_journal_after_mirror_failure(
@@ -526,26 +1518,10 @@ bool rollback_primary_journal_after_mirror_failure(
             "quarantine\t" + hex_encode(quarantine_reason) + "\n",
             "state journal quarantine",
             &quarantine_error);
-        const std::string marker =
-            state_journal_quarantine_marker(journal_path);
-        {
-            std::ofstream output(
-                marker.c_str(), std::ios::binary | std::ios::trunc);
-            if (output)
-            {
-                output << quarantine_reason << "\n";
-                output.flush();
-            }
-        }
-        bool externally_quarantined =
-            ::dsn::utils::filesystem::file_exists(marker);
-        if (!externally_quarantined &&
-            ::dsn::utils::filesystem::file_exists(journal_path))
-        {
-            externally_quarantined =
-                ::dsn::utils::filesystem::rename_path(
-                    journal_path, state_journal_quarantined_file(journal_path));
-        }
+        std::string external_error;
+        const bool externally_quarantined =
+            persist_external_state_journal_quarantine(
+                journal_path, quarantine_reason, &external_error);
         derror("cannot roll back primary state journal after mirror failure: mirror=%s rollback=%s",
                mirror_error.c_str(),
                rollback_error.c_str());
@@ -557,8 +1533,9 @@ bool rollback_primary_journal_after_mirror_failure(
         }
         if (!externally_quarantined)
         {
-            derror("failed to persist external state journal quarantine path=%s",
-                   journal_path.c_str());
+            derror("failed to persist external state journal quarantine path=%s error=%s",
+                   journal_path.c_str(),
+                   external_error.c_str());
         }
         ::dsn_exit(1);
         return false;
@@ -674,18 +1651,38 @@ bool config_bool(const std::string &section, const std::string &key, bool fallba
 std::string path_parent_or_current(const std::string &path)
 {
     const std::string parent = ::dsn::utils::filesystem::remove_file_name(path);
-    return parent.empty() ? "." : parent;
+    if (!parent.empty())
+    {
+#if defined(_WIN32)
+        if (parent.size() == 2 && parent[1] == ':')
+        {
+            return parent + "\\";
+        }
+#endif
+        return parent;
+    }
+#if defined(_WIN32)
+    if (!path.empty() && (path[0] == '/' || path[0] == '\\'))
+#else
+    if (!path.empty() && path[0] == '/')
+#endif
+    {
+        return path.substr(0, 1);
+    }
+    return ".";
 }
 
 bool copy_local_file(const std::string &source, const std::string &destination, std::string *error)
 {
-    if (source == destination)
+    if (state_paths_refer_to_same_file(source, destination))
     {
-        return true;
+        return sync_state_file(source, "state file copy", error);
     }
 
-    std::ifstream input(source.c_str(), std::ios::binary);
-    if (!input)
+    int64_t source_size = 0;
+    const int source_fd =
+        open_state_file_read_only(source, &source_size);
+    if (source_fd < 0)
     {
         if (error != nullptr)
         {
@@ -697,6 +1694,7 @@ bool copy_local_file(const std::string &source, const std::string &destination, 
     std::string directory_error;
     if (!ensure_parent_directory(destination, &directory_error))
     {
+        close_state_journal(source_fd);
         if (error != nullptr)
         {
             *error = directory_error;
@@ -705,33 +1703,67 @@ bool copy_local_file(const std::string &source, const std::string &destination, 
     }
 
     const std::string temp_path = destination + ".nfs.tmp";
-    std::ofstream output(temp_path.c_str(), std::ios::binary | std::ios::trunc);
-    if (!output)
+    int output_fd = -1;
+    if (!prepare_exclusive_state_staging_file(
+            temp_path, "state file copy", &output_fd, error))
     {
-        if (error != nullptr)
-        {
-            *error = "failed to open state file target: " + temp_path;
-        }
+        close_state_journal(source_fd);
         return false;
     }
-    output << input.rdbuf();
-    output.close();
-    if (!output)
+    char buffer[65536];
+    int64_t remaining = source_size;
+    bool copied = true;
+    while (remaining > 0)
+    {
+        const size_t chunk = static_cast<size_t>(
+            (std::min)(remaining,
+                       static_cast<int64_t>(sizeof(buffer))));
+        int64_t read = -1;
+        do
+        {
+            read = read_state_journal(source_fd, buffer, chunk);
+        } while (read < 0 && errno == EINTR);
+        if (read != static_cast<int64_t>(chunk))
+        {
+            copied = false;
+            break;
+        }
+        if (!write_all_state_file(
+                output_fd, buffer, chunk))
+        {
+            copied = false;
+            break;
+        }
+        remaining -= static_cast<int64_t>(chunk);
+    }
+    char extra = '\0';
+    if (copied)
+    {
+        int64_t read = -1;
+        do
+        {
+            read = read_state_journal(source_fd, &extra, 1);
+        } while (read < 0 && errno == EINTR);
+        copied = read == 0;
+    }
+    close_state_journal(source_fd);
+    const bool synced = copied && sync_state_file_descriptor(output_fd);
+    close_state_journal(output_fd);
+    if (!synced)
     {
         ::dsn::utils::filesystem::remove_path(temp_path);
         if (error != nullptr)
         {
-            *error = "failed to flush state file target: " + temp_path;
+            *error = copied
+                         ? "failed to flush copied state file: " + temp_path
+                         : "failed to copy complete source state file: " + source;
         }
         return false;
     }
-    if (!::dsn::utils::filesystem::rename_path(temp_path, destination))
+    if (!durable_rename_state_path(
+            temp_path, destination, "state file copy", error))
     {
         ::dsn::utils::filesystem::remove_path(temp_path);
-        if (error != nullptr)
-        {
-            *error = "failed to move state file into place: " + destination;
-        }
         return false;
     }
     return true;
@@ -765,7 +1797,284 @@ std::string replica_path_for(const state_replica_config &config, const std::stri
     return ::dsn::utils::filesystem::path_combine(config.directory, file_name.empty() ? "rasn-state" : file_name);
 }
 
-bool copy_checkpoint_to_replica(const std::string &checkpoint_path, std::string *error)
+bool state_replica_journal_is_quarantined(const std::string &journal_path)
+{
+    const state_replica_config config = load_state_replica_config();
+    return config.enabled && !config.directory.empty() &&
+           state_journal_is_quarantined(replica_path_for(config, journal_path));
+}
+
+struct named_state_path
+{
+    std::string path;
+    std::string description;
+};
+
+bool state_path_is_link(const std::string &path)
+{
+#if defined(_WIN32)
+    const DWORD attributes = ::GetFileAttributesA(path.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES)
+    {
+        return (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    }
+    const HANDLE handle = ::CreateFileA(
+        path.c_str(),
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        nullptr);
+    if (handle == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+    BY_HANDLE_FILE_INFORMATION info;
+    const bool reparse =
+        ::GetFileInformationByHandle(handle, &info) != 0 &&
+        (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    ::CloseHandle(handle);
+    return reparse;
+#else
+    struct stat link_info;
+    return ::lstat(path.c_str(), &link_info) == 0 &&
+           S_ISLNK(link_info.st_mode);
+#endif
+}
+
+void add_checkpoint_lifecycle_paths(const std::string &checkpoint_path,
+                                    const std::string &description,
+                                    bool copied,
+                                    std::vector<named_state_path> *paths)
+{
+    paths->push_back({checkpoint_path, description});
+    if (copied)
+    {
+        paths->push_back(
+            {checkpoint_path + ".nfs.tmp", description + " copy staging"});
+        return;
+    }
+    paths->push_back({checkpoint_path + ".tmp", description + " staging"});
+    paths->push_back(
+        {checkpoint_path + ".delete.tmp", description + " delete staging"});
+    paths->push_back(
+        {checkpoint_path + ".nfs.tmp", description + " import staging"});
+    paths->push_back(
+        {checkpoint_path + ".bak", description + " legacy backup"});
+    paths->push_back({checkpoint_path + ".bak.nfs.tmp",
+                      description + " legacy backup staging"});
+    paths->push_back({checkpoint_path + ".bak.delete.tmp",
+                      description + " legacy backup delete staging"});
+    const std::string nfs_marker = state_nfs_import_marker(checkpoint_path);
+    paths->push_back({nfs_marker, description + " NFS import marker"});
+    paths->push_back(
+        {nfs_marker + ".tmp", description + " NFS import marker staging"});
+    paths->push_back({nfs_marker + ".delete.tmp",
+                      description + " NFS import marker delete staging"});
+}
+
+void add_journal_lifecycle_paths(const std::string &journal_path,
+                                 const std::string &description,
+                                 std::vector<named_state_path> *paths)
+{
+    paths->push_back({journal_path, description});
+    paths->push_back(
+        {journal_path + ".quarantine", description + " quarantine marker"});
+    paths->push_back({journal_path + ".quarantine.tmp",
+                      description + " quarantine staging"});
+    paths->push_back(
+        {journal_path + ".quarantined", description + " quarantined journal"});
+    paths->push_back(
+        {journal_path + ".delete.tmp", description + " delete staging"});
+    paths->push_back(
+        {journal_path + ".nfs.tmp", description + " import staging"});
+}
+
+bool validate_distinct_state_paths(const std::vector<named_state_path> &paths,
+                                   std::string *error)
+{
+    for (const named_state_path &candidate : paths)
+    {
+        if (state_path_is_link(candidate.path))
+        {
+            if (error != nullptr)
+            {
+                *error = "state storage path is a link or reparse point: " +
+                         candidate.description + "=" + candidate.path;
+            }
+            return false;
+        }
+    }
+    for (size_t left = 0; left < paths.size(); ++left)
+    {
+        for (size_t right = left + 1; right < paths.size(); ++right)
+        {
+            if (state_paths_refer_to_same_file(paths[left].path,
+                                              paths[right].path))
+            {
+                if (error != nullptr)
+                {
+                    *error = "state storage paths overlap: " +
+                             paths[left].description + "=" + paths[left].path +
+                             " and " + paths[right].description + "=" +
+                             paths[right].path;
+                }
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool validate_checkpoint_lifecycle_target(const std::string &checkpoint_path,
+                                          std::string *error)
+{
+    if (!ensure_parent_directory(checkpoint_path, error))
+    {
+        return false;
+    }
+    std::vector<named_state_path> paths;
+    add_checkpoint_lifecycle_paths(
+        checkpoint_path, "checkpoint", false, &paths);
+    return validate_distinct_state_paths(paths, error);
+}
+
+bool collect_state_storage_paths(const std::string &checkpoint_path,
+                                 bool include_replica_checkpoint,
+                                 std::vector<named_state_path> *paths,
+                                 std::string *error)
+{
+    const std::string journal_path = configured_state_journal_path();
+    if (!ensure_parent_directory(checkpoint_path, error) ||
+        !ensure_parent_directory(journal_path, error))
+    {
+        return false;
+    }
+
+    add_checkpoint_lifecycle_paths(
+        checkpoint_path, "primary checkpoint", false, paths);
+    add_journal_lifecycle_paths(
+        journal_path, "primary journal", paths);
+    const state_replica_config config = load_state_replica_config();
+    if (config.enabled)
+    {
+        if (config.directory.empty())
+        {
+            if (error != nullptr)
+            {
+                *error =
+                    "rasn.state.replica is enabled but directory is empty";
+            }
+            return false;
+        }
+        const std::string replica_checkpoint =
+            replica_path_for(config, checkpoint_path);
+        const std::string replica_journal =
+            replica_path_for(config, journal_path);
+        if (!ensure_parent_directory(replica_checkpoint, error) ||
+            !ensure_parent_directory(replica_journal, error))
+        {
+            return false;
+        }
+        if (include_replica_checkpoint)
+        {
+            add_checkpoint_lifecycle_paths(
+                replica_checkpoint, "replica checkpoint", true, paths);
+        }
+        add_journal_lifecycle_paths(
+            replica_journal, "replica journal", paths);
+    }
+    return true;
+}
+
+bool validate_state_checkpoint_target(const std::string &checkpoint_path,
+                                      bool include_replica_checkpoint,
+                                      std::string *error)
+{
+    std::vector<named_state_path> paths;
+    return collect_state_storage_paths(
+               checkpoint_path, include_replica_checkpoint, &paths, error) &&
+           validate_distinct_state_paths(paths, error);
+}
+
+bool validate_custom_checkpoint_target(const std::string &checkpoint_path,
+                                       std::string *error)
+{
+    if (!validate_state_checkpoint_target(
+            checkpoint_path, false, error))
+    {
+        return false;
+    }
+
+    const std::string configured_checkpoint =
+        configured_state_checkpoint_path();
+    if (!ensure_parent_directory(configured_checkpoint, error))
+    {
+        return false;
+    }
+    std::vector<named_state_path> custom_paths;
+    std::vector<named_state_path> protected_paths;
+    add_checkpoint_lifecycle_paths(
+        checkpoint_path, "custom checkpoint", false, &custom_paths);
+    add_checkpoint_lifecycle_paths(configured_checkpoint,
+                                   "configured recovery checkpoint",
+                                   false,
+                                   &protected_paths);
+    std::vector<std::string> protected_entries{configured_checkpoint};
+
+    const state_replica_config config = load_state_replica_config();
+    if (config.enabled)
+    {
+        const std::string replica_checkpoint =
+            replica_path_for(config, configured_checkpoint);
+        if (!ensure_parent_directory(replica_checkpoint, error))
+        {
+            return false;
+        }
+        add_checkpoint_lifecycle_paths(replica_checkpoint,
+                                       "configured replica checkpoint",
+                                       true,
+                                       &protected_paths);
+        protected_entries.push_back(replica_checkpoint);
+    }
+    if (!validate_distinct_state_paths(protected_paths, error))
+    {
+        return false;
+    }
+
+    for (const named_state_path &custom : custom_paths)
+    {
+        for (const named_state_path &protected_path : protected_paths)
+        {
+            const bool distinct_live_entry_alias =
+                custom.path == checkpoint_path &&
+                std::find(protected_entries.begin(),
+                          protected_entries.end(),
+                          protected_path.path) != protected_entries.end() &&
+                !state_path_entries_refer_to_same_file(
+                    custom.path, protected_path.path);
+            if (!distinct_live_entry_alias &&
+                state_paths_refer_to_same_file(
+                    custom.path, protected_path.path))
+            {
+                if (error != nullptr)
+                {
+                    *error = "custom checkpoint lifecycle overlaps recovery "
+                             "checkpoint storage: " +
+                             custom.path + " and " + protected_path.path;
+                }
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool copy_checkpoint_to_replica(
+    const std::string &checkpoint_path,
+    std::string *error,
+    std::atomic<bool> *quarantine_latch)
 {
     const state_replica_config config = load_state_replica_config();
     if (!config.enabled)
@@ -781,11 +2090,32 @@ bool copy_checkpoint_to_replica(const std::string &checkpoint_path, std::string 
         return false;
     }
 
+    const std::string replica_journal =
+        replica_path_for(config, configured_state_journal_path());
+    if (state_journal_is_quarantined(replica_journal))
+    {
+        if (quarantine_latch != nullptr)
+        {
+            quarantine_latch->store(true, std::memory_order_release);
+        }
+        if (error != nullptr)
+        {
+            *error =
+                "replicated state journal is quarantined and requires operator "
+                "repair: " +
+                replica_journal;
+        }
+        return false;
+    }
+
     const std::string replica_checkpoint = replica_path_for(config, checkpoint_path);
     return copy_local_file(checkpoint_path, replica_checkpoint, error);
 }
 
-bool remove_replica_journal(const std::string &journal_path, std::string *error)
+bool remove_replica_journal(
+    const std::string &journal_path,
+    std::string *error,
+    std::atomic<bool> *quarantine_latch)
 {
     const state_replica_config config = load_state_replica_config();
     if (!config.enabled)
@@ -802,10 +2132,25 @@ bool remove_replica_journal(const std::string &journal_path, std::string *error)
     }
 
     const std::string replica_journal = replica_path_for(config, journal_path);
-    if (::dsn::utils::filesystem::file_exists(replica_journal) &&
-        !::dsn::utils::filesystem::remove_path(replica_journal))
+    if (state_journal_is_quarantined(replica_journal))
     {
+        if (quarantine_latch != nullptr)
+        {
+            quarantine_latch->store(true, std::memory_order_release);
+        }
         if (error != nullptr)
+        {
+            *error =
+                "replicated state journal is quarantined and requires operator "
+                "repair: " +
+                replica_journal;
+        }
+        return false;
+    }
+    if (!durable_remove_state_path(
+            replica_journal, "replicated state journal", error))
+    {
+        if (error != nullptr && error->empty())
         {
             *error = "failed to compact replicated state journal: " + replica_journal;
         }
@@ -814,7 +2159,11 @@ bool remove_replica_journal(const std::string &journal_path, std::string *error)
     return true;
 }
 
-bool mirror_journal_record_to_replica(const std::string &journal_path, const state_record &record, std::string *error)
+bool mirror_journal_record_to_replica(
+    const std::string &journal_path,
+    const state_record &record,
+    std::string *error,
+    std::atomic<bool> *quarantine_latch)
 {
     const state_replica_config config = load_state_replica_config();
     if (!config.enabled)
@@ -835,13 +2184,19 @@ bool mirror_journal_record_to_replica(const std::string &journal_path, const sta
     {
         return false;
     }
-    return append_state_journal_file(replica_journal, record, "replicated state journal", error);
+    return append_state_journal_file(replica_journal,
+                                     record,
+                                     "replicated state journal",
+                                     error,
+                                     nullptr,
+                                     quarantine_latch);
 }
 
 bool mirror_journal_delete_prefix_to_replica(const std::string &journal_path,
                                              const state_delete_prefix_request &request,
                                              uint64_t operation_sequence,
-                                             std::string *error)
+                                             std::string *error,
+                                             std::atomic<bool> *quarantine_latch)
 {
     const state_replica_config config = load_state_replica_config();
     if (!config.enabled)
@@ -866,13 +2221,16 @@ bool mirror_journal_delete_prefix_to_replica(const std::string &journal_path,
                                            request,
                                            operation_sequence,
                                            "replicated state journal",
-                                           error);
+                                           error,
+                                           nullptr,
+                                           quarantine_latch);
 }
 
 bool mirror_journal_sequence_barrier_to_replica(
     const std::string &journal_path,
     const state_sequence_barrier_request &request,
-    std::string *error)
+    std::string *error,
+    std::atomic<bool> *quarantine_latch)
 {
     const state_replica_config config = load_state_replica_config();
     if (!config.enabled)
@@ -894,12 +2252,18 @@ bool mirror_journal_sequence_barrier_to_replica(
         return false;
     }
     return append_state_sequence_barrier_file(
-        replica_journal, request, "replicated state journal", error);
+        replica_journal,
+        request,
+        "replicated state journal",
+        error,
+        nullptr,
+        quarantine_latch);
 }
 
 bool import_state_recovery_files_from_replica(const std::string &checkpoint_path,
                                               const std::string &journal_path,
-                                              std::string *error)
+                                              std::string *error,
+                                              std::atomic<bool> *quarantine_latch)
 {
     const state_replica_config config = load_state_replica_config();
     if (!config.enabled || !config.recover)
@@ -915,6 +2279,23 @@ bool import_state_recovery_files_from_replica(const std::string &checkpoint_path
         return false;
     }
 
+    const std::string replica_journal = replica_path_for(config, journal_path);
+    if (state_journal_is_quarantined(replica_journal))
+    {
+        if (quarantine_latch != nullptr)
+        {
+            quarantine_latch->store(true, std::memory_order_release);
+        }
+        if (error != nullptr)
+        {
+            *error =
+                "replicated state journal is quarantined and requires operator "
+                "repair: " +
+                replica_journal;
+        }
+        return false;
+    }
+
     const std::string replica_checkpoint = replica_path_for(config, checkpoint_path);
     if (!::dsn::utils::filesystem::file_exists(checkpoint_path) &&
         ::dsn::utils::filesystem::file_exists(replica_checkpoint) &&
@@ -923,7 +2304,6 @@ bool import_state_recovery_files_from_replica(const std::string &checkpoint_path
         return false;
     }
 
-    const std::string replica_journal = replica_path_for(config, journal_path);
     if (!::dsn::utils::filesystem::file_exists(journal_path) &&
         ::dsn::utils::filesystem::file_exists(replica_journal) &&
         !copy_local_file(replica_journal, journal_path, error))
@@ -963,7 +2343,7 @@ nfs_state_import_config load_nfs_state_import_config(const std::string &checkpoi
         config_string("rasn.state.nfs", "local_import_dir", "", "Local NFS import directory");
     if (config.local_import_dir.empty())
     {
-        config.local_import_dir = path_parent_or_current(checkpoint_path);
+        config.local_import_dir = checkpoint_path + ".nfs-import";
     }
     config.overwrite = config_bool("rasn.state.nfs", "overwrite", true, "Overwrite existing local NFS imports");
     const uint64_t timeout_ms =
@@ -1005,31 +2385,120 @@ bool import_state_recovery_files_from_nfs(const std::string &checkpoint_path,
         return false;
     }
 
+    const bool checkpoint_missing =
+        !::dsn::utils::filesystem::file_exists(checkpoint_path);
+    const bool journal_missing =
+        !::dsn::utils::filesystem::file_exists(journal_path);
+    if (!checkpoint_missing || !journal_missing)
+    {
+        // A missing journal is also the normal compacted state. Without a shared
+        // generation identifier, never combine one local artifact with a
+        // potentially stale remote counterpart.
+        return true;
+    }
+
+    const bool import_checkpoint = !config.remote_checkpoint_file.empty();
+    const bool import_journal = !config.remote_journal_file.empty();
+
     std::vector<std::string> files;
-    if (!config.remote_checkpoint_file.empty())
+    if (import_checkpoint)
     {
         files.push_back(config.remote_checkpoint_file);
     }
-    if (!config.remote_journal_file.empty())
+    if (import_journal)
     {
         files.push_back(config.remote_journal_file);
     }
     if (files.empty())
     {
-        if (error != nullptr)
+        if (!import_checkpoint && !import_journal)
         {
-            *error = "rasn.state.nfs is enabled but no remote checkpoint or journal file is configured";
+            if (error != nullptr)
+            {
+                *error =
+                    "rasn.state.nfs is enabled but no remote checkpoint or "
+                    "journal file is configured";
+            }
+            return false;
         }
-        return false;
+        return true;
     }
 
+    static std::atomic<uint64_t> nfs_import_attempt{0};
+    std::ostringstream attempt_name;
+#if defined(_WIN32)
+    const uint64_t process_id = static_cast<uint64_t>(::GetCurrentProcessId());
+#else
+    const uint64_t process_id = static_cast<uint64_t>(::getpid());
+#endif
+    attempt_name << "attempt-" << std::hex << process_id << "-"
+                 << ::dsn_now_ns() << "-"
+                 << nfs_import_attempt.fetch_add(1, std::memory_order_relaxed);
+    const std::string attempt_directory =
+        ::dsn::utils::filesystem::path_combine(
+            config.local_import_dir, attempt_name.str());
+
     std::string directory_error;
-    if (!ensure_parent_directory(::dsn::utils::filesystem::path_combine(config.local_import_dir, "placeholder"), &directory_error))
+    if (!ensure_parent_directory(
+            ::dsn::utils::filesystem::path_combine(
+                attempt_directory, "placeholder"),
+            &directory_error))
     {
         if (error != nullptr)
         {
             *error = directory_error;
         }
+        return false;
+    }
+    nfs_attempt_directory_cleanup attempt_cleanup(attempt_directory);
+
+    std::vector<named_state_path> storage_paths;
+    if (!collect_state_storage_paths(
+            checkpoint_path, true, &storage_paths, error))
+    {
+        return false;
+    }
+    if (import_checkpoint)
+    {
+        const std::string imported_checkpoint =
+            ::dsn::utils::filesystem::path_combine(
+                attempt_directory, config.remote_checkpoint_file);
+        if (state_paths_refer_to_same_file(
+                imported_checkpoint, checkpoint_path))
+        {
+            if (error != nullptr)
+            {
+                *error =
+                    "NFS checkpoint staging must be distinct from primary "
+                    "checkpoint storage: " +
+                    imported_checkpoint;
+            }
+            return false;
+        }
+        storage_paths.push_back(
+            {imported_checkpoint, "NFS checkpoint import"});
+    }
+    if (import_journal)
+    {
+        const std::string imported_journal =
+            ::dsn::utils::filesystem::path_combine(
+                attempt_directory, config.remote_journal_file);
+        if (state_paths_refer_to_same_file(imported_journal, journal_path))
+        {
+            if (error != nullptr)
+            {
+                *error =
+                    "NFS journal staging must be distinct from primary journal "
+                    "storage: " +
+                    imported_journal;
+            }
+            return false;
+        }
+        storage_paths.push_back(
+            {imported_journal, "NFS journal import"});
+    }
+    if (!validate_distinct_state_paths(storage_paths, error))
+    {
         return false;
     }
 
@@ -1041,7 +2510,7 @@ bool import_state_recovery_files_from_nfs(const std::string &checkpoint_path,
         remote,
         config.remote_checkpoint_dir,
         files,
-        config.local_import_dir,
+        attempt_directory,
         config.overwrite,
         LPC_RASN_STATE_NFS_COPY,
         nullptr,
@@ -1063,6 +2532,7 @@ bool import_state_recovery_files_from_nfs(const std::string &checkpoint_path,
         // result, so it stays alive even if the copy finishes after we return.
         bool finished = false;
         task->cancel(false, &finished);
+        attempt_cleanup.preserve();
         if (error != nullptr)
         {
             *error = "timed out importing rASN state through rDSN NFS";
@@ -1086,20 +2556,32 @@ bool import_state_recovery_files_from_nfs(const std::string &checkpoint_path,
         return false;
     }
 
-    if (!config.remote_checkpoint_file.empty())
+    const std::string import_marker =
+        state_nfs_import_marker(checkpoint_path);
+    if (!write_durable_state_text_file(import_marker,
+                                       "rasn-state-nfs-import-v1\n",
+                                       "pending NFS state import marker",
+                                       error))
     {
-        const std::string imported_checkpoint =
-            ::dsn::utils::filesystem::path_combine(config.local_import_dir, config.remote_checkpoint_file);
-        if (!copy_local_file(imported_checkpoint, checkpoint_path, error))
+        return false;
+    }
+
+    if (import_journal)
+    {
+        const std::string imported_journal =
+            ::dsn::utils::filesystem::path_combine(
+                attempt_directory, config.remote_journal_file);
+        if (!copy_local_file(imported_journal, journal_path, error))
         {
             return false;
         }
     }
-    if (!config.remote_journal_file.empty())
+    if (import_checkpoint)
     {
-        const std::string imported_journal =
-            ::dsn::utils::filesystem::path_combine(config.local_import_dir, config.remote_journal_file);
-        if (!copy_local_file(imported_journal, journal_path, error))
+        const std::string imported_checkpoint =
+            ::dsn::utils::filesystem::path_combine(
+                attempt_directory, config.remote_checkpoint_file);
+        if (!copy_local_file(imported_checkpoint, checkpoint_path, error))
         {
             return false;
         }
@@ -1211,8 +2693,8 @@ bool load_state_checkpoint_file(const std::string &path,
                                 uint64_t *last_sequence,
                                 std::string *error)
 {
-    std::ifstream input(path.c_str(), std::ios::binary);
-    if (!input)
+    FILE *raw_input = open_state_file_stream(path);
+    if (raw_input == nullptr)
     {
         if (error != nullptr)
         {
@@ -1220,13 +2702,19 @@ bool load_state_checkpoint_file(const std::string &path,
         }
         return false;
     }
+    std::unique_ptr<FILE, int (*)(FILE *)> input(raw_input, &std::fclose);
 
     std::string header;
-    if (!std::getline(input, header))
+    const state_file_line_result header_result =
+        read_state_file_line(input.get(), &header);
+    if (header_result == state_file_line_result::end ||
+        header_result == state_file_line_result::error)
     {
         if (error != nullptr)
         {
-            *error = "empty checkpoint: " + path;
+            *error = header_result == state_file_line_result::error
+                         ? "failed to read checkpoint: " + path
+                         : "empty checkpoint: " + path;
         }
         return false;
     }
@@ -1251,8 +2739,22 @@ bool load_state_checkpoint_file(const std::string &path,
 
     std::map<std::string, state_record> loaded;
     std::string line;
-    while (std::getline(input, line))
+    while (true)
     {
+        const state_file_line_result line_result =
+            read_state_file_line(input.get(), &line);
+        if (line_result == state_file_line_result::error)
+        {
+            if (error != nullptr)
+            {
+                *error = "failed to read checkpoint: " + path;
+            }
+            return false;
+        }
+        if (line_result == state_file_line_result::end)
+        {
+            break;
+        }
         if (line.empty())
         {
             continue;
@@ -1265,14 +2767,6 @@ bool load_state_checkpoint_file(const std::string &path,
         }
         loaded[record.key] = record;
         loaded_last_sequence = (std::max)(loaded_last_sequence, record.sequence);
-    }
-    if (input.bad())
-    {
-        if (error != nullptr)
-        {
-            *error = "failed to read checkpoint: " + path;
-        }
-        return false;
     }
 
     if (records != nullptr)
@@ -1297,74 +2791,83 @@ bool write_state_checkpoint_file(const std::string &path,
     }
 
     const std::string temp_path = path + ".tmp";
-    std::ofstream output(temp_path.c_str(), std::ios::binary | std::ios::trunc);
-    if (!output)
+    int fd = -1;
+    if (!prepare_exclusive_state_staging_file(
+            temp_path, "state checkpoint", &fd, error))
     {
-        if (error != nullptr)
-        {
-            *error = "failed to open checkpoint for write: " + temp_path;
-        }
         return false;
     }
 
-    output << "rasn-state-v1\t" << last_sequence << "\n";
+    std::ostringstream header;
+    header << "rasn-state-v1\t" << last_sequence << "\n";
+    const std::string encoded_header = header.str();
+    bool written =
+        write_all_state_file(fd, encoded_header.data(), encoded_header.size());
     for (const std::map<std::string, state_record>::value_type &entry : records)
     {
-        write_state_record_line(output, entry.second);
+        if (!written)
+        {
+            break;
+        }
+        std::ostringstream line;
+        write_state_record_line(line, entry.second);
+        const std::string encoded = line.str();
+        written = write_all_state_file(fd, encoded.data(), encoded.size());
     }
-    output.close();
-    if (!output)
+    const bool synced = written && sync_state_file_descriptor(fd);
+    close_state_journal(fd);
+    if (!synced)
     {
         ::dsn::utils::filesystem::remove_path(temp_path);
-        if (error != nullptr)
+        if (error != nullptr && error->empty())
         {
-            *error = "failed to flush checkpoint: " + temp_path;
+            *error = written ? "failed to flush checkpoint: " + temp_path
+                             : "failed to write checkpoint: " + temp_path;
         }
         return false;
     }
 
+    // An older interrupted replacement may have left a stale backup beside the
+    // live checkpoint. Refresh it from the flushed new image before replacing the
+    // live name, so even a failed cleanup cannot later resurrect an old baseline
+    // after journal compaction.
     const std::string backup_path = path + ".bak";
-    bool has_backup = false;
-    if (::dsn::utils::filesystem::file_exists(path))
+    if (::dsn::utils::filesystem::file_exists(backup_path) &&
+        !copy_local_file(temp_path, backup_path, error))
     {
-        if (::dsn::utils::filesystem::file_exists(backup_path) &&
-            !::dsn::utils::filesystem::remove_path(backup_path))
+        ::dsn::utils::filesystem::remove_path(temp_path);
+        if (error != nullptr && error->empty())
         {
-            ::dsn::utils::filesystem::remove_path(temp_path);
-            if (error != nullptr)
-            {
-                *error = "failed to remove stale checkpoint backup: " + backup_path;
-            }
-            return false;
+            *error =
+                "failed to synchronize legacy state checkpoint backup: " +
+                backup_path;
         }
-        if (!::dsn::utils::filesystem::rename_path(path, backup_path))
-        {
-            ::dsn::utils::filesystem::remove_path(temp_path);
-            if (error != nullptr)
-            {
-                *error = "failed to preserve existing checkpoint: " + path;
-            }
-            return false;
-        }
-        has_backup = true;
+        return false;
     }
 
-    if (!::dsn::utils::filesystem::rename_path(temp_path, path))
+    // Replacing the live name directly is atomic on both supported platforms.
+    // Moving the old checkpoint aside first leaves a crash window with no recovery
+    // baseline, so do not use a rename-to-backup sequence here.
+    if (!durable_rename_state_path(
+            temp_path, path, "state checkpoint", error))
     {
-        if (has_backup)
-        {
-            ::dsn::utils::filesystem::rename_path(backup_path, path);
-        }
         ::dsn::utils::filesystem::remove_path(temp_path);
-        if (error != nullptr)
+        if (error != nullptr && error->empty())
         {
             *error = "failed to move checkpoint into place: " + path;
         }
         return false;
     }
-    if (has_backup)
+
+    // Refuse to report a compactable checkpoint while a recovery alias remains.
+    // The backup now contains the same snapshot, but treating cleanup failure as
+    // an error also keeps the journal until the operator resolves the filesystem
+    // problem.
+    // The refreshed backup is safe if cleanup encounters a transient error.
+    if (!durable_remove_state_path(
+            backup_path, "legacy state checkpoint backup", error))
     {
-        ::dsn::utils::filesystem::remove_path(backup_path);
+        return false;
     }
     return true;
 }
@@ -1372,12 +2875,63 @@ bool write_state_checkpoint_file(const std::string &path,
 bool ensure_parent_directory(const std::string &path, std::string *error)
 {
     const std::string directory = ::dsn::utils::filesystem::remove_file_name(path);
-    if (directory.empty() || ::dsn::utils::filesystem::directory_exists(directory))
+    if (directory.empty())
     {
         return true;
     }
+    if (::dsn::utils::filesystem::directory_exists(directory))
+    {
+        if (::dsn::utils::filesystem::path_exists(path))
+        {
+            return true;
+        }
+
+        // A previous attempt may have created the directory tree but failed while
+        // flushing one of its links. Before creating the first file in that tree,
+        // re-flush every ancestor so a retry cannot acknowledge through an
+        // unverified directory entry.
+        std::string candidate = directory;
+        while (true)
+        {
+            if (!sync_state_directory(
+                    candidate, "state directory creation", error))
+            {
+                return false;
+            }
+            const std::string parent = path_parent_or_current(candidate);
+            if (parent == candidate)
+            {
+                break;
+            }
+            candidate = parent;
+        }
+        return true;
+    }
+
+    std::vector<std::string> directories_to_sync;
+    std::string candidate = directory;
+    while (!candidate.empty() &&
+           !::dsn::utils::filesystem::directory_exists(candidate))
+    {
+        directories_to_sync.push_back(candidate);
+        const std::string parent = path_parent_or_current(candidate);
+        if (parent == candidate)
+        {
+            break;
+        }
+        candidate = parent;
+    }
     if (::dsn::utils::filesystem::create_directory(directory))
     {
+        directories_to_sync.push_back(candidate);
+        for (const std::string &created : directories_to_sync)
+        {
+            if (!sync_state_directory(
+                    created, "state directory creation", error))
+            {
+                return false;
+            }
+        }
         return true;
     }
     if (error != nullptr)
@@ -1424,6 +2978,33 @@ bool same_state_record(const state_record &left, const state_record &right)
     return left.schema_version == right.schema_version && left.key == right.key &&
            left.kind == right.kind && left.scope == right.scope &&
            left.value == right.value && left.sequence == right.sequence;
+}
+
+bool validate_replicated_state_write_classification(std::string *error)
+{
+    const ::dsn::task_code *write_codes[] = {
+        &RPC_RASN_STATE_PUT,
+        &RPC_RASN_STATE_PUT_CONDITIONAL,
+        &RPC_RASN_STATE_DELETE_PREFIX,
+        &RPC_RASN_STATE_DELETE_PREFIX_DETAILED,
+        &RPC_RASN_STATE_ADVANCE_SEQUENCE,
+        &RPC_RASN_STATE_RECOVER};
+    for (const ::dsn::task_code *code : write_codes)
+    {
+        const ::dsn::task_spec *spec =
+            ::dsn::task_spec::get(static_cast<dsn_task_code_t>(*code));
+        if (spec == nullptr || !spec->rpc_request_is_write_operation)
+        {
+            if (error != nullptr)
+            {
+                *error = std::string(code->to_string()) +
+                         " must set rpc_request_is_write_operation=true for "
+                         "replicated rasn.state";
+            }
+            return false;
+        }
+    }
+    return true;
 }
 
 const char kReplicatedStateCheckpointPrefix[] = "rasn-state-checkpoint.";
@@ -1494,7 +3075,15 @@ bool configured_state_recovery_available(const state_checkpoint_request &request
 
     const std::string checkpoint = configured_state_checkpoint_path();
     const std::string journal = configured_state_journal_path();
-    if (::dsn::utils::filesystem::file_exists(checkpoint) || ::dsn::utils::filesystem::file_exists(journal))
+    const std::string nfs_import_marker =
+        state_nfs_import_marker(checkpoint);
+    if (::dsn::utils::filesystem::file_exists(checkpoint) ||
+        ::dsn::utils::filesystem::file_exists(checkpoint + ".bak") ||
+        ::dsn::utils::filesystem::file_exists(journal) ||
+        ::dsn::utils::filesystem::file_exists(nfs_import_marker) ||
+        ::dsn::utils::filesystem::file_exists(nfs_import_marker + ".tmp") ||
+        state_journal_is_quarantined(journal) ||
+        state_replica_journal_is_quarantined(journal))
     {
         return true;
     }
@@ -1550,9 +3139,7 @@ state_response state_store::put(const state_put_request &request)
     ::dsn::service::zauto_lock mutation_guard(_mutation_lock);
     if (journal_is_quarantined())
     {
-        return error_response(
-            "state journal is quarantined and requires operator repair: " +
-            default_journal_path());
+        return error_response(quarantine_error());
     }
     state_record stored = request.record;
     uint64_t last_sequence = 0;
@@ -1612,12 +3199,16 @@ state_response state_store::put(const state_put_request &request)
                                   std::to_string(stored.sequence));
         }
 
-        std::string journal_error;
-        if (_journal_enabled && !append_journal_record(stored, &journal_error))
-        {
-            return error_response(journal_error);
-        }
+    }
 
+    std::string journal_error;
+    if (_journal_enabled && !append_journal_record(stored, &journal_error))
+    {
+        return error_response(journal_error);
+    }
+
+    {
+        ::dsn::service::zauto_lock guard(_lock);
         _last_sequence = (std::max)(_last_sequence, stored.sequence);
         _records[stored.key] = stored;
         ++_write_epoch;
@@ -1650,9 +3241,7 @@ state_response state_store::get(const state_key_request &request) const
     }
     if (journal_is_quarantined())
     {
-        return error_response(
-            "state journal is quarantined and requires operator repair: " +
-            default_journal_path());
+        return error_response(quarantine_error());
     }
 
     ::dsn::service::zauto_lock guard(_lock);
@@ -1677,9 +3266,7 @@ state_response state_store::query(const state_query_request &request) const
     }
     if (journal_is_quarantined())
     {
-        return error_response(
-            "state journal is quarantined and requires operator repair: " +
-            default_journal_path());
+        return error_response(quarantine_error());
     }
 
     ::dsn::service::zauto_lock guard(_lock);
@@ -1697,39 +3284,62 @@ state_response state_store::query(const state_query_request &request) const
 
 state_response state_store::delete_prefix(const state_delete_prefix_request &request)
 {
+    return delete_prefix_impl(request, true).response;
+}
+
+state_delete_prefix_result
+state_store::delete_prefix_detailed(const state_delete_prefix_request &request)
+{
+    return delete_prefix_impl(request, false);
+}
+
+state_delete_prefix_result
+state_store::delete_prefix_impl(const state_delete_prefix_request &request,
+                                bool include_deleted_records)
+{
+    state_delete_prefix_result result;
     if (!valid_schema(request.schema_version))
     {
-        return error_response("state delete-prefix request has unsupported schema version");
+        result.response =
+            error_response("state delete-prefix request has unsupported schema version");
+        return result;
     }
     if (request.key_prefix.empty())
     {
-        return error_response("state delete-prefix request missing key prefix");
+        result.response =
+            error_response("state delete-prefix request missing key prefix");
+        return result;
     }
     if (!valid_state_key(request.key_prefix))
     {
-        return error_response("state delete-prefix key must be namespaced as <scope>/<id>");
+        result.response = error_response(
+            "state delete-prefix key must be namespaced as <scope>/<id>");
+        return result;
     }
     if (request.max_sequence == 0)
     {
-        return error_response("state delete-prefix requires a non-zero maximum sequence");
+        result.response = error_response(
+            "state delete-prefix requires a non-zero maximum sequence");
+        return result;
     }
 
     ::dsn::service::zauto_lock mutation_guard(_mutation_lock);
     if (journal_is_quarantined())
     {
-        return error_response(
-            "state journal is quarantined and requires operator repair: " +
-            default_journal_path());
+        result.response = error_response(quarantine_error());
+        return result;
     }
-    state_response response;
+    uint64_t operation_sequence = 0;
     {
         ::dsn::service::zauto_lock guard(_lock);
         if (request.max_sequence > _last_sequence)
         {
-            return error_response("state delete-prefix maximum sequence " +
-                                  std::to_string(request.max_sequence) +
-                                  " exceeds current sequence " +
-                                  std::to_string(_last_sequence));
+            result.response =
+                error_response("state delete-prefix maximum sequence " +
+                               std::to_string(request.max_sequence) +
+                               " exceeds current sequence " +
+                               std::to_string(_last_sequence));
+            return result;
         }
 
         for (const std::map<std::string, state_record>::value_type &entry : _records)
@@ -1737,28 +3347,38 @@ state_response state_store::delete_prefix(const state_delete_prefix_request &req
             if (entry.second.sequence <= request.max_sequence &&
                 state_key_matches_prefix(entry.first, request.key_prefix))
             {
-                response.records.push_back(entry.second);
+                ++result.deleted_records;
+                if (include_deleted_records)
+                {
+                    result.response.records.push_back(entry.second);
+                }
             }
         }
-        if (response.records.empty())
+        if (result.deleted_records == 0)
         {
-            response.last_sequence = _last_sequence;
-            return response;
+            result.response.last_sequence = _last_sequence;
+            return result;
         }
         if (_last_sequence == (std::numeric_limits<uint64_t>::max)())
         {
-            return error_response("state sequence space exhausted while deleting prefix " +
-                                  request.key_prefix);
+            result.response = error_response(
+                "state sequence space exhausted while deleting prefix " +
+                request.key_prefix);
+            return result;
         }
+        operation_sequence = _last_sequence + 1;
+    }
 
-        const uint64_t operation_sequence = _last_sequence + 1;
-        std::string journal_error;
-        if (_journal_enabled &&
-            !append_journal_delete_prefix(request, operation_sequence, &journal_error))
-        {
-            return error_response(journal_error);
-        }
+    std::string journal_error;
+    if (_journal_enabled &&
+        !append_journal_delete_prefix(request, operation_sequence, &journal_error))
+    {
+        result.response = error_response(journal_error);
+        return result;
+    }
 
+    {
+        ::dsn::service::zauto_lock guard(_lock);
         for (std::map<std::string, state_record>::iterator it = _records.begin();
              it != _records.end();)
         {
@@ -1774,15 +3394,15 @@ state_response state_store::delete_prefix(const state_delete_prefix_request &req
         }
         _last_sequence = operation_sequence;
         ++_write_epoch;
-        response.last_sequence = _last_sequence;
+        result.response.last_sequence = _last_sequence;
     }
 
     dinfo("deleted rASN state prefix=%s records=%llu through_sequence=%llu operation_sequence=%llu",
           request.key_prefix.c_str(),
-          static_cast<unsigned long long>(response.records.size()),
+          static_cast<unsigned long long>(result.deleted_records),
           static_cast<unsigned long long>(request.max_sequence),
-          static_cast<unsigned long long>(response.last_sequence));
-    return response;
+          static_cast<unsigned long long>(result.response.last_sequence));
+    return result;
 }
 
 state_response
@@ -1802,9 +3422,7 @@ state_store::advance_sequence(const state_sequence_barrier_request &request)
     ::dsn::service::zauto_lock mutation_guard(_mutation_lock);
     if (journal_is_quarantined())
     {
-        return error_response(
-            "state journal is quarantined and requires operator repair: " +
-            default_journal_path());
+        return error_response(quarantine_error());
     }
     state_response response;
     {
@@ -1814,13 +3432,17 @@ state_store::advance_sequence(const state_sequence_barrier_request &request)
             response.last_sequence = _last_sequence;
             return response;
         }
+    }
 
-        std::string journal_error;
-        if (_journal_enabled &&
-            !append_journal_sequence_barrier(request, &journal_error))
-        {
-            return error_response(journal_error);
-        }
+    std::string journal_error;
+    if (_journal_enabled &&
+        !append_journal_sequence_barrier(request, &journal_error))
+    {
+        return error_response(journal_error);
+    }
+
+    {
+        ::dsn::service::zauto_lock guard(_lock);
         _last_sequence = request.minimum_sequence;
         ++_write_epoch;
         response.last_sequence = _last_sequence;
@@ -1844,35 +3466,51 @@ state_store::checkpoint_detailed(const state_checkpoint_request &request) const
         return result;
     }
 
-    ::dsn::service::zauto_lock mutation_guard(_mutation_lock);
+    ::dsn::service::zauto_lock checkpoint_guard(_checkpoint_lock);
     const std::string path = request.path.empty() ? default_checkpoint_path() : request.path;
+    const bool recovery_checkpoint =
+        request.path.empty() ||
+        state_path_entries_refer_to_same_file(
+            path, default_checkpoint_path());
     result.checkpoint_path = path;
-    if (journal_is_quarantined())
+    std::string checkpoint_error;
+    const bool checkpoint_path_valid =
+        _journal_enabled
+            ? (recovery_checkpoint
+                   ? validate_state_checkpoint_target(
+                         path, true, &checkpoint_error)
+                   : validate_custom_checkpoint_target(
+                         path, &checkpoint_error))
+            : validate_checkpoint_lifecycle_target(path, &checkpoint_error);
+    if (!checkpoint_path_valid)
     {
-        result.response = error_response(
-            "state journal is quarantined and requires operator repair: " +
-            default_journal_path());
+        result.response = error_response(checkpoint_error);
         return result;
     }
     std::map<std::string, state_record> snapshot;
     uint64_t last_sequence = 0;
     uint64_t snapshot_epoch = 0;
     {
-        ::dsn::service::zauto_lock guard(_lock);
-        snapshot = _records;
-        last_sequence = _last_sequence;
-        snapshot_epoch = _write_epoch;
+        ::dsn::service::zauto_lock mutation_guard(_mutation_lock);
+        if (journal_is_quarantined())
+        {
+            result.response = error_response(quarantine_error());
+            return result;
+        }
+        {
+            ::dsn::service::zauto_lock guard(_lock);
+            snapshot = _records;
+            last_sequence = _last_sequence;
+            snapshot_epoch = _write_epoch;
+        }
     }
 
-    std::string checkpoint_error;
     if (!write_state_checkpoint_file(path, snapshot, last_sequence, &checkpoint_error))
     {
         result.response = error_response(checkpoint_error);
         return result;
     }
 
-    const bool recovery_checkpoint =
-        request.path.empty() || path == default_checkpoint_path();
     if (_journal_enabled && recovery_checkpoint)
     {
         const std::string journal_path = default_journal_path();
@@ -1882,43 +3520,41 @@ state_store::checkpoint_detailed(const state_checkpoint_request &request) const
         // is always safe because the journal (kept or compacted below) determines
         // which post-snapshot writes recovery must replay.
         std::string replica_error;
-        if (!copy_checkpoint_to_replica(path, &replica_error))
+        if (!copy_checkpoint_to_replica(
+                path, &replica_error, &_quarantine_seen))
         {
             result.response = error_response(replica_error);
             return result;
         }
 
-        // Only compact (delete) the journals if no write landed since we snapshotted
-        // _records. A mutation appended after the snapshot is not in
-        // this checkpoint file, so removing the journal would lose it from durable
-        // storage. In that case leave both journals for the next checkpoint to fold
-        // in (recovery replays checkpoint + journal, so keeping them is safe).
-        //
-        // The epoch re-check and the removals must happen under a single lock
-        // acquisition. A concurrent mutation serializes on _lock to append its
-        // durable journal entry to both the primary and mirrored replica journal
-        // and bump _write_epoch atomically; checking the
-        // epoch under the lock but unlinking after releasing it would let such a put
-        // slip in between and have its just-acknowledged record deleted from either
-        // journal. The primary and replica journals are compacted together so the
-        // replica can never lose an acked write the primary keeps (and vice versa).
-        // remove_path is a fast unlink, so holding _lock across both matches the
-        // pre-refactor design where the whole checkpoint ran locked.
+        // Mutations may proceed while the snapshot and replica copy are written.
+        // Re-enter the mutation lifecycle before checking the epoch and compacting;
+        // this prevents a write from landing between the check and durable journal
+        // removal without holding the read lock across filesystem I/O.
         {
-            ::dsn::service::zauto_lock guard(_lock);
-            if (_write_epoch == snapshot_epoch)
+            ::dsn::service::zauto_lock mutation_guard(_mutation_lock);
+            if (journal_is_quarantined())
             {
-                if (::dsn::utils::filesystem::file_exists(journal_path) &&
-                    !::dsn::utils::filesystem::remove_path(journal_path))
-                {
-                    result.response =
-                        error_response("failed to compact state journal: " +
-                                       journal_path);
-                    return result;
-                }
-                if (!remove_replica_journal(journal_path, &replica_error))
+                result.response = error_response(quarantine_error());
+                return result;
+            }
+            bool snapshot_current = false;
+            {
+                ::dsn::service::zauto_lock guard(_lock);
+                snapshot_current = _write_epoch == snapshot_epoch;
+            }
+            if (snapshot_current)
+            {
+                if (!remove_replica_journal(
+                        journal_path, &replica_error, &_quarantine_seen))
                 {
                     result.response = error_response(replica_error);
+                    return result;
+                }
+                if (!durable_remove_state_path(
+                        journal_path, "state journal", &checkpoint_error))
+                {
+                    result.response = error_response(checkpoint_error);
                     return result;
                 }
                 result.journal_compacted = true;
@@ -1964,12 +3600,11 @@ state_response state_store::import_checkpoint(const state_checkpoint_request &re
         return error_response("state checkpoint import requires a source path");
     }
 
+    ::dsn::service::zauto_lock checkpoint_guard(_checkpoint_lock);
     ::dsn::service::zauto_lock mutation_guard(_mutation_lock);
     if (journal_is_quarantined())
     {
-        return error_response(
-            "state journal is quarantined and requires operator repair: " +
-            default_journal_path());
+        return error_response(quarantine_error());
     }
     std::map<std::string, state_record> imported;
     uint64_t last_sequence = 0;
@@ -1978,10 +3613,24 @@ state_response state_store::import_checkpoint(const state_checkpoint_request &re
     {
         return error_response(import_error);
     }
-    if (!durable_path.empty() && durable_path != request.path &&
-        !write_state_checkpoint_file(durable_path, imported, last_sequence, &import_error))
+    if (!durable_path.empty() &&
+        !state_paths_refer_to_same_file(durable_path, request.path))
     {
-        return error_response(import_error);
+        const bool durable_path_valid =
+            _journal_enabled
+                ? validate_custom_checkpoint_target(
+                      durable_path, &import_error)
+                : validate_checkpoint_lifecycle_target(
+                      durable_path, &import_error);
+        if (!durable_path_valid)
+        {
+            return error_response(import_error);
+        }
+        if (!write_state_checkpoint_file(
+                durable_path, imported, last_sequence, &import_error))
+        {
+            return error_response(import_error);
+        }
     }
 
     if (replace)
@@ -2016,29 +3665,67 @@ state_response state_store::recover(const state_checkpoint_request &request)
         return error_response("state recover request has unsupported schema version");
     }
 
+    ::dsn::service::zauto_lock checkpoint_guard(_checkpoint_lock);
     ::dsn::service::zauto_lock mutation_guard(_mutation_lock);
     const std::string path = request.path.empty() ? default_checkpoint_path() : request.path;
-    const std::string journal_path = default_journal_path();
+    const std::string journal_path =
+        _journal_enabled ? default_journal_path() : "";
     if (journal_is_quarantined())
     {
-        return error_response(
-            "state journal is quarantined after an unprovable mirror rollback: " +
-            journal_path);
+        return error_response(quarantine_error());
+    }
+    std::string storage_error;
+    const bool storage_paths_valid =
+        _journal_enabled
+            ? validate_state_checkpoint_target(path, true, &storage_error)
+            : validate_checkpoint_lifecycle_target(path, &storage_error);
+    if (!storage_paths_valid)
+    {
+        return error_response(storage_error);
+    }
+    if (_journal_enabled &&
+        !cleanup_pending_nfs_state_import(
+            path, journal_path, &storage_error))
+    {
+        return error_response(storage_error);
     }
     std::map<std::string, state_record> recovered;
     std::vector<state_journal_delete_prefix> recovered_deletions;
     uint64_t last_sequence = 0;
 
-    if (!::dsn::utils::filesystem::file_exists(path) && !::dsn::utils::filesystem::file_exists(journal_path))
+    if (_journal_enabled &&
+        (!::dsn::utils::filesystem::file_exists(path) ||
+         !::dsn::utils::filesystem::file_exists(journal_path)))
     {
         std::string replica_error;
-        if (!import_state_recovery_files_from_replica(path, journal_path, &replica_error))
+        if (!import_state_recovery_files_from_replica(
+                path,
+                journal_path,
+                &replica_error,
+                &_quarantine_seen))
         {
             return error_response(replica_error);
         }
     }
 
-    if (!::dsn::utils::filesystem::file_exists(path) && !::dsn::utils::filesystem::file_exists(journal_path))
+    const std::string legacy_backup_path = path + ".bak";
+    if (!::dsn::utils::filesystem::file_exists(path) &&
+        ::dsn::utils::filesystem::file_exists(legacy_backup_path))
+    {
+        std::string restore_error;
+        if (!durable_rename_state_path(legacy_backup_path,
+                                       path,
+                                       "legacy state checkpoint backup",
+                                       &restore_error))
+        {
+            return error_response(restore_error);
+        }
+        dwarn("restored legacy state checkpoint backup path=%s", path.c_str());
+    }
+
+    if (_journal_enabled &&
+        (!::dsn::utils::filesystem::file_exists(path) ||
+         !::dsn::utils::filesystem::file_exists(journal_path)))
     {
         std::string import_error;
         if (!import_state_recovery_files_from_nfs(path, journal_path, &import_error))
@@ -2054,29 +3741,41 @@ state_response state_store::recover(const state_checkpoint_request &request)
         {
             return error_response(checkpoint_error);
         }
+        if (!durable_remove_state_path(legacy_backup_path,
+                                       "superseded legacy state checkpoint backup",
+                                       &checkpoint_error))
+        {
+            return error_response(checkpoint_error);
+        }
     }
-    else if (!::dsn::utils::filesystem::file_exists(journal_path))
+    else if (!_journal_enabled ||
+             !::dsn::utils::filesystem::file_exists(journal_path))
     {
         return error_response("failed to open checkpoint for recovery: " + path);
     }
 
-    if (::dsn::utils::filesystem::file_exists(journal_path))
+    if (_journal_enabled &&
+        ::dsn::utils::filesystem::file_exists(journal_path))
     {
-        std::ifstream journal(journal_path.c_str(), std::ios::binary);
-        if (!journal)
+        FILE *raw_journal = open_state_file_stream(journal_path);
+        if (raw_journal == nullptr)
         {
             return error_response("failed to open state journal for recovery: " + journal_path);
         }
+        std::unique_ptr<FILE, int (*)(FILE *)> journal(
+            raw_journal, &std::fclose);
 
         const std::string expected_header = "rasn-state-journal-v1";
         std::string header;
         bool replay_records = true;
-        if (!std::getline(journal, header))
+        const state_file_line_result header_result =
+            read_state_file_line(journal.get(), &header);
+        if (header_result == state_file_line_result::error)
         {
-            if (!journal.eof() || journal.bad())
-            {
-                return error_response("failed to read state journal header: " + journal_path);
-            }
+            return error_response("failed to read state journal header: " + journal_path);
+        }
+        if (header_result == state_file_line_result::end)
+        {
             dwarn("ignoring empty state journal left by an interrupted first append: %s",
                   journal_path.c_str());
             replay_records = false;
@@ -2084,7 +3783,8 @@ state_response state_store::recover(const state_checkpoint_request &request)
         else if (header != expected_header)
         {
             const bool torn_header =
-                journal.eof() && !journal.bad() && header.size() < expected_header.size() &&
+                header_result == state_file_line_result::unterminated &&
+                header.size() < expected_header.size() &&
                 expected_header.compare(0, header.size(), header) == 0;
             if (!torn_header)
             {
@@ -2094,21 +3794,32 @@ state_response state_store::recover(const state_checkpoint_request &request)
                   journal_path.c_str());
             replay_records = false;
         }
-        else if (journal.eof())
+        else if (header_result == state_file_line_result::unterminated)
         {
             dwarn("ignoring unterminated state journal header: %s", journal_path.c_str());
             replay_records = false;
         }
 
         std::string line;
-        while (replay_records && std::getline(journal, line))
+        while (replay_records)
         {
+            const state_file_line_result line_result =
+                read_state_file_line(journal.get(), &line);
+            if (line_result == state_file_line_result::error)
+            {
+                return error_response("failed to read state journal: " +
+                                      journal_path);
+            }
+            if (line_result == state_file_line_result::end)
+            {
+                break;
+            }
             if (line.empty())
             {
                 continue;
             }
 
-            if (journal.eof())
+            if (line_result == state_file_line_result::unterminated)
             {
                 // Every complete journal entry is newline-terminated. A non-empty
                 // line read with eofbit already set
@@ -2123,6 +3834,7 @@ state_response state_store::recover(const state_checkpoint_request &request)
             const std::vector<std::string> fields = split_tab_fields(line);
             if (!fields.empty() && fields[0] == "quarantine")
             {
+                _quarantine_seen.store(true, std::memory_order_release);
                 return error_response(
                     "state journal contains a quarantine marker after an "
                     "unprovable mirror rollback: " +
@@ -2187,6 +3899,16 @@ state_response state_store::recover(const state_checkpoint_request &request)
             recovered[record.key] = record;
             last_sequence = (std::max)(last_sequence, record.sequence);
         }
+    }
+
+    const std::string nfs_import_marker =
+        state_nfs_import_marker(path);
+    if (_journal_enabled &&
+        !durable_remove_state_path(nfs_import_marker,
+                                   "completed NFS state import marker",
+                                   &storage_error))
+    {
+        return error_response(storage_error);
     }
 
     {
@@ -2255,11 +3977,14 @@ bool state_store::has_recovery_state(const state_checkpoint_request &request) co
         return false;
     }
 
-    const std::string path = request.path.empty() ? default_checkpoint_path() : request.path;
-    const std::string journal_path = default_journal_path();
+    if (_journal_enabled)
+    {
+        return configured_state_recovery_available(request);
+    }
+    const std::string path =
+        request.path.empty() ? default_checkpoint_path() : request.path;
     return ::dsn::utils::filesystem::file_exists(path) ||
-           ::dsn::utils::filesystem::file_exists(journal_path) ||
-           state_journal_is_quarantined(journal_path);
+           ::dsn::utils::filesystem::file_exists(path + ".bak");
 }
 
 state_response state_store::error_response(const std::string &error) const
@@ -2280,25 +4005,59 @@ std::string state_store::default_journal_path() const
     return configured_state_journal_path();
 }
 
+std::string state_store::quarantine_error() const
+{
+    return "state journal or configured replica is quarantined and requires "
+           "offline operator repair; primary journal: " +
+           default_journal_path();
+}
+
 bool state_store::journal_is_quarantined() const
 {
     if (!_journal_enabled)
     {
         return false;
     }
-    const int cached = _quarantine_state.load(std::memory_order_acquire);
-    if (cached >= 0)
+    if (_quarantine_seen.load(std::memory_order_acquire))
     {
-        return cached != 0;
+        return true;
     }
     const bool quarantined =
-        state_journal_is_quarantined(default_journal_path());
-    _quarantine_state.store(quarantined ? 1 : 0, std::memory_order_release);
+        state_journal_is_quarantined(default_journal_path()) ||
+        state_replica_journal_is_quarantined(default_journal_path());
+    if (quarantined)
+    {
+        _quarantine_seen.store(true, std::memory_order_release);
+    }
     return quarantined;
+}
+
+bool state_store::validate_default_storage_paths(std::string *error) const
+{
+    if (!_journal_enabled)
+    {
+        return true;
+    }
+    ::dsn::service::zauto_lock guard(_storage_validation_lock);
+    if (!_storage_validation_checked)
+    {
+        _storage_validation_ok = validate_state_checkpoint_target(
+            default_checkpoint_path(), true, &_storage_validation_error);
+        _storage_validation_checked = true;
+    }
+    if (!_storage_validation_ok && error != nullptr)
+    {
+        *error = _storage_validation_error;
+    }
+    return _storage_validation_ok;
 }
 
 bool state_store::append_journal_record(const state_record &record, std::string *error) const
 {
+    if (!validate_default_storage_paths(error))
+    {
+        return false;
+    }
     const std::string journal_path = default_journal_path();
     if (!ensure_parent_directory(journal_path, error))
     {
@@ -2307,13 +4066,18 @@ bool state_store::append_journal_record(const state_record &record, std::string 
 
     state_journal_append_token token;
     if (!append_state_journal_file(
-            journal_path, record, "state journal", error, &token))
+            journal_path,
+            record,
+            "state journal",
+            error,
+            &token,
+            &_quarantine_seen))
     {
         return false;
     }
     std::string mirror_error;
     if (!mirror_journal_record_to_replica(
-            journal_path, record, &mirror_error))
+            journal_path, record, &mirror_error, &_quarantine_seen))
     {
         return rollback_primary_journal_after_mirror_failure(
             journal_path, token, mirror_error, error);
@@ -2325,6 +4089,10 @@ bool state_store::append_journal_delete_prefix(const state_delete_prefix_request
                                                uint64_t operation_sequence,
                                                std::string *error) const
 {
+    if (!validate_default_storage_paths(error))
+    {
+        return false;
+    }
     const std::string journal_path = default_journal_path();
     if (!ensure_parent_directory(journal_path, error))
     {
@@ -2336,13 +4104,18 @@ bool state_store::append_journal_delete_prefix(const state_delete_prefix_request
                                          operation_sequence,
                                          "state journal",
                                          error,
-                                         &token))
+                                         &token,
+                                         &_quarantine_seen))
     {
         return false;
     }
     std::string mirror_error;
     if (!mirror_journal_delete_prefix_to_replica(
-            journal_path, request, operation_sequence, &mirror_error))
+            journal_path,
+            request,
+            operation_sequence,
+            &mirror_error,
+            &_quarantine_seen))
     {
         return rollback_primary_journal_after_mirror_failure(
             journal_path, token, mirror_error, error);
@@ -2354,6 +4127,10 @@ bool state_store::append_journal_sequence_barrier(
     const state_sequence_barrier_request &request,
     std::string *error) const
 {
+    if (!validate_default_storage_paths(error))
+    {
+        return false;
+    }
     const std::string journal_path = default_journal_path();
     if (!ensure_parent_directory(journal_path, error))
     {
@@ -2361,13 +4138,21 @@ bool state_store::append_journal_sequence_barrier(
     }
     state_journal_append_token token;
     if (!append_state_sequence_barrier_file(
-            journal_path, request, "state journal", error, &token))
+            journal_path,
+            request,
+            "state journal",
+            error,
+            &token,
+            &_quarantine_seen))
     {
         return false;
     }
     std::string mirror_error;
     if (!mirror_journal_sequence_barrier_to_replica(
-            journal_path, request, &mirror_error))
+            journal_path,
+            request,
+            &mirror_error,
+            &_quarantine_seen))
     {
         return rollback_primary_journal_after_mirror_failure(
             journal_path, token, mirror_error, error);
@@ -2399,6 +4184,11 @@ void rasn_state_rpc_service::open_service(::dsn_gpid gpid)
                                      "delete_prefix",
                                      &rasn_state_rpc_service::on_delete_prefix,
                                      gpid);
+    this->register_async_rpc_handler(
+        RPC_RASN_STATE_DELETE_PREFIX_DETAILED,
+        "delete_prefix_detailed",
+        &rasn_state_rpc_service::on_delete_prefix_detailed,
+        gpid);
     this->register_async_rpc_handler(RPC_RASN_STATE_ADVANCE_SEQUENCE,
                                      "advance_sequence",
                                      &rasn_state_rpc_service::on_advance_sequence,
@@ -2425,6 +4215,7 @@ void rasn_state_rpc_service::close_service(::dsn_gpid gpid)
     this->unregister_rpc_handler(RPC_RASN_STATE_GET, gpid);
     this->unregister_rpc_handler(RPC_RASN_STATE_QUERY, gpid);
     this->unregister_rpc_handler(RPC_RASN_STATE_DELETE_PREFIX, gpid);
+    this->unregister_rpc_handler(RPC_RASN_STATE_DELETE_PREFIX_DETAILED, gpid);
     this->unregister_rpc_handler(RPC_RASN_STATE_ADVANCE_SEQUENCE, gpid);
     this->unregister_rpc_handler(RPC_RASN_STATE_CHECKPOINT, gpid);
     this->unregister_rpc_handler(RPC_RASN_STATE_CHECKPOINT_DETAILED, gpid);
@@ -2457,6 +4248,13 @@ void rasn_state_rpc_service::on_delete_prefix(
     ::dsn::rpc_replier<state_response> &reply)
 {
     reply(_store->delete_prefix(request));
+}
+
+void rasn_state_rpc_service::on_delete_prefix_detailed(
+    const state_delete_prefix_request &request,
+    ::dsn::rpc_replier<state_delete_prefix_result> &reply)
+{
+    reply(_store->delete_prefix_detailed(request));
 }
 
 void rasn_state_rpc_service::on_advance_sequence(
@@ -2573,6 +4371,24 @@ rasn_state_client::delete_prefix_sync(const state_delete_prefix_request &request
                          partition_hash));
 }
 
+std::pair< ::dsn::error_code, state_delete_prefix_result>
+rasn_state_client::delete_prefix_detailed_sync(
+    const state_delete_prefix_request &request,
+    std::chrono::milliseconds timeout,
+    int thread_hash,
+    uint64_t partition_hash)
+{
+    return ::dsn::rpc::wait_and_unwrap<state_delete_prefix_result>(
+        ::dsn::rpc::call(_server,
+                         RPC_RASN_STATE_DELETE_PREFIX_DETAILED,
+                         request,
+                         nullptr,
+                         empty_callback,
+                         timeout,
+                         thread_hash,
+                         partition_hash));
+}
+
 std::pair< ::dsn::error_code, state_response>
 rasn_state_client::advance_sequence_sync(
     const state_sequence_barrier_request &request,
@@ -2631,6 +4447,15 @@ rasn_state_client::recover_sync(const state_checkpoint_request &request,
 
 ::dsn::error_code rasn_state_app::start(int argc, char **argv)
 {
+    std::string storage_error;
+    if (!validate_state_checkpoint_target(
+            configured_state_checkpoint_path(), true, &storage_error))
+    {
+        derror("refusing to start rasn.state with unsafe storage paths: %s",
+               storage_error.c_str());
+        return ::dsn::ERR_INVALID_PARAMETERS;
+    }
+
     const char *recover_on_start_value =
         ::dsn_config_get_value_string("rasn.state", "recover_on_start", "", "checkpoint file to recover at startup");
     const std::string recover_on_start = recover_on_start_value == nullptr ? "" : recover_on_start_value;
@@ -2684,6 +4509,15 @@ rasn_replicated_state_app::rasn_replicated_state_app(::dsn_gpid gpid)
 
 ::dsn::error_code rasn_replicated_state_app::start(int argc, char **argv)
 {
+    std::string classification_error;
+    if (!validate_replicated_state_write_classification(
+            &classification_error))
+    {
+        derror("refusing to start replicated rasn.state: %s",
+               classification_error.c_str());
+        return ::dsn::ERR_INVALID_PARAMETERS;
+    }
+
     const char *data_dir = ::dsn_get_app_data_dir(get_gpid());
     if (data_dir == nullptr || data_dir[0] == '\0')
     {

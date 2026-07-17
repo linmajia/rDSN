@@ -26,7 +26,8 @@ namespace dsn {
 namespace rasn {
 
 int run_rasn_state_command(rasn_service_graph &services,
-                           const std::vector<std::string> &args);
+                           const std::vector<std::string> &args,
+                           const std::string &default_scope = "");
 
 class rasn_service_graph_lifecycle_scope
 {

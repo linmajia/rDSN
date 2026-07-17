@@ -40,6 +40,7 @@ srepilot.exe observe events
 srepilot.exe observe failures
 srepilot.exe observe metrics text
 srepilot.exe observe resilience
+srepilot.exe state put srepilot/example "value"
 srepilot.exe state query rasn/runtime
 srepilot.exe state migrate rasn/state/export.chkpt --prefix rasn/runtime
 srepilot.exe provider simulator
@@ -47,6 +48,9 @@ srepilot.exe interactive
 srepilot.exe C:\path\to\service-repo
 srepilot.exe C:\path\to\incident.log
 ```
+
+State keys are stored as `<scope>/<id>`; a bare SREPilot `state put|get` key is
+resolved as `srepilot/<key>`, and put records use `scope=srepilot` metadata.
 
 ```sh
 ./srepilot ~/src/service-repo

@@ -189,7 +189,9 @@ Design notes:
   **logical delete** for an explicitly obsolete namespace. It is not part of
   compaction, and operators must not prune the active runtime-mirror prefix merely
   because its records are present in a checkpoint: hydration still queries those
-  live records. Locally routed hybrid modules are intentionally not mirrored, so
+  live records. A prefix beginning with `-` uses `--prefix=-tenant/...`; use `--`
+  before a leading-dash query prefix or checkpoint/recovery path. Locally routed
+  hybrid modules are intentionally not mirrored, so
   flipping a module from `local` to `remote` is still a **cold migration** unless
   an operator exports/imports that module's prior local state.
 
@@ -835,7 +837,9 @@ Create a verified export while attached to the source state service. The export
 path is local to that service process; run the command on the source host or copy
 the file through the existing NFS workflow. Then point `[rasn.service]` at the
 destination state service and preflight/apply from a CLI process that can read the
-export:
+export. Quiesce **all writers to the destination state service** during `--apply`;
+the tool rechecks the exact prefix and global sequence before and after each phase,
+fails on concurrent target changes, and remains safe to resume:
 
 ```bat
 codepilot.exe state compact --prefix rasn/runtime rasn/state/runtime-mirror-export.chkpt
@@ -858,13 +862,15 @@ fresh CLI process cannot checkpoint or prune an empty in-memory store over durab
 state. RPC-client mode delegates this responsibility to the state-service process.
 
 If a mirror failure cannot be rolled back conclusively, the state store fail-stops
-and leaves quarantine evidence beside or in place of the configured journal
-(`.quarantine`, `.quarantined`, and, when possible, an in-journal marker). Stop the
-role, preserve those files for diagnosis, reconcile the primary and replica against
-a known-good checkpoint, and replace the journal with a verified recovery image
-before removing the external marker and restarting. There is intentionally no
-in-process "clear quarantine" path, and deleting only the sidecar is insufficient
-when the journal itself contains the marker.
+and leaves quarantine evidence beside or in place of the affected primary or
+configured replica journal (`.quarantine`, `.quarantined`, and, when possible, an
+in-journal marker). Stop the role, preserve those files for diagnosis, reconcile
+both journal copies against a known-good checkpoint, and replace them with verified
+recovery images before removing the external markers and restarting. There is
+intentionally no
+in-process "clear quarantine" path: once a live store observes external evidence it
+remains quarantined until restart. Deleting only the sidecar is insufficient when
+the journal itself contains the marker.
 
 Hybrid (agents call most modules in-process; shared state on dedicated nodes):
 
@@ -1620,12 +1626,14 @@ The application owns a journal-free `state_store`: rDSN's committed mutation log
 is the durability authority, so a second per-replica append journal would introduce
 filesystem-dependent divergence. `RPC_RASN_STATE_PUT` and
 `RPC_RASN_STATE_PUT_CONDITIONAL`, `RPC_RASN_STATE_DELETE_PREFIX`, and
-`RPC_RASN_STATE_ADVANCE_SEQUENCE` are marked
+`RPC_RASN_STATE_DELETE_PREFIX_DETAILED`, and `RPC_RASN_STATE_ADVANCE_SEQUENCE` are marked
 `rpc_request_is_write_operation`; the replication layer commits them before
 dispatching the same deterministic mutation on every replica. Ordered replay and
 checkpoint-restored `_last_sequence` make server-assigned sequences,
 cutoff-guarded deletions, migration sequence barriers, and conditional-write
-outcomes deterministic.
+outcomes deterministic. Replicated startup validates every mutating task flag and
+fails closed when an older/custom config omits one, preventing a newly registered
+handler from bypassing quorum during a configuration upgrade.
 `RPC_RASN_STATE_RECOVER` is also classified as a write but is rejected by replicated
 instances: operators cannot replace one live replica from an arbitrary path.
 
@@ -1649,10 +1657,41 @@ The standalone state journal records PUTs, cutoff-guarded prefix tombstones, and
 sequence barriers in commit order. Recovery applies tombstones without deleting
 records newer than their cutoff and restores barriers even when no live record
 carries the checkpoint's final sequence. A checkpoint written to the configured
-recovery path removes its covered journal only when no concurrent mutation landed.
-An explicit custom export path never removes that recovery journal.
-Checkpoint/recovery/mutation lifecycles are serialized so a recovery image cannot
-resurrect a key deleted after its journal read. When local write-through mirroring
+recovery directory entry (including an equivalent normalized/absolute spelling)
+removes its covered journal only when no concurrent mutation landed. Leaf
+symlinks/reparse points are rejected; distinct hard-link aliases and explicit
+custom export paths never remove that recovery journal. Journal records are flushed before
+acknowledgement; checkpoint/replica temporary files are flushed before atomic
+replacement, with directory metadata flush, macOS `F_FULLFSYNC` for regular files,
+or Windows write-through replacement.
+Checkpoint/export targets and their `.tmp`/`.bak` staging names are rejected when
+they alias either the primary or configured-replica journal lifecycle paths.
+Validation covers effective replica basenames and `.nfs.tmp` copy staging, uses
+native identity for existing files/hard links, resolves canonical parents for
+future names, and honors Windows and case-insensitive macOS naming. Any legacy `.bak` is
+first synchronized to the new flushed image; journal compaction proceeds only
+after that alias is durably removed. Recovery files are opened no-follow, and a
+live journal, trusted recovery input, or stale staging entry is accepted only
+when it is a regular single-link file. A hard-link custom export remains safe
+because atomic replacement detaches the export entry before writing.
+Ancestor directories are an operator-owned trust boundary and must not be
+writable by untrusted users; parent symlinks/mount indirections remain supported.
+Recovery restores
+independently missing checkpoint/journal artifacts from the local replica. NFS is
+then used only as a coherent cold seed when both remain absent; distinct staging
+uses a fresh per-attempt subdirectory, preventing shorter or timed-out transfers
+from contaminating retries. A durable pending marker ensures a crash or partial
+install discards both destinations before retry rather than mixing checkpoint
+generations; it stays present through retry and is removed only after parsing.
+Completed failed attempt directories are removed, while possibly active timed-out
+directories are orphaned and never reused. Local file copies reject short/failed/changing source reads before
+replacement, and deletion retries flush directory metadata even when the target
+name is already absent.
+Checkpoint/recovery lifecycles are serialized so a recovery image cannot resurrect
+a key deleted after its journal read. Mutations serialize their durable append and
+in-memory commit but do not hold the read lock during disk/replica I/O. Checkpoint
+file writing permits concurrent mutations and retains the journal when its captured
+write epoch was superseded. When local write-through mirroring
 is enabled, a mirror append failure rolls the primary append back before returning
 failure; inability to prove that rollback fail-stops instead of leaving a
 success-shaped or restart-visible partial mutation. It also persists quarantine
@@ -1664,7 +1703,9 @@ successful or failed recovery becomes that graph's recorded recovery outcome. Th
 detailed checkpoint RPC
 returns the server-resolved path and whether journal compaction actually occurred;
 mixed-version fallback keeps the old checkpoint RPC but reports that outcome as
-unknown.
+unknown. Apply-mode pruning skips the full-value dry-run query and prefers a bounded
+detailed delete response containing only the deleted count; old servers remain
+supported through the legacy response.
 
 Checkpoint files are currently retained without automatic garbage collection.
 rDSN may still be transferring a path returned by `get_checkpoint()` after that
