@@ -37,7 +37,7 @@ struct app_status {
 
 extern const std::map<int, const char*> _app_status_VALUES_TO_NAMES;
 
-class partition_configuration;
+class DSN_TEST_API partition_configuration;
 
 class configuration_query_by_index_request;
 
@@ -56,7 +56,7 @@ typedef struct _partition_configuration__isset {
   bool last_committed_decree :1;
 } _partition_configuration__isset;
 
-class partition_configuration {
+class DSN_TEST_API partition_configuration {
  public:
 
   partition_configuration(const partition_configuration&);

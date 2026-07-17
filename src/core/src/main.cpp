@@ -325,7 +325,13 @@ extern bool dsn_log_init();
 
 // load all modules: local components, tools, frameworks, apps
 static bool load_all_modules(::dsn::configuration_ptr config)
-{    
+{
+    const bool log_module_load_success = config->get_value<bool>(
+        "core",
+        "log_module_load_success",
+        true,
+        "whether to log every successfully loaded shared library");
+
     std::vector<std::pair<std::string, std::string>> modules;
     std::map<std::string, std::size_t> module_map; // name -> index in modules
 
@@ -395,7 +401,7 @@ static bool load_all_modules(::dsn::configuration_ptr config)
             derror("cannot load shared library '%s' specified in config file", m.first.c_str());
             return false;
         }
-        else
+        else if (log_module_load_success)
         {
             dinfo("load shared library '%s' successfully", m.first.c_str());
         }
@@ -445,7 +451,6 @@ static bool load_all_modules(::dsn::configuration_ptr config)
     return true;
 }
 
-void run_all_unit_tests_prepare_when_necessary();
 bool run(
     const char* config_file, 
     const char* config_arguments, 
@@ -497,9 +502,6 @@ bool run(
     {
         return false;
     }
-
-    // prepare unit test run if necessary
-    run_all_unit_tests_prepare_when_necessary();
 
     for (int i = 0; i <= dsn_task_code_max(); i++)
     {

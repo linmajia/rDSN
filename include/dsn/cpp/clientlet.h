@@ -47,7 +47,7 @@ namespace dsn
     clientlet is the base class for RPC service and client
     there can be multiple clientlet in the system
     */
-    class clientlet
+    class DSN_TEST_API clientlet
     {
     public:
         clientlet(int task_bucket_count = 13);

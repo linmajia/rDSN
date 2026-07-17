@@ -151,7 +151,7 @@ namespace dsn {
             unsigned int magic;
             int local_tid;
         } tls_tid;
-        extern __thread tls_tid s_tid;
+        extern DSN_TEST_API __thread tls_tid s_tid;
 
         inline int get_current_tid()
         {

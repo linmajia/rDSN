@@ -41,7 +41,7 @@
 
 namespace dsn
 {
-    class dsn_message_parser : public message_parser
+    class DSN_TEST_API dsn_message_parser : public message_parser
     {
     public:
         dsn_message_parser() : _header_checked(false) {}

@@ -7,6 +7,8 @@ cmake_minimum_required(VERSION 3.22)
 project(dsn C CXX)
 
 set(DSN_BUILD_RUNTIME TRUE)
+include(CTest)
+
 option(BUILD_CSHARP "Build rDSN C# projects" OFF)
 option(BUILD_PROTOBUF_CSHARP "Build protobuf C# library" OFF)
 option(BUILD_THRIFT_CSHARP "Build thrift C# library" OFF)
@@ -16,6 +18,7 @@ message(STATUS "use BUILD_PLUGINS = ${BUILD_PLUGINS}")
 message(STATUS "use BUILD_CSHARP = ${BUILD_CSHARP}")
 message(STATUS "use BUILD_PROTOBUF_CSHARP = ${BUILD_PROTOBUF_CSHARP}")
 message(STATUS "use BUILD_THRIFT_CSHARP = ${BUILD_THRIFT_CSHARP}")
+message(STATUS "use BUILD_TESTING = ${BUILD_TESTING}")
 message(STATUS "use BOOST_INCLUDEDIR = ${BOOST_INCLUDEDIR}")
 
 
@@ -58,7 +61,11 @@ add_custom_target(sync_js_binding ALL
 
 include(${GIT_SOURCE_FILE})
 add_subdirectory(ext/thrift)
-add_subdirectory(ext/gtest)
+if(BUILD_TESTING OR BUILD_PLUGINS)
+    # External plugins still use the legacy embedded-test layout. Keep GTest
+    # available for those projects until they migrate to component test targets.
+    add_subdirectory(ext/gtest)
+endif()
 add_subdirectory(ext/protobuf)
 #
 # !!! gflags is currently not used, and when it is enabled, it causes failure on windows compilation

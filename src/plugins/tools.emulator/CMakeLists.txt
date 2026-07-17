@@ -23,10 +23,11 @@ endif()
 # "GLOB_RECURSE" for recursive search
 # "GLOB" for non-recursive search
 set(MY_SRC_SEARCH_MODE "GLOB")
+set(MY_PROJ_EXCLUDE_REGEXES "\\.test\\.cpp$")
 
-set(MY_PROJ_INC_PATH ${GTEST_INCLUDE_DIR} "${CMAKE_CURRENT_SOURCE_DIR}/../tools.common")
+set(MY_PROJ_INC_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../tools.common")
 
-set(MY_PROJ_LIBS gtest)
+set(MY_PROJ_LIBS "")
 
 set(MY_BOOST_PACKAGES "")
 
@@ -37,4 +38,6 @@ set(MY_BINPLACES "")
 
 dsn_add_shared_library()
 
-file(COPY test/ DESTINATION "${CMAKE_BINARY_DIR}/test/${MY_PROJ_NAME}")
+if(BUILD_TESTING)
+    add_subdirectory(test)
+endif()

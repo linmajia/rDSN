@@ -101,12 +101,25 @@ REM SET DSN_TMP_OLD_PATH=%Path%
 IF NOT DEFINED DSN_TMP_BUILD_DIR_IN_PATH SET Path=%build_dir%\bin\%build_type%;%build_dir%\lib;%Path%
 SET DSN_TMP_BUILD_DIR_IN_PATH=
 
-REM run dll-embedded unit tests
-SET DSN_TEST_HOST=%DSN_ROOT:/=\%\bin\dsn.svchost.exe
-IF EXIST "%build_dir%\bin\dsn.svchost\%build_type%\dsn.svchost.exe"  SET DSN_TEST_HOST=%build_dir%\bin\dsn.svchost\%build_type%\dsn.svchost.exe
+REM run component unit tests
+PUSHD "%build_dir%"
+ctest -C "%build_type%" --output-on-failure -LE "performance|fault"
+IF ERRORLEVEL 1 (
+    POPD
+    ECHO CTest component tests failed
+    GOTO error
+)
+POPD
+
+REM run legacy dll-embedded external plugin tests
+SET DSN_TEST_HOST=%build_dir%\test\dsn.legacy.tests\%build_type%\dsn.legacy.tests.exe
 
 FOR /D %%A IN ("%build_dir%\test\*") DO (
     IF EXIST "%%A\gtests" (
+        IF NOT EXIST "%DSN_TEST_HOST%" (
+            ECHO legacy plugin tests were not built; rebuild without --skip_tests
+            GOTO error
+        )
         PUSHD "%%A"
         FOR /F "usebackq eol=# delims=" %%I IN ("%%A\gtests") DO (
             IF EXIST "%%A" (
@@ -115,7 +128,7 @@ FOR /D %%A IN ("%build_dir%\test\*") DO (
                 IF EXIST data DEL /F /Q data
                 IF EXIST core\ RMDIR /S /Q core
                 IF EXIST core DEL /F /Q core
-                CALL "%DSN_TEST_HOST%" "%%I"
+                CALL "%DSN_TEST_HOST%" "%%I" -overwrite core.log_module_load_success=false
                 IF ERRORLEVEL 1 POPD && ECHO test "%%I" failed && goto error
             )
         )

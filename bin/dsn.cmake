@@ -1,3 +1,5 @@
+include(CMakeParseArguments)
+
 function(ms_add_project PROJ_LANG PROJ_TYPE PROJ_NAME PROJ_SRC PROJ_INC_PATH PROJ_LIBS PROJ_LIB_PATH PROJ_BINPLACES PROJ_BINDIRS DO_INSTALL)
     if(DEFINED DSN_DEBUG_CMAKE)
         message(STATUS "PROJ_LANG = ${PROJ_LANG}")
@@ -337,6 +339,20 @@ function(dsn_add_project)
     set(TEMP_SRC "")
     ms_find_source_files("${MY_PROJ_LANG}" "${CMAKE_CURRENT_SOURCE_DIR}" ${MY_SRC_SEARCH_MODE} TEMP_SRC)
     set(MY_PROJ_SRC ${TEMP_SRC} ${MY_PROJ_SRC})
+    set(DSN_LEGACY_TEST_PROJECT FALSE)
+    if(NOT BUILD_TESTING)
+        if(CMAKE_CURRENT_SOURCE_DIR MATCHES "/src/test(/|$)")
+            set(DSN_LEGACY_TEST_PROJECT TRUE)
+            set(MY_DO_INSTALL FALSE)
+        else()
+            list(FILTER MY_PROJ_SRC EXCLUDE REGEX "\\.test\\.cpp$")
+        endif()
+    endif()
+    if(DEFINED MY_PROJ_EXCLUDE_REGEXES)
+        foreach(EXCLUDE_REGEX ${MY_PROJ_EXCLUDE_REGEXES})
+            list(FILTER MY_PROJ_SRC EXCLUDE REGEX "${EXCLUDE_REGEX}")
+        endforeach()
+    endif()
     if(NOT DEFINED MY_PROJ_INC_PATH)
         set(MY_PROJ_INC_PATH "")
     endif()
@@ -345,6 +361,9 @@ function(dsn_add_project)
     endif()
     if(NOT DEFINED MY_PROJ_LIBS)
         set(MY_PROJ_LIBS "")
+    endif()
+    if((NOT BUILD_TESTING) AND (NOT DSN_LEGACY_TEST_PROJECT))
+        list(REMOVE_ITEM MY_PROJ_LIBS gtest)
     endif()
     if(NOT DEFINED MY_PROJ_LIB_PATH)
         set(MY_PROJ_LIB_PATH "")
@@ -374,6 +393,9 @@ function(dsn_add_project)
     list(FIND MY_PROJ_LIBS gtest DSN_GTEST_LIB_INDEX)
     if((NOT DSN_GTEST_LIB_INDEX EQUAL -1) AND DEFINED GTEST_LIB_DIR AND NOT "${GTEST_LIB_DIR}" STREQUAL "")
         list(APPEND MY_PROJ_LIB_PATH ${GTEST_LIB_DIR})
+        if(WIN32)
+            list(APPEND MY_PROJ_LIB_PATH "${GTEST_LIB_DIR}/$<CONFIG>")
+        endif()
     endif()
 
     if(MY_PROJ_LANG STREQUAL "CXX")
@@ -417,6 +439,23 @@ function(dsn_add_project)
         include_directories(SYSTEM ${MY_PROJ_SYS_INC_PATH})
     endif()
     ms_add_project("${MY_PROJ_LANG}" "${MY_PROJ_TYPE}" "${MY_PROJ_NAME}" "${MY_PROJ_SRC}" "${MY_PROJ_INC_PATH}" "${MY_PROJ_LIBS}" "${MY_PROJ_LIB_PATH}" "${MY_BINPLACES}" "${MY_PROJ_BINDIRS}" "${MY_DO_INSTALL}")
+
+    if(DSN_LEGACY_TEST_PROJECT)
+        set_target_properties(
+            ${MY_PROJ_NAME}
+            PROPERTIES
+                EXCLUDE_FROM_ALL TRUE
+                EXCLUDE_FROM_DEFAULT_BUILD TRUE)
+    endif()
+
+    if((NOT DSN_GTEST_LIB_INDEX EQUAL -1) AND TARGET googletest)
+        add_dependencies(${MY_PROJ_NAME} googletest)
+        target_compile_definitions(${MY_PROJ_NAME} PRIVATE DSN_WITH_EMBEDDED_TESTS)
+        if(GTEST_LINKED_AS_SHARED_LIBRARY)
+            target_compile_definitions(
+                ${MY_PROJ_NAME} PRIVATE GTEST_LINKED_AS_SHARED_LIBRARY=1)
+        endif()
+    endif()
 
     if (DSN_BUILD_RUNTIME)
         if (USE_THRIFT)
@@ -479,6 +518,161 @@ function(dsn_add_executable)
     set(MY_PROJ_TYPE "EXECUTABLE")
     dsn_add_project()
 endfunction(dsn_add_executable)
+
+function(dsn_add_test_executable)
+    if(NOT BUILD_TESTING)
+        return()
+    endif()
+
+    set(one_value_args NAME MAIN)
+    set(multi_value_args SOURCES LIBRARIES INCLUDE_DIRECTORIES RESOURCES)
+    cmake_parse_arguments(TEST "" "${one_value_args}" "${multi_value_args}" ${ARGN})
+
+    if(NOT TEST_NAME)
+        message(FATAL_ERROR "dsn_add_test_executable requires NAME")
+    endif()
+    if(NOT TEST_MAIN)
+        set(TEST_MAIN "${CMAKE_SOURCE_DIR}/src/tests/support/component_test_main.cpp")
+    endif()
+
+    add_executable(${TEST_NAME} ${TEST_MAIN} ${TEST_SOURCES})
+    if(WIN32)
+        target_compile_definitions(${TEST_NAME} PRIVATE DSN_TEST_IMPORTS)
+        foreach(TEST_DLL_TARGET dsn.core ${TEST_LIBRARIES})
+            if(TARGET ${TEST_DLL_TARGET})
+                # Standalone tests exercise implementation details that are not part
+                # of the installed C API. Export them only from test-linked DLLs.
+                set_property(TARGET ${TEST_DLL_TARGET} PROPERTY WINDOWS_EXPORT_ALL_SYMBOLS ON)
+            endif()
+        endforeach()
+    endif()
+    if(GTEST_LINKED_AS_SHARED_LIBRARY)
+        target_compile_definitions(
+            ${TEST_NAME} PRIVATE GTEST_LINKED_AS_SHARED_LIBRARY=1)
+    endif()
+    target_include_directories(
+        ${TEST_NAME}
+        PRIVATE
+            ${GTEST_INCLUDE_DIR}
+            ${THRIFT_INCLUDE_DIR}
+            "${CMAKE_SOURCE_DIR}/src/tests/support"
+            ${TEST_INCLUDE_DIRECTORIES})
+    if(DEFINED GTEST_LIB_DIR AND NOT "${GTEST_LIB_DIR}" STREQUAL "")
+        target_link_directories(${TEST_NAME} PRIVATE ${GTEST_LIB_DIR})
+        if(WIN32)
+            target_link_directories(${TEST_NAME} PRIVATE "${GTEST_LIB_DIR}/$<CONFIG>")
+        endif()
+    endif()
+    if(DEFINED THRIFT_LIB_DIR AND NOT "${THRIFT_LIB_DIR}" STREQUAL "")
+        target_link_directories(${TEST_NAME} PRIVATE ${THRIFT_LIB_DIR})
+    endif()
+    if(WIN32)
+        set(TEST_THRIFT_LIBRARY thriftmt)
+    else()
+        set(TEST_THRIFT_LIBRARY thrift.so)
+    endif()
+    target_link_libraries(
+        ${TEST_NAME}
+        PRIVATE
+            dsn.test.support
+            gtest
+            ${TEST_THRIFT_LIBRARY}
+            ${TEST_LIBRARIES}
+            dsn.dev.cpp
+            dsn.core
+            dsn.dev.utility
+            ${DSN_SYSTEM_LIBS})
+    add_dependencies(${TEST_NAME} googletest thrift)
+
+    set(TEST_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/test/${TEST_NAME}")
+    set_target_properties(
+        ${TEST_NAME}
+        PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${TEST_OUTPUT_DIRECTORY}")
+
+    set(TEST_OUTPUT_DIRECTORIES "${TEST_OUTPUT_DIRECTORY}")
+    if(CMAKE_CONFIGURATION_TYPES)
+        set(TEST_OUTPUT_DIRECTORIES "")
+        foreach(CONFIGURATION ${CMAKE_CONFIGURATION_TYPES})
+            list(APPEND
+                TEST_OUTPUT_DIRECTORIES
+                "${TEST_OUTPUT_DIRECTORY}/${CONFIGURATION}")
+        endforeach()
+    endif()
+
+    foreach(TEST_RESOURCE_DIRECTORY ${TEST_OUTPUT_DIRECTORIES})
+        file(MAKE_DIRECTORY "${TEST_RESOURCE_DIRECTORY}")
+        foreach(TEST_RESOURCE ${TEST_RESOURCES})
+            get_filename_component(TEST_RESOURCE_NAME "${TEST_RESOURCE}" NAME)
+            configure_file(
+                "${TEST_RESOURCE}"
+                "${TEST_RESOURCE_DIRECTORY}/${TEST_RESOURCE_NAME}"
+                COPYONLY)
+        endforeach()
+    endforeach()
+endfunction(dsn_add_test_executable)
+
+function(dsn_register_test)
+    if(NOT BUILD_TESTING)
+        return()
+    endif()
+
+    set(options RUN_SERIAL)
+    set(one_value_args NAME TARGET CONFIG TIMEOUT)
+    set(multi_value_args LABELS)
+    cmake_parse_arguments(TEST "${options}" "${one_value_args}" "${multi_value_args}" ${ARGN})
+
+    if(NOT TEST_NAME OR NOT TEST_TARGET OR NOT TEST_CONFIG)
+        message(FATAL_ERROR "dsn_register_test requires NAME, TARGET, and CONFIG")
+    endif()
+
+    get_filename_component(TEST_CONFIG_NAME "${TEST_CONFIG}" NAME)
+    set(TEST_WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/test/${TEST_TARGET}")
+    set(TEST_WORKING_DIRECTORIES "${TEST_WORKING_DIRECTORY}")
+    if(CMAKE_CONFIGURATION_TYPES)
+        set(TEST_WORKING_DIRECTORIES "")
+        foreach(CONFIGURATION ${CMAKE_CONFIGURATION_TYPES})
+            list(APPEND
+                TEST_WORKING_DIRECTORIES
+                "${TEST_WORKING_DIRECTORY}/${CONFIGURATION}")
+        endforeach()
+    endif()
+    foreach(TEST_CONFIG_DIRECTORY ${TEST_WORKING_DIRECTORIES})
+        file(MAKE_DIRECTORY "${TEST_CONFIG_DIRECTORY}")
+        configure_file(
+            "${TEST_CONFIG}"
+            "${TEST_CONFIG_DIRECTORY}/${TEST_CONFIG_NAME}"
+            COPYONLY)
+    endforeach()
+
+    add_test(
+        NAME ${TEST_NAME}
+        COMMAND
+            "${CMAKE_COMMAND}"
+            -E
+            chdir
+            "$<TARGET_FILE_DIR:${TEST_TARGET}>"
+            "$<TARGET_FILE:${TEST_TARGET}>"
+            "${TEST_CONFIG_NAME}")
+
+    set(TEST_ALL_LABELS ${TEST_LABELS} ${TEST_TARGET})
+    list(REMOVE_DUPLICATES TEST_ALL_LABELS)
+    set_tests_properties(${TEST_NAME} PROPERTIES LABELS "${TEST_ALL_LABELS}")
+    if(WIN32)
+        set_property(
+            TEST ${TEST_NAME}
+            APPEND
+            PROPERTY ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:${CMAKE_BINARY_DIR}/lib"
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:dsn.core>")
+    endif()
+    if(TEST_TIMEOUT)
+        set_tests_properties(${TEST_NAME} PROPERTIES TIMEOUT "${TEST_TIMEOUT}")
+    endif()
+    if(TEST_RUN_SERIAL)
+        set_tests_properties(${TEST_NAME} PROPERTIES RUN_SERIAL TRUE)
+    endif()
+endfunction(dsn_register_test)
 
 function(dsn_setup_compiler_flags)
     ms_replace_compiler_flags("STATIC_LINK")
@@ -678,7 +872,7 @@ endfunction(dsn_setup_link_path)
 
 function(dsn_setup_install)
     if(DSN_BUILD_RUNTIME)
-        install(DIRECTORY include/ DESTINATION include)
+        install(DIRECTORY include/ DESTINATION include PATTERN "gtest" EXCLUDE)
         install(DIRECTORY bin/ DESTINATION bin USE_SOURCE_PERMISSIONS)
         install(DIRECTORY src/tools/webstudio/ DESTINATION webstudio USE_SOURCE_PERMISSIONS)
         #if(MSVC)

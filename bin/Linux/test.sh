@@ -4,7 +4,7 @@
 # Shell Options:
 #    RUN_VERBOSE    YES|NO
 #    ENABLE_GCOV    YES|NO
-#    TEST_MODULE    "<module1> <module2> ..."
+#    TEST_MODULE    "<module1>,<module2>,..."
 
 ROOT=`pwd`
 BUILD_DIR="${DSN_BUILD_DIR:-$ROOT/builder}"
@@ -92,21 +92,41 @@ fi
 rm -rf "$TEST_TMP_DIR"
 mkdir -p "$TEST_TMP_DIR"
 
-### TODO: add test module filtering 
-
-##### unit tests #######
-if [ -f "$BUILD_DIR/bin/dsn.svchost/dsn.svchost" ]
+##### CTest unit tests #######
+if [ -f "$BUILD_DIR/CTestTestfile.cmake" ]
 then
-    SVC_HOST=$BUILD_DIR/bin/dsn.svchost/dsn.svchost
-else
-    SVC_HOST=$DSN_ROOT/bin/dsn.svchost
-fi 
+    CTEST_OPTIONS=(--output-on-failure -LE "performance|fault")
+    if [ -n "$TEST_MODULE" ]
+    then
+        CTEST_OPTIONS+=(-L "${TEST_MODULE//,/|}")
+    fi
+
+    pushd "$BUILD_DIR" >/dev/null
+    if ! ctest "${CTEST_OPTIONS[@]}"; then
+        popd >/dev/null
+        echo "run CTest unit tests failed"
+        exit -1
+    fi
+    popd >/dev/null
+fi
+
+##### legacy plugin unit tests #######
+LEGACY_TEST_HOST="$BUILD_DIR/test/dsn.legacy.tests/dsn.legacy.tests"
 
 for dir in $BUILD_DIR/test/*/
 do
     echo $dir
+    if [ -n "$TEST_MODULE" ] && [[ ! $dir =~ ${TEST_MODULE//,/|} ]]
+    then
+        continue
+    fi
     if [ -f "$dir/gtests" ]
     then
+        if [ ! -x "$LEGACY_TEST_HOST" ]
+        then
+            echo "legacy plugin tests were not built; rebuild without --skip_tests"
+            exit -1
+        fi
         pushd "$dir" >/dev/null
         while read -r line || [ -n "$line" ]; do
             case "$line" in
@@ -114,7 +134,8 @@ do
             esac
             echo "============ run unit tests in $dir with $line ============"
             rm -fr ./data core
-            $SVC_HOST $dir/$line
+            "$LEGACY_TEST_HOST" "$dir/$line" \
+                -overwrite core.log_module_load_success=false
 
             if [ $? -ne 0 ]; then
                 echo "run unit tests in $dir with $line failed"
@@ -125,8 +146,8 @@ do
                     tail -n 100 `find . -name log.1.txt`
                 fi
                 if [ -f core ]; then
-                    echo "---- gdb $SVC_HOST core ----"
-                    gdb $SVC_HOST core -ex "thread apply all bt" -ex "set pagination 0" -batch
+                    echo "---- gdb $LEGACY_TEST_HOST core ----"
+                    gdb "$LEGACY_TEST_HOST" core -ex "thread apply all bt" -ex "set pagination 0" -batch
                 fi
                 popd >/dev/null
                 exit -1

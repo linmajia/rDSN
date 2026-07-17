@@ -47,4 +47,8 @@
 # define DSN_API
 # endif
 
-
+# if defined(_WIN32) && defined(DSN_TEST_IMPORTS)
+# define DSN_TEST_API __declspec(dllimport)
+# else
+# define DSN_TEST_API
+# endif

@@ -95,11 +95,11 @@ struct __tls_dsn__
     char*         scratch_next() { return scratch_buffer[++scratch_buffer_index % 4]; }
 };
 
-extern __thread struct __tls_dsn__ tls_dsn;
+extern DSN_TEST_API __thread struct __tls_dsn__ tls_dsn;
 
 //----------------- common task -------------------------------------------------------
 
-class task :
+class DSN_TEST_API task :
     public ref_counter, 
     public extensible_object<task, 4>
 {

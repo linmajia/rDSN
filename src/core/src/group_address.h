@@ -74,7 +74,7 @@ namespace dsn
         bool        _update_leader_automatically;
         std::string _name;
         rpc_address _group_address;
-        static const rpc_address _invalid;
+        DSN_TEST_API static const rpc_address _invalid;
     };
 
     // ------------------ inline implementation --------------------

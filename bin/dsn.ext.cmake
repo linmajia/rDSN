@@ -23,8 +23,13 @@ else ()
     set(target_bin_subdir "")
 endif ()
 set(install_cmd "")
+if(NOT DEFINED exclude_from_all)
+    set(exclude_from_all FALSE)
+endif()
 
-if(WIN32)
+if(DEFINED skip_install AND skip_install)
+    set(install_cmd ${CMAKE_COMMAND} -E echo "Skipping external project installation")
+elseif(WIN32)
     if(EXISTS "${PROJECT_SOURCE_DIR}/bin/dsn.ext.copy.cmd")
         set (install_cmd CALL ${PROJECT_SOURCE_DIR}/bin/dsn.ext.copy.cmd ${target_bin_dir}${target_bin_subdir} ${PROJECT_BINARY_DIR}/lib)
     else()
@@ -44,10 +49,12 @@ endif()
 #message (INFO " install_cmd = ${install_cmd}")
 
 ExternalProject_Add(${project_name}
+    EXCLUDE_FROM_ALL ${exclude_from_all}
     GIT_REPOSITORY ${target_url}
     GIT_TAG ${git_tag}
     GIT_PROGRESS FALSE
-    CMAKE_ARGS "${CMAKE_ARGS};-DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX};${my_cmake_args};"
+    CMAKE_ARGS
+        "${CMAKE_ARGS};-DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX};-DCMAKE_C_COMPILER=${CMAKE_C_COMPILER};-DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER};-DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM};${my_cmake_args};"
     BINARY_DIR "${target_bin_dir}"
     INSTALL_DIR "${PROJECT_BINARY_DIR}/lib"
     INSTALL_COMMAND ${install_cmd}

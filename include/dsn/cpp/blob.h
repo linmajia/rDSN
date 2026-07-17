@@ -266,7 +266,7 @@ namespace dsn
         int         _remaining_size;
     };
 
-    class binary_writer
+    class DSN_TEST_API binary_writer
     {
     public:
         binary_writer(int reserved_buffer_size = 0);

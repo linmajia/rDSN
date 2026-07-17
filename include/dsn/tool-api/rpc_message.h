@@ -164,7 +164,7 @@ namespace dsn
         DSN_API void prepare_buffer_header();
 
     private:        
-        static std::atomic<uint64_t> _id;
+        DSN_TEST_API static std::atomic<uint64_t> _id;
 
     private:
         // by msg read & write

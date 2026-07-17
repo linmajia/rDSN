@@ -53,6 +53,7 @@ function usage_build()
     echo "   -w|--warning_all  open all warnings when build, default no"
     echo "   --enable_gcov     generate gcov code coverage report, default no"
     echo "   --build_plugins   build all plugins as well, default no"
+    echo "   --skip_tests      do not build unit-test targets, default false"
     echo "   --build_csharp    build rDSN C# projects, default no"
     echo "   --build_protobuf_csharp"
     echo "                     build protobuf C# project, default no"
@@ -71,6 +72,7 @@ function run_build()
     ENABLE_GCOV=NO
     RUN_VERBOSE=NO
     BUILD_PLUGINS=NO
+    BUILD_TESTING=YES
     BUILD_CSHARP=NO
     BUILD_PROTOBUF_CSHARP=NO
     BUILD_THRIFT_CSHARP=NO
@@ -109,6 +111,9 @@ function run_build()
             --build_plugins)
                 BUILD_PLUGINS=YES
                 ;;
+            --skip_tests)
+                BUILD_TESTING=NO
+                ;;
             --build_csharp)
                 BUILD_CSHARP=YES
                 ;;
@@ -145,6 +150,7 @@ function run_build()
     BUILD_TYPE="$BUILD_TYPE" GIT_SOURCE="$GIT_SOURCE" CLEAR="$CLEAR" JOB_NUM="$JOB_NUM" \
         BOOST_DIR="$BOOST_DIR" WARNING_ALL="$WARNING_ALL" ENABLE_GCOV="$ENABLE_GCOV" \
         RUN_VERBOSE="$RUN_VERBOSE" BUILD_PLUGINS="$BUILD_PLUGINS" BUILD_CSHARP="$BUILD_CSHARP" \
+        BUILD_TESTING="$BUILD_TESTING" \
         BUILD_PROTOBUF_CSHARP="$BUILD_PROTOBUF_CSHARP" BUILD_THRIFT_CSHARP="$BUILD_THRIFT_CSHARP" \
         $scripts_dir/build.sh
 }

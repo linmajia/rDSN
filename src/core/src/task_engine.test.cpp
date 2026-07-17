@@ -37,40 +37,10 @@
 # include <dsn/cpp/test_utils.h>
 # include <dsn/tool_api.h>
 # include <gtest/gtest.h>
+# include "core_test_environment.h"
 # include <sstream>
 
 using namespace ::dsn;
-
-class admission_controller_for_test : public admission_controller
-{
-public:
-    admission_controller_for_test(task_queue* q, std::vector<std::string>& sargs)
-        : admission_controller(q, sargs), _args(sargs)
-    {
-    }
-
-    virtual ~admission_controller_for_test()
-    {
-    }
-
-    virtual bool is_task_accepted(task* task)
-    {
-        return true;
-    }
-
-    const std::vector<std::string>& arguments() const
-    {
-        return _args;
-    }
-
-private:
-    std::vector<std::string> _args;
-};
-
-void task_engine_module_init()
-{
-    tools::register_component_provider<admission_controller_for_test>("dsn::tools::admission_controller_for_test");
-}
 
 DEFINE_THREAD_POOL_CODE(THREAD_POOL_FOR_TEST_1)
 DEFINE_THREAD_POOL_CODE(THREAD_POOL_FOR_TEST_2)
@@ -215,4 +185,3 @@ TEST(core, task_engine)
     ASSERT_EQ(nullptr, controllers2[1]);
 }
 */
-

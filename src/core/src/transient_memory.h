@@ -51,7 +51,7 @@ namespace dsn
         bool                  committed;
     } tls_transient_memory_t;
 
-    extern __thread tls_transient_memory_t tls_trans_memory;
+    extern DSN_TEST_API __thread tls_transient_memory_t tls_trans_memory;
     extern void tls_trans_mem_init(size_t default_per_block_bytes);
     extern void tls_trans_mem_alloc(size_t min_size);
 
