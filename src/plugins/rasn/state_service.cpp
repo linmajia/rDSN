@@ -969,6 +969,86 @@ bool state_parent_directory_is_case_sensitive(const std::string &parent)
 }
 #endif
 
+bool resolve_existing_state_path_identity(const std::string &path,
+                                          std::string *identity)
+{
+#if defined(_WIN32)
+    const HANDLE handle = ::CreateFileA(
+        path.c_str(),
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        nullptr);
+    if (handle == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+    BY_HANDLE_FILE_INFORMATION info;
+    const bool inspected =
+        ::GetFileInformationByHandle(handle, &info) != 0;
+    ::CloseHandle(handle);
+    if (!inspected)
+    {
+        return false;
+    }
+    if (identity != nullptr)
+    {
+        identity->assign(
+            reinterpret_cast<const char *>(&info.dwVolumeSerialNumber),
+            sizeof(info.dwVolumeSerialNumber));
+        identity->append(
+            reinterpret_cast<const char *>(&info.nFileIndexHigh),
+            sizeof(info.nFileIndexHigh));
+        identity->append(
+            reinterpret_cast<const char *>(&info.nFileIndexLow),
+            sizeof(info.nFileIndexLow));
+    }
+#else
+    struct stat info;
+    if (::stat(path.c_str(), &info) != 0)
+    {
+        return false;
+    }
+    if (identity != nullptr)
+    {
+        identity->assign(reinterpret_cast<const char *>(&info.st_dev),
+                         sizeof(info.st_dev));
+        identity->append(reinterpret_cast<const char *>(&info.st_ino),
+                         sizeof(info.st_ino));
+    }
+#endif
+    return true;
+}
+
+std::string normalize_state_path_entry_identity(std::string identity)
+{
+#if defined(__APPLE__)
+    const std::string parent = path_parent_or_current(identity);
+    if (!state_parent_directory_is_case_sensitive(parent))
+    {
+        identity = ::dsn::utils::filesystem::path_combine(
+            parent,
+            fold_ascii_state_path_component(
+                ::dsn::utils::filesystem::get_file_name(identity)));
+    }
+#endif
+    return identity;
+}
+
+struct state_path_entry_identity_less
+{
+    bool operator()(const std::string &left, const std::string &right) const
+    {
+#if defined(_WIN32)
+        return ::_stricmp(left.c_str(), right.c_str()) < 0;
+#else
+        return left < right;
+#endif
+    }
+};
+
 bool state_path_entries_refer_to_same_file(const std::string &left,
                                            const std::string &right)
 {
@@ -985,21 +1065,9 @@ bool state_path_entries_refer_to_same_file(const std::string &left,
     }
 #if defined(_WIN32)
     return ::_stricmp(absolute_left.c_str(), absolute_right.c_str()) == 0;
-#elif defined(__APPLE__)
-    if (absolute_left == absolute_right)
-    {
-        return true;
-    }
-    const std::string left_parent = path_parent_or_current(absolute_left);
-    const std::string right_parent = path_parent_or_current(absolute_right);
-    return left_parent == right_parent &&
-           !state_parent_directory_is_case_sensitive(left_parent) &&
-           fold_ascii_state_path_component(
-               ::dsn::utils::filesystem::get_file_name(absolute_left)) ==
-               fold_ascii_state_path_component(
-                   ::dsn::utils::filesystem::get_file_name(absolute_right));
 #else
-    return absolute_left == absolute_right;
+    return normalize_state_path_entry_identity(std::move(absolute_left)) ==
+           normalize_state_path_entry_identity(std::move(absolute_right));
 #endif
 }
 
@@ -1011,63 +1079,14 @@ bool state_paths_refer_to_same_file(const std::string &left,
         return true;
     }
 
-#if defined(_WIN32)
-    const DWORD share_mode =
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-    const HANDLE left_handle = ::CreateFileA(left.c_str(),
-                                             0,
-                                             share_mode,
-                                             nullptr,
-                                             OPEN_EXISTING,
-                                             FILE_FLAG_BACKUP_SEMANTICS,
-                                             nullptr);
-    const HANDLE right_handle = ::CreateFileA(right.c_str(),
-                                              0,
-                                              share_mode,
-                                              nullptr,
-                                              OPEN_EXISTING,
-                                              FILE_FLAG_BACKUP_SEMANTICS,
-                                              nullptr);
-    if (left_handle != INVALID_HANDLE_VALUE &&
-        right_handle != INVALID_HANDLE_VALUE)
-    {
-        BY_HANDLE_FILE_INFORMATION left_info;
-        BY_HANDLE_FILE_INFORMATION right_info;
-        const bool same =
-            ::GetFileInformationByHandle(left_handle, &left_info) != 0 &&
-            ::GetFileInformationByHandle(right_handle, &right_info) != 0 &&
-            left_info.dwVolumeSerialNumber == right_info.dwVolumeSerialNumber &&
-            left_info.nFileIndexHigh == right_info.nFileIndexHigh &&
-            left_info.nFileIndexLow == right_info.nFileIndexLow;
-        ::CloseHandle(left_handle);
-        ::CloseHandle(right_handle);
-        if (same)
-        {
-            return true;
-        }
-    }
-    else
-    {
-        if (left_handle != INVALID_HANDLE_VALUE)
-        {
-            ::CloseHandle(left_handle);
-        }
-        if (right_handle != INVALID_HANDLE_VALUE)
-        {
-            ::CloseHandle(right_handle);
-        }
-    }
-#else
-    struct stat left_info;
-    struct stat right_info;
-    if (::stat(left.c_str(), &left_info) == 0 &&
-        ::stat(right.c_str(), &right_info) == 0 &&
-        left_info.st_dev == right_info.st_dev &&
-        left_info.st_ino == right_info.st_ino)
+    std::string left_identity;
+    std::string right_identity;
+    if (resolve_existing_state_path_identity(left, &left_identity) &&
+        resolve_existing_state_path_identity(right, &right_identity) &&
+        left_identity == right_identity)
     {
         return true;
     }
-#endif
 
     return state_path_entries_refer_to_same_file(left, right);
 }
@@ -1970,8 +1989,13 @@ void add_journal_lifecycle_paths(const std::string &journal_path,
 bool validate_distinct_state_paths(const std::vector<named_state_path> &paths,
                                    std::string *error)
 {
-    for (const named_state_path &candidate : paths)
+    std::map<std::string, size_t> exact_paths;
+    std::map<std::string, size_t> existing_path_identities;
+    std::map<std::string, size_t, state_path_entry_identity_less>
+        entry_identities;
+    for (size_t index = 0; index < paths.size(); ++index)
     {
+        const named_state_path &candidate = paths[index];
         if (state_path_is_link(candidate.path))
         {
             if (error != nullptr)
@@ -1981,23 +2005,67 @@ bool validate_distinct_state_paths(const std::vector<named_state_path> &paths,
             }
             return false;
         }
-    }
-    for (size_t left = 0; left < paths.size(); ++left)
-    {
-        for (size_t right = left + 1; right < paths.size(); ++right)
+
+        size_t overlap = paths.size();
+        const std::map<std::string, size_t>::const_iterator exact =
+            exact_paths.find(candidate.path);
+        if (exact != exact_paths.end())
         {
-            if (state_paths_refer_to_same_file(paths[left].path,
-                                              paths[right].path))
+            overlap = exact->second;
+        }
+        else
+        {
+            exact_paths.emplace(candidate.path, index);
+        }
+
+        std::string identity;
+        if (overlap == paths.size() &&
+            resolve_existing_state_path_identity(
+                candidate.path, &identity))
+        {
+            const std::map<std::string, size_t>::const_iterator existing =
+                existing_path_identities.find(identity);
+            if (existing != existing_path_identities.end())
             {
-                if (error != nullptr)
-                {
-                    *error = "state storage paths overlap: " +
-                             paths[left].description + "=" + paths[left].path +
-                             " and " + paths[right].description + "=" +
-                             paths[right].path;
-                }
-                return false;
+                overlap = existing->second;
             }
+            else
+            {
+                existing_path_identities.emplace(std::move(identity), index);
+            }
+        }
+
+        identity.clear();
+        if (overlap == paths.size() &&
+            resolve_state_path_entry_identity(
+                candidate.path, &identity))
+        {
+            identity =
+                normalize_state_path_entry_identity(std::move(identity));
+            const std::map<std::string,
+                           size_t,
+                           state_path_entry_identity_less>::const_iterator
+                entry = entry_identities.find(identity);
+            if (entry != entry_identities.end())
+            {
+                overlap = entry->second;
+            }
+            else
+            {
+                entry_identities.emplace(std::move(identity), index);
+            }
+        }
+
+        if (overlap != paths.size())
+        {
+            if (error != nullptr)
+            {
+                *error = "state storage paths overlap: " +
+                         paths[overlap].description + "=" +
+                         paths[overlap].path + " and " +
+                         candidate.description + "=" + candidate.path;
+            }
+            return false;
         }
     }
     return true;
