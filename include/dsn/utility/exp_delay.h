@@ -74,6 +74,11 @@ namespace dsn
 
         inline int delay(int value)
         {
+            if (_threshold <= 0)
+            {
+                return 0;
+            }
+
             if (value >= _threshold)
             {
                 double f = (double)value / (double)_threshold;
@@ -123,6 +128,11 @@ namespace dsn
 
         inline int delay(int value, int threshold)
         {
+            if (threshold <= 0)
+            {
+                return 0;
+            }
+
             if (value >= threshold)
             {
                 double f = (double)value / (double)threshold;

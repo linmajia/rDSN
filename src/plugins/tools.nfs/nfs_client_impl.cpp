@@ -111,6 +111,12 @@ namespace dsn {
                 return;
             }
 
+            if (resp.file_list.empty())
+            {
+                handle_completion(ureq, ERR_OK);
+                return;
+            }
+
             // file_list comes from the (untrusted) remote server and is combined with the local
             // dst_dir below to form the path this client creates and writes. Reject any name that
             // escapes dst_dir (see nfs_path_has_parent_ref) up front -- before any file_context is
@@ -446,7 +452,10 @@ namespace dsn {
                     hfile = reqc->file_ctx->file.load();
                     if (!hfile)
                     {
-                        hfile = dsn_file_open(file_path.c_str(), O_RDWR | O_CREAT | O_BINARY, 0666);
+                        int open_flags =
+                            nfs_client_detail::destination_open_flags(
+                                reqc->copy_req.overwrite);
+                        hfile = dsn_file_open(file_path.c_str(), open_flags, 0666);
                         reqc->file_ctx->file = hfile;
                     }
                 }
@@ -460,12 +469,12 @@ namespace dsn {
                 }
 
                 // An empty source file yields a copy request with response.size == 0. The
-                // destination file has just been created (or already exists) via the
-                // O_RDWR | O_CREAT open above, so there is nothing to write: a zero-length
-                // file::write would complete with ERR_HANDLE_EOF and be reported as a
-                // failure. Finalize this segment as a success inline -- mirroring the
-                // success bookkeeping in local_write_callback -- and continue the loop
-                // (no recursion) instead of issuing the zero-length write.
+                // destination file has already been opened with the requested creation
+                // policy, so there is nothing to write: a zero-length file::write would
+                // complete with ERR_HANDLE_EOF and be reported as a failure. Finalize this
+                // segment as a success inline -- mirroring the success bookkeeping in
+                // local_write_callback -- and continue the loop (no recursion) instead of
+                // issuing the zero-length write.
                 if (reqc->response.size == 0)
                 {
                     reqc->response.file_content = blob();
@@ -513,6 +522,17 @@ namespace dsn {
         {
             //dassert(reqc->local_write_task == task::get_current_task(), "");
             --_concurrent_local_write_count;
+
+            auto write_err =
+                nfs_client_detail::local_write_result(err, sz, reqc->response.size);
+            if (err == ERR_OK && write_err != ERR_OK)
+            {
+                derror("short write for nfs file '%s': expected %u bytes, wrote %zu",
+                       reqc->file_ctx->file_name.c_str(),
+                       static_cast<unsigned int>(reqc->response.size),
+                       sz);
+            }
+            err = write_err;
 
             // clear all content to release memory quickly
             reqc->response.file_content = blob();
@@ -601,12 +621,19 @@ namespace dsn {
 
                     f.second->file = nullptr;
 
-                    if (f.second->finished_segments != (int)f.second->copy_requests.size())
+                    const bool is_incomplete =
+                        f.second->finished_segments != (int)f.second->copy_requests.size();
+                    const bool rollback_preserving_copy =
+                        err != ERR_OK && !req->file_size_req.overwrite;
+                    if (is_incomplete || rollback_preserving_copy)
                     {
-                        std::string path = f.second->user_req->file_size_req.dst_dir + f.second->file_name;
+                        // A preserving copy creates files with O_EXCL, so every opened file
+                        // belongs to this request. Roll all of them back when any file fails;
+                        // otherwise completed siblings would make a retry fail with O_EXCL.
+                        const std::string& path = f.first;
                         if (!::dsn::utils::filesystem::remove_path(path))
                         {
-                            dwarn("failed to remove incomplete transfer file %s", path.c_str());
+                            dwarn("failed to remove transfer file %s during cleanup", path.c_str());
                         }
                     }
 
