@@ -1183,8 +1183,29 @@ state_path_identity_status resolve_existing_state_path_identities_impl(
 {
     identities = existing_state_path_identities();
 #if defined(_WIN32)
-    return state_service_internal::resolve_windows_state_path_identities(
-        path, identities, nullptr);
+    const HANDLE handle = ::CreateFileA(
+        path.c_str(),
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        nullptr);
+    if (handle == INVALID_HANDLE_VALUE)
+    {
+        const DWORD error = ::GetLastError();
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND
+                   ? classify_missing_windows_state_path(path)
+                   : state_path_identity_status::uninspectable;
+    }
+
+    // A preferred-only result cannot be compared with a fallback-only alias.
+    // Fail closed if the legacy comparison key cannot be obtained.
+    const state_path_identity_status status =
+        state_service_internal::resolve_open_windows_state_path_identities(
+            handle, identities);
+    ::CloseHandle(handle);
+    return status;
 #else
     struct stat info;
     if (::stat(path.c_str(), &info) != 0)
@@ -3573,56 +3594,6 @@ state_service_internal::resolve_open_windows_state_path_identities(
                 static_cast<uint32_t>(info.nFileIndexLow);
             return true;
         });
-}
-
-state_service_internal::state_path_identity_status
-state_service_internal::resolve_windows_state_path_identities(
-    const std::string &path,
-    existing_state_path_identities &identities,
-    windows_identity_query_observation *observation)
-{
-    identities = existing_state_path_identities();
-    if (observation != nullptr)
-    {
-        *observation = windows_identity_query_observation();
-    }
-    const HANDLE handle = ::CreateFileA(
-        path.c_str(),
-        0,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr,
-        OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS,
-        nullptr);
-    if (handle == INVALID_HANDLE_VALUE)
-    {
-        const DWORD error = ::GetLastError();
-        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND
-                   ? classify_missing_windows_state_path(path)
-                   : state_path_identity_status::uninspectable;
-    }
-
-    if (observation != nullptr)
-    {
-        const FILE_INFO_BY_HANDLE_CLASS file_id_info_class =
-            static_cast<FILE_INFO_BY_HANDLE_CLASS>(18);
-        observation->preferred_supported =
-            ::GetFileInformationByHandleEx(
-                handle,
-                file_id_info_class,
-                &observation->preferred,
-                static_cast<DWORD>(sizeof(observation->preferred))) != 0;
-        observation->fallback_supported =
-            ::GetFileInformationByHandle(handle, &observation->fallback) != 0;
-    }
-
-    // A preferred-only result cannot be compared with a fallback-only alias.
-    // The legacy query is supported on every accepted Windows filesystem, so
-    // fail closed rather than silently omit this existing path from an index.
-    const state_path_identity_status status =
-        resolve_open_windows_state_path_identities(handle, identities);
-    ::CloseHandle(handle);
-    return status;
 }
 #endif
 

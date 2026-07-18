@@ -2965,12 +2965,10 @@ TEST(rasn_state, windows_identity_adapter_classifies_real_paths)
     ::dsn::utils::filesystem::remove_path(blocked_parent);
     write_text_file(existing_path, "identity");
     write_text_file(blocked_parent, "not-a-directory");
-
     state_service_internal::existing_state_path_identities existing_identities;
-    state_service_internal::windows_identity_query_observation observation;
     const state_service_internal::state_path_identity_status existing_status =
-        state_service_internal::resolve_windows_state_path_identities(
-            existing_path, existing_identities, &observation);
+        state_service_internal::resolve_existing_state_path_identities(
+            existing_path, existing_identities);
     state_service_internal::existing_state_path_identities missing_identities;
     const state_service_internal::state_path_identity_status missing_status =
         state_service_internal::resolve_existing_state_path_identities(
@@ -2982,42 +2980,28 @@ TEST(rasn_state, windows_identity_adapter_classifies_real_paths)
 
     ::dsn::utils::filesystem::remove_path(existing_path);
     ::dsn::utils::filesystem::remove_path(blocked_parent);
-    EXPECT_EQ(observation.fallback_supported
-                  ? state_service_internal::state_path_identity_status::resolved
-                  : state_service_internal::state_path_identity_status::
-                        uninspectable,
+    // Unsupported legacy identity queries fail closed; the handle-level test
+    // above verifies the exact status and bytes returned by the OS queries.
+    EXPECT_NE(state_service_internal::state_path_identity_status::absent,
               existing_status);
-    std::string expected_fallback_identity;
-    if (observation.fallback_supported)
+    EXPECT_EQ(existing_status ==
+                  state_service_internal::state_path_identity_status::resolved,
+              !existing_identities.fallback.empty());
+    if (!existing_identities.fallback.empty())
     {
-        expected_fallback_identity = "windows-file-index-64:";
-        expected_fallback_identity.append(
-            reinterpret_cast<const char *>(
-                &observation.fallback.dwVolumeSerialNumber),
-            sizeof(observation.fallback.dwVolumeSerialNumber));
-        expected_fallback_identity.append(
-            reinterpret_cast<const char *>(
-                &observation.fallback.nFileIndexHigh),
-            sizeof(observation.fallback.nFileIndexHigh));
-        expected_fallback_identity.append(
-            reinterpret_cast<const char *>(
-                &observation.fallback.nFileIndexLow),
-            sizeof(observation.fallback.nFileIndexLow));
+        const std::string prefix = "windows-file-index-64:";
+        EXPECT_EQ(0U, existing_identities.fallback.find(prefix));
+        EXPECT_EQ(prefix.size() +
+                      sizeof(state_service_internal::windows_file_index_64),
+                  existing_identities.fallback.size());
     }
-    EXPECT_EQ(expected_fallback_identity, existing_identities.fallback);
-    EXPECT_EQ(observation.preferred_supported,
-              !existing_identities.preferred.empty());
-    if (observation.preferred_supported)
+    if (!existing_identities.preferred.empty())
     {
-        std::string expected_preferred_identity = "windows-file-id-128:";
-        expected_preferred_identity.append(
-            reinterpret_cast<const char *>(
-                &observation.preferred.volume_serial_number),
-            sizeof(observation.preferred.volume_serial_number));
-        expected_preferred_identity.append(
-            reinterpret_cast<const char *>(observation.preferred.file_id),
-            sizeof(observation.preferred.file_id));
-        EXPECT_EQ(expected_preferred_identity, existing_identities.preferred);
+        const std::string prefix = "windows-file-id-128:";
+        EXPECT_EQ(0U, existing_identities.preferred.find(prefix));
+        EXPECT_EQ(prefix.size() +
+                      sizeof(state_service_internal::windows_file_id_128),
+                  existing_identities.preferred.size());
     }
     EXPECT_EQ(state_service_internal::state_path_identity_status::absent,
               missing_status);
