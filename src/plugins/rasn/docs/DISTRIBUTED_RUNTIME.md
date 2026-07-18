@@ -1688,7 +1688,11 @@ non-directory parent) also prevent state-file content from being copied or
 replaced. Do not hot-loop these errors: restore permissions, mount/redirector
 health, or the path layout first, then retry the operator command with bounded
 backoff. Persistent failures require filesystem intervention rather than
-automatic bypass.
+automatic bypass. Windows additionally walks parent attributes after
+`ERROR_PATH_NOT_FOUND`: a missing tree below an existing directory remains a
+valid future target, while an existing regular-file or inaccessible ancestor is
+uninspectable. The walk preserves drive, UNC-share, and extended-path roots and
+validates root accessibility before accepting a future path.
 Checkpoint/export targets and their `.tmp`/`.bak` staging names are rejected when
 they alias either the primary or configured-replica journal lifecycle paths.
 Validation covers effective replica basenames and `.nfs.tmp` copy staging, uses

@@ -525,8 +525,11 @@ Correctness and robustness requirements:
   Permission, I/O, redirector, symlink-loop, and non-directory-parent probe
   errors are likewise uninspectable rather than absent. These failures prevent
   state-file content from being copied or replaced; callers may retry with
-  bounded backoff only after restoring path access or filesystem health. Leaf
-  symlinks/reparse points are rejected,
+  bounded backoff only after restoring path access or filesystem health. Windows
+  disambiguates `ERROR_PATH_NOT_FOUND` by walking to the nearest existing parent:
+  a directory permits future nested paths, while a regular-file or inaccessible
+  parent fails closed. Drive, UNC-share, and extended-path roots are preserved and
+  validated as accessible during that walk. Leaf symlinks/reparse points are rejected,
   recovery reads are opened no-follow, and live journals, trusted recovery inputs,
   and replaceable staging must be regular single-link files. Journal compaction requires the configured
   checkpoint directory entry; a distinct hard-link alias is treated as a custom

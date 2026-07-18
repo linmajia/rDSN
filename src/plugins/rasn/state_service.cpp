@@ -983,6 +983,180 @@ enum class state_path_identity_status
     uninspectable
 };
 
+#if defined(_WIN32)
+bool is_windows_state_path_separator(char value)
+{
+    return value == '\\' || value == '/';
+}
+
+size_t windows_state_path_root_after_components(const std::string &path,
+                                                size_t start,
+                                                size_t component_count)
+{
+    size_t component_start = start;
+    for (size_t component = 0; component < component_count; ++component)
+    {
+        if (component_start >= path.size() ||
+            is_windows_state_path_separator(path[component_start]))
+        {
+            return 0;
+        }
+        const size_t separator = path.find_first_of("\\/", component_start);
+        if (component + 1 == component_count)
+        {
+            return separator == std::string::npos ? path.size() : separator + 1;
+        }
+        if (separator == std::string::npos)
+        {
+            return 0;
+        }
+        component_start = separator + 1;
+    }
+    return 0;
+}
+
+size_t windows_state_path_root_length(const std::string &path)
+{
+    if (path.size() >= 3 && path[1] == ':' &&
+        is_windows_state_path_separator(path[2]))
+    {
+        return 3;
+    }
+    if (path.size() < 2 || !is_windows_state_path_separator(path[0]) ||
+        !is_windows_state_path_separator(path[1]))
+    {
+        return !path.empty() && is_windows_state_path_separator(path[0]) ? 1
+                                                                         : 0;
+    }
+
+    if (path.size() >= 4 && (path[2] == '?' || path[2] == '.') &&
+        is_windows_state_path_separator(path[3]))
+    {
+        const bool extended_unc =
+            path.size() >= 8 && ::_strnicmp(path.c_str() + 4, "UNC", 3) == 0 &&
+            is_windows_state_path_separator(path[7]);
+        return windows_state_path_root_after_components(
+            path, extended_unc ? 8 : 4, extended_unc ? 2 : 1);
+    }
+    return windows_state_path_root_after_components(path, 2, 2);
+}
+
+bool absolute_windows_state_path(const std::string &path,
+                                 std::string &absolute)
+{
+    const DWORD required =
+        ::GetFullPathNameA(path.c_str(), 0, nullptr, nullptr);
+    if (required == 0)
+    {
+        return false;
+    }
+    std::vector<char> resolved(static_cast<size_t>(required) + 1, '\0');
+    const DWORD length = ::GetFullPathNameA(
+        path.c_str(), static_cast<DWORD>(resolved.size()), resolved.data(), nullptr);
+    if (length == 0 || length >= resolved.size())
+    {
+        return false;
+    }
+    absolute.assign(resolved.data(), length);
+    return true;
+}
+
+std::string windows_state_path_parent(const std::string &path,
+                                      size_t root_length)
+{
+    size_t end = path.size();
+    while (end > root_length &&
+           is_windows_state_path_separator(path[end - 1]))
+    {
+        --end;
+    }
+    if (end <= root_length)
+    {
+        return path.substr(0, root_length);
+    }
+    const size_t separator = path.find_last_of("\\/", end - 1);
+    if (separator == std::string::npos || separator + 1 <= root_length)
+    {
+        return path.substr(0, root_length);
+    }
+    return path.substr(0, separator);
+}
+
+bool windows_state_root_is_accessible(std::string root)
+{
+    if (root.empty())
+    {
+        return false;
+    }
+    if (!is_windows_state_path_separator(root.back()))
+    {
+        root.push_back('\\');
+    }
+    // GetFileAttributes deliberately rejects a bare UNC share. A volume query
+    // validates drive, share, and extended roots without mistaking that quirk
+    // for an inaccessible root.
+    char filesystem_name[256] = {'\0'};
+    return ::GetVolumeInformationA(root.c_str(),
+                                   nullptr,
+                                   0,
+                                   nullptr,
+                                   nullptr,
+                                   nullptr,
+                                   filesystem_name,
+                                   static_cast<DWORD>(sizeof(filesystem_name))) != 0;
+}
+
+state_path_identity_status
+classify_missing_windows_state_path(const std::string &path)
+{
+    std::string absolute;
+    if (!absolute_windows_state_path(path, absolute))
+    {
+        return state_path_identity_status::uninspectable;
+    }
+    const size_t root_length = windows_state_path_root_length(absolute);
+    if (root_length == 0 || root_length > absolute.size())
+    {
+        return state_path_identity_status::uninspectable;
+    }
+
+    const std::string root = absolute.substr(0, root_length);
+    std::string candidate =
+        windows_state_path_parent(absolute, root_length);
+    while (true)
+    {
+        const DWORD attributes = ::GetFileAttributesA(candidate.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES)
+        {
+            return (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+                       ? state_path_identity_status::absent
+                       : state_path_identity_status::uninspectable;
+        }
+        const DWORD error = ::GetLastError();
+        if (candidate == root)
+        {
+            return (error == ERROR_FILE_NOT_FOUND ||
+                    error == ERROR_PATH_NOT_FOUND ||
+                    error == ERROR_BAD_NETPATH) &&
+                           windows_state_root_is_accessible(root)
+                       ? state_path_identity_status::absent
+                       : state_path_identity_status::uninspectable;
+        }
+        if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND)
+        {
+            return state_path_identity_status::uninspectable;
+        }
+        const std::string parent =
+            windows_state_path_parent(candidate, root_length);
+        if (parent == candidate)
+        {
+            return state_path_identity_status::uninspectable;
+        }
+        candidate = parent;
+    }
+}
+#endif
+
 state_path_identity_status resolve_existing_state_path_identities(
     const std::string &path, existing_state_path_identities &identities)
 {
@@ -1000,7 +1174,7 @@ state_path_identity_status resolve_existing_state_path_identities(
     {
         const DWORD error = ::GetLastError();
         return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND
-                   ? state_path_identity_status::absent
+                   ? classify_missing_windows_state_path(path)
                    : state_path_identity_status::uninspectable;
     }
 
