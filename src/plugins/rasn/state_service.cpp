@@ -971,18 +971,10 @@ bool state_parent_directory_is_case_sensitive(const std::string &parent)
 }
 #endif
 
-struct existing_state_path_identities
-{
-    std::string preferred;
-    std::string fallback;
-};
-
-enum class state_path_identity_status
-{
-    absent,
-    resolved,
-    uninspectable
-};
+using existing_state_path_identities =
+    state_service_internal::existing_state_path_identities;
+using state_path_identity_status =
+    state_service_internal::state_path_identity_status;
 
 #if defined(_WIN32)
 bool is_windows_state_path_separator(char value)
@@ -1158,7 +1150,7 @@ classify_missing_windows_state_path(const std::string &path)
 }
 #endif
 
-state_path_identity_status resolve_existing_state_path_identities(
+state_path_identity_status resolve_existing_state_path_identities_impl(
     const std::string &path, existing_state_path_identities &identities)
 {
     identities = existing_state_path_identities();
@@ -1189,54 +1181,54 @@ state_path_identity_status resolve_existing_state_path_identities(
     const FILE_INFO_BY_HANDLE_CLASS file_id_info_class =
         static_cast<FILE_INFO_BY_HANDLE_CLASS>(18);
     state_file_id_info extended_info = {};
-    bool preferred_resolved = false;
-    if (::GetFileInformationByHandleEx(handle,
-                                       file_id_info_class,
-                                       &extended_info,
-                                       sizeof(extended_info)) != 0)
-    {
-        preferred_resolved = true;
-        identities.preferred = "windows-file-id-128:";
-        identities.preferred.append(
-            reinterpret_cast<const char *>(
-                &extended_info.volume_serial_number),
-            sizeof(extended_info.volume_serial_number));
-        identities.preferred.append(
-            reinterpret_cast<const char *>(extended_info.file_id),
-            sizeof(extended_info.file_id));
-    }
-
-    // Older systems and some filesystem redirectors reject FileIdInfo with
-    // provider-specific errors. Always collect the universally supported legacy
-    // identity too, so mixed extended/fallback results share a comparable key.
     BY_HANDLE_FILE_INFORMATION info;
-    bool legacy_resolved = false;
-    if (::GetFileInformationByHandle(handle, &info) != 0)
-    {
-        legacy_resolved = true;
-        identities.fallback = "windows-file-index-64:";
-        identities.fallback.append(
-            reinterpret_cast<const char *>(&info.dwVolumeSerialNumber),
-            sizeof(info.dwVolumeSerialNumber));
-        identities.fallback.append(
-            reinterpret_cast<const char *>(&info.nFileIndexHigh),
-            sizeof(info.nFileIndexHigh));
-        identities.fallback.append(
-            reinterpret_cast<const char *>(&info.nFileIndexLow),
-            sizeof(info.nFileIndexLow));
-    }
+    const state_path_identity_status query_status =
+        state_service_internal::collect_windows_identity_query_results(
+            identities,
+            [&](std::string &identity) {
+                if (::GetFileInformationByHandleEx(handle,
+                                                   file_id_info_class,
+                                                   &extended_info,
+                                                   sizeof(extended_info)) == 0)
+                {
+                    return false;
+                }
+                identity = "windows-file-id-128:";
+                identity.append(
+                    reinterpret_cast<const char *>(
+                        &extended_info.volume_serial_number),
+                    sizeof(extended_info.volume_serial_number));
+                identity.append(
+                    reinterpret_cast<const char *>(extended_info.file_id),
+                    sizeof(extended_info.file_id));
+                return true;
+            },
+            [&](std::string &identity) {
+                // Older systems and some filesystem redirectors reject
+                // FileIdInfo with provider-specific errors. Always collect the
+                // universally supported legacy identity too, so mixed query
+                // results share a comparable key.
+                if (::GetFileInformationByHandle(handle, &info) == 0)
+                {
+                    return false;
+                }
+                identity = "windows-file-index-64:";
+                identity.append(
+                    reinterpret_cast<const char *>(&info.dwVolumeSerialNumber),
+                    sizeof(info.dwVolumeSerialNumber));
+                identity.append(
+                    reinterpret_cast<const char *>(&info.nFileIndexHigh),
+                    sizeof(info.nFileIndexHigh));
+                identity.append(
+                    reinterpret_cast<const char *>(&info.nFileIndexLow),
+                    sizeof(info.nFileIndexLow));
+                return true;
+            });
     ::CloseHandle(handle);
-    const state_service_internal::windows_identity_query_status query_status =
-        state_service_internal::classify_windows_identity_queries(
-            preferred_resolved, legacy_resolved);
     // A preferred-only result cannot be compared with a fallback-only alias.
     // The legacy query is supported on every accepted Windows filesystem, so
     // fail closed rather than silently omit this existing path from an index.
-    return query_status ==
-                   state_service_internal::windows_identity_query_status::
-                       uninspectable
-               ? state_path_identity_status::uninspectable
-               : state_path_identity_status::resolved;
+    return query_status;
 #else
     struct stat info;
     if (::stat(path.c_str(), &info) != 0)
@@ -1333,9 +1325,11 @@ state_path_relation compare_state_paths(const std::string &left,
     existing_state_path_identities left_identities;
     existing_state_path_identities right_identities;
     const state_path_identity_status left_status =
-        resolve_existing_state_path_identities(left, left_identities);
+        state_service_internal::resolve_existing_state_path_identities(
+            left, left_identities);
     const state_path_identity_status right_status =
-        resolve_existing_state_path_identities(right, right_identities);
+        state_service_internal::resolve_existing_state_path_identities(
+            right, right_identities);
     if (left_status == state_path_identity_status::uninspectable ||
         right_status == state_path_identity_status::uninspectable)
     {
@@ -2299,7 +2293,8 @@ bool validate_distinct_state_paths(const std::vector<named_state_path> &paths,
 
         existing_state_path_identities identities;
         const state_path_identity_status identity_status =
-            resolve_existing_state_path_identities(candidate.path, identities);
+            state_service_internal::resolve_existing_state_path_identities(
+                candidate.path, identities);
         if (identity_status == state_path_identity_status::uninspectable)
         {
             if (error != nullptr)
@@ -3589,6 +3584,13 @@ bool parse_replicated_checkpoint_decree(const std::string &file_name, int64_t *d
 }
 
 } // namespace
+
+state_service_internal::state_path_identity_status
+state_service_internal::resolve_existing_state_path_identities(
+    const std::string &path, existing_state_path_identities &identities)
+{
+    return resolve_existing_state_path_identities_impl(path, identities);
+}
 
 std::string configured_state_checkpoint_path()
 {

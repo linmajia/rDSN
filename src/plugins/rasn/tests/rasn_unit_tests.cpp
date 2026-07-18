@@ -2752,18 +2752,67 @@ TEST(rasn_state, checkpoint_copy_rejects_inaccessible_identity_parent)
 
 TEST(rasn_state, windows_identity_queries_require_legacy_comparison_key)
 {
-    using state_service_internal::classify_windows_identity_queries;
-    using state_service_internal::windows_identity_query_status;
+    using state_service_internal::collect_windows_identity_query_results;
+    using state_service_internal::existing_state_path_identities;
+    using state_service_internal::state_path_identity_status;
 
-    EXPECT_EQ(windows_identity_query_status::uninspectable,
-              classify_windows_identity_queries(false, false));
-    EXPECT_EQ(windows_identity_query_status::uninspectable,
-              classify_windows_identity_queries(true, false));
-    EXPECT_EQ(windows_identity_query_status::legacy_only,
-              classify_windows_identity_queries(false, true));
-    EXPECT_EQ(windows_identity_query_status::preferred_and_legacy,
-              classify_windows_identity_queries(true, true));
+    const auto verify = [](bool preferred_succeeds,
+                           bool legacy_succeeds,
+                           state_path_identity_status expected_status) {
+        existing_state_path_identities identities;
+        int preferred_calls = 0;
+        int legacy_calls = 0;
+        const state_path_identity_status status =
+            collect_windows_identity_query_results(
+                identities,
+                [&](std::string &identity) {
+                    ++preferred_calls;
+                    identity = "preferred";
+                    return preferred_succeeds;
+                },
+                [&](std::string &identity) {
+                    ++legacy_calls;
+                    identity = "legacy";
+                    return legacy_succeeds;
+                });
+
+        EXPECT_EQ(expected_status, status);
+        EXPECT_EQ(1, preferred_calls);
+        EXPECT_EQ(1, legacy_calls);
+        EXPECT_EQ(preferred_succeeds ? "preferred" : "",
+                  identities.preferred);
+        EXPECT_EQ(legacy_succeeds ? "legacy" : "", identities.fallback);
+    };
+
+    verify(false, false, state_path_identity_status::uninspectable);
+    verify(true, false, state_path_identity_status::uninspectable);
+    verify(false, true, state_path_identity_status::resolved);
+    verify(true, true, state_path_identity_status::resolved);
 }
+
+#if defined(_WIN32)
+TEST(rasn_state, windows_identity_adapter_resolves_real_file)
+{
+    const std::string path =
+        workspace_temp_file_path("rasn-state-windows-identity.chkpt");
+    std::remove(path.c_str());
+    write_text_file(path, "identity");
+
+    state_service_internal::existing_state_path_identities identities;
+    const state_service_internal::state_path_identity_status status =
+        state_service_internal::resolve_existing_state_path_identities(
+            path, identities);
+
+    std::remove(path.c_str());
+    EXPECT_EQ(state_service_internal::state_path_identity_status::resolved,
+              status);
+    EXPECT_EQ(0U, identities.fallback.find("windows-file-index-64:"));
+    if (!identities.preferred.empty())
+    {
+        EXPECT_EQ(0U, identities.preferred.find("windows-file-id-128:"));
+    }
+}
+#endif
 
 TEST(rasn_state, checkpoint_copy_rejects_non_directory_identity_parent)
 {
