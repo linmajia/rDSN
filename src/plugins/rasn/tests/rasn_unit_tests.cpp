@@ -3546,6 +3546,47 @@ TEST(rasn_state, checkpoint_rejects_multiply_linked_staging_file)
 }
 
 #if !defined(_WIN32)
+TEST(rasn_state, checkpoint_reports_link_before_existing_path_overlap)
+{
+    const std::string checkpoint_path =
+        workspace_temp_file_path("rasn-state-link-precedence.chkpt");
+    const std::string staging_path = checkpoint_path + ".tmp";
+    const std::string import_staging_path = checkpoint_path + ".nfs.tmp";
+    const std::string marker_path =
+        checkpoint_path + ".nfs-import.pending";
+    for (const std::string &path :
+         {checkpoint_path, staging_path, import_staging_path, marker_path})
+    {
+        std::remove(path.c_str());
+    }
+    write_text_file(staging_path, "overlap");
+    const hard_link_creation linked =
+        try_create_hard_link(staging_path, import_staging_path);
+    if (linked == hard_link_creation::unsupported)
+    {
+        std::remove(staging_path.c_str());
+        return;
+    }
+    ASSERT_TRUE(linked == hard_link_creation::created);
+    ASSERT_EQ(0, ::symlink(staging_path.c_str(), marker_path.c_str()));
+
+    state_store store(false, 0);
+    state_checkpoint_request checkpoint;
+    checkpoint.path = checkpoint_path;
+    const state_response response = store.checkpoint(checkpoint);
+    EXPECT_FALSE(response.ok);
+    EXPECT_NE(std::string::npos,
+              response.error.find("link or reparse point"));
+    EXPECT_NE(std::string::npos, response.error.find(marker_path));
+    EXPECT_EQ(std::string::npos,
+              response.error.find("storage paths overlap"));
+
+    std::remove(marker_path.c_str());
+    std::remove(import_staging_path.c_str());
+    std::remove(staging_path.c_str());
+    std::remove(checkpoint_path.c_str());
+}
+
 TEST(rasn_state, configured_checkpoint_rechecks_symlinks_after_cached_validation)
 {
     const std::string journal_path = configured_state_journal_path();

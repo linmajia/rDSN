@@ -516,8 +516,9 @@ Correctness and robustness requirements:
   identities are resolved once per candidate and indexed rather than compared as
   every possible path pair. The validator preserves the legacy earliest-pair
   diagnostic when multiple collision groups exist. Windows native identity uses
-  the full 128-bit file ID required by ReFS, with a legacy fallback only when the
-  information class is unavailable. Leaf symlinks/reparse points are rejected,
+  the full 128-bit file ID required by ReFS and retries with the universally
+  supported legacy query after any extended-query failure. Leaf
+  symlinks/reparse points are rejected,
   recovery reads are opened no-follow, and live journals, trusted recovery inputs,
   and replaceable staging must be regular single-link files. Journal compaction requires the configured
   checkpoint directory entry; a distinct hard-link alias is treated as a custom

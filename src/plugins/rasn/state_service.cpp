@@ -1016,16 +1016,8 @@ bool resolve_existing_state_path_identity(const std::string &path,
         return true;
     }
 
-    const DWORD extended_error = ::GetLastError();
-    if (extended_error != ERROR_INVALID_FUNCTION &&
-        extended_error != ERROR_INVALID_PARAMETER &&
-        extended_error != ERROR_NOT_SUPPORTED &&
-        extended_error != ERROR_CALL_NOT_IMPLEMENTED)
-    {
-        ::CloseHandle(handle);
-        return false;
-    }
-
+    // Older systems and some filesystem redirectors reject FileIdInfo with
+    // provider-specific errors. The legacy query is universally supported.
     BY_HANDLE_FILE_INFORMATION info;
     const bool inspected =
         ::GetFileInformationByHandle(handle, &info) != 0;
