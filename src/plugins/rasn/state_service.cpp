@@ -27,6 +27,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <rasn/state_service_windows_internal.h>
 #include <fcntl.h>
 #include <io.h>
 #include <share.h>
@@ -1004,42 +1005,6 @@ static_assert(
     "internal preferred file ID must match Windows SDK FILE_ID_INFO");
 #endif
 
-state_path_identity_status resolve_open_windows_state_path_identities(
-    HANDLE handle, existing_state_path_identities &identities)
-{
-    // The caller owns a handle already validated by CreateFileA and closes it
-    // immediately after this helper returns.
-    identities = existing_state_path_identities();
-    const FILE_INFO_BY_HANDLE_CLASS file_id_info_class =
-        static_cast<FILE_INFO_BY_HANDLE_CLASS>(18);
-    BY_HANDLE_FILE_INFORMATION info;
-    return state_service_internal::collect_windows_identity_query_results(
-        identities,
-        [&](state_service_internal::windows_file_id_128 *buffer,
-            size_t buffer_size) {
-            return ::GetFileInformationByHandleEx(
-                       handle,
-                       file_id_info_class,
-                       static_cast<void *>(buffer),
-                       static_cast<DWORD>(buffer_size)) != 0;
-        },
-        [&](state_service_internal::windows_file_index_64 *identity,
-            size_t buffer_size) {
-            if (buffer_size != sizeof(*identity) ||
-                ::GetFileInformationByHandle(handle, &info) == 0)
-            {
-                return false;
-            }
-            identity->volume_serial_number =
-                static_cast<uint32_t>(info.dwVolumeSerialNumber);
-            identity->file_index_high =
-                static_cast<uint32_t>(info.nFileIndexHigh);
-            identity->file_index_low =
-                static_cast<uint32_t>(info.nFileIndexLow);
-            return true;
-        });
-}
-
 bool is_windows_state_path_separator(char value)
 {
     return value == '\\' || value == '/';
@@ -1238,7 +1203,8 @@ state_path_identity_status resolve_existing_state_path_identities_impl(
     // ReFS. Older systems and some redirectors reject it, so the shared helper
     // still performs the universally supported legacy query for comparison.
     const state_path_identity_status query_status =
-        resolve_open_windows_state_path_identities(handle, identities);
+        state_service_internal::resolve_open_windows_state_path_identities(
+            handle, identities);
     ::CloseHandle(handle);
     // A preferred-only result cannot be compared with a fallback-only alias.
     // The legacy query is supported on every accepted Windows filesystem, so
@@ -3599,6 +3565,41 @@ bool parse_replicated_checkpoint_decree(const std::string &file_name, int64_t *d
 }
 
 } // namespace
+
+#if defined(_WIN32)
+state_service_internal::state_path_identity_status
+state_service_internal::resolve_open_windows_state_path_identities(
+    HANDLE handle, existing_state_path_identities &identities)
+{
+    identities = existing_state_path_identities();
+    const FILE_INFO_BY_HANDLE_CLASS file_id_info_class =
+        static_cast<FILE_INFO_BY_HANDLE_CLASS>(18);
+    BY_HANDLE_FILE_INFORMATION info;
+    return collect_windows_identity_query_results(
+        identities,
+        [&](windows_file_id_128 *buffer, size_t buffer_size) {
+            return ::GetFileInformationByHandleEx(
+                       handle,
+                       file_id_info_class,
+                       static_cast<void *>(buffer),
+                       static_cast<DWORD>(buffer_size)) != 0;
+        },
+        [&](windows_file_index_64 *identity, size_t buffer_size) {
+            if (buffer_size != sizeof(*identity) ||
+                ::GetFileInformationByHandle(handle, &info) == 0)
+            {
+                return false;
+            }
+            identity->volume_serial_number =
+                static_cast<uint32_t>(info.dwVolumeSerialNumber);
+            identity->file_index_high =
+                static_cast<uint32_t>(info.nFileIndexHigh);
+            identity->file_index_low =
+                static_cast<uint32_t>(info.nFileIndexLow);
+            return true;
+        });
+}
+#endif
 
 state_service_internal::state_path_identity_status
 state_service_internal::resolve_existing_state_path_identities(

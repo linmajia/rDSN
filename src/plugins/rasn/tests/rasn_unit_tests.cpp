@@ -74,6 +74,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <rasn/state_service_windows_internal.h>
 #else
 #include <sys/stat.h>
 #include <unistd.h>
@@ -2866,6 +2867,86 @@ TEST(rasn_state, windows_identity_queries_encode_all_result_combinations)
 }
 
 #if defined(_WIN32)
+TEST(rasn_state, windows_identity_handle_adapter_matches_os_queries)
+{
+    const std::string path =
+        workspace_temp_file_path("rasn-state-windows-handle-identity.chkpt");
+    ::dsn::utils::filesystem::remove_path(path);
+    write_text_file(path, "identity");
+
+    const HANDLE probe = ::CreateFileA(
+        path.c_str(),
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        nullptr);
+    if (probe == INVALID_HANDLE_VALUE)
+    {
+        const DWORD probe_error = ::GetLastError();
+        ::dsn::utils::filesystem::remove_path(path);
+        ADD_FAILURE() << "failed to open Windows identity probe: "
+                      << probe_error;
+        return;
+    }
+
+    state_service_internal::windows_file_id_128 expected_preferred;
+    const FILE_INFO_BY_HANDLE_CLASS file_id_info_class =
+        static_cast<FILE_INFO_BY_HANDLE_CLASS>(18);
+    const bool preferred_supported =
+        ::GetFileInformationByHandleEx(
+            probe,
+            file_id_info_class,
+            &expected_preferred,
+            static_cast<DWORD>(sizeof(expected_preferred))) != 0;
+    BY_HANDLE_FILE_INFORMATION expected_fallback = {};
+    const bool fallback_supported =
+        ::GetFileInformationByHandle(probe, &expected_fallback) != 0;
+    state_service_internal::existing_state_path_identities identities;
+    const state_service_internal::state_path_identity_status status =
+        state_service_internal::resolve_open_windows_state_path_identities(
+            probe, identities);
+    ::CloseHandle(probe);
+    ::dsn::utils::filesystem::remove_path(path);
+
+    EXPECT_TRUE(fallback_supported);
+    EXPECT_EQ(fallback_supported
+                  ? state_service_internal::state_path_identity_status::resolved
+                  : state_service_internal::state_path_identity_status::
+                        uninspectable,
+              status);
+    std::string expected_fallback_identity;
+    if (fallback_supported)
+    {
+        expected_fallback_identity = "windows-file-index-64:";
+        expected_fallback_identity.append(
+            reinterpret_cast<const char *>(
+                &expected_fallback.dwVolumeSerialNumber),
+            sizeof(expected_fallback.dwVolumeSerialNumber));
+        expected_fallback_identity.append(
+            reinterpret_cast<const char *>(&expected_fallback.nFileIndexHigh),
+            sizeof(expected_fallback.nFileIndexHigh));
+        expected_fallback_identity.append(
+            reinterpret_cast<const char *>(&expected_fallback.nFileIndexLow),
+            sizeof(expected_fallback.nFileIndexLow));
+    }
+    EXPECT_EQ(expected_fallback_identity, identities.fallback);
+    EXPECT_EQ(preferred_supported, !identities.preferred.empty());
+    if (preferred_supported)
+    {
+        std::string expected_preferred_identity = "windows-file-id-128:";
+        expected_preferred_identity.append(
+            reinterpret_cast<const char *>(
+                &expected_preferred.volume_serial_number),
+            sizeof(expected_preferred.volume_serial_number));
+        expected_preferred_identity.append(
+            reinterpret_cast<const char *>(expected_preferred.file_id),
+            sizeof(expected_preferred.file_id));
+        EXPECT_EQ(expected_preferred_identity, identities.preferred);
+    }
+}
+
 TEST(rasn_state, windows_identity_adapter_classifies_real_paths)
 {
     const std::string existing_path =
