@@ -1,4 +1,5 @@
 #include <rasn/state_service.h>
+#include <rasn/state_service_internal.h>
 
 #include <dsn/cpp/clientlet.h>
 #include <dsn/cpp/utils.h>
@@ -1188,13 +1189,13 @@ state_path_identity_status resolve_existing_state_path_identities(
     const FILE_INFO_BY_HANDLE_CLASS file_id_info_class =
         static_cast<FILE_INFO_BY_HANDLE_CLASS>(18);
     state_file_id_info extended_info = {};
-    bool resolved = false;
+    bool preferred_resolved = false;
     if (::GetFileInformationByHandleEx(handle,
                                        file_id_info_class,
                                        &extended_info,
                                        sizeof(extended_info)) != 0)
     {
-        resolved = true;
+        preferred_resolved = true;
         identities.preferred = "windows-file-id-128:";
         identities.preferred.append(
             reinterpret_cast<const char *>(
@@ -1209,9 +1210,10 @@ state_path_identity_status resolve_existing_state_path_identities(
     // provider-specific errors. Always collect the universally supported legacy
     // identity too, so mixed extended/fallback results share a comparable key.
     BY_HANDLE_FILE_INFORMATION info;
+    bool legacy_resolved = false;
     if (::GetFileInformationByHandle(handle, &info) != 0)
     {
-        resolved = true;
+        legacy_resolved = true;
         identities.fallback = "windows-file-index-64:";
         identities.fallback.append(
             reinterpret_cast<const char *>(&info.dwVolumeSerialNumber),
@@ -1224,15 +1226,17 @@ state_path_identity_status resolve_existing_state_path_identities(
             sizeof(info.nFileIndexLow));
     }
     ::CloseHandle(handle);
+    const state_service_internal::windows_identity_query_status query_status =
+        state_service_internal::classify_windows_identity_queries(
+            preferred_resolved, legacy_resolved);
     // A preferred-only result cannot be compared with a fallback-only alias.
     // The legacy query is supported on every accepted Windows filesystem, so
     // fail closed rather than silently omit this existing path from an index.
-    if (!identities.preferred.empty() && identities.fallback.empty())
-    {
-        return state_path_identity_status::uninspectable;
-    }
-    return resolved ? state_path_identity_status::resolved
-                    : state_path_identity_status::uninspectable;
+    return query_status ==
+                   state_service_internal::windows_identity_query_status::
+                       uninspectable
+               ? state_path_identity_status::uninspectable
+               : state_path_identity_status::resolved;
 #else
     struct stat info;
     if (::stat(path.c_str(), &info) != 0)

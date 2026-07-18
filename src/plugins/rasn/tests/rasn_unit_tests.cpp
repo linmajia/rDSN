@@ -31,6 +31,7 @@
 #include <rasn/rpc_resilience.h>
 #include <rasn/sandbox_runtime.h>
 #include <rasn/state_service.h>
+#include <rasn/state_service_internal.h>
 #include <rasn/schema_manifest.h>
 #include <rasn/session_store.h>
 #include <rasn/task_orchestration.h>
@@ -2737,7 +2738,9 @@ TEST(rasn_state, checkpoint_copy_rejects_inaccessible_identity_parent)
         ::chmod(blocked_directory.c_str(), S_IRWXU);
     EXPECT_EQ(0, restored);
     EXPECT_FALSE(copied.ok);
-    EXPECT_FALSE(copied.error.empty());
+    EXPECT_NE(std::string::npos,
+              copied.error.find(
+                  "failed to compare imported and durable checkpoint identities"));
     EXPECT_FALSE(
         ::dsn::utils::filesystem::file_exists(durable_path));
 
@@ -2746,6 +2749,21 @@ TEST(rasn_state, checkpoint_copy_rejects_inaccessible_identity_parent)
     std::remove((source_path + ".bak").c_str());
 }
 #endif
+
+TEST(rasn_state, windows_identity_queries_require_legacy_comparison_key)
+{
+    using state_service_internal::classify_windows_identity_queries;
+    using state_service_internal::windows_identity_query_status;
+
+    EXPECT_EQ(windows_identity_query_status::uninspectable,
+              classify_windows_identity_queries(false, false));
+    EXPECT_EQ(windows_identity_query_status::uninspectable,
+              classify_windows_identity_queries(true, false));
+    EXPECT_EQ(windows_identity_query_status::legacy_only,
+              classify_windows_identity_queries(false, true));
+    EXPECT_EQ(windows_identity_query_status::preferred_and_legacy,
+              classify_windows_identity_queries(true, true));
+}
 
 TEST(rasn_state, checkpoint_copy_rejects_non_directory_identity_parent)
 {

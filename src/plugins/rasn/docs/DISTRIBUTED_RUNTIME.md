@@ -1692,7 +1692,11 @@ automatic bypass. Windows additionally walks parent attributes after
 `ERROR_PATH_NOT_FOUND`: a missing tree below an existing directory remains a
 valid future target, while an existing regular-file or inaccessible ancestor is
 uninspectable. The walk preserves drive, UNC-share, and extended-path roots and
-validates root accessibility before accepting a future path.
+validates root accessibility before accepting a future path. That UNC root check
+uses a synchronous Windows volume query: a disconnected share can delay the
+checkpoint, import, copy, or recovery operation until the OS redirector timeout.
+Do not launch overlapping retries; restore share connectivity or move the state
+path to a healthy supported filesystem before retrying with bounded backoff.
 Checkpoint/export targets and their `.tmp`/`.bak` staging names are rejected when
 they alias either the primary or configured-replica journal lifecycle paths.
 Validation covers effective replica basenames and `.nfs.tmp` copy staging, uses

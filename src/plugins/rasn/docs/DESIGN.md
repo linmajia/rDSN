@@ -529,7 +529,10 @@ Correctness and robustness requirements:
   disambiguates `ERROR_PATH_NOT_FOUND` by walking to the nearest existing parent:
   a directory permits future nested paths, while a regular-file or inaccessible
   parent fails closed. Drive, UNC-share, and extended-path roots are preserved and
-  validated as accessible during that walk. Leaf symlinks/reparse points are rejected,
+  validated as accessible during that walk. UNC root validation uses the synchronous
+  Windows volume API, so a disconnected share may hold the lifecycle operation until
+  the OS redirector timeout; callers must not run it on a latency-sensitive handler
+  or issue overlapping retries. Leaf symlinks/reparse points are rejected,
   recovery reads are opened no-follow, and live journals, trusted recovery inputs,
   and replaceable staging must be regular single-link files. Journal compaction requires the configured
   checkpoint directory entry; a distinct hard-link alias is treated as a custom
