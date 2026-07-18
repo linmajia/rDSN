@@ -2947,9 +2947,9 @@ TEST(rasn_state, windows_identity_handle_adapter_matches_os_queries)
     }
 }
 
-// Path-flow coverage is limited to opening and classifying paths around the
-// byte-tested handle helper above.
-TEST(rasn_state, windows_identity_path_flow_classifies_open_outcomes)
+// Path flow verifies opening, classification, and forwarded encoding shape.
+// The handle test above owns capability correspondence and exact bytes.
+TEST(rasn_state, windows_identity_path_flow_preserves_shape_and_classifies_outcomes)
 {
     const std::string existing_path =
         workspace_temp_file_path("rasn-state-windows-identity.chkpt");
@@ -2989,6 +2989,24 @@ TEST(rasn_state, windows_identity_path_flow_classifies_open_outcomes)
     EXPECT_EQ(existing_status ==
                   state_service_internal::state_path_identity_status::resolved,
               !existing_identities.fallback.empty());
+    const auto expect_forwarded_identity_shape =
+        [](const std::string &identity,
+           const std::string &prefix,
+           size_t payload_size) {
+            if (!identity.empty())
+            {
+                EXPECT_EQ(0U, identity.find(prefix));
+                EXPECT_EQ(prefix.size() + payload_size, identity.size());
+            }
+        };
+    expect_forwarded_identity_shape(
+        existing_identities.preferred,
+        "windows-file-id-128:",
+        sizeof(state_service_internal::windows_file_id_128));
+    expect_forwarded_identity_shape(
+        existing_identities.fallback,
+        "windows-file-index-64:",
+        sizeof(state_service_internal::windows_file_index_64));
     EXPECT_EQ(state_service_internal::state_path_identity_status::absent,
               missing_status);
     EXPECT_TRUE(missing_identities.preferred.empty());
