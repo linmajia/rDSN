@@ -15,7 +15,8 @@ namespace dsn {
 namespace rasn {
 namespace state_service_internal {
 
-// The handle must be valid. The caller retains ownership and closes it.
+// Centralizes Windows identity queries and tagged encoding. The handle must be
+// valid; the caller retains ownership and closes it.
 state_path_identity_status resolve_open_windows_state_path_identities(
     HANDLE handle, existing_state_path_identities &identities);
 
