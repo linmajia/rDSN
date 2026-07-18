@@ -521,7 +521,11 @@ Correctness and robustness requirements:
   provide them; the legacy index only bridges a handle without an extended
   result, avoiding ReFS truncation collisions. Because the legacy identity is
   the required cross-format key, an abnormal preferred-only handle fails closed
-  instead of entering lifecycle validation with an unmatchable identity. Leaf
+  instead of entering lifecycle validation with an unmatchable identity.
+  Permission, I/O, redirector, symlink-loop, and non-directory-parent probe
+  errors are likewise uninspectable rather than absent. These failures prevent
+  state-file content from being copied or replaced; callers may retry with
+  bounded backoff only after restoring path access or filesystem health. Leaf
   symlinks/reparse points are rejected,
   recovery reads are opened no-follow, and live journals, trusted recovery inputs,
   and replaceable staging must be regular single-link files. Journal compaction requires the configured

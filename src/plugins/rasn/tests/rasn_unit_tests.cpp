@@ -73,6 +73,7 @@
 #endif
 #include <windows.h>
 #else
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -2687,6 +2688,115 @@ TEST(rasn_state, replicated_checkpoint_copy_does_not_replace_live_state)
         std::remove((path + ".bak").c_str());
     }
 }
+
+#if !defined(_WIN32)
+TEST(rasn_state, checkpoint_copy_rejects_inaccessible_identity_parent)
+{
+    const std::string source_path =
+        workspace_temp_file_path("rasn-state-inaccessible-source.chkpt");
+    const std::string blocked_directory =
+        workspace_temp_file_path("rasn-state-inaccessible-parent");
+    const std::string durable_path =
+        ::dsn::utils::filesystem::path_combine(
+            blocked_directory, "copy.chkpt");
+    std::remove(source_path.c_str());
+    std::remove((source_path + ".tmp").c_str());
+    std::remove((source_path + ".bak").c_str());
+    ::dsn::utils::filesystem::remove_path(blocked_directory);
+
+    state_store source(false, 0);
+    state_record record;
+    record.key = "unit/inaccessible-identity";
+    record.kind = "observation";
+    record.scope = "unit";
+    record.value = "preserve";
+    ASSERT_TRUE(source.put(record).ok);
+    state_checkpoint_request checkpoint;
+    checkpoint.path = source_path;
+    ASSERT_TRUE(source.checkpoint(checkpoint).ok);
+    ASSERT_TRUE(
+        ::dsn::utils::filesystem::create_directory(blocked_directory));
+    ASSERT_EQ(0, ::chmod(blocked_directory.c_str(), 0));
+
+    struct stat probe;
+    errno = 0;
+    const bool access_denied =
+        ::stat(durable_path.c_str(), &probe) != 0 && errno == EACCES;
+    if (!access_denied)
+    {
+        EXPECT_EQ(0, ::chmod(blocked_directory.c_str(), S_IRWXU));
+        ::dsn::utils::filesystem::remove_path(blocked_directory);
+        std::remove(source_path.c_str());
+        std::remove((source_path + ".bak").c_str());
+        return;
+    }
+
+    const state_response copied =
+        source.copy_checkpoint(checkpoint, durable_path);
+    const int restored =
+        ::chmod(blocked_directory.c_str(), S_IRWXU);
+    EXPECT_EQ(0, restored);
+    EXPECT_FALSE(copied.ok);
+    EXPECT_NE(std::string::npos,
+              copied.error.find(
+                  "failed to compare imported and durable checkpoint identities"));
+    EXPECT_FALSE(
+        ::dsn::utils::filesystem::file_exists(durable_path));
+
+    ::dsn::utils::filesystem::remove_path(blocked_directory);
+    std::remove(source_path.c_str());
+    std::remove((source_path + ".bak").c_str());
+}
+
+TEST(rasn_state, checkpoint_copy_rejects_non_directory_identity_parent)
+{
+    const std::string source_path =
+        workspace_temp_file_path("rasn-state-enotdir-source.chkpt");
+    const std::string parent_path =
+        workspace_temp_file_path("rasn-state-enotdir-parent");
+    const std::string durable_path =
+        ::dsn::utils::filesystem::path_combine(parent_path, "copy.chkpt");
+    for (const std::string &path : {source_path, parent_path})
+    {
+        std::remove(path.c_str());
+        std::remove((path + ".tmp").c_str());
+        std::remove((path + ".bak").c_str());
+    }
+
+    state_store source(false, 0);
+    state_record record;
+    record.key = "unit/enotdir-identity";
+    record.kind = "observation";
+    record.scope = "unit";
+    record.value = "preserve";
+    ASSERT_TRUE(source.put(record).ok);
+    state_checkpoint_request checkpoint;
+    checkpoint.path = source_path;
+    ASSERT_TRUE(source.checkpoint(checkpoint).ok);
+    write_text_file(parent_path, "not-a-directory");
+
+    struct stat probe;
+    errno = 0;
+    const int probe_result = ::stat(durable_path.c_str(), &probe);
+    const int probe_error = errno;
+    const state_response copied =
+        source.copy_checkpoint(checkpoint, durable_path);
+    const bool durable_path_exists =
+        ::dsn::utils::filesystem::file_exists(durable_path);
+
+    std::remove(parent_path.c_str());
+    std::remove(source_path.c_str());
+    std::remove((source_path + ".bak").c_str());
+
+    EXPECT_NE(0, probe_result);
+    EXPECT_EQ(ENOTDIR, probe_error);
+    EXPECT_FALSE(copied.ok);
+    EXPECT_NE(std::string::npos,
+              copied.error.find(
+                  "failed to compare imported and durable checkpoint identities"));
+    EXPECT_FALSE(durable_path_exists);
+}
+#endif
 
 TEST(rasn_state, replicated_stores_assign_deterministic_sequences)
 {

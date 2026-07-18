@@ -1682,7 +1682,13 @@ redirectors with provider-specific behavior. When both handles provide full
 IDs, validation does not compare their potentially truncated legacy IDs. If a
 handle supplies a full ID but the universally supported legacy compatibility
 query fails, lifecycle validation fails closed rather than accepting an identity
-that cannot be compared with a fallback-only alias.
+that cannot be compared with a fallback-only alias. Other identity-probe failures
+(`ACCESS_DENIED`/`EACCES`, I/O or redirector errors, symlink loops, or a
+non-directory parent) also prevent state-file content from being copied or
+replaced. Do not hot-loop these errors: restore permissions, mount/redirector
+health, or the path layout first, then retry the operator command with bounded
+backoff. Persistent failures require filesystem intervention rather than
+automatic bypass.
 Checkpoint/export targets and their `.tmp`/`.bak` staging names are rejected when
 they alias either the primary or configured-replica journal lifecycle paths.
 Validation covers effective replica basenames and `.nfs.tmp` copy staging, uses

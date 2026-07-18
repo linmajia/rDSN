@@ -1063,7 +1063,7 @@ state_path_identity_status resolve_existing_state_path_identities(
     struct stat info;
     if (::stat(path.c_str(), &info) != 0)
     {
-        return errno == ENOENT || errno == ENOTDIR
+        return errno == ENOENT
                    ? state_path_identity_status::absent
                    : state_path_identity_status::uninspectable;
     }
