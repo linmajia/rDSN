@@ -272,6 +272,54 @@ hard_link_creation try_create_hard_link(const std::string &source,
 #endif
 }
 
+enum class symbolic_link_creation
+{
+    created,
+    unsupported,
+    failed
+};
+
+symbolic_link_creation try_create_symbolic_link(const std::string &source,
+                                               const std::string &alias)
+{
+#if defined(_WIN32)
+    const DWORD allow_unprivileged_create = 0x2;
+    if (::CreateSymbolicLinkA(
+            alias.c_str(), source.c_str(), allow_unprivileged_create) != 0)
+    {
+        return symbolic_link_creation::created;
+    }
+    DWORD error = ::GetLastError();
+    if (error == ERROR_INVALID_PARAMETER)
+    {
+        if (::CreateSymbolicLinkA(alias.c_str(), source.c_str(), 0) != 0)
+        {
+            return symbolic_link_creation::created;
+        }
+        error = ::GetLastError();
+    }
+    return error == ERROR_NOT_SUPPORTED ||
+                   error == ERROR_INVALID_FUNCTION ||
+                   error == ERROR_INVALID_PARAMETER ||
+                   error == ERROR_CALL_NOT_IMPLEMENTED ||
+                   error == ERROR_PRIVILEGE_NOT_HELD ||
+                   error == ERROR_ACCESS_DENIED
+               ? symbolic_link_creation::unsupported
+               : symbolic_link_creation::failed;
+#else
+    if (::symlink(source.c_str(), alias.c_str()) == 0)
+    {
+        return symbolic_link_creation::created;
+    }
+    const int error = errno;
+    return error == EPERM || error == EACCES || error == EROFS ||
+                   error == ENOSYS || error == EOPNOTSUPP ||
+                   error == ENOTSUP
+               ? symbolic_link_creation::unsupported
+               : symbolic_link_creation::failed;
+#endif
+}
+
 agent_descriptor make_unit_agent_descriptor(const std::string &agent_id,
                                             const std::string &role,
                                             const std::string &capability)
@@ -3545,7 +3593,6 @@ TEST(rasn_state, checkpoint_rejects_multiply_linked_staging_file)
     std::remove(checkpoint_path.c_str());
 }
 
-#if !defined(_WIN32)
 TEST(rasn_state, checkpoint_reports_link_before_existing_path_overlap)
 {
     const std::string checkpoint_path =
@@ -3568,7 +3615,15 @@ TEST(rasn_state, checkpoint_reports_link_before_existing_path_overlap)
         return;
     }
     ASSERT_TRUE(linked == hard_link_creation::created);
-    ASSERT_EQ(0, ::symlink(staging_path.c_str(), marker_path.c_str()));
+    const symbolic_link_creation symlinked =
+        try_create_symbolic_link(staging_path, marker_path);
+    if (symlinked == symbolic_link_creation::unsupported)
+    {
+        std::remove(import_staging_path.c_str());
+        std::remove(staging_path.c_str());
+        return;
+    }
+    ASSERT_TRUE(symlinked == symbolic_link_creation::created);
 
     state_store store(false, 0);
     state_checkpoint_request checkpoint;
@@ -3587,6 +3642,7 @@ TEST(rasn_state, checkpoint_reports_link_before_existing_path_overlap)
     std::remove(checkpoint_path.c_str());
 }
 
+#if !defined(_WIN32)
 TEST(rasn_state, configured_checkpoint_rechecks_symlinks_after_cached_validation)
 {
     const std::string journal_path = configured_state_journal_path();

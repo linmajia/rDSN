@@ -1676,8 +1676,10 @@ every lifecycle operation while reusing only the filesystem-capability result.
 The validator resolves and indexes each existing-file and canonical-entry
 identity once, avoiding pairwise lifecycle-path comparisons while preserving the
 legacy earliest-pair diagnostic. Windows identity uses the full 128-bit file ID
-needed by ReFS and retries with the universally supported legacy query after any
-extended-query failure, including filesystem-redirector-specific errors.
+needed by ReFS and also indexes a tagged legacy ID. Mixed extended/fallback
+query results therefore retain a common identity key, including on filesystem
+redirectors with provider-specific behavior. When both handles provide full
+IDs, validation does not compare their potentially truncated legacy IDs.
 Checkpoint/export targets and their `.tmp`/`.bak` staging names are rejected when
 they alias either the primary or configured-replica journal lifecycle paths.
 Validation covers effective replica basenames and `.nfs.tmp` copy staging, uses

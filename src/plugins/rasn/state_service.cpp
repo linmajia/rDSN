@@ -970,9 +970,19 @@ bool state_parent_directory_is_case_sensitive(const std::string &parent)
 }
 #endif
 
-bool resolve_existing_state_path_identity(const std::string &path,
-                                          std::string *identity)
+struct existing_state_path_identities
 {
+    std::string preferred;
+    std::string fallback;
+};
+
+bool resolve_existing_state_path_identities(
+    const std::string &path, existing_state_path_identities *identities)
+{
+    if (identities != nullptr)
+    {
+        *identities = existing_state_path_identities();
+    }
 #if defined(_WIN32)
     const HANDLE handle = ::CreateFileA(
         path.c_str(),
@@ -997,62 +1007,77 @@ bool resolve_existing_state_path_identity(const std::string &path,
     const FILE_INFO_BY_HANDLE_CLASS file_id_info_class =
         static_cast<FILE_INFO_BY_HANDLE_CLASS>(18);
     state_file_id_info extended_info = {};
+    bool resolved = false;
     if (::GetFileInformationByHandleEx(handle,
                                        file_id_info_class,
                                        &extended_info,
                                        sizeof(extended_info)) != 0)
     {
-        if (identity != nullptr)
+        resolved = true;
+        if (identities != nullptr)
         {
-            identity->assign(
+            identities->preferred = "windows-file-id-128:";
+            identities->preferred.append(
                 reinterpret_cast<const char *>(
                     &extended_info.volume_serial_number),
                 sizeof(extended_info.volume_serial_number));
-            identity->append(
+            identities->preferred.append(
                 reinterpret_cast<const char *>(extended_info.file_id),
                 sizeof(extended_info.file_id));
         }
-        ::CloseHandle(handle);
-        return true;
     }
 
     // Older systems and some filesystem redirectors reject FileIdInfo with
-    // provider-specific errors. The legacy query is universally supported.
+    // provider-specific errors. Always collect the universally supported legacy
+    // identity too, so mixed extended/fallback results share a comparable key.
     BY_HANDLE_FILE_INFORMATION info;
-    const bool inspected =
-        ::GetFileInformationByHandle(handle, &info) != 0;
+    if (::GetFileInformationByHandle(handle, &info) != 0)
+    {
+        resolved = true;
+        if (identities != nullptr)
+        {
+            identities->fallback = "windows-file-index-64:";
+            identities->fallback.append(
+                reinterpret_cast<const char *>(&info.dwVolumeSerialNumber),
+                sizeof(info.dwVolumeSerialNumber));
+            identities->fallback.append(
+                reinterpret_cast<const char *>(&info.nFileIndexHigh),
+                sizeof(info.nFileIndexHigh));
+            identities->fallback.append(
+                reinterpret_cast<const char *>(&info.nFileIndexLow),
+                sizeof(info.nFileIndexLow));
+        }
+    }
     ::CloseHandle(handle);
-    if (!inspected)
-    {
-        return false;
-    }
-    if (identity != nullptr)
-    {
-        identity->assign(
-            reinterpret_cast<const char *>(&info.dwVolumeSerialNumber),
-            sizeof(info.dwVolumeSerialNumber));
-        identity->append(
-            reinterpret_cast<const char *>(&info.nFileIndexHigh),
-            sizeof(info.nFileIndexHigh));
-        identity->append(
-            reinterpret_cast<const char *>(&info.nFileIndexLow),
-            sizeof(info.nFileIndexLow));
-    }
+    return resolved;
 #else
     struct stat info;
     if (::stat(path.c_str(), &info) != 0)
     {
         return false;
     }
-    if (identity != nullptr)
+    if (identities != nullptr)
     {
-        identity->assign(reinterpret_cast<const char *>(&info.st_dev),
-                         sizeof(info.st_dev));
-        identity->append(reinterpret_cast<const char *>(&info.st_ino),
-                         sizeof(info.st_ino));
+        identities->preferred = "posix-file-id:";
+        identities->preferred.append(
+            reinterpret_cast<const char *>(&info.st_dev), sizeof(info.st_dev));
+        identities->preferred.append(
+            reinterpret_cast<const char *>(&info.st_ino), sizeof(info.st_ino));
     }
-#endif
     return true;
+#endif
+}
+
+bool state_path_identities_overlap(
+    const existing_state_path_identities &left,
+    const existing_state_path_identities &right)
+{
+    if (!left.preferred.empty() && !right.preferred.empty())
+    {
+        return left.preferred == right.preferred;
+    }
+    return !left.fallback.empty() && !right.fallback.empty() &&
+           left.fallback == right.fallback;
 }
 
 std::string normalize_state_path_entry_identity(std::string identity)
@@ -1112,11 +1137,11 @@ bool state_paths_refer_to_same_file(const std::string &left,
         return true;
     }
 
-    std::string left_identity;
-    std::string right_identity;
-    if (resolve_existing_state_path_identity(left, &left_identity) &&
-        resolve_existing_state_path_identity(right, &right_identity) &&
-        left_identity == right_identity)
+    existing_state_path_identities left_identities;
+    existing_state_path_identities right_identities;
+    if (resolve_existing_state_path_identities(left, &left_identities) &&
+        resolve_existing_state_path_identities(right, &right_identities) &&
+        state_path_identities_overlap(left_identities, right_identities))
     {
         return true;
     }
@@ -2036,7 +2061,11 @@ bool validate_distinct_state_paths(const std::vector<named_state_path> &paths,
     }
 
     std::map<std::string, size_t> exact_paths;
-    std::map<std::string, size_t> existing_path_identities;
+    std::map<std::string, size_t> preferred_path_identities;
+    // Full IDs remain authoritative when both handles provide them. These two
+    // fallback indexes only bridge pairs where at least one handle lacks one.
+    std::map<std::string, size_t> all_fallback_path_identities;
+    std::map<std::string, size_t> fallback_only_path_identities;
     std::map<std::string, size_t, state_path_entry_identity_less>
         entry_identities;
     size_t first_overlap = paths.size();
@@ -2053,20 +2082,57 @@ bool validate_distinct_state_paths(const std::vector<named_state_path> &paths,
         }
         exact_paths.emplace(candidate.path, index);
 
-        std::string identity;
-        if (resolve_existing_state_path_identity(candidate.path, &identity))
+        existing_state_path_identities identities;
+        if (resolve_existing_state_path_identities(candidate.path, &identities))
         {
-            const std::map<std::string, size_t>::const_iterator existing =
-                existing_path_identities.find(identity);
-            if (existing != existing_path_identities.end() &&
-                existing->second < overlap)
+            if (!identities.preferred.empty())
             {
-                overlap = existing->second;
+                const std::map<std::string, size_t>::const_iterator existing =
+                    preferred_path_identities.find(identities.preferred);
+                if (existing != preferred_path_identities.end() &&
+                    existing->second < overlap)
+                {
+                    overlap = existing->second;
+                }
+                if (!identities.fallback.empty())
+                {
+                    const std::map<std::string, size_t>::const_iterator fallback =
+                        fallback_only_path_identities.find(identities.fallback);
+                    if (fallback != fallback_only_path_identities.end() &&
+                        fallback->second < overlap)
+                    {
+                        overlap = fallback->second;
+                    }
+                }
             }
-            existing_path_identities.emplace(std::move(identity), index);
+            else if (!identities.fallback.empty())
+            {
+                const std::map<std::string, size_t>::const_iterator fallback =
+                    all_fallback_path_identities.find(identities.fallback);
+                if (fallback != all_fallback_path_identities.end() &&
+                    fallback->second < overlap)
+                {
+                    overlap = fallback->second;
+                }
+            }
+
+            if (!identities.preferred.empty())
+            {
+                preferred_path_identities.emplace(identities.preferred, index);
+            }
+            if (!identities.fallback.empty())
+            {
+                all_fallback_path_identities.emplace(identities.fallback,
+                                                     index);
+                if (identities.preferred.empty())
+                {
+                    fallback_only_path_identities.emplace(identities.fallback,
+                                                          index);
+                }
+            }
         }
 
-        identity.clear();
+        std::string identity;
         if (resolve_state_path_entry_identity(candidate.path, &identity))
         {
             identity =
