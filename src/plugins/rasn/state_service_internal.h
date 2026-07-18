@@ -58,8 +58,8 @@ static_assert(std::is_standard_layout<windows_file_index_64>::value,
 static_assert(std::is_trivially_copyable<windows_file_index_64>::value,
               "legacy Windows identity must remain trivially copyable");
 
-template <typename Query>
-bool query_windows_file_id_128(windows_file_id_128 &identity, Query &&query)
+template <typename Identity, typename Query>
+bool query_windows_identity_buffer(Identity &identity, Query &&query)
 {
     return std::forward<Query>(query)(
         &identity, sizeof(identity));
@@ -74,10 +74,11 @@ state_path_identity_status collect_windows_identity_query_results(
     windows_file_id_128 preferred;
     windows_file_index_64 fallback;
     const bool preferred_resolved =
-        query_windows_file_id_128(
+        query_windows_identity_buffer(
             preferred, std::forward<PreferredQuery>(preferred_query));
     const bool legacy_resolved =
-        std::forward<LegacyQuery>(legacy_query)(fallback);
+        query_windows_identity_buffer(
+            fallback, std::forward<LegacyQuery>(legacy_query));
     identities.preferred.clear();
     identities.fallback.clear();
     if (preferred_resolved)
@@ -109,6 +110,11 @@ state_path_identity_status collect_windows_identity_query_results(
 
 state_path_identity_status resolve_existing_state_path_identities(
     const std::string &path, existing_state_path_identities &identities);
+
+#if defined(_WIN32)
+state_path_identity_status resolve_open_windows_state_path_identities(
+    void *native_handle, existing_state_path_identities &identities);
+#endif
 
 } // namespace state_service_internal
 } // namespace rasn

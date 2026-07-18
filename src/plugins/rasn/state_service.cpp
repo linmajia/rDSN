@@ -978,8 +978,9 @@ using state_path_identity_status =
 
 #if defined(_WIN32)
 #if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0602
-// FILE_ID_INFO is hidden by the SDK for rDSN's Vista target. Keep that target
-// compatible while making the ABI assumption self-verifying for Win8+ targets.
+// rDSN's default Vista target cannot name FILE_ID_INFO, so the unconditional
+// absolute POD assertions remain its ABI guard. Win8+ targets additionally
+// self-verify against the SDK type here.
 static_assert(
     sizeof(state_service_internal::windows_file_id_128) ==
         sizeof(FILE_ID_INFO),
@@ -1002,6 +1003,40 @@ static_assert(
         sizeof(((FILE_ID_INFO *)nullptr)->FileId),
     "internal preferred file ID must match Windows SDK FILE_ID_INFO");
 #endif
+
+state_path_identity_status resolve_open_windows_state_path_identities_impl(
+    HANDLE handle, existing_state_path_identities &identities)
+{
+    identities = existing_state_path_identities();
+    const FILE_INFO_BY_HANDLE_CLASS file_id_info_class =
+        static_cast<FILE_INFO_BY_HANDLE_CLASS>(18);
+    BY_HANDLE_FILE_INFORMATION info;
+    return state_service_internal::collect_windows_identity_query_results(
+        identities,
+        [&](state_service_internal::windows_file_id_128 *buffer,
+            size_t buffer_size) {
+            return ::GetFileInformationByHandleEx(
+                       handle,
+                       file_id_info_class,
+                       static_cast<void *>(buffer),
+                       static_cast<DWORD>(buffer_size)) != 0;
+        },
+        [&](state_service_internal::windows_file_index_64 *identity,
+            size_t buffer_size) {
+            if (buffer_size != sizeof(*identity) ||
+                ::GetFileInformationByHandle(handle, &info) == 0)
+            {
+                return false;
+            }
+            identity->volume_serial_number =
+                static_cast<uint32_t>(info.dwVolumeSerialNumber);
+            identity->file_index_high =
+                static_cast<uint32_t>(info.nFileIndexHigh);
+            identity->file_index_low =
+                static_cast<uint32_t>(info.nFileIndexLow);
+            return true;
+        });
+}
 
 bool is_windows_state_path_separator(char value)
 {
@@ -1198,38 +1233,11 @@ state_path_identity_status resolve_existing_state_path_identities_impl(
     }
 
     // FileIdInfo is Windows 8+ and carries the full 128-bit identifier used by
-    // ReFS. Keep the Vista-targeted build compatible with older SDK headers.
-    const FILE_INFO_BY_HANDLE_CLASS file_id_info_class =
-        static_cast<FILE_INFO_BY_HANDLE_CLASS>(18);
-    BY_HANDLE_FILE_INFORMATION info;
+    // ReFS. Older systems and some redirectors reject it, so the shared helper
+    // still performs the universally supported legacy query for comparison.
     const state_path_identity_status query_status =
-        state_service_internal::collect_windows_identity_query_results(
-            identities,
-            [&](state_service_internal::windows_file_id_128 *buffer,
-                size_t buffer_size) {
-                return ::GetFileInformationByHandleEx(handle,
-                                                      file_id_info_class,
-                                                      static_cast<void *>(buffer),
-                                                      static_cast<DWORD>(
-                                                          buffer_size)) != 0;
-            },
-            [&](state_service_internal::windows_file_index_64 &identity) {
-                // Older systems and some filesystem redirectors reject
-                // FileIdInfo with provider-specific errors. Always collect the
-                // universally supported legacy identity too, so mixed query
-                // results share a comparable key.
-                if (::GetFileInformationByHandle(handle, &info) == 0)
-                {
-                    return false;
-                }
-                identity.volume_serial_number =
-                    static_cast<uint32_t>(info.dwVolumeSerialNumber);
-                identity.file_index_high =
-                    static_cast<uint32_t>(info.nFileIndexHigh);
-                identity.file_index_low =
-                    static_cast<uint32_t>(info.nFileIndexLow);
-                return true;
-            });
+        state_service_internal::resolve_open_windows_state_path_identities(
+            handle, identities);
     ::CloseHandle(handle);
     // A preferred-only result cannot be compared with a fallback-only alias.
     // The legacy query is supported on every accepted Windows filesystem, so
@@ -3597,6 +3605,22 @@ state_service_internal::resolve_existing_state_path_identities(
 {
     return resolve_existing_state_path_identities_impl(path, identities);
 }
+
+#if defined(_WIN32)
+state_service_internal::state_path_identity_status
+state_service_internal::resolve_open_windows_state_path_identities(
+    void *native_handle, existing_state_path_identities &identities)
+{
+    if (native_handle == nullptr ||
+        native_handle == INVALID_HANDLE_VALUE)
+    {
+        identities = existing_state_path_identities();
+        return state_path_identity_status::uninspectable;
+    }
+    return resolve_open_windows_state_path_identities_impl(
+        static_cast<HANDLE>(native_handle), identities);
+}
+#endif
 
 std::string configured_state_checkpoint_path()
 {

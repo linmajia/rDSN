@@ -521,7 +521,12 @@ Correctness and robustness requirements:
   provide them; the legacy index only bridges a handle without an extended
   result, avoiding ReFS truncation collisions. Because the legacy identity is
   the required cross-format key, an abnormal preferred-only handle fails closed
-  instead of entering lifecycle validation with an unmatchable identity.
+  instead of entering lifecycle validation with an unmatchable identity. The
+  default Windows build targets Vista and therefore cannot name the SDK's
+  Win8-only `FILE_ID_INFO`; unconditional size/offset/layout assertions pin the
+  compatible buffer there, while Win8+ compilation additionally cross-checks
+  the buffer directly against the SDK type. Windows CI should retain a
+  `_WIN32_WINNT >= 0x0602` compile lane to exercise that SDK cross-check.
   Permission, I/O, redirector, symlink-loop, and non-directory-parent probe
   errors are likewise uninspectable rather than absent. These failures prevent
   state-file content from being copied or replaced; callers may retry with

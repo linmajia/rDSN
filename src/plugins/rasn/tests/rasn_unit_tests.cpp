@@ -2791,9 +2791,16 @@ TEST(rasn_state, windows_identity_queries_encode_all_result_combinations)
                     *buffer = preferred;
                     return preferred_succeeds;
                 },
-                [&](windows_file_index_64 &identity) {
+                [&](windows_file_index_64 *identity, size_t buffer_size) {
                     ++legacy_calls;
-                    identity = fallback;
+                    EXPECT_EQ(sizeof(fallback), buffer_size);
+                    EXPECT_NE(nullptr, identity);
+                    if (identity == nullptr ||
+                        buffer_size != sizeof(fallback))
+                    {
+                        return false;
+                    }
+                    *identity = fallback;
                     return legacy_succeeds;
                 });
 
@@ -2905,6 +2912,10 @@ TEST(rasn_state, windows_identity_adapter_classifies_real_paths)
                                        &expected_preferred,
                                        static_cast<DWORD>(
                                            sizeof(expected_preferred))) != 0;
+    state_service_internal::existing_state_path_identities handle_identities;
+    const state_service_internal::state_path_identity_status handle_status =
+        state_service_internal::resolve_open_windows_state_path_identities(
+            preferred_probe, handle_identities);
     ::CloseHandle(preferred_probe);
 
     state_service_internal::existing_state_path_identities existing_identities;
@@ -2924,18 +2935,25 @@ TEST(rasn_state, windows_identity_adapter_classifies_real_paths)
     ::dsn::utils::filesystem::remove_path(blocked_parent);
     EXPECT_EQ(state_service_internal::state_path_identity_status::resolved,
               existing_status);
+    EXPECT_EQ(state_service_internal::state_path_identity_status::resolved,
+              handle_status);
     EXPECT_EQ(0U,
               existing_identities.fallback.find("windows-file-index-64:"));
-    EXPECT_EQ(preferred_supported, !existing_identities.preferred.empty());
+    EXPECT_EQ(0U,
+              handle_identities.fallback.find("windows-file-index-64:"));
+    // Both probes use one unchanged handle. The comparison relies on repeated
+    // metadata queries for that live handle returning stable support and identity,
+    // rather than assuming identity stability across separate opens.
+    EXPECT_EQ(preferred_supported, !handle_identities.preferred.empty());
     if (preferred_supported)
     {
         const std::string prefix = "windows-file-id-128:";
         EXPECT_EQ(0U,
-                  existing_identities.preferred.find(prefix));
+                  handle_identities.preferred.find(prefix));
         ASSERT_EQ(prefix.size() + sizeof(expected_preferred),
-                  existing_identities.preferred.size());
+                  handle_identities.preferred.size());
         EXPECT_EQ(0,
-                  std::memcmp(existing_identities.preferred.data() +
+                  std::memcmp(handle_identities.preferred.data() +
                                   prefix.size(),
                               &expected_preferred,
                               sizeof(expected_preferred)));
