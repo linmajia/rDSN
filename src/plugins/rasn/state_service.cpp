@@ -977,6 +977,32 @@ using state_path_identity_status =
     state_service_internal::state_path_identity_status;
 
 #if defined(_WIN32)
+#if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0602
+// FILE_ID_INFO is hidden by the SDK for rDSN's Vista target. Keep that target
+// compatible while making the ABI assumption self-verifying for Win8+ targets.
+static_assert(
+    sizeof(state_service_internal::windows_file_id_128) ==
+        sizeof(FILE_ID_INFO),
+    "internal preferred identity must match the Windows SDK FILE_ID_INFO");
+static_assert(
+    alignof(state_service_internal::windows_file_id_128) ==
+        alignof(FILE_ID_INFO),
+    "internal preferred identity alignment must match Windows SDK FILE_ID_INFO");
+static_assert(
+    offsetof(state_service_internal::windows_file_id_128,
+             volume_serial_number) ==
+        offsetof(FILE_ID_INFO, VolumeSerialNumber),
+    "internal preferred volume must match Windows SDK FILE_ID_INFO");
+static_assert(
+    offsetof(state_service_internal::windows_file_id_128, file_id) ==
+        offsetof(FILE_ID_INFO, FileId),
+    "internal preferred identity fields must match Windows SDK FILE_ID_INFO");
+static_assert(
+    sizeof(((state_service_internal::windows_file_id_128 *)nullptr)->file_id) ==
+        sizeof(((FILE_ID_INFO *)nullptr)->FileId),
+    "internal preferred file ID must match Windows SDK FILE_ID_INFO");
+#endif
+
 bool is_windows_state_path_separator(char value)
 {
     return value == '\\' || value == '/';
@@ -1179,11 +1205,13 @@ state_path_identity_status resolve_existing_state_path_identities_impl(
     const state_path_identity_status query_status =
         state_service_internal::collect_windows_identity_query_results(
             identities,
-            [&](state_service_internal::windows_file_id_128 &identity) {
+            [&](state_service_internal::windows_file_id_128 *buffer,
+                size_t buffer_size) {
                 return ::GetFileInformationByHandleEx(handle,
                                                       file_id_info_class,
-                                                      &identity,
-                                                      sizeof(identity)) != 0;
+                                                      static_cast<void *>(buffer),
+                                                      static_cast<DWORD>(
+                                                          buffer_size)) != 0;
             },
             [&](state_service_internal::windows_file_index_64 &identity) {
                 // Older systems and some filesystem redirectors reject

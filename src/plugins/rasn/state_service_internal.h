@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 namespace dsn {
@@ -32,6 +33,10 @@ static_assert(sizeof(windows_file_id_128) == 24,
               "FileIdInfo-compatible identity layout must remain 24 bytes");
 static_assert(offsetof(windows_file_id_128, file_id) == sizeof(uint64_t),
               "FileIdInfo-compatible byte identifier must follow its volume");
+static_assert(std::is_standard_layout<windows_file_id_128>::value,
+              "FileIdInfo-compatible identity must remain standard-layout");
+static_assert(std::is_trivially_copyable<windows_file_id_128>::value,
+              "FileIdInfo-compatible identity must remain trivially copyable");
 
 struct windows_file_index_64
 {
@@ -39,6 +44,26 @@ struct windows_file_index_64
     uint32_t file_index_high = 0;
     uint32_t file_index_low = 0;
 };
+
+static_assert(sizeof(windows_file_index_64) == 12,
+              "legacy Windows identity must remain three 32-bit values");
+static_assert(offsetof(windows_file_index_64, file_index_high) ==
+                  sizeof(uint32_t),
+              "legacy Windows high index must follow its volume");
+static_assert(offsetof(windows_file_index_64, file_index_low) ==
+                  2 * sizeof(uint32_t),
+              "legacy Windows low index must follow its high index");
+static_assert(std::is_standard_layout<windows_file_index_64>::value,
+              "legacy Windows identity must remain standard-layout");
+static_assert(std::is_trivially_copyable<windows_file_index_64>::value,
+              "legacy Windows identity must remain trivially copyable");
+
+template <typename Query>
+bool query_windows_file_id_128(windows_file_id_128 &identity, Query &&query)
+{
+    return std::forward<Query>(query)(
+        &identity, sizeof(identity));
+}
 
 template <typename PreferredQuery, typename LegacyQuery>
 state_path_identity_status collect_windows_identity_query_results(
@@ -49,7 +74,8 @@ state_path_identity_status collect_windows_identity_query_results(
     windows_file_id_128 preferred;
     windows_file_index_64 fallback;
     const bool preferred_resolved =
-        std::forward<PreferredQuery>(preferred_query)(preferred);
+        query_windows_file_id_128(
+            preferred, std::forward<PreferredQuery>(preferred_query));
     const bool legacy_resolved =
         std::forward<LegacyQuery>(legacy_query)(fallback);
     identities.preferred.clear();
