@@ -1674,7 +1674,10 @@ do not re-query volume metadata and rely on file flushes plus write-through move
 Configured checkpoint/recovery calls still re-check links and path collisions on
 every lifecycle operation while reusing only the filesystem-capability result.
 The validator resolves and indexes each existing-file and canonical-entry
-identity once, avoiding pairwise lifecycle-path comparisons.
+identity once, avoiding pairwise lifecycle-path comparisons while preserving the
+legacy earliest-pair diagnostic. Windows identity uses the full 128-bit file ID
+needed by ReFS and falls back to the legacy ID only when that newer information
+class is unavailable.
 Checkpoint/export targets and their `.tmp`/`.bak` staging names are rejected when
 they alias either the primary or configured-replica journal lifecycle paths.
 Validation covers effective replica basenames and `.nfs.tmp` copy staging, uses

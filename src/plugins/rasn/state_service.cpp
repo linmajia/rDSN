@@ -14,6 +14,7 @@
 #include <cstring>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <memory>
 #include <sstream>
 
@@ -985,6 +986,46 @@ bool resolve_existing_state_path_identity(const std::string &path,
     {
         return false;
     }
+
+    // FileIdInfo is Windows 8+ and carries the full 128-bit identifier used by
+    // ReFS. Keep the Vista-targeted build compatible with older SDK headers.
+    struct state_file_id_info
+    {
+        ULONGLONG volume_serial_number;
+        BYTE file_id[16];
+    };
+    const FILE_INFO_BY_HANDLE_CLASS file_id_info_class =
+        static_cast<FILE_INFO_BY_HANDLE_CLASS>(18);
+    state_file_id_info extended_info = {};
+    if (::GetFileInformationByHandleEx(handle,
+                                       file_id_info_class,
+                                       &extended_info,
+                                       sizeof(extended_info)) != 0)
+    {
+        if (identity != nullptr)
+        {
+            identity->assign(
+                reinterpret_cast<const char *>(
+                    &extended_info.volume_serial_number),
+                sizeof(extended_info.volume_serial_number));
+            identity->append(
+                reinterpret_cast<const char *>(extended_info.file_id),
+                sizeof(extended_info.file_id));
+        }
+        ::CloseHandle(handle);
+        return true;
+    }
+
+    const DWORD extended_error = ::GetLastError();
+    if (extended_error != ERROR_INVALID_FUNCTION &&
+        extended_error != ERROR_INVALID_PARAMETER &&
+        extended_error != ERROR_NOT_SUPPORTED &&
+        extended_error != ERROR_CALL_NOT_IMPLEMENTED)
+    {
+        ::CloseHandle(handle);
+        return false;
+    }
+
     BY_HANDLE_FILE_INFORMATION info;
     const bool inspected =
         ::GetFileInformationByHandle(handle, &info) != 0;
@@ -1989,13 +2030,8 @@ void add_journal_lifecycle_paths(const std::string &journal_path,
 bool validate_distinct_state_paths(const std::vector<named_state_path> &paths,
                                    std::string *error)
 {
-    std::map<std::string, size_t> exact_paths;
-    std::map<std::string, size_t> existing_path_identities;
-    std::map<std::string, size_t, state_path_entry_identity_less>
-        entry_identities;
-    for (size_t index = 0; index < paths.size(); ++index)
+    for (const named_state_path &candidate : paths)
     {
-        const named_state_path &candidate = paths[index];
         if (state_path_is_link(candidate.path))
         {
             if (error != nullptr)
@@ -2005,7 +2041,17 @@ bool validate_distinct_state_paths(const std::vector<named_state_path> &paths,
             }
             return false;
         }
+    }
 
+    std::map<std::string, size_t> exact_paths;
+    std::map<std::string, size_t> existing_path_identities;
+    std::map<std::string, size_t, state_path_entry_identity_less>
+        entry_identities;
+    size_t first_overlap = paths.size();
+    size_t second_overlap = paths.size();
+    for (size_t index = 0; index < paths.size(); ++index)
+    {
+        const named_state_path &candidate = paths[index];
         size_t overlap = paths.size();
         const std::map<std::string, size_t>::const_iterator exact =
             exact_paths.find(candidate.path);
@@ -2013,32 +2059,23 @@ bool validate_distinct_state_paths(const std::vector<named_state_path> &paths,
         {
             overlap = exact->second;
         }
-        else
-        {
-            exact_paths.emplace(candidate.path, index);
-        }
+        exact_paths.emplace(candidate.path, index);
 
         std::string identity;
-        if (overlap == paths.size() &&
-            resolve_existing_state_path_identity(
-                candidate.path, &identity))
+        if (resolve_existing_state_path_identity(candidate.path, &identity))
         {
             const std::map<std::string, size_t>::const_iterator existing =
                 existing_path_identities.find(identity);
-            if (existing != existing_path_identities.end())
+            if (existing != existing_path_identities.end() &&
+                existing->second < overlap)
             {
                 overlap = existing->second;
             }
-            else
-            {
-                existing_path_identities.emplace(std::move(identity), index);
-            }
+            existing_path_identities.emplace(std::move(identity), index);
         }
 
         identity.clear();
-        if (overlap == paths.size() &&
-            resolve_state_path_entry_identity(
-                candidate.path, &identity))
+        if (resolve_state_path_entry_identity(candidate.path, &identity))
         {
             identity =
                 normalize_state_path_entry_identity(std::move(identity));
@@ -2046,29 +2083,35 @@ bool validate_distinct_state_paths(const std::vector<named_state_path> &paths,
                            size_t,
                            state_path_entry_identity_less>::const_iterator
                 entry = entry_identities.find(identity);
-            if (entry != entry_identities.end())
+            if (entry != entry_identities.end() &&
+                entry->second < overlap)
             {
                 overlap = entry->second;
             }
-            else
-            {
-                entry_identities.emplace(std::move(identity), index);
-            }
+            entry_identities.emplace(std::move(identity), index);
         }
 
-        if (overlap != paths.size())
+        if (overlap != paths.size() &&
+            (overlap < first_overlap ||
+             (overlap == first_overlap && index < second_overlap)))
         {
-            if (error != nullptr)
-            {
-                *error = "state storage paths overlap: " +
-                         paths[overlap].description + "=" +
-                         paths[overlap].path + " and " +
-                         candidate.description + "=" + candidate.path;
-            }
-            return false;
+            first_overlap = overlap;
+            second_overlap = index;
         }
     }
-    return true;
+    if (first_overlap == paths.size())
+    {
+        return true;
+    }
+    if (error != nullptr)
+    {
+        *error = "state storage paths overlap: " +
+                 paths[first_overlap].description + "=" +
+                 paths[first_overlap].path + " and " +
+                 paths[second_overlap].description + "=" +
+                 paths[second_overlap].path;
+    }
+    return false;
 }
 
 bool validate_state_storage_filesystems(

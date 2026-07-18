@@ -3336,6 +3336,77 @@ TEST(rasn_state, checkpoint_rejects_hard_linked_staging_path)
     std::remove(journal_path.c_str());
 }
 
+TEST(rasn_state, indexed_path_validation_preserves_legacy_overlap_pair)
+{
+    const std::string checkpoint_path =
+        workspace_temp_file_path("rasn-state-indexed-collision.chkpt");
+    const std::string checkpoint_staging = checkpoint_path + ".tmp";
+    const std::string checkpoint_delete_staging =
+        checkpoint_path + ".delete.tmp";
+    const std::string checkpoint_import_staging = checkpoint_path + ".nfs.tmp";
+    const std::string marker =
+        checkpoint_path + ".nfs-import.pending";
+    const std::string marker_staging = marker + ".tmp";
+    const std::string marker_delete_staging = marker + ".delete.tmp";
+    const std::vector<std::string> paths{checkpoint_path,
+                                         checkpoint_staging,
+                                         checkpoint_delete_staging,
+                                         checkpoint_import_staging,
+                                         marker_staging,
+                                         marker_delete_staging};
+    for (const std::string &path : paths)
+    {
+        std::remove(path.c_str());
+    }
+    write_text_file(checkpoint_staging, "first-group");
+    write_text_file(checkpoint_delete_staging, "second-group");
+
+    const hard_link_creation marker_link =
+        try_create_hard_link(checkpoint_staging, marker_staging);
+    const hard_link_creation marker_delete_link =
+        marker_link == hard_link_creation::created
+            ? try_create_hard_link(checkpoint_staging, marker_delete_staging)
+            : marker_link;
+    const hard_link_creation import_link =
+        marker_delete_link == hard_link_creation::created
+            ? try_create_hard_link(checkpoint_delete_staging,
+                                   checkpoint_import_staging)
+            : marker_delete_link;
+    if (marker_link == hard_link_creation::unsupported ||
+        marker_delete_link == hard_link_creation::unsupported ||
+        import_link == hard_link_creation::unsupported)
+    {
+        for (const std::string &path : paths)
+        {
+            std::remove(path.c_str());
+        }
+        return;
+    }
+    ASSERT_TRUE(marker_link == hard_link_creation::created);
+    ASSERT_TRUE(marker_delete_link == hard_link_creation::created);
+    ASSERT_TRUE(import_link == hard_link_creation::created);
+
+    state_store store(false, 0);
+    state_checkpoint_request checkpoint;
+    checkpoint.path = checkpoint_path;
+    const state_response response = store.checkpoint(checkpoint);
+    EXPECT_FALSE(response.ok);
+    EXPECT_NE(std::string::npos,
+              response.error.find("checkpoint staging=" +
+                                  checkpoint_staging));
+    EXPECT_NE(std::string::npos,
+              response.error.find("checkpoint NFS import marker staging=" +
+                                  marker_staging));
+    EXPECT_EQ(std::string::npos,
+              response.error.find("checkpoint delete staging=" +
+                                  checkpoint_delete_staging));
+
+    for (const std::string &path : paths)
+    {
+        std::remove(path.c_str());
+    }
+}
+
 TEST(rasn_state, configured_checkpoint_rechecks_hard_links_after_cached_validation)
 {
     const std::string journal_path = configured_state_journal_path();
