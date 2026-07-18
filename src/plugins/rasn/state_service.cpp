@@ -976,13 +976,17 @@ struct existing_state_path_identities
     std::string fallback;
 };
 
-bool resolve_existing_state_path_identities(
-    const std::string &path, existing_state_path_identities *identities)
+enum class state_path_identity_status
 {
-    if (identities != nullptr)
-    {
-        *identities = existing_state_path_identities();
-    }
+    absent,
+    resolved,
+    uninspectable
+};
+
+state_path_identity_status resolve_existing_state_path_identities(
+    const std::string &path, existing_state_path_identities &identities)
+{
+    identities = existing_state_path_identities();
 #if defined(_WIN32)
     const HANDLE handle = ::CreateFileA(
         path.c_str(),
@@ -994,7 +998,10 @@ bool resolve_existing_state_path_identities(
         nullptr);
     if (handle == INVALID_HANDLE_VALUE)
     {
-        return false;
+        const DWORD error = ::GetLastError();
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND
+                   ? state_path_identity_status::absent
+                   : state_path_identity_status::uninspectable;
     }
 
     // FileIdInfo is Windows 8+ and carries the full 128-bit identifier used by
@@ -1014,17 +1021,14 @@ bool resolve_existing_state_path_identities(
                                        sizeof(extended_info)) != 0)
     {
         resolved = true;
-        if (identities != nullptr)
-        {
-            identities->preferred = "windows-file-id-128:";
-            identities->preferred.append(
-                reinterpret_cast<const char *>(
-                    &extended_info.volume_serial_number),
-                sizeof(extended_info.volume_serial_number));
-            identities->preferred.append(
-                reinterpret_cast<const char *>(extended_info.file_id),
-                sizeof(extended_info.file_id));
-        }
+        identities.preferred = "windows-file-id-128:";
+        identities.preferred.append(
+            reinterpret_cast<const char *>(
+                &extended_info.volume_serial_number),
+            sizeof(extended_info.volume_serial_number));
+        identities.preferred.append(
+            reinterpret_cast<const char *>(extended_info.file_id),
+            sizeof(extended_info.file_id));
     }
 
     // Older systems and some filesystem redirectors reject FileIdInfo with
@@ -1034,37 +1038,41 @@ bool resolve_existing_state_path_identities(
     if (::GetFileInformationByHandle(handle, &info) != 0)
     {
         resolved = true;
-        if (identities != nullptr)
-        {
-            identities->fallback = "windows-file-index-64:";
-            identities->fallback.append(
-                reinterpret_cast<const char *>(&info.dwVolumeSerialNumber),
-                sizeof(info.dwVolumeSerialNumber));
-            identities->fallback.append(
-                reinterpret_cast<const char *>(&info.nFileIndexHigh),
-                sizeof(info.nFileIndexHigh));
-            identities->fallback.append(
-                reinterpret_cast<const char *>(&info.nFileIndexLow),
-                sizeof(info.nFileIndexLow));
-        }
+        identities.fallback = "windows-file-index-64:";
+        identities.fallback.append(
+            reinterpret_cast<const char *>(&info.dwVolumeSerialNumber),
+            sizeof(info.dwVolumeSerialNumber));
+        identities.fallback.append(
+            reinterpret_cast<const char *>(&info.nFileIndexHigh),
+            sizeof(info.nFileIndexHigh));
+        identities.fallback.append(
+            reinterpret_cast<const char *>(&info.nFileIndexLow),
+            sizeof(info.nFileIndexLow));
     }
     ::CloseHandle(handle);
-    return resolved;
+    // A preferred-only result cannot be compared with a fallback-only alias.
+    // The legacy query is supported on every accepted Windows filesystem, so
+    // fail closed rather than silently omit this existing path from an index.
+    if (!identities.preferred.empty() && identities.fallback.empty())
+    {
+        return state_path_identity_status::uninspectable;
+    }
+    return resolved ? state_path_identity_status::resolved
+                    : state_path_identity_status::uninspectable;
 #else
     struct stat info;
     if (::stat(path.c_str(), &info) != 0)
     {
-        return false;
+        return errno == ENOENT || errno == ENOTDIR
+                   ? state_path_identity_status::absent
+                   : state_path_identity_status::uninspectable;
     }
-    if (identities != nullptr)
-    {
-        identities->preferred = "posix-file-id:";
-        identities->preferred.append(
-            reinterpret_cast<const char *>(&info.st_dev), sizeof(info.st_dev));
-        identities->preferred.append(
-            reinterpret_cast<const char *>(&info.st_ino), sizeof(info.st_ino));
-    }
-    return true;
+    identities.preferred = "posix-file-id:";
+    identities.preferred.append(
+        reinterpret_cast<const char *>(&info.st_dev), sizeof(info.st_dev));
+    identities.preferred.append(
+        reinterpret_cast<const char *>(&info.st_ino), sizeof(info.st_ino));
+    return state_path_identity_status::resolved;
 #endif
 }
 
@@ -1079,6 +1087,13 @@ bool state_path_identities_overlap(
     return !left.fallback.empty() && !right.fallback.empty() &&
            left.fallback == right.fallback;
 }
+
+enum class state_path_relation
+{
+    distinct,
+    same,
+    uninspectable
+};
 
 std::string normalize_state_path_entry_identity(std::string identity)
 {
@@ -1129,24 +1144,35 @@ bool state_path_entries_refer_to_same_file(const std::string &left,
 #endif
 }
 
-bool state_paths_refer_to_same_file(const std::string &left,
-                                    const std::string &right)
+state_path_relation compare_state_paths(const std::string &left,
+                                        const std::string &right)
 {
     if (left == right)
     {
-        return true;
+        return state_path_relation::same;
     }
 
     existing_state_path_identities left_identities;
     existing_state_path_identities right_identities;
-    if (resolve_existing_state_path_identities(left, &left_identities) &&
-        resolve_existing_state_path_identities(right, &right_identities) &&
+    const state_path_identity_status left_status =
+        resolve_existing_state_path_identities(left, left_identities);
+    const state_path_identity_status right_status =
+        resolve_existing_state_path_identities(right, right_identities);
+    if (left_status == state_path_identity_status::uninspectable ||
+        right_status == state_path_identity_status::uninspectable)
+    {
+        return state_path_relation::uninspectable;
+    }
+    if (left_status == state_path_identity_status::resolved &&
+        right_status == state_path_identity_status::resolved &&
         state_path_identities_overlap(left_identities, right_identities))
     {
-        return true;
+        return state_path_relation::same;
     }
 
-    return state_path_entries_refer_to_same_file(left, right);
+    return state_path_entries_refer_to_same_file(left, right)
+               ? state_path_relation::same
+               : state_path_relation::distinct;
 }
 
 bool write_durable_state_text_file(const std::string &path,
@@ -1827,7 +1853,18 @@ std::string path_parent_or_current(const std::string &path)
 
 bool copy_local_file(const std::string &source, const std::string &destination, std::string *error)
 {
-    if (state_paths_refer_to_same_file(source, destination))
+    const state_path_relation relation =
+        compare_state_paths(source, destination);
+    if (relation == state_path_relation::uninspectable)
+    {
+        if (error != nullptr)
+        {
+            *error = "failed to compare state file identities: " + source +
+                     " and " + destination;
+        }
+        return false;
+    }
+    if (relation == state_path_relation::same)
     {
         return sync_state_file(source, "state file copy", error);
     }
@@ -2083,7 +2120,18 @@ bool validate_distinct_state_paths(const std::vector<named_state_path> &paths,
         exact_paths.emplace(candidate.path, index);
 
         existing_state_path_identities identities;
-        if (resolve_existing_state_path_identities(candidate.path, &identities))
+        const state_path_identity_status identity_status =
+            resolve_existing_state_path_identities(candidate.path, identities);
+        if (identity_status == state_path_identity_status::uninspectable)
+        {
+            if (error != nullptr)
+            {
+                *error = "failed to inspect state storage path identity: " +
+                         candidate.description + "=" + candidate.path;
+            }
+            return false;
+        }
+        if (identity_status == state_path_identity_status::resolved)
         {
             if (!identities.preferred.empty())
             {
@@ -2329,9 +2377,24 @@ bool validate_custom_checkpoint_target(const std::string &checkpoint_path,
                           protected_path.path) != protected_entries.end() &&
                 !state_path_entries_refer_to_same_file(
                     custom.path, protected_path.path);
-            if (!distinct_live_entry_alias &&
-                state_paths_refer_to_same_file(
-                    custom.path, protected_path.path))
+            if (distinct_live_entry_alias)
+            {
+                continue;
+            }
+            const state_path_relation relation =
+                compare_state_paths(custom.path, protected_path.path);
+            if (relation == state_path_relation::uninspectable)
+            {
+                if (error != nullptr)
+                {
+                    *error =
+                        "failed to compare custom and recovery checkpoint "
+                        "storage identities: " +
+                        custom.path + " and " + protected_path.path;
+                }
+                return false;
+            }
+            if (relation == state_path_relation::same)
             {
                 if (error != nullptr)
                 {
@@ -2738,8 +2801,19 @@ bool import_state_recovery_files_from_nfs(const std::string &checkpoint_path,
         const std::string imported_checkpoint =
             ::dsn::utils::filesystem::path_combine(
                 attempt_directory, config.remote_checkpoint_file);
-        if (state_paths_refer_to_same_file(
-                imported_checkpoint, checkpoint_path))
+        const state_path_relation relation =
+            compare_state_paths(imported_checkpoint, checkpoint_path);
+        if (relation == state_path_relation::uninspectable)
+        {
+            if (error != nullptr)
+            {
+                *error = "failed to compare NFS checkpoint staging and primary "
+                         "checkpoint identities: " +
+                         imported_checkpoint + " and " + checkpoint_path;
+            }
+            return false;
+        }
+        if (relation == state_path_relation::same)
         {
             if (error != nullptr)
             {
@@ -2758,7 +2832,20 @@ bool import_state_recovery_files_from_nfs(const std::string &checkpoint_path,
         const std::string imported_journal =
             ::dsn::utils::filesystem::path_combine(
                 attempt_directory, config.remote_journal_file);
-        if (state_paths_refer_to_same_file(imported_journal, journal_path))
+        const state_path_relation relation =
+            compare_state_paths(imported_journal, journal_path);
+        if (relation == state_path_relation::uninspectable)
+        {
+            if (error != nullptr)
+            {
+                *error =
+                    "failed to compare NFS journal staging and primary journal "
+                    "identities: " +
+                    imported_journal + " and " + journal_path;
+            }
+            return false;
+        }
+        if (relation == state_path_relation::same)
         {
             if (error != nullptr)
             {
@@ -3911,8 +3998,20 @@ state_response state_store::import_checkpoint(const state_checkpoint_request &re
     {
         return error_response(import_error);
     }
+    state_path_relation durable_relation = state_path_relation::same;
+    if (!durable_path.empty())
+    {
+        durable_relation = compare_state_paths(durable_path, request.path);
+        if (durable_relation == state_path_relation::uninspectable)
+        {
+            return error_response(
+                "failed to compare imported and durable checkpoint "
+                "identities: " +
+                request.path + " and " + durable_path);
+        }
+    }
     if (!durable_path.empty() &&
-        !state_paths_refer_to_same_file(durable_path, request.path))
+        durable_relation == state_path_relation::distinct)
     {
         const bool durable_path_valid =
             _journal_enabled

@@ -1679,7 +1679,10 @@ legacy earliest-pair diagnostic. Windows identity uses the full 128-bit file ID
 needed by ReFS and also indexes a tagged legacy ID. Mixed extended/fallback
 query results therefore retain a common identity key, including on filesystem
 redirectors with provider-specific behavior. When both handles provide full
-IDs, validation does not compare their potentially truncated legacy IDs.
+IDs, validation does not compare their potentially truncated legacy IDs. If a
+handle supplies a full ID but the universally supported legacy compatibility
+query fails, lifecycle validation fails closed rather than accepting an identity
+that cannot be compared with a fallback-only alias.
 Checkpoint/export targets and their `.tmp`/`.bak` staging names are rejected when
 they alias either the primary or configured-replica journal lifecycle paths.
 Validation covers effective replica basenames and `.nfs.tmp` copy staging, uses

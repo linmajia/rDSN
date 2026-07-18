@@ -519,8 +519,10 @@ Correctness and robustness requirements:
   tagged full 128-bit file IDs required by ReFS and also indexes the tagged
   universally supported legacy ID. Full IDs take precedence when both handles
   provide them; the legacy index only bridges a handle without an extended
-  result, avoiding ReFS truncation collisions. Leaf symlinks/reparse points are
-  rejected,
+  result, avoiding ReFS truncation collisions. Because the legacy identity is
+  the required cross-format key, an abnormal preferred-only handle fails closed
+  instead of entering lifecycle validation with an unmatchable identity. Leaf
+  symlinks/reparse points are rejected,
   recovery reads are opened no-follow, and live journals, trusted recovery inputs,
   and replaceable staging must be regular single-link files. Journal compaction requires the configured
   checkpoint directory entry; a distinct hard-link alias is treated as a custom
