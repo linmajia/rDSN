@@ -2866,6 +2866,26 @@ TEST(rasn_state, windows_identity_queries_encode_all_result_combinations)
 }
 
 #if defined(_WIN32)
+TEST(rasn_state, windows_identity_adapter_rejects_invalid_handles)
+{
+    state_service_internal::existing_state_path_identities identities;
+    identities.preferred = "stale-preferred";
+    identities.fallback = "stale-fallback";
+    EXPECT_EQ(state_service_internal::state_path_identity_status::uninspectable,
+              state_service_internal::resolve_open_windows_state_path_identities(
+                  nullptr, identities));
+    EXPECT_TRUE(identities.preferred.empty());
+    EXPECT_TRUE(identities.fallback.empty());
+
+    identities.preferred = "stale-preferred";
+    identities.fallback = "stale-fallback";
+    EXPECT_EQ(state_service_internal::state_path_identity_status::uninspectable,
+              state_service_internal::resolve_open_windows_state_path_identities(
+                  INVALID_HANDLE_VALUE, identities));
+    EXPECT_TRUE(identities.preferred.empty());
+    EXPECT_TRUE(identities.fallback.empty());
+}
+
 TEST(rasn_state, windows_identity_adapter_classifies_real_paths)
 {
     const std::string existing_path =
@@ -2941,22 +2961,30 @@ TEST(rasn_state, windows_identity_adapter_classifies_real_paths)
               existing_identities.fallback.find("windows-file-index-64:"));
     EXPECT_EQ(0U,
               handle_identities.fallback.find("windows-file-index-64:"));
+    EXPECT_EQ(handle_identities.fallback, existing_identities.fallback);
     // Both probes use one unchanged handle. The comparison relies on repeated
     // metadata queries for that live handle returning stable support and identity,
     // rather than assuming identity stability across separate opens.
     EXPECT_EQ(preferred_supported, !handle_identities.preferred.empty());
+    // The fresh resolver opens the same exclusively owned, unchanged temp file;
+    // require that open to return the exact same identity bytes.
+    EXPECT_EQ(preferred_supported, !existing_identities.preferred.empty());
+    EXPECT_EQ(handle_identities.preferred, existing_identities.preferred);
     if (preferred_supported)
     {
         const std::string prefix = "windows-file-id-128:";
-        EXPECT_EQ(0U,
-                  handle_identities.preferred.find(prefix));
-        ASSERT_EQ(prefix.size() + sizeof(expected_preferred),
-                  handle_identities.preferred.size());
-        EXPECT_EQ(0,
-                  std::memcmp(handle_identities.preferred.data() +
-                                  prefix.size(),
-                              &expected_preferred,
-                              sizeof(expected_preferred)));
+        for (const std::string *identity :
+             {&handle_identities.preferred,
+              &existing_identities.preferred})
+        {
+            EXPECT_EQ(0U, identity->find(prefix));
+            ASSERT_EQ(prefix.size() + sizeof(expected_preferred),
+                      identity->size());
+            EXPECT_EQ(0,
+                      std::memcmp(identity->data() + prefix.size(),
+                                  &expected_preferred,
+                                  sizeof(expected_preferred)));
+        }
     }
     EXPECT_EQ(state_service_internal::state_path_identity_status::absent,
               missing_status);

@@ -1236,8 +1236,7 @@ state_path_identity_status resolve_existing_state_path_identities_impl(
     // ReFS. Older systems and some redirectors reject it, so the shared helper
     // still performs the universally supported legacy query for comparison.
     const state_path_identity_status query_status =
-        state_service_internal::resolve_open_windows_state_path_identities(
-            handle, identities);
+        resolve_open_windows_state_path_identities_impl(handle, identities);
     ::CloseHandle(handle);
     // A preferred-only result cannot be compared with a fallback-only alias.
     // The legacy query is supported on every accepted Windows filesystem, so
