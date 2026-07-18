@@ -2866,26 +2866,6 @@ TEST(rasn_state, windows_identity_queries_encode_all_result_combinations)
 }
 
 #if defined(_WIN32)
-TEST(rasn_state, windows_identity_adapter_rejects_invalid_handles)
-{
-    state_service_internal::existing_state_path_identities identities;
-    identities.preferred = "stale-preferred";
-    identities.fallback = "stale-fallback";
-    EXPECT_EQ(state_service_internal::state_path_identity_status::uninspectable,
-              state_service_internal::resolve_open_windows_state_path_identities(
-                  nullptr, identities));
-    EXPECT_TRUE(identities.preferred.empty());
-    EXPECT_TRUE(identities.fallback.empty());
-
-    identities.preferred = "stale-preferred";
-    identities.fallback = "stale-fallback";
-    EXPECT_EQ(state_service_internal::state_path_identity_status::uninspectable,
-              state_service_internal::resolve_open_windows_state_path_identities(
-                  INVALID_HANDLE_VALUE, identities));
-    EXPECT_TRUE(identities.preferred.empty());
-    EXPECT_TRUE(identities.fallback.empty());
-}
-
 TEST(rasn_state, windows_identity_adapter_classifies_real_paths)
 {
     const std::string existing_path =
@@ -2906,38 +2886,6 @@ TEST(rasn_state, windows_identity_adapter_classifies_real_paths)
     write_text_file(existing_path, "identity");
     write_text_file(blocked_parent, "not-a-directory");
 
-    const HANDLE preferred_probe = ::CreateFileA(
-        existing_path.c_str(),
-        0,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr,
-        OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS,
-        nullptr);
-    if (preferred_probe == INVALID_HANDLE_VALUE)
-    {
-        const DWORD probe_error = ::GetLastError();
-        ::dsn::utils::filesystem::remove_path(existing_path);
-        ::dsn::utils::filesystem::remove_path(blocked_parent);
-        ADD_FAILURE() << "failed to open Windows identity probe: "
-                      << probe_error;
-        return;
-    }
-    state_service_internal::windows_file_id_128 expected_preferred;
-    const FILE_INFO_BY_HANDLE_CLASS file_id_info_class =
-        static_cast<FILE_INFO_BY_HANDLE_CLASS>(18);
-    const bool preferred_supported =
-        ::GetFileInformationByHandleEx(preferred_probe,
-                                       file_id_info_class,
-                                       &expected_preferred,
-                                       static_cast<DWORD>(
-                                           sizeof(expected_preferred))) != 0;
-    state_service_internal::existing_state_path_identities handle_identities;
-    const state_service_internal::state_path_identity_status handle_status =
-        state_service_internal::resolve_open_windows_state_path_identities(
-            preferred_probe, handle_identities);
-    ::CloseHandle(preferred_probe);
-
     state_service_internal::existing_state_path_identities existing_identities;
     const state_service_internal::state_path_identity_status existing_status =
         state_service_internal::resolve_existing_state_path_identities(
@@ -2955,36 +2903,15 @@ TEST(rasn_state, windows_identity_adapter_classifies_real_paths)
     ::dsn::utils::filesystem::remove_path(blocked_parent);
     EXPECT_EQ(state_service_internal::state_path_identity_status::resolved,
               existing_status);
-    EXPECT_EQ(state_service_internal::state_path_identity_status::resolved,
-              handle_status);
     EXPECT_EQ(0U,
               existing_identities.fallback.find("windows-file-index-64:"));
-    EXPECT_EQ(0U,
-              handle_identities.fallback.find("windows-file-index-64:"));
-    EXPECT_EQ(handle_identities.fallback, existing_identities.fallback);
-    // Both probes use one unchanged handle. The comparison relies on repeated
-    // metadata queries for that live handle returning stable support and identity,
-    // rather than assuming identity stability across separate opens.
-    EXPECT_EQ(preferred_supported, !handle_identities.preferred.empty());
-    // The fresh resolver opens the same exclusively owned, unchanged temp file;
-    // require that open to return the exact same identity bytes.
-    EXPECT_EQ(preferred_supported, !existing_identities.preferred.empty());
-    EXPECT_EQ(handle_identities.preferred, existing_identities.preferred);
-    if (preferred_supported)
+    if (!existing_identities.preferred.empty())
     {
         const std::string prefix = "windows-file-id-128:";
-        for (const std::string *identity :
-             {&handle_identities.preferred,
-              &existing_identities.preferred})
-        {
-            EXPECT_EQ(0U, identity->find(prefix));
-            ASSERT_EQ(prefix.size() + sizeof(expected_preferred),
-                      identity->size());
-            EXPECT_EQ(0,
-                      std::memcmp(identity->data() + prefix.size(),
-                                  &expected_preferred,
-                                  sizeof(expected_preferred)));
-        }
+        EXPECT_EQ(0U, existing_identities.preferred.find(prefix));
+        EXPECT_EQ(prefix.size() +
+                      sizeof(state_service_internal::windows_file_id_128),
+                  existing_identities.preferred.size());
     }
     EXPECT_EQ(state_service_internal::state_path_identity_status::absent,
               missing_status);

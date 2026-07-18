@@ -1004,9 +1004,11 @@ static_assert(
     "internal preferred file ID must match Windows SDK FILE_ID_INFO");
 #endif
 
-state_path_identity_status resolve_open_windows_state_path_identities_impl(
+state_path_identity_status resolve_open_windows_state_path_identities(
     HANDLE handle, existing_state_path_identities &identities)
 {
+    // The caller owns a handle already validated by CreateFileA and closes it
+    // immediately after this helper returns.
     identities = existing_state_path_identities();
     const FILE_INFO_BY_HANDLE_CLASS file_id_info_class =
         static_cast<FILE_INFO_BY_HANDLE_CLASS>(18);
@@ -1236,7 +1238,7 @@ state_path_identity_status resolve_existing_state_path_identities_impl(
     // ReFS. Older systems and some redirectors reject it, so the shared helper
     // still performs the universally supported legacy query for comparison.
     const state_path_identity_status query_status =
-        resolve_open_windows_state_path_identities_impl(handle, identities);
+        resolve_open_windows_state_path_identities(handle, identities);
     ::CloseHandle(handle);
     // A preferred-only result cannot be compared with a fallback-only alias.
     // The legacy query is supported on every accepted Windows filesystem, so
@@ -3604,22 +3606,6 @@ state_service_internal::resolve_existing_state_path_identities(
 {
     return resolve_existing_state_path_identities_impl(path, identities);
 }
-
-#if defined(_WIN32)
-state_service_internal::state_path_identity_status
-state_service_internal::resolve_open_windows_state_path_identities(
-    void *native_handle, existing_state_path_identities &identities)
-{
-    if (native_handle == nullptr ||
-        native_handle == INVALID_HANDLE_VALUE)
-    {
-        identities = existing_state_path_identities();
-        return state_path_identity_status::uninspectable;
-    }
-    return resolve_open_windows_state_path_identities_impl(
-        static_cast<HANDLE>(native_handle), identities);
-}
-#endif
 
 std::string configured_state_checkpoint_path()
 {

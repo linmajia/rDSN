@@ -111,11 +111,6 @@ state_path_identity_status collect_windows_identity_query_results(
 state_path_identity_status resolve_existing_state_path_identities(
     const std::string &path, existing_state_path_identities &identities);
 
-#if defined(_WIN32)
-state_path_identity_status resolve_open_windows_state_path_identities(
-    void *native_handle, existing_state_path_identities &identities);
-#endif
-
 } // namespace state_service_internal
 } // namespace rasn
 } // namespace dsn
