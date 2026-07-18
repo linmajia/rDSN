@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <string>
 #include <utility>
 
@@ -20,20 +22,61 @@ enum class state_path_identity_status
     uninspectable
 };
 
+struct windows_file_id_128
+{
+    uint64_t volume_serial_number = 0;
+    uint8_t file_id[16] = {};
+};
+
+static_assert(sizeof(windows_file_id_128) == 24,
+              "FileIdInfo-compatible identity layout must remain 24 bytes");
+static_assert(offsetof(windows_file_id_128, file_id) == sizeof(uint64_t),
+              "FileIdInfo-compatible byte identifier must follow its volume");
+
+struct windows_file_index_64
+{
+    uint32_t volume_serial_number = 0;
+    uint32_t file_index_high = 0;
+    uint32_t file_index_low = 0;
+};
+
 template <typename PreferredQuery, typename LegacyQuery>
 state_path_identity_status collect_windows_identity_query_results(
     existing_state_path_identities &identities,
-    PreferredQuery preferred_query,
-    LegacyQuery legacy_query)
+    PreferredQuery &&preferred_query,
+    LegacyQuery &&legacy_query)
 {
-    std::string preferred;
-    std::string fallback;
-    const bool preferred_resolved = preferred_query(preferred);
-    const bool legacy_resolved = legacy_query(fallback);
-    identities.preferred =
-        preferred_resolved ? std::move(preferred) : std::string();
-    identities.fallback =
-        legacy_resolved ? std::move(fallback) : std::string();
+    windows_file_id_128 preferred;
+    windows_file_index_64 fallback;
+    const bool preferred_resolved =
+        std::forward<PreferredQuery>(preferred_query)(preferred);
+    const bool legacy_resolved =
+        std::forward<LegacyQuery>(legacy_query)(fallback);
+    identities.preferred.clear();
+    identities.fallback.clear();
+    if (preferred_resolved)
+    {
+        identities.preferred = "windows-file-id-128:";
+        identities.preferred.append(
+            reinterpret_cast<const char *>(&preferred.volume_serial_number),
+            sizeof(preferred.volume_serial_number));
+        identities.preferred.append(
+            reinterpret_cast<const char *>(preferred.file_id),
+            sizeof(preferred.file_id));
+    }
+    if (legacy_resolved)
+    {
+        identities.fallback = "windows-file-index-64:";
+        identities.fallback.append(
+            reinterpret_cast<const char *>(&fallback.volume_serial_number),
+            sizeof(fallback.volume_serial_number));
+        identities.fallback.append(
+            reinterpret_cast<const char *>(&fallback.file_index_high),
+            sizeof(fallback.file_index_high));
+        identities.fallback.append(
+            reinterpret_cast<const char *>(&fallback.file_index_low),
+            sizeof(fallback.file_index_low));
+    }
     return legacy_resolved ? state_path_identity_status::resolved
                            : state_path_identity_status::uninspectable;
 }

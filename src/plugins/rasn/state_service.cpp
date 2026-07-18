@@ -1173,37 +1173,19 @@ state_path_identity_status resolve_existing_state_path_identities_impl(
 
     // FileIdInfo is Windows 8+ and carries the full 128-bit identifier used by
     // ReFS. Keep the Vista-targeted build compatible with older SDK headers.
-    struct state_file_id_info
-    {
-        ULONGLONG volume_serial_number;
-        BYTE file_id[16];
-    };
     const FILE_INFO_BY_HANDLE_CLASS file_id_info_class =
         static_cast<FILE_INFO_BY_HANDLE_CLASS>(18);
-    state_file_id_info extended_info = {};
     BY_HANDLE_FILE_INFORMATION info;
     const state_path_identity_status query_status =
         state_service_internal::collect_windows_identity_query_results(
             identities,
-            [&](std::string &identity) {
-                if (::GetFileInformationByHandleEx(handle,
-                                                   file_id_info_class,
-                                                   &extended_info,
-                                                   sizeof(extended_info)) == 0)
-                {
-                    return false;
-                }
-                identity = "windows-file-id-128:";
-                identity.append(
-                    reinterpret_cast<const char *>(
-                        &extended_info.volume_serial_number),
-                    sizeof(extended_info.volume_serial_number));
-                identity.append(
-                    reinterpret_cast<const char *>(extended_info.file_id),
-                    sizeof(extended_info.file_id));
-                return true;
+            [&](state_service_internal::windows_file_id_128 &identity) {
+                return ::GetFileInformationByHandleEx(handle,
+                                                      file_id_info_class,
+                                                      &identity,
+                                                      sizeof(identity)) != 0;
             },
-            [&](std::string &identity) {
+            [&](state_service_internal::windows_file_index_64 &identity) {
                 // Older systems and some filesystem redirectors reject
                 // FileIdInfo with provider-specific errors. Always collect the
                 // universally supported legacy identity too, so mixed query
@@ -1212,16 +1194,12 @@ state_path_identity_status resolve_existing_state_path_identities_impl(
                 {
                     return false;
                 }
-                identity = "windows-file-index-64:";
-                identity.append(
-                    reinterpret_cast<const char *>(&info.dwVolumeSerialNumber),
-                    sizeof(info.dwVolumeSerialNumber));
-                identity.append(
-                    reinterpret_cast<const char *>(&info.nFileIndexHigh),
-                    sizeof(info.nFileIndexHigh));
-                identity.append(
-                    reinterpret_cast<const char *>(&info.nFileIndexLow),
-                    sizeof(info.nFileIndexLow));
+                identity.volume_serial_number =
+                    static_cast<uint32_t>(info.dwVolumeSerialNumber);
+                identity.file_index_high =
+                    static_cast<uint32_t>(info.nFileIndexHigh);
+                identity.file_index_low =
+                    static_cast<uint32_t>(info.nFileIndexLow);
                 return true;
             });
     ::CloseHandle(handle);

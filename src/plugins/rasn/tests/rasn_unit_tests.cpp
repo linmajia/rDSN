@@ -54,6 +54,7 @@
 #include <chrono>
 #include <climits>
 #include <condition_variable>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -2750,38 +2751,98 @@ TEST(rasn_state, checkpoint_copy_rejects_inaccessible_identity_parent)
 }
 #endif
 
-TEST(rasn_state, windows_identity_queries_require_legacy_comparison_key)
+TEST(rasn_state, windows_identity_queries_encode_all_result_combinations)
 {
     using state_service_internal::collect_windows_identity_query_results;
     using state_service_internal::existing_state_path_identities;
     using state_service_internal::state_path_identity_status;
+    using state_service_internal::windows_file_id_128;
+    using state_service_internal::windows_file_index_64;
 
-    const auto verify = [](bool preferred_succeeds,
-                           bool legacy_succeeds,
-                           state_path_identity_status expected_status) {
+    windows_file_id_128 preferred;
+    preferred.volume_serial_number = UINT64_C(0x0102030405060708);
+    for (size_t i = 0; i < sizeof(preferred.file_id); ++i)
+    {
+        preferred.file_id[i] = static_cast<uint8_t>(0x10 + i);
+    }
+    windows_file_index_64 fallback;
+    fallback.volume_serial_number = UINT32_C(0x11223344);
+    fallback.file_index_high = UINT32_C(0x55667788);
+    fallback.file_index_low = UINT32_C(0x99aabbcc);
+
+    const auto verify = [&](bool preferred_succeeds,
+                            bool legacy_succeeds,
+                            state_path_identity_status expected_status) {
         existing_state_path_identities identities;
         int preferred_calls = 0;
         int legacy_calls = 0;
         const state_path_identity_status status =
             collect_windows_identity_query_results(
                 identities,
-                [&](std::string &identity) {
+                [&](windows_file_id_128 &identity) {
                     ++preferred_calls;
-                    identity = "preferred";
+                    identity = preferred;
                     return preferred_succeeds;
                 },
-                [&](std::string &identity) {
+                [&](windows_file_index_64 &identity) {
                     ++legacy_calls;
-                    identity = "legacy";
+                    identity = fallback;
                     return legacy_succeeds;
                 });
 
         EXPECT_EQ(expected_status, status);
         EXPECT_EQ(1, preferred_calls);
         EXPECT_EQ(1, legacy_calls);
-        EXPECT_EQ(preferred_succeeds ? "preferred" : "",
-                  identities.preferred);
-        EXPECT_EQ(legacy_succeeds ? "legacy" : "", identities.fallback);
+        if (preferred_succeeds)
+        {
+            const std::string prefix = "windows-file-id-128:";
+            ASSERT_EQ(prefix.size() + sizeof(preferred.volume_serial_number) +
+                          sizeof(preferred.file_id),
+                      identities.preferred.size());
+            EXPECT_EQ(0U, identities.preferred.find(prefix));
+            EXPECT_EQ(0,
+                      std::memcmp(identities.preferred.data() + prefix.size(),
+                                  &preferred.volume_serial_number,
+                                  sizeof(preferred.volume_serial_number)));
+            EXPECT_EQ(0,
+                      std::memcmp(
+                          identities.preferred.data() + prefix.size() +
+                              sizeof(preferred.volume_serial_number),
+                          preferred.file_id,
+                          sizeof(preferred.file_id)));
+        }
+        else
+        {
+            EXPECT_TRUE(identities.preferred.empty());
+        }
+        if (legacy_succeeds)
+        {
+            const std::string prefix = "windows-file-index-64:";
+            ASSERT_EQ(prefix.size() + sizeof(fallback.volume_serial_number) +
+                          sizeof(fallback.file_index_high) +
+                          sizeof(fallback.file_index_low),
+                      identities.fallback.size());
+            EXPECT_EQ(0U, identities.fallback.find(prefix));
+            size_t offset = prefix.size();
+            EXPECT_EQ(0,
+                      std::memcmp(identities.fallback.data() + offset,
+                                  &fallback.volume_serial_number,
+                                  sizeof(fallback.volume_serial_number)));
+            offset += sizeof(fallback.volume_serial_number);
+            EXPECT_EQ(0,
+                      std::memcmp(identities.fallback.data() + offset,
+                                  &fallback.file_index_high,
+                                  sizeof(fallback.file_index_high)));
+            offset += sizeof(fallback.file_index_high);
+            EXPECT_EQ(0,
+                      std::memcmp(identities.fallback.data() + offset,
+                                  &fallback.file_index_low,
+                                  sizeof(fallback.file_index_low)));
+        }
+        else
+        {
+            EXPECT_TRUE(identities.fallback.empty());
+        }
     };
 
     verify(false, false, state_path_identity_status::uninspectable);
@@ -2791,26 +2852,58 @@ TEST(rasn_state, windows_identity_queries_require_legacy_comparison_key)
 }
 
 #if defined(_WIN32)
-TEST(rasn_state, windows_identity_adapter_resolves_real_file)
+TEST(rasn_state, windows_identity_adapter_classifies_real_paths)
 {
-    const std::string path =
+    const std::string existing_path =
         workspace_temp_file_path("rasn-state-windows-identity.chkpt");
-    std::remove(path.c_str());
-    write_text_file(path, "identity");
+    const std::string missing_root =
+        workspace_temp_file_path("rasn-state-windows-identity-missing");
+    const std::string missing_path =
+        ::dsn::utils::filesystem::path_combine(
+            ::dsn::utils::filesystem::path_combine(missing_root, "nested"),
+            "copy.chkpt");
+    const std::string blocked_parent =
+        workspace_temp_file_path("rasn-state-windows-identity-parent");
+    const std::string blocked_path =
+        ::dsn::utils::filesystem::path_combine(blocked_parent, "copy.chkpt");
+    ::dsn::utils::filesystem::remove_path(existing_path);
+    ::dsn::utils::filesystem::remove_path(missing_root);
+    ::dsn::utils::filesystem::remove_path(blocked_parent);
+    write_text_file(existing_path, "identity");
+    write_text_file(blocked_parent, "not-a-directory");
 
-    state_service_internal::existing_state_path_identities identities;
-    const state_service_internal::state_path_identity_status status =
+    state_service_internal::existing_state_path_identities existing_identities;
+    const state_service_internal::state_path_identity_status existing_status =
         state_service_internal::resolve_existing_state_path_identities(
-            path, identities);
+            existing_path, existing_identities);
+    state_service_internal::existing_state_path_identities missing_identities;
+    const state_service_internal::state_path_identity_status missing_status =
+        state_service_internal::resolve_existing_state_path_identities(
+            missing_path, missing_identities);
+    state_service_internal::existing_state_path_identities blocked_identities;
+    const state_service_internal::state_path_identity_status blocked_status =
+        state_service_internal::resolve_existing_state_path_identities(
+            blocked_path, blocked_identities);
 
-    std::remove(path.c_str());
+    ::dsn::utils::filesystem::remove_path(existing_path);
+    ::dsn::utils::filesystem::remove_path(blocked_parent);
     EXPECT_EQ(state_service_internal::state_path_identity_status::resolved,
-              status);
-    EXPECT_EQ(0U, identities.fallback.find("windows-file-index-64:"));
-    if (!identities.preferred.empty())
+              existing_status);
+    EXPECT_EQ(0U,
+              existing_identities.fallback.find("windows-file-index-64:"));
+    if (!existing_identities.preferred.empty())
     {
-        EXPECT_EQ(0U, identities.preferred.find("windows-file-id-128:"));
+        EXPECT_EQ(0U,
+                  existing_identities.preferred.find("windows-file-id-128:"));
     }
+    EXPECT_EQ(state_service_internal::state_path_identity_status::absent,
+              missing_status);
+    EXPECT_TRUE(missing_identities.preferred.empty());
+    EXPECT_TRUE(missing_identities.fallback.empty());
+    EXPECT_EQ(state_service_internal::state_path_identity_status::uninspectable,
+              blocked_status);
+    EXPECT_TRUE(blocked_identities.preferred.empty());
+    EXPECT_TRUE(blocked_identities.fallback.empty());
 }
 #endif
 
