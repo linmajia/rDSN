@@ -1189,9 +1189,9 @@ Pass `"meta;replica"` as the optional `serve` app-list argument, as shown in the
 profile header, so the generic standalone-role list does not filter those two
 cluster roles. The `human_interaction` table accepts live open, answer, cancel,
 and expiry mutations through the same runtime facade; it is not limited to
-checkpoint import. Expiry and global queue reads use partition fan-out even
-though the shipped table is a singleton, avoiding partial behavior if its
-placement is expanded later.
+checkpoint import. Its `expire`, `snapshot`, and requester-filtered `pending`
+operations use partition fan-out even though the shipped table is a singleton,
+avoiding partial behavior if its placement is expanded later.
 
 `rasn.llm.agent`, `rasn.tool.agent`, `rasn.coordinator`, `rasn.workflow`, and
 `rasn.observability` all retain the shared
@@ -1290,6 +1290,30 @@ The provider is chosen like an rDSN environment/aspect provider: apps depend onl
 on the facade API, and swapping `local`/`distributed`/`hybrid` changes where the
 modules run without any app code change.
 
+All eleven module boundaries use generated, versioned Thrift request/response
+pairs from `rasn_runtime.thrift`. Requests carry common metadata plus a
+module-specific operation enum and exactly one matching typed body; responses
+carry structured status and a typed result. The old generic module/operation/key
+field-map payload is not accepted. This is a coordinated wire cutover: upgrade
+every runtime client and service together. Existing `rasn_runtime` calls,
+configuration keys, roles, endpoints, and task-code names remain compatible.
+Future compatible revisions add optional fields with new Thrift field IDs and
+widen the explicit compatibility range; incompatible semantics require a new
+major wire version.
+
+Generated artifacts are checked in as `rasn_runtime_types.{h,cpp}` and
+`rasn_runtime.types.h`. Regenerate them from the repository root with:
+
+```text
+bin/dsn.cg.sh src/plugins/rasn/rasn_runtime.thrift cpp src/plugins/rasn binary
+```
+
+The generator also emits unused service/client scaffolding and overwrites the
+destination CMake file; discard those outputs and retain the rASN CMake
+integration when refreshing types. `runtime_rpc_schema.{h,cpp}` owns validation,
+structured error mapping, and conversion between generated wire records and the
+application-facing domain types.
+
 A standalone host's aggregate `rasn.runtime` app hosts all eleven modules
 behind one endpoint (default port `27107`). Each module also has a standalone
 role so it can be deployed on its own process or node:
@@ -1338,13 +1362,15 @@ blackboard_host = remote-host
 blackboard_port = 27117
 ```
 
-Sharded modules (`agent_message_bus`, `resource_budget`, and `blackboard`) also
-support deterministic key-based partition routing. Set `<module>_shard_count`,
+Sharded modules (`agent_message_bus`, `resource_budget`, `blackboard`, and
+`human_interaction`) also support deterministic key-based partition routing. Set `<module>_shard_count`,
 then optionally override each shard with
 `<module>_shard_<n>_uri` or `<module>_shard_<n>_{host,port}`. Writes and keyed
-reads route by the module's natural key (`message_id`, budget `scope`, or
-blackboard `key`); snapshot-style reads fan out to every configured partition and
-merge typed results.
+reads route by the module's natural key (`message_id`, budget `scope`, blackboard
+`key`, or human-interaction `request_id`). Message-bus `snapshot`, resource-budget
+`describe`, blackboard `snapshot`, and human-interaction `expire`, `snapshot`, and
+requester-filtered `pending` operations fan out to every configured partition and
+merge typed results. The default shard count remains one.
 
 ```ini
 blackboard_shard_count = 2
@@ -1412,9 +1438,8 @@ single unhealthy module node cannot stall or corrupt the system:
   consecutive transport failures to a resolved module/shard endpoint, its breaker opens and calls
   short-circuit for `rasn_runtime_breaker_open_ms` before a half-open probe is
   admitted. This bounds the blast radius of a dead node instead of retrying into it.
-- **Idempotent retries.** When `rasn_runtime_idempotency_enabled` is set, the
-  client stamps each remote call with a unique id that is stable across its own
-  retries. Module services dedup mutating operations by full request signature
+- **Idempotent retries.** Every typed mutation carries a unique request id that is
+  stable across its own retries. Module services dedup mutating operations by full request signature
   plus id: a concurrent duplicate waits on the in-flight placeholder and receives
   the first response instead of applying twice. Read-only operations bypass the
   cache, and the completed-response window is bounded by
@@ -1423,11 +1448,13 @@ single unhealthy module node cannot stall or corrupt the system:
   lost-reply double-apply within one standalone service process. Native type-1
   module tables instead replicate and checkpoint a deterministic FIFO result
   window with a protocol-fixed capacity of 8192, so retries remain deduplicated
-  after primary failover.
+  after primary failover. The existing `rasn_runtime_idempotency_enabled` key is
+  still accepted for configuration compatibility, but `false` cannot disable
+  request ids because they are required by the typed mutation contract.
 - **Optional standalone service-to-service auth.** When
   `rasn_runtime_auth_enabled` is true,
-  distributed/hybrid clients stamp a shared token onto runtime module RPC
-  envelopes and runtime services reject missing or invalid tokens before
+  distributed/hybrid clients stamp a shared token into typed request metadata
+  and runtime services reject missing or invalid tokens before
   dispatching to module handlers. Rejections increment
   `rasn_runtime_auth_rejected_total`. Keep it disabled for trusted local
   experiments; for multi-node deployments, provide the same
@@ -1463,10 +1490,11 @@ verifying a hybrid or multi-node layout.
 
 Each module declares an intended distributed consistency model
 (`rasn_runtime_module_descriptors()`): `sharded` modules (`blackboard` by key,
-`resource_budget` by scope, `agent_message_bus` by message id) now have
+`resource_budget` by scope, `agent_message_bus` by message id, and
+`human_interaction` by request id) now have
 deterministic partition routing, ownership/ledger modules are `replicated` (for
 example `agent_control_plane`, `determinism_ledger`), and control-surface modules
-are `singleton` (for example `human_interaction`, `sandbox_runtime`). Standalone
+are `singleton` (currently `sandbox_runtime`). Standalone
 roles realize these as single-writer stores; the native replicated profile gives
 each module an independent table, mutation log, checkpoint stream, and failover
 boundary. The facade exposes the human-interaction queue's open, answer, cancel,
@@ -1546,7 +1574,7 @@ hardening gaps remain:
 | Discovery availability | Local registry by default; optional ZooKeeper-backed shared descriptors/leases, committed-epoch active-writer failover, read-capable standby frontends, bounded epoch/tombstone retention, and rDSN group-address client failover across `registry_addresses`. | Automated multi-process registry-writer failover evidence remains. |
 | Tool isolation | Default-deny side effects, workspace scoping, approvals, command allowlists, timeout/job containment, and a configurable container command wrapper. | No hardened container orchestrator with image, mount, network, and lifecycle policy. |
 | Replay fidelity | Replay for model responses, tool results, workflow scheduling, filesystem snapshots, and an `external.effect` ledger for side-effect intents. | No full virtualization of arbitrary external services, clocks, network state, or process environments. |
-| Deployment validation | Inline mode, typed service-mode RPC, URI/host endpoint configuration, registry heartbeats, active lease cleanup, distributed runtime modules, state-mirror hydration/watermarks, safe journal compaction/custom export, explicit obsolete-prefix pruning, checkpoint-to-state-service migration, and deployable rDSN type-1 profiles for shared state and all runtime modules. | Automated real multi-host module-primary failover/checkpoint transfer and standalone-state-to-native-module-table migration remain. |
+| Deployment validation | Inline mode, generated typed/versioned runtime-module RPC, URI/host endpoint configuration, registry heartbeats, active lease cleanup, state-mirror hydration/watermarks, safe journal compaction/custom export, explicit obsolete-prefix pruning, checkpoint-to-state-service migration, and deployable rDSN type-1 profiles for shared state and all runtime modules. | Automated real multi-host module-primary failover/checkpoint transfer and standalone-state-to-native-module-table migration remain. |
 | Credentials | `token_ref` handles for environment variables, files, and commands, plus deterministic redaction. | No vault-backed or OS-backed credential provider integration. |
 | SDK packaging | Generated C++/TypeScript/Python contracts and RPC-client source. | Packaged SDKs and concrete TypeScript/Python transports are not shipped. |
 | Evaluation evidence | Unit tests, self-tests, service smokes, schema smokes, report build, and a small eval harness. | Large benchmarks and user studies for debugging effectiveness remain future work. |

@@ -33,7 +33,7 @@ rASN should follow these existing rDSN patterns:
 | RPC server | `dsn::serverlet<T>` and `dsn::rpc_replier<T>` | Agent services expose typed handlers. |
 | RPC client | `dsn::clientlet`, `dsn::rpc::call`, `wait_and_unwrap` | Coordinator and applications call agents through generated-style clients. |
 | Task codes | `DEFINE_TASK_CODE_RPC` | Every cross-component operation has an explicit task code. |
-| Serialization | `binary_writer`, `binary_reader`, `marshall`, `unmarshall` | All generic messages are typed and versioned. |
+| Serialization | Generated Thrift types, `DSF_THRIFT_BINARY`, `marshall`, `unmarshall` | Runtime modules use generated, typed, versioned records rather than field-map payloads. |
 | Configuration | `dsn_config_get_value_*` | Ports, policies, budgets, timeouts, persistence paths, and provider settings are config-driven. |
 | Logging/assertions | `dinfo`, `dwarn`, `derror`, `dassert` | Runtime behavior and invariant violations are visible. |
 | Locks | `dsn::service::zlock`, `zauto_lock` | Shared service state is protected using rDSN locks. |
@@ -1562,11 +1562,19 @@ remaining limitations are:
   fence barrier, per-transition owner nonces, bounded provider operations, and
   provider-timeout-aware probe leases; retries still do not provide cross-process
   exactly-once or replication.
-- **End-to-end trace propagation:** the runtime-module RPC envelope now carries a
-  `trace_id` (EOF-safe on the wire) that is stamped from an ambient
-  `rasn_runtime_trace_scope` on egress and restored/echoed on ingress, so a single
-  operation can be followed across nodes in logs (DISTRIBUTED_RUNTIME.md §13.4,
-  audit finding 1.4 — RESOLVED).
+- **Typed runtime-module wire contract:** `rasn_runtime.thrift` defines generated
+  request/response pairs for all eleven modules. Common metadata carries the
+  explicit wire compatibility range, request id, partition, auth token, and trace
+  id; module-specific enums select exactly one typed body/result. The public
+  `rasn_runtime` facade and local/distributed/hybrid placement remain unchanged.
+  fd5 is a coordinated wire cutover with no generic-peer fallback. Legacy
+  field-map records are accepted only by isolated persistence readers, while new
+  checkpoint state and dedup results use generated Thrift serialization
+  (DISTRIBUTED_RUNTIME.md §4/§13.15).
+- **End-to-end trace propagation:** generated runtime request/response metadata
+  carries `trace_id`, stamped from an ambient `rasn_runtime_trace_scope` on egress
+  and restored/echoed on ingress, so a single operation can be followed across
+  nodes in logs (DISTRIBUTED_RUNTIME.md §13.4, audit finding 1.4 — RESOLVED).
 - **Distributed coordination:** a coordination module
   (`coordination_service.h/.cpp`) reuses rDSN's own facilities instead of
   reinventing them — `distributed_lock_service` for single-writer ownership /
@@ -1595,7 +1603,8 @@ remaining limitations are:
   `replicated_service_app_type_1` (used by `rasn.state.replicated` and all eleven
   module groups) for quorum-replicated storage,
   `dist::partition_resolver` (used by URI-backed module tables) for shard routing,
-  and Thrift IDL for typed RPC schemas. Remaining missing-module gaps
+  and generated Thrift IDL (used by all runtime modules) for typed RPC schemas.
+  Remaining missing-module gaps
   (durable/vector agent memory, a
   **global** quota/rate authority consuming the new shared store, secrets vault,
   multi-tenancy, distributed scheduler/placement) are tracked there as roadmap

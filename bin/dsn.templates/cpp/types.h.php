@@ -36,11 +36,11 @@ if ($idl_type == "thrift")
 
 <?php } ?>
 
-<?=$_PROG->get_cpp_namespace_begin()?>
+<?=rtrim($_PROG->get_cpp_namespace_begin())?>
 
 <?php
 foreach ($_PROG->structs as $s){
     Echo "    GENERATED_TYPE_SERIALIZATION(".$s->name.", ".$idl_name.")".PHP_EOL;
 } ?>
 
-<?=$_PROG->get_cpp_namespace_end()?>
+<?=rtrim($_PROG->get_cpp_namespace_end())?>

@@ -14,6 +14,7 @@
 #include <rasn/cli_app.h>
 #include <rasn/cli_support.h>
 #include <rasn/runtime_provider.h>
+#include <rasn/runtime_provider_internal.h>
 #include <rasn/contract_verifier.h>
 #include <rasn/coordinator_service.h>
 #include <rasn/apps/codepilot/local_tools.h>
@@ -44,6 +45,7 @@
 #include <dsn/cpp/utils.h>
 #include <dsn/tool-api/command.h>
 #include <dsn/tool-api/task.h>
+#include <dsn/utility/configuration.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -584,6 +586,23 @@ TEST(rasn_agent_types, schema_manifest_exposes_core_contracts)
     const std::vector<rpc_operation_descriptor> operations = rasn_rpc_operation_manifest();
     EXPECT_GE(operations.size(), 28u);
     EXPECT_EQ("rasn.agent", operations.front().service);
+    const std::map<std::string, std::string> sharded_routing = {
+        {"agent_message_bus", "partition key: message_id; aggregate operations: snapshot"},
+        {"resource_budget", "partition key: scope; aggregate operations: describe"},
+        {"blackboard", "partition key: key; aggregate operations: snapshot"},
+        {"human_interaction",
+         "partition key: request_id; aggregate operations: expire, snapshot, pending"}};
+    for (const auto &expected : sharded_routing)
+    {
+        const auto runtime = std::find_if(
+            operations.begin(),
+            operations.end(),
+            [&expected](const rpc_operation_descriptor &operation) {
+                return operation.method == expected.first;
+            });
+        ASSERT_NE(operations.end(), runtime);
+        EXPECT_EQ(expected.second, runtime->routing);
+    }
     const std::string cpp_clients = rasn_schema_manifest_cpp_clients();
     EXPECT_NE(std::string::npos, cpp_clients.find("class workflow_rpc_client"));
     EXPECT_NE(std::string::npos, cpp_clients.find("RPC_RASN_OBSERVABILITY_LOAD_REPLAY"));
@@ -592,6 +611,15 @@ TEST(rasn_agent_types, schema_manifest_exposes_core_contracts)
               cpp_clients.find("RPC_RASN_STATE_DELETE_PREFIX_DETAILED"));
     EXPECT_NE(std::string::npos, cpp_clients.find("RPC_RASN_STATE_ADVANCE_SEQUENCE"));
     EXPECT_NE(std::string::npos, cpp_clients.find("RPC_RASN_STATE_CHECKPOINT_DETAILED"));
+    EXPECT_NE(std::string::npos, cpp_clients.find("#include \"rasn_runtime.types.h\""));
+    EXPECT_NE(std::string::npos,
+              cpp_clients.find("dsn::rasn::rpc::blackboard_request"));
+    EXPECT_NE(std::string::npos,
+              cpp_clients.find(
+                 "routing: partition key: request_id; aggregate operations: expire, snapshot, pending"));
+    EXPECT_NE(std::string::npos,
+              cpp_clients.find(
+                  "routing: partition key: scope; aggregate operations: describe"));
     EXPECT_NE(std::string::npos, cpp_clients.find("std::pair< ::dsn::error_code, state_response>"));
 
     const std::string typescript = rasn_schema_manifest_typescript();
@@ -602,6 +630,13 @@ TEST(rasn_agent_types, schema_manifest_exposes_core_contracts)
     EXPECT_NE(std::string::npos, typescript_clients.find("export interface RasnRpcTransport"));
     EXPECT_NE(std::string::npos, typescript_clients.find("export class WorkflowRpcClient"));
     EXPECT_NE(std::string::npos, typescript_clients.find("\"RPC_RASN_WORKFLOW_START\""));
+    EXPECT_NE(std::string::npos,
+              typescript_clients.find("blackboard(request: unknown"));
+    EXPECT_NE(std::string::npos,
+              typescript_clients.find(
+                  "routing: partition key: scope; aggregate operations: describe"));
+    EXPECT_EQ(std::string::npos,
+              typescript_clients.find("dsn::rasn::rpc::"));
 
     const std::string python = rasn_schema_manifest_python();
     EXPECT_NE(std::string::npos, python.find("class agent_request:"));
@@ -611,6 +646,13 @@ TEST(rasn_agent_types, schema_manifest_exposes_core_contracts)
     EXPECT_NE(std::string::npos, python_clients.find("class RasnRpcTransport"));
     EXPECT_NE(std::string::npos, python_clients.find("class WorkflowRpcClient"));
     EXPECT_NE(std::string::npos, python_clients.find("\"RPC_RASN_WORKFLOW_START\""));
+    EXPECT_NE(std::string::npos,
+              python_clients.find("def blackboard(self, request: Any"));
+    EXPECT_NE(std::string::npos,
+              python_clients.find(
+                  "routing: partition key: scope; aggregate operations: describe"));
+    EXPECT_EQ(std::string::npos,
+              python_clients.find("dsn::rasn::rpc::"));
 }
 
 TEST(rasn_redaction, redacts_exact_values_and_common_secret_patterns)
@@ -956,9 +998,15 @@ TEST(rasn_registry, shard_capabilities_select_exact_partition_owners)
     shard0.port = 27117;
     shard0.health = "healthy";
     shard0.capabilities.push_back(
-        make_capability("rasn.runtime.blackboard", "rasn_runtime_request", "rasn_runtime_response", "stateful"));
+        make_capability("rasn.runtime.blackboard",
+                        "blackboard_request.v1",
+                        "blackboard_response.v1",
+                        "stateful"));
     shard0.capabilities.push_back(
-        make_capability("rasn.runtime.blackboard.shard.0", "rasn_runtime_request", "rasn_runtime_response", "stateful"));
+        make_capability("rasn.runtime.blackboard.shard.0",
+                        "blackboard_request.v1",
+                        "blackboard_response.v1",
+                        "stateful"));
 
     agent_descriptor shard1 = shard0;
     shard1.agent_id = "rasn.runtime.blackboard@node-b";
@@ -966,7 +1014,10 @@ TEST(rasn_registry, shard_capabilities_select_exact_partition_owners)
     shard1.port = 27127;
     shard1.capabilities.pop_back();
     shard1.capabilities.push_back(
-        make_capability("rasn.runtime.blackboard.shard.1", "rasn_runtime_request", "rasn_runtime_response", "stateful"));
+        make_capability("rasn.runtime.blackboard.shard.1",
+                        "blackboard_request.v1",
+                        "blackboard_response.v1",
+                        "stateful"));
 
     std::string error;
     ASSERT_TRUE(registry.register_agent(shard0, &error, true)) << error;
@@ -6778,56 +6829,250 @@ TEST(rasn_runtime, host_app_validation_uses_effective_run_and_count)
     std::remove(config_path.c_str());
 }
 
-TEST(rasn_runtime, dispatch_requires_module_and_operation)
-{
-    rasn_runtime_request missing_module;
-    missing_module.operation = "describe";
-    EXPECT_FALSE(dispatch_rasn_runtime_request(missing_module).ok);
 
-    rasn_runtime_request missing_operation;
-    missing_operation.module = "resource_budget";
-    EXPECT_FALSE(dispatch_rasn_runtime_request(missing_operation).ok);
+template <typename Request>
+void expect_typed_runtime_request_round_trip(const Request &request, const std::string &module)
+{
+    std::string error;
+    ASSERT_TRUE(validate_runtime_request(request, &error)) << module << ": " << error;
+    EXPECT_EQ(module, runtime_module_name(request));
+
+    const std::string encoded = serialize_runtime_rpc_value(request);
+    Request decoded;
+    ASSERT_TRUE(deserialize_runtime_rpc_value(encoded, &decoded, &error)) << module << ": " << error;
+    EXPECT_EQ(request.operation, decoded.operation);
+    EXPECT_TRUE(validate_runtime_request(decoded, &error)) << module << ": " << error;
 }
 
-TEST(rasn_runtime, dispatch_pings_and_describes_every_module)
+TEST(rasn_runtime_typed_rpc, round_trips_every_module_request_type)
 {
-    for (const std::string &module : rasn_runtime_module_names())
+    ::dsn::rasn::rpc::agent_control_request agent_control;
+    agent_control.__set_metadata(make_runtime_request_metadata());
+    agent_control.__set_operation(::dsn::rasn::rpc::agent_control_operation::ping);
+    expect_typed_runtime_request_round_trip(agent_control, "agent_control_plane");
+
+    ::dsn::rasn::rpc::message_bus_request message_bus;
+    message_bus.__set_metadata(make_runtime_request_metadata());
+    message_bus.__set_operation(::dsn::rasn::rpc::message_bus_operation::ping);
+    expect_typed_runtime_request_round_trip(message_bus, "agent_message_bus");
+
+    ::dsn::rasn::rpc::task_orchestration_request task_orchestration;
+    task_orchestration.__set_metadata(make_runtime_request_metadata());
+    task_orchestration.__set_operation(::dsn::rasn::rpc::task_orchestration_operation::ping);
+    expect_typed_runtime_request_round_trip(task_orchestration, "task_orchestration_kernel");
+
+    ::dsn::rasn::rpc::determinism_request determinism;
+    determinism.__set_metadata(make_runtime_request_metadata());
+    determinism.__set_operation(::dsn::rasn::rpc::determinism_operation::ping);
+    expect_typed_runtime_request_round_trip(determinism, "determinism_ledger");
+
+    ::dsn::rasn::rpc::capability_directory_request capability;
+    capability.__set_metadata(make_runtime_request_metadata());
+    capability.__set_operation(::dsn::rasn::rpc::capability_directory_operation::ping);
+    expect_typed_runtime_request_round_trip(capability, "capability_directory");
+
+    ::dsn::rasn::rpc::resource_budget_request budget;
+    budget.__set_metadata(make_runtime_request_metadata());
+    budget.__set_operation(::dsn::rasn::rpc::resource_budget_operation::ping);
+    expect_typed_runtime_request_round_trip(budget, "resource_budget");
+
+    ::dsn::rasn::rpc::recovery_supervisor_request recovery;
+    recovery.__set_metadata(make_runtime_request_metadata());
+    recovery.__set_operation(::dsn::rasn::rpc::recovery_supervisor_operation::ping);
+    expect_typed_runtime_request_round_trip(recovery, "recovery_supervisor");
+
+    ::dsn::rasn::rpc::blackboard_request blackboard;
+    blackboard.__set_metadata(make_runtime_request_metadata());
+    blackboard.__set_operation(::dsn::rasn::rpc::blackboard_operation::ping);
+    expect_typed_runtime_request_round_trip(blackboard, "blackboard");
+
+    ::dsn::rasn::rpc::contract_verifier_request contract;
+    contract.__set_metadata(make_runtime_request_metadata());
+    contract.__set_operation(::dsn::rasn::rpc::contract_verifier_operation::ping);
+    expect_typed_runtime_request_round_trip(contract, "contract_verifier");
+
+    ::dsn::rasn::rpc::human_interaction_rpc_request human;
+    human.__set_metadata(make_runtime_request_metadata());
+    human.__set_operation(::dsn::rasn::rpc::human_interaction_operation::ping);
+    expect_typed_runtime_request_round_trip(human, "human_interaction");
+
+    ::dsn::rasn::rpc::sandbox_runtime_request sandbox;
+    sandbox.__set_metadata(make_runtime_request_metadata());
+    sandbox.__set_operation(::dsn::rasn::rpc::sandbox_runtime_operation::ping);
+    expect_typed_runtime_request_round_trip(sandbox, "sandbox_runtime");
+}
+
+TEST(rasn_runtime_typed_rpc, preserves_full_unsigned_domain_ranges)
+{
+    resource_quota quota;
+    quota.scope = "unlimited";
+    quota.max_cost_units = (std::numeric_limits<uint64_t>::max)();
+    quota.max_latency_ms = (std::numeric_limits<uint64_t>::max)();
+    quota.max_tokens = (std::numeric_limits<uint64_t>::max)();
+    quota.max_tool_calls = (std::numeric_limits<uint64_t>::max)();
+
+    const ::dsn::rasn::rpc::wire_resource_quota wire = to_wire(quota);
+    EXPECT_EQ(-1, wire.max_cost_units);
+    resource_quota decoded;
+    std::string error;
+    ASSERT_TRUE(from_wire(wire, &decoded, &error)) << error;
+    EXPECT_EQ(quota.max_cost_units, decoded.max_cost_units);
+    EXPECT_EQ(quota.max_latency_ms, decoded.max_latency_ms);
+    EXPECT_EQ(quota.max_tokens, decoded.max_tokens);
+    EXPECT_EQ(quota.max_tool_calls, decoded.max_tool_calls);
+
+    agent_capability capability;
+    capability.schema_version = (std::numeric_limits<uint32_t>::max)();
+    capability.cost_hint = (std::numeric_limits<uint32_t>::max)();
+    const ::dsn::rasn::rpc::wire_agent_capability wire_capability = to_wire(capability);
+    agent_capability decoded_capability;
+    ASSERT_TRUE(from_wire(wire_capability, &decoded_capability, &error)) << error;
+    EXPECT_EQ(capability.schema_version, decoded_capability.schema_version);
+    EXPECT_EQ(capability.cost_hint, decoded_capability.cost_hint);
+}
+
+TEST(rasn_runtime_typed_rpc, validates_tagged_body_and_version_range)
+{
+    ::dsn::rasn::rpc::resource_budget_request request;
+    request.__set_metadata(make_runtime_request_metadata());
+    request.metadata.__set_request_id("typed-reserve-1");
+    request.metadata.__set_trace_id("trace-typed-reserve");
+    request.__set_operation(::dsn::rasn::rpc::resource_budget_operation::reserve);
+    ::dsn::rasn::rpc::wire_resource_request body;
+    body.scope = "tenant-a";
+    body.cost_units = 2;
+    body.latency_ms = 3;
+    body.tokens = 5;
+    body.tool_calls = 1;
+    body.reason = "unit";
+    request.__set_reserve(body);
+
+    std::string error;
+    ::dsn::rasn::rpc::resource_budget_request missing_id = request;
+    missing_id.metadata.__isset.request_id = false;
+    EXPECT_FALSE(validate_runtime_request(missing_id, &error));
+    EXPECT_NE(std::string::npos, error.find("request id"));
+
+    EXPECT_TRUE(validate_runtime_request(request, &error)) << error;
+    const std::string encoded = serialize_runtime_rpc_value(request);
+    ::dsn::rasn::rpc::resource_budget_request decoded;
+    ASSERT_TRUE(deserialize_runtime_rpc_value(encoded, &decoded, &error)) << error;
+    EXPECT_EQ(request.operation, decoded.operation);
+    EXPECT_EQ("tenant-a", decoded.reserve.scope);
+    EXPECT_EQ("typed-reserve-1", decoded.metadata.request_id);
+    EXPECT_EQ("trace-typed-reserve", decoded.metadata.trace_id);
+
+    request.__isset.reserve = false;
+    EXPECT_FALSE(validate_runtime_request(request, &error));
+    request.__set_reserve(body);
+    ::dsn::rasn::rpc::resource_usage_request usage;
+    usage.scope = "tenant-a";
+    request.__set_usage(usage);
+    EXPECT_FALSE(validate_runtime_request(request, &error));
+    request.__isset.usage = false;
+    request.metadata.wire_version = RASN_RUNTIME_WIRE_VERSION + 1;
+    EXPECT_FALSE(validate_runtime_request(request, &error));
+
+    rasn_runtime_replica_store store("resource_budget");
+    const ::dsn::rasn::rpc::resource_budget_response response = store.dispatch(request);
+    EXPECT_FALSE(response.status.ok);
+    EXPECT_EQ(::dsn::rasn::rpc::runtime_error_code::unsupported_version,
+              response.status.code);
+}
+
+TEST(rasn_runtime_typed_rpc, preserves_specific_validation_errors)
+{
+    std::string error = "stale error";
+
+    ::dsn::rasn::rpc::message_bus_request oversized_text;
+    oversized_text.__set_metadata(make_runtime_request_metadata());
+    oversized_text.metadata.__set_request_id("oversized-text");
+    oversized_text.__set_operation(::dsn::rasn::rpc::message_bus_operation::publish);
+    ::dsn::rasn::rpc::wire_agent_message message;
+    message.message_id = "oversized";
+    message.payload.assign(16 * 1024 * 1024 + 1, 'x');
+    oversized_text.__set_publish(message);
+    EXPECT_FALSE(validate_runtime_request(oversized_text, &error));
+    EXPECT_EQ("runtime RPC field is too large: message.payload", error);
+
+    ::dsn::rasn::rpc::message_find_request extra_body;
+    extra_body.message_id = "extra";
+    oversized_text.__set_find(extra_body);
+    error = "stale error";
+    EXPECT_FALSE(validate_runtime_request(oversized_text, &error));
+    EXPECT_EQ("runtime RPC operation must have exactly its matching typed body", error);
+
+    ::dsn::rasn::rpc::task_orchestration_request oversized_collection;
+    oversized_collection.__set_metadata(make_runtime_request_metadata());
+    oversized_collection.metadata.__set_request_id("oversized-collection");
+    oversized_collection.__set_operation(
+        ::dsn::rasn::rpc::task_orchestration_operation::add_task);
+    ::dsn::rasn::rpc::wire_orchestration_task task;
+    task.task_id = "oversized";
+    task.depends_on.assign(4097, "dependency");
+    oversized_collection.__set_add_task(task);
+    EXPECT_FALSE(validate_runtime_request(oversized_collection, &error));
+    EXPECT_EQ("runtime RPC collection is too large: task.depends_on", error);
+
+    ::dsn::rasn::rpc::message_bus_request malformed_tag;
+    malformed_tag.__set_metadata(make_runtime_request_metadata());
+    malformed_tag.metadata.__set_request_id("malformed-tag");
+    malformed_tag.__set_operation(::dsn::rasn::rpc::message_bus_operation::publish);
+    ::dsn::rasn::rpc::message_find_request find;
+    find.message_id = "wrong-body";
+    malformed_tag.__set_find(find);
+    error = "stale error";
+    EXPECT_FALSE(validate_runtime_request(malformed_tag, &error));
+    EXPECT_EQ("invalid message-bus operation body", error);
+}
+
+TEST(rasn_runtime_typed_rpc, response_metadata_and_structured_errors_round_trip)
+{
+    ::dsn::rasn::rpc::blackboard_request request;
+    request.__set_metadata(make_runtime_request_metadata());
+    request.metadata.__set_trace_id("typed-trace");
+    request.metadata.__set_route_partition(3);
+    request.__set_operation(::dsn::rasn::rpc::blackboard_operation::ping);
+
+    ::dsn::rasn::rpc::blackboard_response response =
+        make_runtime_response<::dsn::rasn::rpc::blackboard_request,
+                              ::dsn::rasn::rpc::blackboard_response>(request);
+    EXPECT_TRUE(response.status.ok);
+    EXPECT_EQ("typed-trace", response.metadata.trace_id);
+    EXPECT_EQ(3, response.metadata.route_partition);
+
+    set_runtime_error(&response,
+                      ::dsn::rasn::rpc::runtime_error_code::unavailable,
+                      "runtime unavailable",
+                      true);
+    EXPECT_FALSE(response.status.ok);
+    EXPECT_TRUE(response.status.retryable);
+    EXPECT_EQ("runtime unavailable", runtime_error_message(response));
+
+    const std::string encoded = serialize_runtime_rpc_value(response);
+    ::dsn::rasn::rpc::blackboard_response decoded;
+    std::string error;
+    ASSERT_TRUE(deserialize_runtime_rpc_value(encoded, &decoded, &error)) << error;
+    EXPECT_EQ(::dsn::rasn::rpc::runtime_error_code::unavailable,
+              decoded.status.code);
+    EXPECT_EQ("typed-trace", decoded.metadata.trace_id);
+}
+
+TEST(rasn_runtime_typed_rpc, trace_scope_sets_and_restores_ambient_trace_id)
+{
+    EXPECT_TRUE(current_rasn_runtime_trace_id().empty());
     {
-        rasn_runtime_request ping;
-        ping.module = module;
-        ping.operation = "ping";
-        const rasn_runtime_response ping_response = dispatch_rasn_runtime_request(ping);
-        EXPECT_TRUE(ping_response.ok) << "ping " << module << ": " << ping_response.error;
-
-        rasn_runtime_request describe;
-        describe.module = module;
-        describe.operation = "describe";
-        const rasn_runtime_response describe_response = dispatch_rasn_runtime_request(describe);
-        EXPECT_TRUE(describe_response.ok) << "describe " << module << ": " << describe_response.error;
+        rasn_runtime_trace_scope outer("trace-outer");
+        EXPECT_EQ("trace-outer", current_rasn_runtime_trace_id());
+        {
+            rasn_runtime_trace_scope inner("trace-inner");
+            EXPECT_EQ("trace-inner", current_rasn_runtime_trace_id());
+            rasn_runtime_trace_scope noop("");
+            EXPECT_EQ("trace-inner", current_rasn_runtime_trace_id());
+        }
+        EXPECT_EQ("trace-outer", current_rasn_runtime_trace_id());
     }
-}
-
-TEST(rasn_runtime, dispatch_rejects_unknown_module_and_operation)
-{
-    rasn_runtime_request unknown_module;
-    unknown_module.module = "not_a_module";
-    unknown_module.operation = "ping";
-    EXPECT_FALSE(dispatch_rasn_runtime_request(unknown_module).ok);
-
-    rasn_runtime_request unknown_operation;
-    unknown_operation.module = "resource_budget";
-    unknown_operation.operation = "not_an_operation";
-    EXPECT_FALSE(dispatch_rasn_runtime_request(unknown_operation).ok);
-}
-
-TEST(rasn_runtime, dispatch_accepts_state_mirror_operations)
-{
-    rasn_runtime_request mirror;
-    mirror.module = "blackboard";
-    mirror.operation = "mirror_state:entry";
-    mirror.key = "runtime-key";
-    mirror.payload = "runtime-value";
-    EXPECT_TRUE(dispatch_rasn_runtime_request(mirror).ok);
+    EXPECT_TRUE(current_rasn_runtime_trace_id().empty());
 }
 
 TEST(rasn_runtime, compacts_state_mirror_after_watermark_verification)
@@ -6943,462 +7188,653 @@ TEST(rasn_runtime, module_descriptors_cover_every_module_with_role_and_consisten
     }
 }
 
-TEST(rasn_runtime, request_marshalling_round_trips_request_metadata)
+
+TEST(rasn_runtime_typed_rpc, dispatches_typed_requests_and_deduplicates_mutations)
 {
-    rasn_runtime_request request;
-    request.module = "resource_budget";
-    request.operation = "reserve";
-    request.key = "scope-a";
-    request.payload = "amount=5";
-    request.request_id = "idem-1234";
-    request.route_partition = 7;
-    request.auth_token = "shared-runtime-token";
-    request.trace_id = "trace-abc-9f2";
+    ::dsn::rasn::rpc::determinism_request record;
+    record.__set_metadata(make_runtime_request_metadata());
+    record.metadata.__set_request_id("typed-dedup-1");
+    record.__set_operation(::dsn::rasn::rpc::determinism_operation::record);
+    ::dsn::rasn::rpc::determinism_record_request body;
+    body.task_id = "typed-task";
+    body.key = "route";
+    body.source = "unit";
+    body.value = "primary";
+    record.__set_record(body);
 
-    ::dsn::binary_writer writer;
-    marshall(writer, request, DSF_THRIFT_BINARY);
-    ::dsn::binary_reader reader(writer.get_buffer());
+    rasn_runtime_replica_store store("determinism_ledger");
+    const ::dsn::rasn::rpc::determinism_response first = store.dispatch(record);
+    ASSERT_TRUE(first.status.ok) << runtime_error_message(first);
+    const ::dsn::rasn::rpc::determinism_response duplicate = store.dispatch(record);
+    ASSERT_TRUE(duplicate.status.ok) << runtime_error_message(duplicate);
+    ASSERT_TRUE(first.__isset.choice);
+    ASSERT_TRUE(duplicate.__isset.choice);
+    EXPECT_EQ(first.choice.sequence, duplicate.choice.sequence);
 
-    rasn_runtime_request decoded;
-    unmarshall(reader, decoded, DSF_THRIFT_BINARY);
-
-    EXPECT_EQ(request.schema_version, decoded.schema_version);
-    EXPECT_EQ(request.module, decoded.module);
-    EXPECT_EQ(request.operation, decoded.operation);
-    EXPECT_EQ(request.key, decoded.key);
-    EXPECT_EQ(request.payload, decoded.payload);
-    // The idempotency id survives the wire round-trip so a retry reuses it.
-    EXPECT_EQ(request.request_id, decoded.request_id);
-    EXPECT_EQ(request.route_partition, decoded.route_partition);
-    EXPECT_EQ(request.auth_token, decoded.auth_token);
-    // The end-to-end trace id survives so a module request stays correlated.
-    EXPECT_EQ(request.trace_id, decoded.trace_id);
-
-    ::dsn::binary_writer legacy_writer;
-    legacy_writer.write(request.schema_version);
-    legacy_writer.write(request.module);
-    legacy_writer.write(request.operation);
-    legacy_writer.write(request.key);
-    legacy_writer.write(request.payload);
-    ::dsn::binary_reader legacy_reader(legacy_writer.get_buffer());
-
-    rasn_runtime_request legacy_decoded;
-    unmarshall(legacy_reader, legacy_decoded, DSF_THRIFT_BINARY);
-    EXPECT_EQ(request.module, legacy_decoded.module);
-    EXPECT_TRUE(legacy_decoded.request_id.empty());
-    EXPECT_EQ((std::numeric_limits<uint32_t>::max)(), legacy_decoded.route_partition);
-    EXPECT_TRUE(legacy_decoded.auth_token.empty());
-    EXPECT_TRUE(legacy_decoded.trace_id.empty());
+    ::dsn::rasn::rpc::determinism_request snapshot;
+    snapshot.__set_metadata(make_runtime_request_metadata());
+    snapshot.__set_operation(::dsn::rasn::rpc::determinism_operation::snapshot);
+    const ::dsn::rasn::rpc::determinism_response state = store.dispatch(snapshot);
+    ASSERT_TRUE(state.status.ok) << runtime_error_message(state);
+    ASSERT_TRUE(state.__isset.choices);
+    EXPECT_EQ(1u, state.choices.size());
 }
 
-TEST(rasn_runtime, response_marshalling_round_trips_trace_id)
+TEST(rasn_runtime_typed_rpc, checkpoint_restores_typed_state_and_dedup_response)
 {
-    rasn_runtime_response response;
-    response.module = "blackboard";
-    response.operation = "get";
-    response.ok = true;
-    response.route_partition = 3;
-    response.trace_id = "trace-resp-77";
-
-    ::dsn::binary_writer writer;
-    marshall(writer, response, DSF_THRIFT_BINARY);
-    ::dsn::binary_reader reader(writer.get_buffer());
-    rasn_runtime_response decoded;
-    unmarshall(reader, decoded, DSF_THRIFT_BINARY);
-    EXPECT_EQ(response.route_partition, decoded.route_partition);
-    EXPECT_EQ(response.trace_id, decoded.trace_id);
-
-    // A legacy peer that predates trace_id (encodes only through route_partition)
-    // still decodes cleanly, leaving the trace id empty.
-    ::dsn::binary_writer legacy_writer;
-    legacy_writer.write(response.schema_version);
-    legacy_writer.write(response.ok);
-    legacy_writer.write(response.error);
-    legacy_writer.write(response.module);
-    legacy_writer.write(response.operation);
-    legacy_writer.write(response.key);
-    legacy_writer.write(response.payload);
-    legacy_writer.write(response.route_partition);
-    ::dsn::binary_reader legacy_reader(legacy_writer.get_buffer());
-    rasn_runtime_response legacy_decoded;
-    unmarshall(legacy_reader, legacy_decoded, DSF_THRIFT_BINARY);
-    EXPECT_EQ(response.route_partition, legacy_decoded.route_partition);
-    EXPECT_TRUE(legacy_decoded.trace_id.empty());
-}
-
-TEST(rasn_runtime, trace_scope_sets_and_restores_ambient_trace_id)
-{
-    EXPECT_TRUE(current_rasn_runtime_trace_id().empty());
-    {
-        rasn_runtime_trace_scope outer("trace-outer");
-        EXPECT_EQ("trace-outer", current_rasn_runtime_trace_id());
-        {
-            rasn_runtime_trace_scope inner("trace-inner");
-            EXPECT_EQ("trace-inner", current_rasn_runtime_trace_id());
-            {
-                // An empty id is a no-op so callers can install unconditionally.
-                rasn_runtime_trace_scope noop("");
-                EXPECT_EQ("trace-inner", current_rasn_runtime_trace_id());
-            }
-            EXPECT_EQ("trace-inner", current_rasn_runtime_trace_id());
-        }
-        EXPECT_EQ("trace-outer", current_rasn_runtime_trace_id());
-    }
-    EXPECT_TRUE(current_rasn_runtime_trace_id().empty());
-}
-
-TEST(rasn_runtime, dispatch_echoes_request_trace_id_onto_response)
-{
-    // dispatch runs the central response builder for both success and error paths,
-    // so the caller's trace id is echoed regardless of the module's verdict.
-    rasn_runtime_request request;
-    request.module = "determinism_ledger";
-    request.operation = "ping";
-    request.trace_id = "trace-dispatch-echo";
-    const rasn_runtime_response response = dispatch_rasn_runtime_request(request);
-    EXPECT_EQ(request.trace_id, response.trace_id);
-}
-
-TEST(rasn_runtime, dispatch_dedups_repeated_request_signatures)
-{
-    const auto encode_field = [](const std::string &key, const std::string &value) {
-        return key + "=" + std::to_string(value.size()) + ":" + value + "\n";
-    };
-    const auto count_substring = [](const std::string &text, const std::string &needle) {
-        size_t count = 0;
-        size_t offset = 0;
-        while ((offset = text.find(needle, offset)) != std::string::npos)
-        {
-            ++count;
-            offset += needle.size();
-        }
-        return count;
-    };
-    const std::string task_id = "dedup-task-mutating";
-    const std::string payload = encode_field("task_id", task_id) + encode_field("key", "route") +
-                                encode_field("source", "test") + encode_field("value", "first");
-
-    // The first mutating request installs an in-flight placeholder, applies once,
-    // and stores the response for the same logical retry signature.
-    rasn_runtime_request first;
-    first.module = "determinism_ledger";
-    first.operation = "record";
-    first.key = task_id + "/route";
-    first.payload = payload;
-    first.request_id = "dedup-req-alpha";
-    const rasn_runtime_response first_response = dispatch_rasn_runtime_request(first);
-    ASSERT_TRUE(first_response.ok) << first_response.error;
-    EXPECT_EQ(first.key, first_response.key);
-
-    const rasn_runtime_response duplicate_response = dispatch_rasn_runtime_request(first);
-    ASSERT_TRUE(duplicate_response.ok) << duplicate_response.error;
-    EXPECT_EQ(first_response.payload, duplicate_response.payload);
-
-    rasn_runtime_request snapshot;
-    snapshot.module = "determinism_ledger";
-    snapshot.operation = "snapshot";
-    const rasn_runtime_response snapshot_response = dispatch_rasn_runtime_request(snapshot);
-    ASSERT_TRUE(snapshot_response.ok) << snapshot_response.error;
-    EXPECT_EQ(1u, count_substring(snapshot_response.payload, task_id));
-
-    // A retry carrying the same id but a different key/payload is a distinct
-    // signature, avoiding stale responses after an accidental id collision.
-    rasn_runtime_request retry;
-    retry.module = "determinism_ledger";
-    retry.operation = "record";
-    retry.key = task_id + "/other";
-    retry.payload = encode_field("task_id", task_id) + encode_field("key", "other") +
-                    encode_field("source", "test") + encode_field("value", "second");
-    retry.request_id = "dedup-req-alpha";
-    const rasn_runtime_response retry_response = dispatch_rasn_runtime_request(retry);
-    EXPECT_TRUE(retry_response.ok) << retry_response.error;
-    EXPECT_EQ(retry.key, retry_response.key);
-
-    // A different id for the same module is routed fresh (not deduped).
-    rasn_runtime_request other_id;
-    other_id.module = "determinism_ledger";
-    other_id.operation = "record";
-    other_id.key = task_id + "/third";
-    other_id.payload = encode_field("task_id", task_id) + encode_field("key", "third") +
-                       encode_field("source", "test") + encode_field("value", "third");
-    other_id.request_id = "dedup-req-beta";
-    const rasn_runtime_response other_id_response = dispatch_rasn_runtime_request(other_id);
-    EXPECT_TRUE(other_id_response.ok) << other_id_response.error;
-    EXPECT_EQ(other_id.key, other_id_response.key);
-
-    // Read-only operations bypass the mutating-operation dedup cache even with ids.
-    rasn_runtime_request read_a;
-    read_a.module = "blackboard";
-    read_a.operation = "describe";
-    read_a.key = "read-key-a";
-    read_a.request_id = "dedup-read-id";
-    const rasn_runtime_response read_a_response = dispatch_rasn_runtime_request(read_a);
-    EXPECT_EQ("read-key-a", read_a_response.key);
-
-    rasn_runtime_request read_b = read_a;
-    read_b.key = "read-key-b";
-    const rasn_runtime_response read_b_response = dispatch_rasn_runtime_request(read_b);
-    EXPECT_EQ("read-key-b", read_b_response.key);
-
-    // Requests without an id are never deduped even if otherwise identical.
-    rasn_runtime_request no_id_a;
-    no_id_a.module = "blackboard";
-    no_id_a.operation = "describe";
-    no_id_a.key = "no-id-key-a";
-    const rasn_runtime_response no_id_a_response = dispatch_rasn_runtime_request(no_id_a);
-    EXPECT_EQ("no-id-key-a", no_id_a_response.key);
-
-    rasn_runtime_request no_id_b = no_id_a;
-    no_id_b.key = "no-id-key-b";
-    const rasn_runtime_response no_id_b_response = dispatch_rasn_runtime_request(no_id_b);
-    EXPECT_EQ("no-id-key-b", no_id_b_response.key);
-}
-
-TEST(rasn_runtime, replicated_requests_use_parallel_read_and_write_codes)
-{
-    rasn_runtime_request read;
-    read.module = "determinism_ledger";
-    read.operation = "snapshot";
-    EXPECT_EQ(RPC_RASN_DETERMINISM_LEDGER, rasn_runtime_rpc_code_for_request(read));
-
-    rasn_runtime_request write = read;
-    write.operation = "record";
-    EXPECT_EQ(RPC_RASN_DETERMINISM_LEDGER_WRITE, rasn_runtime_rpc_code_for_request(write));
-    EXPECT_NE(rasn_runtime_rpc_code_for_request(read), rasn_runtime_rpc_code_for_request(write));
-}
-
-TEST(rasn_runtime, replica_checkpoint_restores_module_state_and_dedup)
-{
-    ::dsn_gpid gpid = {};
-    gpid.u.app_id = 1;
-    gpid.u.partition_index = 0;
-    const int64_t decree = 42;
-    const auto encode_field = [](const std::string &key, const std::string &value) {
-        return key + "=" + std::to_string(value.size()) + ":" + value + "\n";
-    };
-    const auto count_substring = [](const std::string &text, const std::string &needle) {
-        size_t count = 0;
-        size_t offset = 0;
-        while ((offset = text.find(needle, offset)) != std::string::npos)
-        {
-            ++count;
-            offset += needle.size();
-        }
-        return count;
-    };
+    ::dsn::rasn::rpc::determinism_request record;
+    record.__set_metadata(make_runtime_request_metadata());
+    record.metadata.__set_request_id("typed-checkpoint-dedup");
+    record.__set_operation(::dsn::rasn::rpc::determinism_operation::record);
+    ::dsn::rasn::rpc::determinism_record_request body;
+    body.task_id = "checkpoint-task";
+    body.key = "route";
+    body.source = "unit";
+    body.value = "primary";
+    record.__set_record(body);
 
     rasn_runtime_replica_store source("determinism_ledger");
-    EXPECT_GT(source.dedup_capacity(), 0u);
-    rasn_runtime_request record;
-    record.module = "determinism_ledger";
-    record.operation = "record";
-    record.key = "replica-task/route";
-    record.payload = encode_field("task_id", "replica-task") + encode_field("key", "route") +
-                     encode_field("source", "unit") + encode_field("value", "primary");
-    record.request_id = "replica-dedup-1";
-    const rasn_runtime_response first = source.dispatch(record);
-    ASSERT_TRUE(first.ok) << first.error;
-    EXPECT_EQ(first.payload, source.dispatch(record).payload);
-    rasn_runtime_request second = record;
-    second.payload = encode_field("task_id", "replica-task") + encode_field("key", "route") +
-                     encode_field("source", "unit") + encode_field("value", "secondary");
-    second.request_id = "replica-dedup-2";
-    ASSERT_TRUE(source.dispatch(second).ok);
+    const ::dsn::rasn::rpc::determinism_response first = source.dispatch(record);
+    ASSERT_TRUE(first.status.ok) << runtime_error_message(first);
+    ASSERT_TRUE(first.__isset.choice);
 
+    ::dsn_gpid gpid = {};
+    gpid.u.app_id = 9;
+    gpid.u.partition_index = 0;
+    const int64_t decree = 42;
     std::vector<state_record> records;
     std::string error;
     ASSERT_TRUE(source.checkpoint_records(gpid, decree, &records, &error)) << error;
-    ASSERT_FALSE(records.empty());
+
+    bool saw_typed_state = false;
+    bool saw_typed_dedup = false;
+    bool saw_v2_manifest = false;
+    for (const state_record &checkpoint_record : records)
+    {
+        if (checkpoint_record.kind == "rasn.runtime.determinism_ledger.choice")
+        {
+            saw_typed_state = checkpoint_record.value.find("rasn.thrift.v1:") == 0;
+        }
+        else if (checkpoint_record.kind == "rasn.runtime.determinism_ledger.dedup")
+        {
+            saw_typed_dedup = true;
+        }
+        else if (checkpoint_record.kind == "rasn.runtime.determinism_ledger.manifest")
+        {
+            saw_v2_manifest =
+                checkpoint_record.value.find("schema_version=1:2\n") != std::string::npos;
+        }
+    }
+    EXPECT_TRUE(saw_typed_state);
+    EXPECT_TRUE(saw_typed_dedup);
+    EXPECT_TRUE(saw_v2_manifest);
 
     rasn_runtime_replica_store restored("determinism_ledger");
-    ASSERT_TRUE(restored.validate_checkpoint_records(records, gpid, decree, &error)) << error;
-    ::dsn_gpid wrong_partition = gpid;
-    wrong_partition.u.partition_index = 1;
-    EXPECT_FALSE(restored.validate_checkpoint_records(records, wrong_partition, decree, &error));
-    EXPECT_FALSE(restored.validate_checkpoint_records(records, gpid, decree + 1, &error));
-    rasn_runtime_replica_store wrong_module("blackboard");
-    EXPECT_FALSE(wrong_module.validate_checkpoint_records(records, gpid, decree, &error));
-
-    rasn_runtime_request snapshot;
-    snapshot.module = "determinism_ledger";
-    snapshot.operation = "snapshot";
-    EXPECT_EQ(0u, count_substring(restored.dispatch(snapshot).payload, "replica-task"));
-
     ASSERT_TRUE(restored.replace_checkpoint_records(records, gpid, decree, &error)) << error;
-    EXPECT_EQ(2u, count_substring(restored.dispatch(snapshot).payload, "replica-task"));
-    EXPECT_EQ(first.payload, restored.dispatch(record).payload);
-    EXPECT_EQ(2u, count_substring(restored.dispatch(snapshot).payload, "replica-task"));
+    const ::dsn::rasn::rpc::determinism_response replayed = restored.dispatch(record);
+    ASSERT_TRUE(replayed.status.ok) << runtime_error_message(replayed);
+    ASSERT_TRUE(replayed.__isset.choice);
+    EXPECT_EQ(first.choice.sequence, replayed.choice.sequence);
 
-    bool corrupted = false;
-    for (state_record &checkpoint_record : records)
+    ::dsn::rasn::rpc::determinism_request snapshot;
+    snapshot.__set_metadata(make_runtime_request_metadata());
+    snapshot.__set_operation(::dsn::rasn::rpc::determinism_operation::snapshot);
+    const ::dsn::rasn::rpc::determinism_response state = restored.dispatch(snapshot);
+    ASSERT_TRUE(state.status.ok) << runtime_error_message(state);
+    ASSERT_TRUE(state.__isset.choices);
+    ASSERT_EQ(1u, state.choices.size());
+    EXPECT_EQ("checkpoint-task", state.choices.front().task_id);
+}
+
+bool collect_runtime_checkpoint(const std::string &module,
+                                rasn_runtime_replica_store *source,
+                                uint32_t partition_index,
+                                std::vector<state_record> *records,
+                                std::string *error)
+{
+    if (source == nullptr || records == nullptr)
     {
-        if (checkpoint_record.kind == "rasn.runtime.determinism_ledger.dedup")
+        if (error != nullptr)
         {
-            checkpoint_record.value = "corrupt";
-            corrupted = true;
+            *error = "runtime checkpoint collection argument is null";
+        }
+        return false;
+    }
+    ::dsn_gpid gpid = {};
+    gpid.u.app_id = 17;
+    gpid.u.partition_index = partition_index;
+    const int64_t decree = 73;
+    records->clear();
+    return source->module() == module &&
+           source->checkpoint_records(gpid, decree, records, error);
+}
+
+class scoped_main_config_override
+{
+public:
+    scoped_main_config_override(std::string section,
+                                std::string key,
+                                std::string value)
+        : _config(::dsn::get_main_config()),
+          _section(std::move(section)),
+          _key(std::move(key))
+    {
+        if (_config != nullptr)
+        {
+            _snapshot = _config->set_with_snapshot(
+                _section.c_str(), _key.c_str(), value.c_str(), "unit-test override");
+        }
+    }
+
+    ~scoped_main_config_override()
+    {
+        if (_config != nullptr)
+        {
+            _config->restore_snapshot(_section.c_str(), _key.c_str(), _snapshot);
+        }
+    }
+
+    bool active() const { return _config != nullptr; }
+
+private:
+    ::dsn::configuration_ptr _config;
+    std::string _section;
+    std::string _key;
+    ::dsn::configuration_value_snapshot _snapshot;
+};
+
+bool replace_mirrored_state_records_for_test(rasn_runtime_replica_store *store,
+                                             const std::vector<state_record> &records,
+                                             const std::vector<uint32_t> &hosted_shards,
+                                             size_t *applied,
+                                             std::string *error)
+{
+    if (store == nullptr)
+    {
+        if (error != nullptr)
+        {
+            *error = "runtime replica store is null";
+        }
+        return false;
+    }
+    return runtime_provider_internal::replica_store_test_accessor::
+        replace_mirrored_state_records(*store, records, hosted_shards, applied, error);
+}
+
+std::vector<std::string> find_runtime_partition_keys(const std::string &module,
+                                                     uint32_t partition_count)
+{
+    std::vector<std::string> keys(partition_count);
+    for (uint32_t candidate = 0; candidate < 10000; ++candidate)
+    {
+        const std::string key = module + "-partition-" + std::to_string(candidate);
+        const uint32_t partition =
+            runtime_provider_internal::replica_store_test_accessor::partition_for_key(module, key);
+        if (partition < keys.size() && keys[partition].empty())
+        {
+            keys[partition] = key;
+        }
+        if (std::find(keys.begin(), keys.end(), std::string()) == keys.end())
+        {
             break;
         }
     }
-    ASSERT_TRUE(corrupted);
-    EXPECT_FALSE(restored.validate_checkpoint_records(records, gpid, decree, &error));
+    return keys;
 }
 
-TEST(rasn_runtime, replica_rejects_nondeterministic_mutations)
+template <typename Request>
+uint32_t routed_runtime_partition(const Request &request)
 {
-    rasn_runtime_replica_store store("blackboard");
-    rasn_runtime_request request;
-    request.module = "blackboard";
-    request.operation = "put";
-    request.key = "missing-timestamp";
-    request.request_id = "replica-nondeterministic-1";
-    request.payload = "schema_version=1:1\nkey=17:missing-timestamp\n";
-    const rasn_runtime_response response = store.dispatch(request);
-    EXPECT_FALSE(response.ok);
-    EXPECT_NE(std::string::npos, response.error.find("timestamp"));
-
-    request.key = "envelope-key";
-    request.request_id = "replica-mismatched-key";
-    request.payload = "key=11:payload-key\nupdated_at_ms=1:1\n";
-    const rasn_runtime_response mismatched = store.dispatch(request);
-    EXPECT_FALSE(mismatched.ok);
-    EXPECT_NE(std::string::npos, mismatched.error.find("request key"));
-
-    rasn_runtime_replica_store human_store("human_interaction");
-    rasn_runtime_request expire;
-    expire.module = "human_interaction";
-    expire.operation = "expire";
-    expire.key = "*";
-    expire.request_id = "replica-missing-expiry-time";
-    expire.payload = "now_ms=1:0\n";
-    const rasn_runtime_response missing_expiry_time = human_store.dispatch(expire);
-    EXPECT_FALSE(missing_expiry_time.ok);
-    EXPECT_NE(std::string::npos, missing_expiry_time.error.find("timestamp"));
+    for (uint32_t partition = 0; partition < 1024; ++partition)
+    {
+        if (rasn_runtime_service_hosts_request(request, {partition}))
+        {
+            return partition;
+        }
+    }
+    return (std::numeric_limits<uint32_t>::max)();
 }
 
-TEST(rasn_runtime, replica_human_interaction_accepts_live_mutations_and_restores)
+TEST(rasn_runtime_typed_rpc, checkpoint_hydrates_each_sharded_record_kind_once)
 {
-    const auto encode_field = [](const std::string &key, const std::string &value) {
-        return key + "=" + std::to_string(value.size()) + ":" + value + "\n";
-    };
-    const auto open_request = [&encode_field](const std::string &human_id,
-                                              const std::string &command_id,
-                                              uint64_t deadline_ms) {
-        rasn_runtime_request request;
-        request.module = "human_interaction";
-        request.operation = "open";
-        request.key = human_id;
-        request.request_id = command_id;
-        request.payload = encode_field("request_id", human_id) +
-                          encode_field("requester", "reviewer") +
-                          encode_field("prompt", "Approve deployment?") +
-                          encode_field("choice", "yes") +
-                          encode_field("choice", "no") +
-                          encode_field("state", "pending") +
-                          encode_field("created_at_ms", "100") +
-                          encode_field("updated_at_ms", "100") +
-                          encode_field("deadline_ms", std::to_string(deadline_ms));
-        return request;
-    };
-    const auto transition_request = [&encode_field](const std::string &human_id,
-                                                    const std::string &operation,
-                                                    const std::string &value_field,
-                                                    const std::string &value,
-                                                    const std::string &command_id,
-                                                    uint64_t updated_at_ms) {
-        rasn_runtime_request request;
-        request.module = "human_interaction";
-        request.operation = operation;
-        request.key = human_id;
-        request.request_id = command_id;
-        request.payload = encode_field("request_id", human_id) +
-                          encode_field(value_field, value) +
-                          encode_field("updated_at_ms", std::to_string(updated_at_ms));
-        return request;
-    };
-    const auto find_request = [](const std::string &human_id) {
-        rasn_runtime_request request;
-        request.module = "human_interaction";
-        request.operation = "find";
-        request.key = human_id;
-        return request;
-    };
+    scoped_main_config_override message_shards(
+        "rasn.service", "agent_message_bus_shard_count", "2");
+    scoped_main_config_override budget_shards(
+        "rasn.service", "resource_budget_shard_count", "2");
+    scoped_main_config_override blackboard_shards(
+        "rasn.service", "blackboard_shard_count", "2");
+    scoped_main_config_override human_shards(
+        "rasn.service", "human_interaction_shard_count", "2");
+    ASSERT_TRUE(message_shards.active());
+    ASSERT_TRUE(budget_shards.active());
+    ASSERT_TRUE(blackboard_shards.active());
+    ASSERT_TRUE(human_shards.active());
 
-    rasn_runtime_replica_store source("human_interaction");
-    ASSERT_TRUE(source.dispatch(open_request("human-answer", "open-answer", 500)).ok);
-    const rasn_runtime_request answer =
-        transition_request("human-answer", "answer", "answer", "yes", "answer-command", 120);
-    ASSERT_TRUE(source.dispatch(answer).ok);
-    EXPECT_NE(std::string::npos,
-              source.dispatch(find_request("human-answer")).payload.find("answered"));
+    std::string error;
 
-    ASSERT_TRUE(source.dispatch(open_request("human-cancel", "open-cancel", 500)).ok);
-    ASSERT_TRUE(source.dispatch(transition_request("human-cancel",
-                                                   "cancel",
-                                                   "reason",
-                                                   "superseded",
-                                                   "cancel-command",
-                                                   130))
-                    .ok);
-    EXPECT_NE(std::string::npos,
-              source.dispatch(find_request("human-cancel")).payload.find("cancelled"));
+    ::dsn::rasn::rpc::message_bus_request publish;
+    publish.__set_metadata(make_runtime_request_metadata());
+    publish.metadata.__set_request_id("checkpoint-message");
+    publish.__set_operation(::dsn::rasn::rpc::message_bus_operation::publish);
+    ::dsn::rasn::rpc::wire_agent_message message;
+    message.message_id = "checkpoint-message";
+    message.receiver = "receiver";
+    message.type = "unit";
+    message.payload = "payload";
+    message.created_at_ms = 10;
+    message.updated_at_ms = 10;
+    publish.__set_publish(message);
+    rasn_runtime_replica_store message_source("agent_message_bus");
+    const ::dsn::rasn::rpc::message_bus_response published_message =
+        message_source.dispatch(publish);
+    ASSERT_TRUE(published_message.status.ok) << runtime_error_message(published_message);
+    ASSERT_TRUE(published_message.__isset.message);
+    const ::dsn::rasn::rpc::wire_agent_message expected_message = published_message.message;
+    rasn_runtime_replica_store message_restored("agent_message_bus");
+    std::vector<state_record> message_records;
+    ASSERT_TRUE(collect_runtime_checkpoint(
+        "agent_message_bus", &message_source, 0, &message_records, &error))
+        << error;
+    const uint32_t message_partition = routed_runtime_partition(publish);
+    ASSERT_NE((std::numeric_limits<uint32_t>::max)(), message_partition);
+    size_t applied = 0;
+    ASSERT_LT(message_partition, 2u);
+    ASSERT_TRUE(replace_mirrored_state_records_for_test(
+        &message_restored, message_records, {message_partition}, &applied, &error))
+        << error;
+    EXPECT_EQ(1u, applied);
+    rasn_runtime_replica_store message_skipped("agent_message_bus");
+    ASSERT_TRUE(replace_mirrored_state_records_for_test(
+        &message_skipped, message_records, {1u - message_partition}, &applied, &error))
+        << error;
+    EXPECT_EQ(0u, applied);
+    rasn_runtime_replica_store message_whole_module("agent_message_bus");
+    ASSERT_TRUE(replace_mirrored_state_records_for_test(
+        &message_whole_module, message_records, {}, &applied, &error))
+        << error;
+    EXPECT_EQ(1u, applied);
+    rasn_runtime_replica_store message_native_checkpoint("agent_message_bus");
+    ::dsn_gpid message_gpid = {};
+    message_gpid.u.app_id = 17;
+    message_gpid.u.partition_index = 0;
+    ASSERT_TRUE(message_native_checkpoint.replace_checkpoint_records(
+        message_records, message_gpid, 73, &error))
+        << error;
+    ::dsn::rasn::rpc::message_bus_request find_message;
+    find_message.__set_metadata(make_runtime_request_metadata());
+    find_message.__set_operation(::dsn::rasn::rpc::message_bus_operation::find);
+    ::dsn::rasn::rpc::message_find_request find_message_body;
+    find_message_body.message_id = expected_message.message_id;
+    find_message.__set_find(find_message_body);
+    const ::dsn::rasn::rpc::message_bus_response found_message =
+        message_restored.dispatch(find_message);
+    ASSERT_TRUE(found_message.status.ok) << runtime_error_message(found_message);
+    ASSERT_TRUE(found_message.__isset.message);
+    EXPECT_TRUE(expected_message == found_message.message);
 
-    ASSERT_TRUE(source.dispatch(open_request("human-expire", "open-expire", 150)).ok);
-    rasn_runtime_request expire;
-    expire.module = "human_interaction";
-    expire.operation = "expire";
-    expire.key = "*";
-    expire.request_id = "expire-command";
-    expire.payload = encode_field("now_ms", "200");
-    ASSERT_TRUE(source.dispatch(expire).ok);
-    EXPECT_NE(std::string::npos,
-              source.dispatch(find_request("human-expire")).payload.find("expired"));
+    const ::dsn::rasn::rpc::message_bus_response native_message =
+        message_native_checkpoint.dispatch(find_message);
+    ASSERT_TRUE(native_message.status.ok) << runtime_error_message(native_message);
+    ASSERT_TRUE(native_message.__isset.message);
+    EXPECT_TRUE(expected_message == native_message.message);
 
-    ::dsn_gpid gpid = {};
-    gpid.u.app_id = 11;
-    gpid.u.partition_index = 0;
-    const int64_t decree = 17;
+    ::dsn::rasn::rpc::message_bus_request absent_message = find_message;
+    absent_message.metadata.__set_request_id("checkpoint-native-absent");
+    absent_message.find.message_id = "checkpoint-native-absent";
+    const ::dsn::rasn::rpc::message_bus_response absent_native_message =
+        message_native_checkpoint.dispatch(absent_message);
+    EXPECT_FALSE(absent_native_message.status.ok);
+    EXPECT_FALSE(absent_native_message.__isset.message);
+
+    ::dsn::rasn::rpc::message_bus_request native_snapshot;
+    native_snapshot.__set_metadata(make_runtime_request_metadata());
+    native_snapshot.__set_operation(::dsn::rasn::rpc::message_bus_operation::snapshot);
+    const ::dsn::rasn::rpc::message_bus_response native_state =
+        message_native_checkpoint.dispatch(native_snapshot);
+    ASSERT_TRUE(native_state.status.ok) << runtime_error_message(native_state);
+    ASSERT_TRUE(native_state.__isset.messages);
+    ASSERT_EQ(1u, native_state.messages.size());
+    EXPECT_TRUE(expected_message == native_state.messages.front());
+
+    ::dsn::rasn::rpc::resource_budget_request configure;
+    configure.__set_metadata(make_runtime_request_metadata());
+    configure.metadata.__set_request_id("checkpoint-budget");
+    configure.__set_operation(::dsn::rasn::rpc::resource_budget_operation::configure);
+    ::dsn::rasn::rpc::wire_resource_quota quota;
+    quota.scope = "checkpoint-budget";
+    quota.max_cost_units = 100;
+    quota.max_latency_ms = 100;
+    quota.max_tokens = 100;
+    quota.max_tool_calls = 100;
+    configure.__set_configure(quota);
+    rasn_runtime_replica_store budget_source("resource_budget");
+    ASSERT_TRUE(budget_source.dispatch(configure).status.ok);
+    ::dsn::rasn::rpc::resource_budget_request reserve;
+    reserve.__set_metadata(make_runtime_request_metadata());
+    reserve.metadata.__set_request_id("checkpoint-budget-reserve");
+    reserve.__set_operation(::dsn::rasn::rpc::resource_budget_operation::reserve);
+    ::dsn::rasn::rpc::wire_resource_request reservation;
+    reservation.scope = quota.scope;
+    reservation.cost_units = 7;
+    reservation.latency_ms = 8;
+    reservation.tokens = 9;
+    reservation.tool_calls = 1;
+    reserve.__set_reserve(reservation);
+    const ::dsn::rasn::rpc::resource_budget_response reserve_response =
+        budget_source.dispatch(reserve);
+    ASSERT_TRUE(reserve_response.status.ok) << runtime_error_message(reserve_response);
+    ASSERT_TRUE(reserve_response.__isset.decision);
+    EXPECT_TRUE(reserve_response.decision.allowed);
+    rasn_runtime_replica_store budget_restored("resource_budget");
+    std::vector<state_record> budget_records;
+    ASSERT_TRUE(collect_runtime_checkpoint(
+        "resource_budget", &budget_source, 1, &budget_records, &error))
+        << error;
+    const uint32_t budget_partition = routed_runtime_partition(configure);
+    ASSERT_NE((std::numeric_limits<uint32_t>::max)(), budget_partition);
+    ASSERT_LT(budget_partition, 2u);
+    ASSERT_TRUE(replace_mirrored_state_records_for_test(
+        &budget_restored, budget_records, {budget_partition}, &applied, &error))
+        << error;
+    EXPECT_EQ(2u, applied);
+    rasn_runtime_replica_store budget_skipped("resource_budget");
+    ASSERT_TRUE(replace_mirrored_state_records_for_test(
+        &budget_skipped, budget_records, {1u - budget_partition}, &applied, &error))
+        << error;
+    EXPECT_EQ(0u, applied);
+    EXPECT_EQ(1u,
+              std::count_if(budget_records.begin(),
+                            budget_records.end(),
+                            [](const state_record &record) {
+                                return record.kind == "rasn.runtime.resource_budget.quota";
+                            }));
+    EXPECT_EQ(1u,
+              std::count_if(budget_records.begin(),
+                            budget_records.end(),
+                            [](const state_record &record) {
+                                return record.kind == "rasn.runtime.resource_budget.usage";
+                            }));
+    ::dsn::rasn::rpc::resource_budget_request budget_usage;
+    budget_usage.__set_metadata(make_runtime_request_metadata());
+    budget_usage.__set_operation(::dsn::rasn::rpc::resource_budget_operation::usage);
+    ::dsn::rasn::rpc::resource_usage_request budget_usage_body;
+    budget_usage_body.scope = quota.scope;
+    budget_usage.__set_usage(budget_usage_body);
+    const ::dsn::rasn::rpc::resource_budget_response restored_usage =
+        budget_restored.dispatch(budget_usage);
+    ASSERT_TRUE(restored_usage.status.ok) << runtime_error_message(restored_usage);
+    ASSERT_TRUE(restored_usage.__isset.usage);
+    EXPECT_EQ(7, restored_usage.usage.cost_units);
+    EXPECT_EQ(8, restored_usage.usage.latency_ms);
+    EXPECT_EQ(9, restored_usage.usage.tokens);
+    EXPECT_EQ(1, restored_usage.usage.tool_calls);
+
+    ::dsn::rasn::rpc::blackboard_request put;
+    put.__set_metadata(make_runtime_request_metadata());
+    put.metadata.__set_request_id("checkpoint-blackboard");
+    put.__set_operation(::dsn::rasn::rpc::blackboard_operation::put);
+    ::dsn::rasn::rpc::wire_blackboard_entry entry;
+    entry.key = "checkpoint-blackboard";
+    entry.kind = "unit";
+    entry.value = "value";
+    entry.created_at_ms = 20;
+    entry.updated_at_ms = 20;
+    put.__set_put(entry);
+    rasn_runtime_replica_store blackboard_source("blackboard");
+    ASSERT_TRUE(blackboard_source.dispatch(put).status.ok);
+    rasn_runtime_replica_store blackboard_restored("blackboard");
+    std::vector<state_record> blackboard_records;
+    ASSERT_TRUE(collect_runtime_checkpoint(
+        "blackboard", &blackboard_source, 2, &blackboard_records, &error))
+        << error;
+    const uint32_t blackboard_partition = routed_runtime_partition(put);
+    ASSERT_NE((std::numeric_limits<uint32_t>::max)(), blackboard_partition);
+    ASSERT_LT(blackboard_partition, 2u);
+    ASSERT_TRUE(replace_mirrored_state_records_for_test(
+        &blackboard_restored, blackboard_records, {blackboard_partition}, &applied, &error))
+        << error;
+    EXPECT_EQ(1u, applied);
+    rasn_runtime_replica_store blackboard_skipped("blackboard");
+    ASSERT_TRUE(replace_mirrored_state_records_for_test(
+        &blackboard_skipped,
+        blackboard_records,
+        {1u - blackboard_partition},
+        &applied,
+        &error))
+        << error;
+    EXPECT_EQ(0u, applied);
+    ::dsn::rasn::rpc::blackboard_request get;
+    get.__set_metadata(make_runtime_request_metadata());
+    get.__set_operation(::dsn::rasn::rpc::blackboard_operation::get);
+    ::dsn::rasn::rpc::blackboard_get_request get_body;
+    get_body.key = entry.key;
+    get.__set_get(get_body);
+    const ::dsn::rasn::rpc::blackboard_response found_entry = blackboard_restored.dispatch(get);
+    ASSERT_TRUE(found_entry.status.ok) << runtime_error_message(found_entry);
+    ASSERT_TRUE(found_entry.__isset.entry);
+    EXPECT_EQ(entry.key, found_entry.entry.key);
+
+    ::dsn::rasn::rpc::human_interaction_rpc_request open;
+    open.__set_metadata(make_runtime_request_metadata());
+    open.metadata.__set_request_id("checkpoint-human");
+    open.__set_operation(::dsn::rasn::rpc::human_interaction_operation::open);
+    ::dsn::rasn::rpc::wire_human_interaction_request interaction;
+    interaction.request_id = "checkpoint-human";
+    interaction.requester = "requester";
+    interaction.prompt = "prompt";
+    interaction.created_at_ms = 30;
+    interaction.updated_at_ms = 30;
+    open.__set_open(interaction);
+    rasn_runtime_replica_store human_source("human_interaction");
+    ASSERT_TRUE(human_source.dispatch(open).status.ok);
+    rasn_runtime_replica_store human_restored("human_interaction");
+    std::vector<state_record> human_records;
+    ASSERT_TRUE(collect_runtime_checkpoint(
+        "human_interaction", &human_source, 3, &human_records, &error))
+        << error;
+    const uint32_t human_partition = routed_runtime_partition(open);
+    ASSERT_NE((std::numeric_limits<uint32_t>::max)(), human_partition);
+    ASSERT_LT(human_partition, 2u);
+    ASSERT_TRUE(replace_mirrored_state_records_for_test(
+        &human_restored, human_records, {human_partition}, &applied, &error))
+        << error;
+    EXPECT_EQ(1u, applied);
+    rasn_runtime_replica_store human_skipped("human_interaction");
+    ASSERT_TRUE(replace_mirrored_state_records_for_test(
+        &human_skipped, human_records, {1u - human_partition}, &applied, &error))
+        << error;
+    EXPECT_EQ(0u, applied);
+    ::dsn::rasn::rpc::human_interaction_rpc_request find_human;
+    find_human.__set_metadata(make_runtime_request_metadata());
+    find_human.__set_operation(::dsn::rasn::rpc::human_interaction_operation::find);
+    ::dsn::rasn::rpc::human_find_request find_human_body;
+    find_human_body.request_id = interaction.request_id;
+    find_human.__set_find(find_human_body);
+    const ::dsn::rasn::rpc::human_interaction_rpc_response found_human =
+        human_restored.dispatch(find_human);
+    ASSERT_TRUE(found_human.status.ok) << runtime_error_message(found_human);
+    ASSERT_TRUE(found_human.__isset.request);
+    EXPECT_EQ(interaction.request_id, found_human.request.request_id);
+
+    std::vector<state_record> malformed = message_records;
+    const auto malformed_message = std::find_if(
+        malformed.begin(), malformed.end(), [](const state_record &record) {
+            return record.kind == "rasn.runtime.agent_message_bus.message";
+        });
+    ASSERT_NE(malformed.end(), malformed_message);
+    malformed_message->value = "rasn.thrift.v1:malformed";
+    rasn_runtime_replica_store rejected("agent_message_bus");
+    error.clear();
+    EXPECT_FALSE(replace_mirrored_state_records_for_test(
+        &rejected, malformed, {message_partition}, &applied, &error));
+    EXPECT_NE(std::string::npos, error.find("decode"));
+}
+
+TEST(rasn_runtime_typed_rpc, mirrored_restore_filters_actual_message_partitions)
+{
+    scoped_main_config_override message_shards(
+        "rasn.service", "agent_message_bus_shard_count", "2");
+    ASSERT_TRUE(message_shards.active());
+
+    const std::vector<std::string> keys =
+        find_runtime_partition_keys("agent_message_bus", 2);
+    ASSERT_EQ(2u, keys.size());
+    ASSERT_FALSE(keys[0].empty());
+    ASSERT_FALSE(keys[1].empty());
+    ASSERT_NE(keys[0], keys[1]);
+    EXPECT_EQ(0u,
+              runtime_provider_internal::replica_store_test_accessor::partition_for_key(
+                  "agent_message_bus", keys[0]));
+    EXPECT_EQ(1u,
+              runtime_provider_internal::replica_store_test_accessor::partition_for_key(
+                  "agent_message_bus", keys[1]));
+
+    rasn_runtime_replica_store source("agent_message_bus");
+    std::vector<::dsn::rasn::rpc::wire_agent_message> expected(2);
+    for (uint32_t partition = 0; partition < 2; ++partition)
+    {
+        ::dsn::rasn::rpc::message_bus_request publish;
+        publish.__set_metadata(make_runtime_request_metadata());
+        publish.metadata.__set_request_id("partition-publish-" + std::to_string(partition));
+        publish.__set_operation(::dsn::rasn::rpc::message_bus_operation::publish);
+        ::dsn::rasn::rpc::wire_agent_message message;
+        message.message_id = keys[partition];
+        message.receiver = "partition-receiver-" + std::to_string(partition);
+        message.type = "partition-test";
+        message.payload = "partition-payload-" + std::to_string(partition);
+        message.created_at_ms = 100 + partition;
+        message.updated_at_ms = 100 + partition;
+        publish.__set_publish(message);
+        const ::dsn::rasn::rpc::message_bus_response response = source.dispatch(publish);
+        ASSERT_TRUE(response.status.ok) << runtime_error_message(response);
+        ASSERT_TRUE(response.__isset.message);
+        expected[partition] = response.message;
+    }
+
     std::vector<state_record> records;
     std::string error;
-    ASSERT_TRUE(source.checkpoint_records(gpid, decree, &records, &error)) << error;
+    ASSERT_TRUE(
+        collect_runtime_checkpoint("agent_message_bus", &source, 0, &records, &error))
+        << error;
 
-    rasn_runtime_replica_store restored("human_interaction");
-    ASSERT_TRUE(restored.replace_checkpoint_records(records, gpid, decree, &error)) << error;
-    EXPECT_NE(std::string::npos,
-              restored.dispatch(find_request("human-answer")).payload.find("answered"));
-    EXPECT_NE(std::string::npos,
-              restored.dispatch(find_request("human-cancel")).payload.find("cancelled"));
-    EXPECT_NE(std::string::npos,
-              restored.dispatch(find_request("human-expire")).payload.find("expired"));
-    EXPECT_EQ(source.dispatch(answer).payload, restored.dispatch(answer).payload);
+    rasn_runtime_replica_store shard_zero("agent_message_bus");
+    rasn_runtime_replica_store shard_one("agent_message_bus");
+    std::vector<rasn_runtime_replica_store *> stores = {&shard_zero, &shard_one};
+    for (uint32_t partition = 0; partition < stores.size(); ++partition)
+    {
+        size_t applied = 0;
+        ASSERT_TRUE(replace_mirrored_state_records_for_test(
+            stores[partition], records, {partition}, &applied, &error))
+            << error;
+        EXPECT_EQ(1u, applied);
+
+        ::dsn::rasn::rpc::message_bus_request find_owned;
+        find_owned.__set_metadata(make_runtime_request_metadata());
+        find_owned.__set_operation(::dsn::rasn::rpc::message_bus_operation::find);
+        ::dsn::rasn::rpc::message_find_request owned_body;
+        owned_body.message_id = keys[partition];
+        find_owned.__set_find(owned_body);
+        const ::dsn::rasn::rpc::message_bus_response owned =
+            stores[partition]->dispatch(find_owned);
+        ASSERT_TRUE(owned.status.ok) << runtime_error_message(owned);
+        ASSERT_TRUE(owned.__isset.message);
+        EXPECT_TRUE(expected[partition] == owned.message);
+
+        ::dsn::rasn::rpc::message_bus_request find_foreign;
+        find_foreign.__set_metadata(make_runtime_request_metadata());
+        find_foreign.__set_operation(::dsn::rasn::rpc::message_bus_operation::find);
+        ::dsn::rasn::rpc::message_find_request foreign_body;
+        foreign_body.message_id = keys[1u - partition];
+        find_foreign.__set_find(foreign_body);
+        const ::dsn::rasn::rpc::message_bus_response foreign =
+            stores[partition]->dispatch(find_foreign);
+        EXPECT_FALSE(foreign.status.ok);
+        EXPECT_FALSE(foreign.__isset.message);
+    }
 }
 
-TEST(rasn_runtime, replica_dedup_preserves_failed_mutation_outcome)
+TEST(rasn_runtime_typed_rpc, replica_rejects_missing_deterministic_timestamp)
 {
-    const auto encode_field = [](const std::string &key, const std::string &value) {
-        return key + "=" + std::to_string(value.size()) + ":" + value + "\n";
-    };
-    rasn_runtime_replica_store store("task_orchestration_kernel");
+    ::dsn::rasn::rpc::blackboard_request request;
+    request.__set_metadata(make_runtime_request_metadata());
+    request.metadata.__set_request_id("typed-missing-timestamp");
+    request.__set_operation(::dsn::rasn::rpc::blackboard_operation::put);
+    ::dsn::rasn::rpc::wire_blackboard_entry entry;
+    entry.key = "missing-timestamp";
+    request.__set_put(entry);
 
-    rasn_runtime_request complete;
-    complete.module = "task_orchestration_kernel";
-    complete.operation = "complete";
-    complete.key = "late-task";
-    complete.payload = "result";
-    complete.request_id = "complete-before-add";
-    const rasn_runtime_response first = store.dispatch(complete);
-    ASSERT_FALSE(first.ok);
+    rasn_runtime_replica_store store("blackboard");
+    const ::dsn::rasn::rpc::blackboard_response response = store.dispatch(request);
+    EXPECT_FALSE(response.status.ok);
+    EXPECT_EQ(::dsn::rasn::rpc::runtime_error_code::invalid_request,
+              response.status.code);
+    EXPECT_NE(std::string::npos, runtime_error_message(response).find("updated_at_ms"));
+}
 
-    rasn_runtime_request add;
-    add.module = "task_orchestration_kernel";
-    add.operation = "add_task";
-    add.key = "late-task";
-    add.payload = encode_field("task_id", "late-task") + encode_field("state", "pending");
-    add.request_id = "add-late-task";
-    ASSERT_TRUE(store.dispatch(add).ok);
+TEST(rasn_runtime_typed_rpc, agent_control_replica_requires_every_mutation_timestamp)
+{
+    using operation = ::dsn::rasn::rpc::agent_control_operation;
+    rasn_runtime_replica_store store("agent_control_plane");
+    const auto expect_timestamp_rejected =
+        [&store](const ::dsn::rasn::rpc::agent_control_request &request) {
+            const ::dsn::rasn::rpc::agent_control_response response = store.dispatch(request);
+            EXPECT_FALSE(response.status.ok);
+            EXPECT_EQ(::dsn::rasn::rpc::runtime_error_code::invalid_request,
+                      response.status.code);
+            EXPECT_EQ("replicated agent-control mutation requires an explicit timestamp",
+                      runtime_error_message(response));
+        };
 
-    const rasn_runtime_response retried = store.dispatch(complete);
-    EXPECT_FALSE(retried.ok);
-    EXPECT_EQ(first.error, retried.error);
+    ::dsn::rasn::rpc::wire_agent_control_record agent;
+    agent.descriptor.agent_id = "deterministic-agent";
+    agent.descriptor.role = "worker";
+
+    ::dsn::rasn::rpc::agent_control_request upsert;
+    upsert.__set_metadata(make_runtime_request_metadata());
+    upsert.metadata.__set_request_id("agent-upsert-missing-time");
+    upsert.__set_operation(operation::upsert_agent);
+    upsert.__set_upsert_agent(agent);
+    expect_timestamp_rejected(upsert);
+    upsert.metadata.__set_request_id("agent-upsert-with-time");
+    upsert.upsert_agent.last_heartbeat_ms = 100;
+    EXPECT_TRUE(store.dispatch(upsert).status.ok);
+
+    ::dsn::rasn::rpc::agent_control_acquire_lease_request acquire_body;
+    acquire_body.agent_id = agent.descriptor.agent_id;
+    acquire_body.owner = "owner";
+    acquire_body.lease_ms = 50;
+    ::dsn::rasn::rpc::agent_control_request acquire;
+    acquire.__set_metadata(make_runtime_request_metadata());
+    acquire.metadata.__set_request_id("agent-acquire-missing-time");
+    acquire.__set_operation(operation::acquire_lease);
+    acquire.__set_acquire_lease(acquire_body);
+    expect_timestamp_rejected(acquire);
+    acquire.metadata.__set_request_id("agent-acquire-with-time");
+    acquire.acquire_lease.now_ms = 110;
+    EXPECT_TRUE(store.dispatch(acquire).status.ok);
+
+    ::dsn::rasn::rpc::agent_control_heartbeat_request heartbeat_body;
+    heartbeat_body.agent_id = agent.descriptor.agent_id;
+    ::dsn::rasn::rpc::agent_control_request heartbeat;
+    heartbeat.__set_metadata(make_runtime_request_metadata());
+    heartbeat.metadata.__set_request_id("agent-heartbeat-missing-time");
+    heartbeat.__set_operation(operation::heartbeat);
+    heartbeat.__set_heartbeat(heartbeat_body);
+    expect_timestamp_rejected(heartbeat);
+    heartbeat.metadata.__set_request_id("agent-heartbeat-with-time");
+    heartbeat.heartbeat.now_ms = 120;
+    EXPECT_TRUE(store.dispatch(heartbeat).status.ok);
+
+    ::dsn::rasn::rpc::agent_control_expire_request expire_body;
+    ::dsn::rasn::rpc::agent_control_request expire;
+    expire.__set_metadata(make_runtime_request_metadata());
+    expire.metadata.__set_request_id("agent-expire-missing-time");
+    expire.__set_operation(operation::expire_leases);
+    expire.__set_expire_leases(expire_body);
+    expect_timestamp_rejected(expire);
+    expire.metadata.__set_request_id("agent-expire-with-time");
+    expire.expire_leases.now_ms = 200;
+    EXPECT_TRUE(store.dispatch(expire).status.ok);
 }
 
 TEST(rasn_runtime, ownership_resources_expand_modules_and_shards)
@@ -7452,70 +7888,90 @@ TEST(rasn_runtime, ownership_resources_whole_sharded_module_locks_every_shard)
                   "blackboard", {}, /*sharded=*/true, /*partition_count=*/3));
 }
 
-TEST(rasn_runtime, partition_hash_preserves_keys_and_explicit_shard_routes)
+
+TEST(rasn_runtime_typed_rpc, routes_by_typed_key_and_explicit_partition)
 {
-    rasn_runtime_request keyed;
-    keyed.module = "blackboard";
-    keyed.key = "topic";
-    EXPECT_EQ(5912253781582851172ULL, rasn_runtime_partition_hash(keyed));
+    EXPECT_TRUE(rasn_runtime_module_is_sharded("human_interaction"));
 
-    keyed.route_partition = 7;
-    EXPECT_EQ(7u, rasn_runtime_partition_hash(keyed));
+    ::dsn::rasn::rpc::blackboard_get_request body;
+    body.key = "topic";
+    ::dsn::rasn::rpc::blackboard_request request;
+    request.__set_metadata(make_runtime_request_metadata());
+    request.__set_operation(::dsn::rasn::rpc::blackboard_operation::get);
+    request.__set_get(body);
+    EXPECT_EQ(5912253781582851172ULL, rasn_runtime_partition_hash(request));
 
-    rasn_runtime_request empty_shard_key;
-    empty_shard_key.module = "blackboard";
-    EXPECT_EQ(14695981039346656037ULL,
-              rasn_runtime_partition_hash(empty_shard_key));
-
-    rasn_runtime_request unkeyed_control;
-    unkeyed_control.module = "agent_control_plane";
-    EXPECT_EQ(0u, rasn_runtime_partition_hash(unkeyed_control));
-
-    rasn_runtime_request expire_human;
-    expire_human.module = "human_interaction";
-    expire_human.operation = "expire";
-    expire_human.key = "*";
-    EXPECT_TRUE(rasn_runtime_request_is_partition_fanout(expire_human));
-    expire_human.route_partition = 3;
-    EXPECT_EQ(3u, rasn_runtime_partition_hash(expire_human));
-
-    rasn_runtime_request open_human = expire_human;
-    open_human.operation = "open";
-    EXPECT_FALSE(rasn_runtime_request_is_partition_fanout(open_human));
-
-    rasn_runtime_request human_snapshot = expire_human;
-    human_snapshot.operation = "snapshot";
-    EXPECT_FALSE(rasn_runtime_request_is_partition_fanout(human_snapshot));
-}
-
-TEST(rasn_runtime, ingress_guard_admits_hosted_shards_and_rejects_others)
-{
-    rasn_runtime_request request;
-    request.module = "agent_message_bus";
-    request.operation = "publish";
-    request.key = "topic";
-
-    // An empty hosted set means the service owns the whole module, so every
-    // request is admitted regardless of the routing hint it carries.
-    request.route_partition = 5;
+    request.metadata.__set_route_partition(7);
+    EXPECT_EQ(7u, rasn_runtime_partition_hash(request));
     EXPECT_TRUE(rasn_runtime_service_hosts_request(request, {}));
-
-    // With no shard_count configured in the unit-test host the module is
-    // single-partition, so requests resolve to shard 0. A service that hosts shard
-    // 0 admits them; one that hosts only other shards rejects them.
     EXPECT_TRUE(rasn_runtime_service_hosts_request(request, {0}));
-    EXPECT_TRUE(rasn_runtime_service_hosts_request(request, {0, 2}));
     EXPECT_FALSE(rasn_runtime_service_hosts_request(request, {1}));
-    EXPECT_FALSE(rasn_runtime_service_hosts_request(request, {1, 2, 3}));
 
-    // The guard keys off the resolved partition, not the module name, so an
-    // unsharded module (always partition 0) is admitted only by a set covering 0.
-    rasn_runtime_request unsharded;
-    unsharded.module = "agent_control_plane";
-    unsharded.operation = "describe";
-    EXPECT_TRUE(rasn_runtime_service_hosts_request(unsharded, {}));
-    EXPECT_TRUE(rasn_runtime_service_hosts_request(unsharded, {0}));
-    EXPECT_FALSE(rasn_runtime_service_hosts_request(unsharded, {4}));
+    ::dsn::rasn::rpc::human_expire_request expire_body;
+    expire_body.now_ms = 10;
+    ::dsn::rasn::rpc::human_interaction_rpc_request expire;
+    expire.__set_metadata(make_runtime_request_metadata());
+    expire.metadata.__set_request_id("typed-expire-1");
+    expire.__set_operation(::dsn::rasn::rpc::human_interaction_operation::expire);
+    expire.__set_expire(expire_body);
+    EXPECT_TRUE(runtime_request_is_partition_fanout(expire));
+    EXPECT_EQ(RPC_RASN_HUMAN_INTERACTION_WRITE, rasn_runtime_rpc_code_for_request(expire));
+
+    ::dsn::rasn::rpc::wire_human_interaction_request open_body;
+    open_body.request_id = "human-route";
+    ::dsn::rasn::rpc::human_interaction_rpc_request open;
+    open.__set_metadata(make_runtime_request_metadata());
+    open.metadata.__set_request_id("human-open");
+    open.__set_operation(::dsn::rasn::rpc::human_interaction_operation::open);
+    open.__set_open(open_body);
+    EXPECT_EQ("human-route", runtime_request_key(open));
+
+    ::dsn::rasn::rpc::human_answer_request answer_body;
+    answer_body.request_id = "human-route";
+    ::dsn::rasn::rpc::human_interaction_rpc_request answer;
+    answer.__set_metadata(make_runtime_request_metadata());
+    answer.metadata.__set_request_id("human-answer");
+    answer.__set_operation(::dsn::rasn::rpc::human_interaction_operation::answer);
+    answer.__set_answer(answer_body);
+    EXPECT_EQ(runtime_request_key(open), runtime_request_key(answer));
+    EXPECT_EQ(rasn_runtime_partition_hash(open), rasn_runtime_partition_hash(answer));
+
+    ::dsn::rasn::rpc::human_cancel_request cancel_body;
+    cancel_body.request_id = "human-route";
+    ::dsn::rasn::rpc::human_interaction_rpc_request cancel;
+    cancel.__set_metadata(make_runtime_request_metadata());
+    cancel.metadata.__set_request_id("human-cancel");
+    cancel.__set_operation(::dsn::rasn::rpc::human_interaction_operation::cancel);
+    cancel.__set_cancel(cancel_body);
+    EXPECT_EQ(runtime_request_key(open), runtime_request_key(cancel));
+    EXPECT_EQ(rasn_runtime_partition_hash(open), rasn_runtime_partition_hash(cancel));
+
+    ::dsn::rasn::rpc::human_find_request find_body;
+    find_body.request_id = "human-route";
+    ::dsn::rasn::rpc::human_interaction_rpc_request find_human;
+    find_human.__set_metadata(make_runtime_request_metadata());
+    find_human.__set_operation(::dsn::rasn::rpc::human_interaction_operation::find);
+    find_human.__set_find(find_body);
+    EXPECT_EQ(runtime_request_key(open), runtime_request_key(find_human));
+    EXPECT_EQ(rasn_runtime_partition_hash(open), rasn_runtime_partition_hash(find_human));
+    EXPECT_FALSE(runtime_request_is_partition_fanout(find_human));
+
+    ::dsn::rasn::rpc::human_interaction_rpc_request snapshot;
+    snapshot.__set_metadata(make_runtime_request_metadata());
+    snapshot.__set_operation(::dsn::rasn::rpc::human_interaction_operation::snapshot);
+    EXPECT_FALSE(runtime_request_is_partition_fanout(snapshot));
+
+    ::dsn::rasn::rpc::human_pending_request pending_body;
+    pending_body.requester = "requester";
+    ::dsn::rasn::rpc::human_interaction_rpc_request pending;
+    pending.__set_metadata(make_runtime_request_metadata());
+    pending.__set_operation(::dsn::rasn::rpc::human_interaction_operation::pending);
+    pending.__set_pending(pending_body);
+    EXPECT_FALSE(runtime_request_is_partition_fanout(pending));
+
+    snapshot.metadata.__set_route_partition(2);
+    EXPECT_TRUE(rasn_runtime_service_hosts_request(snapshot, {2}));
+    EXPECT_FALSE(rasn_runtime_service_hosts_request(snapshot, {1}));
 }
 
 // --- parse_chat_completion: provider response interpretation -----------------

@@ -43,9 +43,13 @@ set(MY_PROJ_LIBS "")
 
 set(MY_PROJ_LIB_PATH "")
 
+set(MY_SERIALIZATION_TYPE "thrift")
+
 set(MY_BINPLACES "")
 
 dsn_add_static_library()
+
+add_dependencies(rasn thrift)
 
 if(TARGET dsn.dist.service.meta_server_lib)
     # PUBLIC so the guard propagates to every consumer of the rasn library

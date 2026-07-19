@@ -3415,6 +3415,56 @@ Validation:
 - [x] Smoke CodePilot and SREPilot directory startup context loading.
 - [x] `git diff --check`.
 
+## Phase 82: Generated typed runtime-module RPC schemas (fd5)
+
+Status: Implemented.
+
+Scope:
+
+- `rasn_runtime.thrift`, generated `rasn_runtime_types.{h,cpp}` and
+  `rasn_runtime.types.h`
+- `runtime_rpc_schema.{h,cpp}`
+- `runtime_provider.{h,cpp}`, `schema_manifest.cpp`, `CMakeLists.txt`
+- `tests/rasn_unit_tests.cpp`
+- `README.md`, `docs/DESIGN.md`, `docs/DISTRIBUTED_RUNTIME.md`
+
+Work items:
+
+- [x] Replace the generic runtime request/response and string field-map payloads
+  with generated, versioned request/response pairs for all eleven modules.
+- [x] Preserve the application-facing `rasn_runtime` facade, configuration,
+  local/distributed/hybrid placement, routing, resilience, and task-code names.
+- [x] Validate version ranges, tagged bodies, natural keys, bounds, request IDs,
+  partition routing, and deterministic replicated mutations with structured typed
+  errors.
+- [x] Route LPC, RPC, service dispatch, fan-out, and native type-1 replication
+  through the generated types and rDSN Thrift serializer.
+- [x] Build dedup signatures from canonical typed request serialization and store
+  typed cached responses.
+- [x] Write version-2 typed checkpoints while retaining version-1 field-map
+  records solely as one-way persistence migration input.
+- [x] Publish per-module `.v1` request/response names through schema discovery.
+- [x] Add focused typed validation, serialization, routing, and replicated-dedup
+  coverage sources.
+- [x] Document the coordinated wire cutover, structured errors, evolution rules,
+  persistence compatibility, and regeneration workflow.
+
+Compatibility:
+
+- All rASN runtime clients/services upgrade together; old generic-wire peers are
+  intentionally unsupported.
+- Compatible future changes append optional fields with new Thrift field IDs and
+  widen the explicit compatibility range. Field IDs are never reused.
+- Existing application calls and deployment configuration remain valid.
+
+Validation:
+
+- [x] Build `rasn`.
+- [x] Compile and link `rasn.unit_tests` without executing it.
+- [x] Build `codepilot` and `srepilot`.
+- [x] Regenerate artifacts and inspect determinism.
+- [x] Run final diff and removed-wire searches.
+
 ## Dependency order
 
 ```text
@@ -3498,6 +3548,8 @@ Phase 1 task model
   -> Phase 78 unified local runtime output layout
   -> Phase 79 model cost-budget arithmetic hardening
   -> Phase 80 shared application CLI startup UX
+  -> Phase 81 shared CLI help and workspace context refinement
+  -> Phase 82 generated typed runtime-module RPC schemas
 ```
 
 Some phases can overlap after Phase 3, but the public message model and generic

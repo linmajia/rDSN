@@ -59,6 +59,22 @@ typedef void (*config_file_change_notifier)(configuration_ptr);
 
 extern configuration_ptr get_main_config();
 
+enum class configuration_value_state
+{
+    missing,
+    defaulted,
+    explicit_value
+};
+
+struct configuration_value_snapshot
+{
+    configuration_value_state state = configuration_value_state::missing;
+    std::string value;
+    std::string description;
+    int line = 0;
+    bool section_existed = false;
+};
+
 class configuration
 {
 public:
@@ -96,6 +112,15 @@ public:
 
     void set(const char* section, const char* key, const char* value, const char* dsptr);
 
+    // These lock-safe operations never create or validate defaults. A snapshot
+    // restores the targeted key, its metadata, and its original section-existence
+    // state. Unrelated keys added concurrently are not rolled back.
+    configuration_value_snapshot query_value(const char* section, const char* key);
+    configuration_value_snapshot set_with_snapshot(
+        const char* section, const char* key, const char* value, const char* dsptr);
+    void restore_snapshot(
+        const char* section, const char* key, const configuration_value_snapshot& snapshot);
+
     void register_config_change_notification(config_file_change_notifier notifier);
 
     bool has_section(const char* section);
@@ -115,6 +140,8 @@ public:
 private:
     bool get_string_value_internal(const char* section, const char* key, const char* default_value, const char** ov, const char* dsptr);
     bool load_include(const char* file, const char* arguments);
+    configuration_value_snapshot query_value_locked(const char* section, const char* key);
+    void set_value_locked(const char* section, const char* key, const char* value, const char* dsptr);
 
 private:
     struct conf

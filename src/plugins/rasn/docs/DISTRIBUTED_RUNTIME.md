@@ -66,9 +66,9 @@ flowchart TD
     subgraph Cluster["Module service nodes"]
         REG["rasn.registry<br/>(capability leases)"]
         R -->|resolve rasn.runtime.<module>| REG
-        R -->|RPC envelope| SVC1["rasn.runtime<br/>(aggregate, :27107)"]
-        R -->|RPC envelope| SVC2["rasn.runtime.budget<br/>(standalone, :27115)"]
-        R -->|RPC envelope| SVCn["rasn.runtime.blackboard<br/>(standalone, :27117)"]
+        R -->|typed Thrift RPC| SVC1["rasn.runtime<br/>(aggregate, :27107)"]
+        R -->|typed Thrift RPC| SVC2["rasn.runtime.budget<br/>(standalone, :27115)"]
+        R -->|typed Thrift RPC| SVCn["rasn.runtime.blackboard<br/>(standalone, :27117)"]
         SVC1 -->|register/heartbeat| REG
         SVC2 -->|register/heartbeat| REG
         SVCn -->|register/heartbeat| REG
@@ -96,46 +96,44 @@ Layers:
 - **State — `rasn_runtime_service_store`.** Owns the actual module objects. It is
   the authority for module state and is where server-side idempotency lives.
 
-## 4. The module API contract (envelope)
+## 4. Generated, typed module RPC contracts
 
-Every operation, regardless of provider, is expressed as one request/response pair
-so a call can travel unchanged over a direct call, an LPC, or an RPC:
+`rasn_runtime.thrift` is the authoritative wire contract. The repository's
+`dsn.cg.sh` workflow generates `rasn_runtime_types.{h,cpp}` and
+`rasn_runtime.types.h`; rDSN serializes those generated classes with
+`DSF_THRIFT_BINARY`. Each of the eleven modules has a distinct request/response
+pair, for example `resource_budget_request` / `resource_budget_response`.
 
-```cpp
-struct rasn_runtime_request {
-    uint32_t    schema_version;
-    std::string module;       // e.g. "resource_budget"
-    std::string operation;    // e.g. "reserve", "put", "mirror_state:usage"
-    std::string key;
-    std::string payload;      // module-specific encoded fields
-    std::string request_id;   // optional idempotency id (see §7)
-    uint32_t    route_partition; // optional exact shard for fan-out reads
-    std::string auth_token;   // optional RPC shared-token credential (see §9)
-};
+Each request contains common versioned metadata, a module-specific operation enum,
+and exactly one matching optional typed body. Each response contains common
+metadata, a structured status, the echoed operation, and an operation-specific
+typed result. There is no module-name string, operation string, generic payload,
+or field map on the RPC path.
 
-struct rasn_runtime_response {
-    uint32_t    schema_version;
-    bool        ok;
-    std::string error;
-    std::string module;
-    std::string operation;
-    std::string key;
-    std::string payload;
-};
-```
+Common request metadata carries `wire_version`, `min_compatible_version`, optional
+`request_id`, `route_partition`, `auth_token`, and `trace_id`. Structured failures
+use `invalid_request`, `unsupported_version`, `not_found`, `conflict`,
+`unauthorized`, `misrouted`, `unavailable`, or `internal`. Validation rejects an
+unsupported version range, an unknown operation, a missing or extra tagged body,
+invalid ranges, oversized collections/text, inconsistent natural keys, or a
+mutation without a request id.
 
-Design notes:
+Same-width signed Thrift integer fields carry C++ unsigned domain values
+bit-for-bit, preserving the full existing `uint32_t`/`uint64_t` facade range.
+Typed mutations always receive a stable request id; the existing
+`rasn_runtime_idempotency_enabled` key remains accepted, but cannot disable that
+protocol requirement.
 
-- **Coarse-grained on purpose.** The network is a leaky abstraction: latency,
-  partial failure, and reordering are real. Operations are whole module actions
-  (reserve a budget, put a blackboard entry), not chatty getters/setters, so one
-  app action is one round trip.
-- **Serialization is append-only.** `marshall`/`unmarshall` write fields in order;
-  new fields (like `request_id`, `route_partition`, and `auth_token`) are
-  appended at the end so the encoding stays forward-compatible within a build.
-- **Typed schemas are future work.** Today the payload is a generic encoded field
-  map. The roadmap replaces it with generated per-module RPC schemas while keeping
-  the same envelope shape.
+The current wire major is version 1. This fd5 migration is a coordinated cutover:
+all runtime clients and services must be upgraded together, and old generic-wire
+peers are rejected. Future compatible revisions append optional Thrift fields with
+new field IDs and widen the explicit compatibility range; field IDs are never
+reused. Incompatible semantic changes require a new major version and adapters.
+
+The public `rasn_runtime` facade, configuration keys, provider modes, endpoint
+resolution, and `RPC_RASN_<MODULE>` / `_WRITE` task codes are unchanged. Local and
+LPC calls pass the same generated objects without serializing; remote calls use the
+generated rDSN Thrift serializer.
 
 ## 5. Provider model
 
@@ -193,7 +191,10 @@ Design notes:
   before a leading-dash query prefix or checkpoint/recovery path. Locally routed
   hybrid modules are intentionally not mirrored, so
   flipping a module from `local` to `remote` is still a **cold migration** unless
-  an operator exports/imports that module's prior local state.
+  an operator exports/imports that module's prior local state. A standalone
+  service configured with `<module>_hosted_shards` decodes each mirrored sharded
+  record's natural key during hydration and loads only records owned by those
+  partitions; whole-module and single-partition hosts continue loading all records.
 
 ## 6. Endpoints, placement, and topology
 
@@ -211,18 +212,20 @@ Design notes:
   can therefore point at an explicitly configured service, a registry-selected
   live service, a standalone role, or a URI-backed rDSN cluster independently.
 - **Shard-aware placement.** Modules whose descriptor is `sharded`
-  (`agent_message_bus`, `resource_budget`, `blackboard`) can set
+  (`agent_message_bus`, `resource_budget`, `blackboard`, `human_interaction`) can set
   `<module>_shard_count > 1`. Mutating and keyed read operations route by the
-  module's natural key (`message_id`, budget `scope`, blackboard `key`) using the
-  existing stable FNV-1a hash, including the empty string so its historical
-  hash/modulo placement is unchanged. That full hash is now carried in the rDSN RPC
-  `partition_hash`: when the endpoint is a module-level `dsn://` URI, the core
-  invokes `dist::partition_resolver` to map it to the current partition replica
-  group and invalidates the resolver cache after access failure. Static and
-  registry endpoints retain deterministic hash/modulo selection as compatibility
-  fallbacks because they are not meta-server tables. Fan-out reads such as
-  snapshots query every URI-backed partition even though all share one logical
-  URI, or each distinct static endpoint, then merge the typed results. Static
+  module's natural key (`message_id`, budget `scope`, blackboard `key`, or
+  human-interaction `request_id`) using the existing stable FNV-1a hash, including
+  the empty string so its historical hash/modulo placement is unchanged. That full
+  hash is now carried in the rDSN RPC `partition_hash`: when the endpoint is a
+  module-level `dsn://` URI, the core invokes `dist::partition_resolver` to map it
+  to the current partition replica group and invalidates the resolver cache after
+  access failure. Static and registry endpoints retain deterministic hash/modulo
+  selection as compatibility fallbacks because they are not meta-server tables.
+  Message-bus `snapshot`, resource-budget `describe`, blackboard `snapshot`, and
+  human-interaction `expire`, `snapshot`, and requester-filtered `pending` query
+  every URI-backed partition even though all share one logical URI, or each
+  distinct static endpoint, then merge the typed results. Static
   per-shard endpoint knobs are
   `<module>_shard_<n>_{uri,host,port}` with the normal per-module endpoint as the
   fallback and remain authoritative per-shard overrides. Resolver-backed clients
@@ -487,16 +490,17 @@ checkpoints; they do not depend on the `rasn.state` mirror.
 
 | Model | Meaning | Modules |
 | --- | --- | --- |
-| `singleton` | One authoritative instance; small control-surface state. | `human_interaction`, `sandbox_runtime` |
-| `sharded` | Partition state by a natural key; scale horizontally. | `agent_message_bus` (topic), `resource_budget` (scope), `blackboard` (key) |
+| `singleton` | One authoritative instance; small control-surface state. | `sandbox_runtime` |
+| `sharded` | Partition state by a natural key; scale horizontally. | `agent_message_bus` (message id), `resource_budget` (scope), `blackboard` (key), `human_interaction` (request id) |
 | `replicated` | Ownership/ledger state that needs consensus for correctness/HA. | `agent_control_plane`, `task_orchestration_kernel`, `determinism_ledger`, `capability_directory`, `recovery_supervisor`, `contract_verifier` |
 
 Deterministic partition routing spreads sharded keys across independent module
 partitions. A module-level `dsn://` endpoint delegates key-hash-to-replica-group
 resolution, failed-access invalidation, and retry to rDSN's native
-`partition_resolver` (§6). The checked-in profile uses four partitions for
-`agent_message_bus`, `resource_budget`, and `blackboard`, one partition for every
-other module, and three replicas per partition.
+`partition_resolver` (§6). The checked-in profile uses four partitions for `agent_message_bus`,
+`resource_budget`, and `blackboard`; `human_interaction` remains sharding-capable
+but defaults to one partition for compatibility. Every other module also uses one
+partition, with three replicas per partition.
 
 `describe_topology()` reports `actual=rdsn_type1_replica_group` for remote modules
 when `rasn_runtime_native_replication_enabled = true` (with per-module overrides
@@ -574,8 +578,8 @@ for mixed deployments); standalone/local modules continue to report
   `client_max_attempts` at least as high as the frontend count.
 - **Cross-node standalone-module auth.** Distributed runtime module RPC can require a shared
   service token with `[rasn.service] rasn_runtime_auth_enabled = true` and
-  a deployment-supplied `rasn_runtime_auth_token`. Remote providers stamp the token onto the
-  envelope before an RPC; `rasn_runtime_rpc_service` verifies it before dispatch
+  a deployment-supplied `rasn_runtime_auth_token`. Remote providers stamp the token into typed
+  request metadata before an RPC; `rasn_runtime_rpc_service` verifies it before dispatch
   and clears it before module handlers see the request. Invalid or missing tokens
   are rejected as normal runtime responses and counted by
   `rasn_runtime_auth_rejected_total`. Local/direct and intra-node LPC paths bypass
@@ -727,7 +731,8 @@ remain keyed by logical module URI plus partition because the public call surfac
 does not expose the resolved physical replica; this is deliberate because rDSN
 already invalidates and retries physical replicas before returning failure.
 `config.rasn.runtime.replicated.ini` wires this path to eleven native type-1
-tables, including matching four-partition counts for the three sharded modules;
+tables, including matching four-partition counts for three sharded modules and
+an explicit single-partition default for sharding-capable `human_interaction`;
 those tables provide quorum durability, primary failover, checkpoint learning,
 and meta-server placement (§13.15). Standalone URI/static endpoints retain the
 single-writer behavior described in §8.
@@ -912,7 +917,9 @@ codepilot.exe serve config.rasn.ini "rasn.state;resource_budget"
   failover for every registry call family. Remaining deployment evidence is a
   multi-process ZooKeeper frontend-failover scenario in the Linux harness.
 - Multi-process integration tests for the distributed/hybrid RPC paths.
-- Generated typed RPC schemas per module (replace the generic envelope payload).
+- **Generated typed RPC schemas — DELIVERED:** `rasn_runtime.thrift` defines
+  versioned request/response pairs for all eleven modules; generated Thrift
+  serialization is used across LPC, RPC, and native replication paths (§4).
 - **State lifecycle tooling — DELIVERED:** watermarks are written and verified;
   `state compact` checkpoints the configured recovery image and compacts only its
   covered journal; custom checkpoint exports retain that journal; `state migrate`
@@ -935,7 +942,7 @@ codepilot.exe serve config.rasn.ini "rasn.state;resource_budget"
  mirrors.
 - URI-backed multi-node cluster coverage beyond the automated explicit,
   registry-discovery, and optional ZooKeeper ownership scenarios.
-- End-to-end trace propagation across core/module RPC envelopes — **DONE** (§13.4).
+- End-to-end trace propagation across core/module typed RPC metadata — **DONE** (§13.4).
 - **Robustness hardening — DELIVERED (§13.8):** cold multi-process start no longer
   aborts on a state-hydration race (readiness retry), the `ERR_UNKNOWN` diagnostic-log
   storm is cleared in both modes, and LLM chat-completion parsing handles
@@ -954,7 +961,9 @@ which gaps are resolved in code, mitigated client-side, or tracked as framework 
 
 | Concern | Location |
 | --- | --- |
-| Facade + provider base, envelopes, descriptors | `runtime_provider.h` |
+| Facade + provider base, typed dispatch, descriptors | `runtime_provider.h` |
+| Authoritative runtime wire schema and generated types | `rasn_runtime.thrift`, `rasn_runtime_types.{h,cpp}`, `rasn_runtime.types.h` |
+| Wire/domain conversion, validation, and compatibility rules | `runtime_rpc_schema.{h,cpp}` |
 | Providers (`local`/`distributed`/`hybrid`), transport helpers, breaker, dedup, service store, apps | `runtime_provider.cpp` |
 | Core-service client RPC resilience (breaker + idempotency-aware retries) | `rpc_resilience.h` / `rpc_resilience.cpp` |
 | Distributed coordination facade (ownership election + cluster-shared state) reusing rDSN `distributed_lock_service` / `meta_state_service` | `coordination_service.h` / `coordination_service.cpp` |
@@ -992,7 +1001,7 @@ bespoke mechanism, the audit names the rDSN facility that should back it.
 | 1.1 | P0 | **Stateful modules execute in single-writer memory.** Running >1 active writer for the same module/shard is split-brain; durable failover also requires an authoritative mirror. | **RESOLVED (code/config)** — standalone roles retain the default-off ownership gate (§13.7), while `config.rasn.runtime.replicated.ini` deploys all eleven modules as direct rDSN type-1 tables with quorum mutation commit, resolver-backed partitions, checkpoint learning, and primary failover (§13.15). `rasn.state.replicated` remains available for standalone mirror durability (§13.13) |
 | 1.2 | P0 | **Core services had no RPC resilience.** `rasn.state` / `rasn.workflow` / `rasn.observability` clients made one-shot RPCs — no breaker, no retry — while the module path was fully hardened. A single transient blip failed the call. | **RESOLVED (code)** — §7.1, `rpc_resilience.h`, wrapped in `agent_services.cpp` |
 | 1.3 | P0 | **Registry discovery was an in-memory SPOF on the request path.** Routing resolved live endpoints through one process-local `rasn.registry`; restart lost dynamic membership and one frontend failure interrupted discovery. | **RESOLVED (code/config)** — §9/§13.14: opt-in ZooKeeper-backed `meta_state_service` records, fenced active-writer election over `distributed_lock_service`, shared reads on every frontend, strict backend errors, and rDSN group-address failover/retry across `registry_addresses`. Local map + legacy one-address behavior remain the default |
-| 1.4 | P1 | **RPC envelopes carry no end-to-end trace id.** `agent_request`/`response` carry `trace_id`, but the runtime-module envelope (`make_module_request`) didn't propagate it, so a call couldn't be followed across nodes in logs. | **RESOLVED (code)** — §13.4; `trace_id` added to the runtime-module envelope (EOF-safe), stamped from an ambient scope on egress, restored/echoed on ingress |
+| 1.4 | P1 | **Runtime RPC carried no end-to-end trace id.** `agent_request`/`response` carried `trace_id`, but module calls did not propagate it, so a call could not be followed across nodes in logs. | **RESOLVED (code)** — §13.4; generated request/response metadata carries `trace_id`, stamped from an ambient scope on egress and restored/echoed on ingress |
 | 1.5 | P1 | **Resilience/quota/dedup state is per serving process.** Breaker, dedup, admission, and rate state live on whichever node serves the RPC; there is no shared view, so protection is per-replica, not cluster-global. | **PARTIALLY RESOLVED (code)** — all four circuit-breaker families can use the fenced coordination adapter (§13.7). Native module tables now replicate deterministic quota mutations and a bounded FIFO dedup window with each partition, including checkpoints (§13.15). Admission, rate/cost, and process-wide overload authorities remain per process because they need leased capacity or transactional allocation. |
 | 1.6 | P2 | **Core service endpoints are bound at construction.** Some core clients resolve their peer once, limiting failover for non-registry paths. | **PARTIALLY RESOLVED** — registry clients now bind one durable rDSN group whose leader changes in place; other core-service addresses still need resolver/group-based rebinding |
 
@@ -1010,17 +1019,15 @@ where rASN grew a parallel mechanism that an existing rDSN facility should own:
 | State replication / HA | standalone journaled store remains available; optional `rasn.state.replicated` plus eleven direct runtime-module tables | `replicated_service_app_type_1` (layer-2 replication SM: `checkpoint`/`learn`/`apply`) | **DELIVERED (§13.13/§13.15)** |
 | Partition routing | stable application key hash with static/registry shard fallbacks; native module tables consume the same hash | `dist::partition_resolver` (partition→endpoint resolution with config/meta integration) | **DELIVERED (§6/§13.15)** |
 | Discovery + failure detection | local map by default; opt-in shared descriptor/lease records with fenced primary and frontend group | `meta_state_service` + `distributed_lock_service` on `ext/zookeeper`; rDSN group address for client failover | **DELIVERED (§13.14)** |
-| Wire schema / IDL | generic envelope with a field-map payload + `schema_manifest` codegen | Thrift IDL + `dsn.tools` codegen (typed, versioned RPC structs) | DOCUMENTED |
+| Wire schema / IDL | generated per-module request/response pairs with tagged typed bodies and structured errors | Thrift IDL + `dsn.tools` codegen (typed, versioned RPC structs) | **DELIVERED (§4)** |
 
-The coordination module (§13.7), replicated state backend (§13.13), and direct
-runtime tables (§13.15) prove this
+The coordination module (§13.7), replicated state backend (§13.13), direct
+runtime tables (§13.15), and generated module wire contracts (§4) prove this
 reuse pattern is viable end-to-end: the
 `rDSN.dist.service` ext plugin builds and links into rASN under a full
 `--build_plugins` checkout, and its `distributed_lock_service`/`meta_state_service`
-providers and type-1 replication applications are consumed directly. The primary
-remaining data-plane migration is the generic field-map wire schema, which stays
-explicitly sequenced rather than being approximated with another rASN-local RPC
-framework.
+providers, type-1 replication applications, Thrift serializer, and code generator
+are consumed directly rather than being approximated with rASN-local equivalents.
 
 ### 13.3 Lens 3 — Missing critical modules
 
@@ -1057,27 +1064,21 @@ followed across nodes. As built:
    `rasn_runtime_trace_scope` (declared in `runtime_provider.h`). An operation
    origin installs a scope for the duration of the call; nested module requests
    inherit it. An empty id is a no-op, so callers install unconditionally.
-2. **Stamp on egress.** `make_module_request(...)` reads the ambient trace id and
-   stamps it onto the envelope. A `trace_id` field was appended to both
-   `rasn_runtime_request` and `rasn_runtime_response`, unmarshalled EOF-safe
-   exactly like `route_partition`/`auth_token`, so old and new peers interoperate.
+2. **Stamp on egress.** Every typed request builder copies the ambient trace id
+   into generated request metadata. The typed response metadata echoes it.
 3. **Restore + echo on ingress.** `rasn_runtime_rpc_service::reply_module_request`
-   installs a `rasn_runtime_trace_scope` from the incoming envelope before
+   installs a `rasn_runtime_trace_scope` from incoming typed metadata before
    dispatch, so server-side logs and any nested module calls share the id. The
-   central response builder `make_rasn_runtime_response` echoes `request.trace_id`
-   onto every response (success and error), so a caller can correlate the reply.
+   shared response-metadata builder echoes `request.metadata.trace_id` onto every
+   response (success and error), so a caller can correlate the reply.
 4. **Origins.** `rasn_coordinator_service::invoke` and `rasn_service_graph::invoke`
    seed the scope from the operation's `agent_request.trace_id`, falling back to
    `nucleus_runtime::trace_id()`, so module RPCs issued while coordinating share
    one end-to-end trace.
 
-Coverage: `request_marshalling_round_trips_request_metadata` (extended),
-`response_marshalling_round_trips_trace_id`,
-`trace_scope_sets_and_restores_ambient_trace_id`, and
-`dispatch_echoes_request_trace_id_onto_response` in `tests/rasn_unit_tests.cpp`
-assert wire round-trip, legacy back-compat (empty on decode), scope
-nesting/restore, and end-to-end echo. The change is purely additive to the wire
-and logs — no behavior change.
+Focused typed-schema coverage in `tests/rasn_unit_tests.cpp` asserts metadata
+round-trip and validation together with ambient scope nesting/restoration. The
+typed response metadata preserves the end-to-end correlation contract.
 
 The id now flows and is echoed end-to-end; surfacing it as an explicit label on
 individual resilience/dedup/auth metrics and log lines is a small additive
@@ -1128,17 +1129,15 @@ Resolved/mitigated **in code and validated** (committed as
 - Config knobs `rasn_core_rpc_*` (`[rasn.service]`) in the shared `config.rasn.ini`.
 - Focused unit coverage: `rasn_rpc_resilience` in `tests/rasn_unit_tests.cpp`
   (pre-apply retry, idempotency-aware timeout policy, breaker short-circuit).
-- End-to-end trace propagation across the runtime-module envelope (§13.4, finding
-  1.4) — `trace_id` added to the request/response envelope (EOF-safe), an ambient
-  `rasn_runtime_trace_scope` stamped on egress and restored/echoed on ingress, with
-  four focused tests for wire round-trip, legacy back-compat, scope nesting, and
-  dispatch echo.
+- End-to-end trace propagation across typed runtime-module metadata (§13.4,
+  finding 1.4) — `rasn_runtime_trace_scope` is stamped on egress and
+  restored/echoed on ingress.
 
 Everything else above is either landed in the coordination (§13.7), replicated
 state (§13.13), HA discovery (§13.14), resolver-aware routing (§6), and direct
 module replication (§13.15) rounds or DOCUMENTED with its rDSN-native target
-because it depends on a larger migration such as IDL codegen. These sections are
-the source of truth for §11.
+because it depends on a larger migration. Typed IDL/codegen is delivered in fd5
+and documented in §4. These sections are the source of truth for §11.
 
 ### 13.7 Distributed coordination module (findings 1.1 ownership, 1.5 shared state) — RESOLVED (code)
 
@@ -1885,13 +1884,14 @@ greater-epoch takeover, and validates online retention against the real provider
 
 `config.rasn.runtime.replicated.ini` deploys every common runtime module as its
 own rDSN `replicated_service_app_type_1` table. Separate tables are intentional:
-the three naturally sharded modules need four partitions in the reference
-profile, while the other modules use one, and every module needs an independent
-placement, mutation-log, checkpoint, learning, and failover boundary. Every
-partition has three replicas in the development profile.
+message bus, budget, and blackboard use four partitions in the reference profile;
+sharding-capable human interaction and the remaining modules use one. Every
+module needs an independent placement, mutation-log, checkpoint, learning, and
+failover boundary. Every partition has three replicas in the development profile.
 
-The wire API remains the common `rasn_runtime_request`/`response` facade, but
-task classification is now explicit:
+The application API remains the common `rasn_runtime` facade. On the wire each
+module uses its generated request/response pair, and task classification is
+explicit:
 
 - Existing `RPC_RASN_<MODULE>` codes are reads. Eleven parallel
   `RPC_RASN_<MODULE>_WRITE` codes are statically marked
@@ -1901,10 +1901,8 @@ task classification is now explicit:
   write channel, and a request whose normalized partition does not match the
   handler GPID. This prevents an old or misrouted client from bypassing quorum
   commit.
-- For rolling standalone upgrades only, a new client retries a mutation on the
-  legacy read code when the write code returns exactly
-  `ERR_HANDLER_NOT_FOUND`. Ambiguous or application errors never trigger that
-  compatibility replay.
+- The fd5 typed-wire migration has no old-peer fallback. Clients and services are
+  upgraded together; incompatible handlers or wire versions fail explicitly.
 
 Replica apply is deterministic. Clients materialize generated IDs and timestamps
 before sending mutations; the replica rejects operations that still require
@@ -1915,24 +1913,28 @@ the original result instead of applying twice. Native eviction uses a
 protocol-fixed capacity of 8192; app startup fails unless the visible config
 matches that constant, so node-local tuning cannot make replicas diverge.
 
-The `human_interaction` singleton is a live replicated queue rather than a
-checkpoint-only mirror. The runtime facade routes open, answer, cancel, and
-deadline-expiry mutations through its write code, and routes find, requester-
-filtered pending, snapshot, and describe operations through its read code.
-Request IDs and transition timestamps are materialized by the client facade
-before replication; checkpoint hydration remains an internal recovery-only
-operation. It is one partition in the reference profile. Global expiry,
-snapshot, and pending operations nevertheless use the partition fan-out path;
-replicated ingress requires each expiry write to carry its explicit partition.
-This prevents a future shard-count change from silently expiring only the shard
-selected by the literal `"*"` key.
+The `human_interaction` module is a live, request-id-sharded replicated queue
+rather than a checkpoint-only mirror. The runtime facade key-routes open, answer,
+cancel, and find, routes deadline-expiry mutations through its write code, and
+routes requester-filtered pending, snapshot, and describe operations through its
+read code. Request IDs and transition timestamps are materialized by the client
+facade before replication; checkpoint hydration remains an internal recovery-only
+operation. It is one partition in the reference profile for compatibility.
+Global expiry, snapshot, and pending operations use the partition fan-out path
+and merge typed counts/records; replicated ingress requires each expiry write to
+carry its explicit partition. This keeps whole-module facade semantics intact
+when operators raise `human_interaction_shard_count`.
 
 Checkpoint files are named `rasn-runtime-checkpoint.<decree>` in each partition
 data directory and reuse the validated `state_store` snapshot format without
-enabling its standalone journal. Every image carries a required module/schema/
-dedup-capacity/GPID/decree manifest plus a record count and content digest, so
-truncation, a wrong table/partition, or inconsistent replica capacity fails
-validation instead of becoming an empty store. Checkpoint record keys use a
+enabling its standalone journal. New images use manifest version 2 and persist
+generated Thrift module records and typed cached responses; the dedup signature
+includes module identity plus canonical Thrift-binary request bytes. Existing
+version-1 field-map state records remain readable only as one-way persistence
+migration input and can never re-enter an RPC. Every image carries a required
+module/schema/dedup-capacity/GPID/decree manifest plus a record count and content
+digest, so truncation, a wrong table/partition, or inconsistent replica capacity
+fails validation instead of becoming an empty store. Checkpoint record keys use a
 length-prefixed full-byte encoding and are checked for collisions before write.
 `sync_checkpoint()` snapshots module state and dedup together;
 `get_checkpoint()` exports the latest durable image;
@@ -1964,5 +1966,4 @@ differently across replicas. Native apps therefore fail startup when it is
 enabled; use network/transport identity and isolation until authentication can be
 validated before replication. Remaining work is deployment evidence rather than
 an alternate consensus implementation: automate real multi-host primary
-failover/checkpoint transfer, add standalone-to-table migration tooling, and
-generate typed module RPC schemas.
+failover/checkpoint transfer and add standalone-to-table migration tooling.

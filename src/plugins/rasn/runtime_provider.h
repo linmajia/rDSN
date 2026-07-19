@@ -11,6 +11,7 @@
 #include <rasn/human_interaction.h>
 #include <rasn/recovery_supervisor.h>
 #include <rasn/resource_budget.h>
+#include <rasn/runtime_rpc_schema.h>
 #include <rasn/sandbox_runtime.h>
 #include <rasn/state_service.h>
 #include <rasn/task_orchestration.h>
@@ -21,7 +22,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <functional>
-#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -33,137 +33,8 @@ namespace dsn {
 namespace rasn {
 
 class rasn_service_graph;
-
-struct rasn_runtime_request
-{
-    uint32_t schema_version = RASN_AGENT_SCHEMA_VERSION;
-    std::string module;
-    std::string operation;
-    std::string key;
-    std::string payload;
-    // Optional idempotency id. When set, the service store returns the cached
-    // response for a repeated id instead of re-applying the operation, so a
-    // client-side retry after a lost reply does not double-apply a write.
-    std::string request_id;
-    // Optional client-side routing hint used by distributed providers for
-    // shard fan-out reads. Runtime module handlers ignore this value.
-    uint32_t route_partition = (std::numeric_limits<uint32_t>::max)();
-    // Optional shared-token credential for cross-node runtime module RPC. Local
-    // and LPC paths leave this empty; RPC services verify it only when auth is
-    // enabled in [rasn.service].
-    std::string auth_token;
-    // Optional end-to-end trace id propagated from the originating operation so a
-    // module request can be correlated across nodes in logs and metrics. Stamped
-    // from the ambient trace scope by make_module_request; empty for untraced calls.
-    std::string trace_id;
-};
-
-struct rasn_runtime_response
-{
-    uint32_t schema_version = RASN_AGENT_SCHEMA_VERSION;
-    bool ok = true;
-    std::string error;
-    std::string module;
-    std::string operation;
-    std::string key;
-    std::string payload;
-    uint32_t route_partition = (std::numeric_limits<uint32_t>::max)();
-    // Echoes the request trace id so a caller can correlate the reply in logs.
-    std::string trace_id;
-};
-
-inline void marshall(::dsn::binary_writer &writer, const rasn_runtime_request &value, ::dsn_msg_serialize_format fmt)
-{
-    writer.write(value.schema_version);
-    writer.write(value.module);
-    writer.write(value.operation);
-    writer.write(value.key);
-    writer.write(value.payload);
-    writer.write(value.request_id);
-    writer.write(value.route_partition);
-    writer.write(value.auth_token);
-    writer.write(value.trace_id);
-}
-
-inline void unmarshall(::dsn::binary_reader &reader, rasn_runtime_request &value, ::dsn_msg_serialize_format fmt)
-{
-    reader.read(value.schema_version);
-    reader.read(value.module);
-    reader.read(value.operation);
-    reader.read(value.key);
-    reader.read(value.payload);
-    if (!reader.is_eof())
-    {
-        reader.read(value.request_id);
-    }
-    else
-    {
-        value.request_id.clear();
-    }
-    if (!reader.is_eof())
-    {
-        reader.read(value.route_partition);
-    }
-    else
-    {
-        value.route_partition = (std::numeric_limits<uint32_t>::max)();
-    }
-    if (!reader.is_eof())
-    {
-        reader.read(value.auth_token);
-    }
-    else
-    {
-        value.auth_token.clear();
-    }
-    if (!reader.is_eof())
-    {
-        reader.read(value.trace_id);
-    }
-    else
-    {
-        value.trace_id.clear();
-    }
-}
-
-inline void marshall(::dsn::binary_writer &writer, const rasn_runtime_response &value, ::dsn_msg_serialize_format fmt)
-{
-    writer.write(value.schema_version);
-    writer.write(value.ok);
-    writer.write(value.error);
-    writer.write(value.module);
-    writer.write(value.operation);
-    writer.write(value.key);
-    writer.write(value.payload);
-    writer.write(value.route_partition);
-    writer.write(value.trace_id);
-}
-
-inline void unmarshall(::dsn::binary_reader &reader, rasn_runtime_response &value, ::dsn_msg_serialize_format fmt)
-{
-    reader.read(value.schema_version);
-    reader.read(value.ok);
-    reader.read(value.error);
-    reader.read(value.module);
-    reader.read(value.operation);
-    reader.read(value.key);
-    reader.read(value.payload);
-    if (!reader.is_eof())
-    {
-        reader.read(value.route_partition);
-    }
-    else
-    {
-        value.route_partition = (std::numeric_limits<uint32_t>::max)();
-    }
-    if (!reader.is_eof())
-    {
-        reader.read(value.trace_id);
-    }
-    else
-    {
-        value.trace_id.clear();
-    }
+namespace runtime_provider_internal {
+struct replica_store_test_accessor;
 }
 
 // Isolated deterministic state machine used by each native rDSN replica
@@ -178,7 +49,22 @@ public:
     rasn_runtime_replica_store(const rasn_runtime_replica_store &) = delete;
     rasn_runtime_replica_store &operator=(const rasn_runtime_replica_store &) = delete;
 
-    rasn_runtime_response dispatch(const rasn_runtime_request &request);
+#define RASN_DECLARE_REPLICA_DISPATCH(request_type, response_type)                                      \
+    ::dsn::rasn::rpc::response_type dispatch(const ::dsn::rasn::rpc::request_type &request)
+
+    RASN_DECLARE_REPLICA_DISPATCH(agent_control_request, agent_control_response);
+    RASN_DECLARE_REPLICA_DISPATCH(message_bus_request, message_bus_response);
+    RASN_DECLARE_REPLICA_DISPATCH(task_orchestration_request, task_orchestration_response);
+    RASN_DECLARE_REPLICA_DISPATCH(determinism_request, determinism_response);
+    RASN_DECLARE_REPLICA_DISPATCH(capability_directory_request, capability_directory_response);
+    RASN_DECLARE_REPLICA_DISPATCH(resource_budget_request, resource_budget_response);
+    RASN_DECLARE_REPLICA_DISPATCH(recovery_supervisor_request, recovery_supervisor_response);
+    RASN_DECLARE_REPLICA_DISPATCH(blackboard_request, blackboard_response);
+    RASN_DECLARE_REPLICA_DISPATCH(contract_verifier_request, contract_verifier_response);
+    RASN_DECLARE_REPLICA_DISPATCH(human_interaction_rpc_request, human_interaction_rpc_response);
+    RASN_DECLARE_REPLICA_DISPATCH(sandbox_runtime_request, sandbox_runtime_response);
+
+#undef RASN_DECLARE_REPLICA_DISPATCH
     bool checkpoint_records(::dsn_gpid gpid,
                             int64_t decree,
                             std::vector<state_record> *records,
@@ -195,18 +81,18 @@ public:
     size_t dedup_capacity() const;
 
 private:
+    friend struct runtime_provider_internal::replica_store_test_accessor;
+    template <typename Request, typename Response>
+    Response dispatch_typed(const Request &request);
     struct impl;
     std::unique_ptr<impl> _impl;
 };
 
-// Ambient end-to-end trace propagation for runtime module RPC.
-//
-// make_module_request stamps the request envelope with the trace id currently in
-// scope on this thread, so a logical operation's trace flows onto every module
-// request it triggers without threading the id through dozens of call sites. An
-// operation origin (e.g. the coordinator/service-graph invoke) or the server RPC
-// ingress installs a scope for the duration of the call; nested module calls and
-// the echoed response then share the id. An empty id leaves the ambient unchanged.
+// Ambient end-to-end trace propagation for runtime module RPC. Typed request
+// builders copy the trace id currently in scope into generated request metadata,
+// so nested module calls and echoed response metadata share one trace without
+// threading it through every facade method. An empty id leaves the ambient
+// unchanged.
 std::string current_rasn_runtime_trace_id();
 
 class rasn_runtime_trace_scope
@@ -444,7 +330,24 @@ public:
     std::string describe_topology() const;
 
 protected:
-    virtual rasn_runtime_response call_module_api(const rasn_runtime_request &request) const = 0;
+#define RASN_DECLARE_PROVIDER_CALL(request_type, response_type)                                         \
+    virtual ::dsn::rasn::rpc::response_type call_module_api(                                            \
+        const ::dsn::rasn::rpc::request_type &request) const = 0
+
+    RASN_DECLARE_PROVIDER_CALL(agent_control_request, agent_control_response);
+    RASN_DECLARE_PROVIDER_CALL(message_bus_request, message_bus_response);
+    RASN_DECLARE_PROVIDER_CALL(task_orchestration_request, task_orchestration_response);
+    RASN_DECLARE_PROVIDER_CALL(determinism_request, determinism_response);
+    RASN_DECLARE_PROVIDER_CALL(capability_directory_request, capability_directory_response);
+    RASN_DECLARE_PROVIDER_CALL(resource_budget_request, resource_budget_response);
+    RASN_DECLARE_PROVIDER_CALL(recovery_supervisor_request, recovery_supervisor_response);
+    RASN_DECLARE_PROVIDER_CALL(blackboard_request, blackboard_response);
+    RASN_DECLARE_PROVIDER_CALL(contract_verifier_request, contract_verifier_response);
+    RASN_DECLARE_PROVIDER_CALL(human_interaction_rpc_request, human_interaction_rpc_response);
+    RASN_DECLARE_PROVIDER_CALL(sandbox_runtime_request, sandbox_runtime_response);
+
+#undef RASN_DECLARE_PROVIDER_CALL
+
     virtual bool write_state(const std::string &module,
                              const std::string &kind,
                              const std::string &key,
@@ -463,7 +366,14 @@ protected:
         (void)module;
         return "in-process";
     }
-    std::vector<rasn_runtime_response> call_module_api_shards(const rasn_runtime_request &request) const;
+    std::vector<::dsn::rasn::rpc::message_bus_response>
+    call_module_api_shards(const ::dsn::rasn::rpc::message_bus_request &request) const;
+    std::vector<::dsn::rasn::rpc::resource_budget_response>
+    call_module_api_shards(const ::dsn::rasn::rpc::resource_budget_request &request) const;
+    std::vector<::dsn::rasn::rpc::blackboard_response>
+    call_module_api_shards(const ::dsn::rasn::rpc::blackboard_request &request) const;
+    std::vector<::dsn::rasn::rpc::human_interaction_rpc_response>
+    call_module_api_shards(const ::dsn::rasn::rpc::human_interaction_rpc_request &request) const;
     bool mirror_state_after_success(const std::string &module,
                                     const std::string &kind,
                                     const std::string &key,
@@ -483,13 +393,40 @@ rasn_runtime_config load_rasn_runtime_config();
 // any read failure. Placement always lives in the app's own config.ini.
 bool rasn_runtime_config_file_selects_remote(const std::string &config_path);
 std::unique_ptr<rasn_runtime> create_rasn_runtime(rasn_service_graph &services, const rasn_runtime_config &config);
-rasn_runtime_response dispatch_rasn_runtime_request(const rasn_runtime_request &request);
+
+#define RASN_DECLARE_RUNTIME_RPC_API(request_type, response_type)                                       \
+    ::dsn::rasn::rpc::response_type dispatch_rasn_runtime_request(                                     \
+        const ::dsn::rasn::rpc::request_type &request);                                                \
+    uint64_t rasn_runtime_partition_hash(const ::dsn::rasn::rpc::request_type &request);                \
+    bool rasn_runtime_service_hosts_request(                                                            \
+        const ::dsn::rasn::rpc::request_type &request,                                                 \
+        const std::vector<uint32_t> &hosted_shards);                                                   \
+    ::dsn::task_code rasn_runtime_rpc_code_for_request(                                                \
+        const ::dsn::rasn::rpc::request_type &request)
+
+RASN_DECLARE_RUNTIME_RPC_API(agent_control_request, agent_control_response);
+RASN_DECLARE_RUNTIME_RPC_API(message_bus_request, message_bus_response);
+RASN_DECLARE_RUNTIME_RPC_API(task_orchestration_request, task_orchestration_response);
+RASN_DECLARE_RUNTIME_RPC_API(determinism_request, determinism_response);
+RASN_DECLARE_RUNTIME_RPC_API(capability_directory_request, capability_directory_response);
+RASN_DECLARE_RUNTIME_RPC_API(resource_budget_request, resource_budget_response);
+RASN_DECLARE_RUNTIME_RPC_API(recovery_supervisor_request, recovery_supervisor_response);
+RASN_DECLARE_RUNTIME_RPC_API(blackboard_request, blackboard_response);
+RASN_DECLARE_RUNTIME_RPC_API(contract_verifier_request, contract_verifier_response);
+RASN_DECLARE_RUNTIME_RPC_API(human_interaction_rpc_request, human_interaction_rpc_response);
+RASN_DECLARE_RUNTIME_RPC_API(sandbox_runtime_request, sandbox_runtime_response);
+
+#undef RASN_DECLARE_RUNTIME_RPC_API
+
 std::vector<std::string> rasn_runtime_module_names();
 // Ownership resources a runtime service must acquire before serving the given
 // modules: one resource per module, or one per hosted shard when the module is
 // sharded. Used by the default-off single-writer ownership gate; exported so it
 // can be unit-tested independently of a live app host.
 std::vector<std::string> rasn_runtime_module_ownership_resources(const std::vector<std::string> &modules);
+// Shared placement classification used by endpoint resolution, registry shard
+// discovery, hosted-shard guards, ownership resources, and facade fan-out.
+bool rasn_runtime_module_is_sharded(const std::string &module);
 // Pure expansion of a single hosted module into the coordination resources its
 // runtime app must single-writer own, kept free of configuration lookups (callers
 // pass the resolved hosted-shard subset, sharded flag, and partition count) so the
@@ -506,20 +443,16 @@ std::vector<std::string> rasn_runtime_module_ownership_resources_for(const std::
 // partition selector and therefore takes precedence over the natural key hash.
 // Sharded modules hash every natural key, including the empty string, to preserve
 // the original hash/modulo mapping; unsharded keyless requests use zero.
-uint64_t rasn_runtime_partition_hash(const rasn_runtime_request &request);
 // Global mutations normally need one committed write per partition rather than
 // natural-key routing to a single partition. The provider fans these requests
 // out with an explicit route_partition, and replicated ingress rejects an
 // unscoped request so a future shard-count change cannot silently update only
 // one partition.
-bool rasn_runtime_request_is_partition_fanout(const rasn_runtime_request &request);
 // Ingress shard-ownership guard: true when a runtime service that hosts
 // `hosted_shards` of a module should serve `request`. An empty hosted set means
 // the service owns the whole module (or the module is unsharded) and serves every
 // request; otherwise the request must route to a hosted shard. Exported so the
 // guard can be unit-tested independently of a live RPC host.
-bool rasn_runtime_service_hosts_request(const rasn_runtime_request &request,
-                                        const std::vector<uint32_t> &hosted_shards);
 std::vector<rasn_runtime_descriptor> rasn_runtime_module_descriptors();
 std::string rasn_runtime_module_app_role(const std::string &module_or_role);
 std::string normalize_rasn_runtime_app_list(const std::string &app_list);
@@ -562,56 +495,52 @@ rasn_runtime_state_compaction_report compact_rasn_runtime_state_mirror(rasn_serv
                                                                        const std::string &checkpoint_path = "",
                                                                        const std::string &state_prefix = "");
 void register_rasn_runtime_apps();
-::dsn::task_code rasn_runtime_rpc_code_for_request(const rasn_runtime_request &request);
 
 class rasn_runtime_rpc_service : public ::dsn::serverlet<rasn_runtime_rpc_service>
 {
 public:
-    using dispatch_callback = std::function<rasn_runtime_response(const rasn_runtime_request &)>;
-
     explicit rasn_runtime_rpc_service(std::vector<std::string> modules = std::vector<std::string>(),
-                                      dispatch_callback dispatcher = dispatch_callback(),
-                                      bool replicated = false);
+                                      rasn_runtime_replica_store *replica_store = nullptr);
     void open_service(::dsn_gpid gpid = ::dsn_gpid());
     bool close_service(std::chrono::milliseconds timeout);
     const std::vector<std::string> &modules() const { return _modules; }
 
 protected:
-    void on_agent_control(const rasn_runtime_request &request, ::dsn::rpc_replier<rasn_runtime_response> &reply);
-    void on_message_bus(const rasn_runtime_request &request, ::dsn::rpc_replier<rasn_runtime_response> &reply);
-    void on_task_orchestration(const rasn_runtime_request &request, ::dsn::rpc_replier<rasn_runtime_response> &reply);
-    void on_determinism_ledger(const rasn_runtime_request &request, ::dsn::rpc_replier<rasn_runtime_response> &reply);
-    void on_capability_directory(const rasn_runtime_request &request, ::dsn::rpc_replier<rasn_runtime_response> &reply);
-    void on_resource_budget(const rasn_runtime_request &request, ::dsn::rpc_replier<rasn_runtime_response> &reply);
-    void on_recovery_supervisor(const rasn_runtime_request &request, ::dsn::rpc_replier<rasn_runtime_response> &reply);
-    void on_blackboard(const rasn_runtime_request &request, ::dsn::rpc_replier<rasn_runtime_response> &reply);
-    void on_contract_verifier(const rasn_runtime_request &request, ::dsn::rpc_replier<rasn_runtime_response> &reply);
-    void on_human_interaction(const rasn_runtime_request &request, ::dsn::rpc_replier<rasn_runtime_response> &reply);
-    void on_sandbox_runtime(const rasn_runtime_request &request, ::dsn::rpc_replier<rasn_runtime_response> &reply);
-    void on_agent_control_write(const rasn_runtime_request &request,
-                                ::dsn::rpc_replier<rasn_runtime_response> &reply);
-    void on_message_bus_write(const rasn_runtime_request &request,
-                              ::dsn::rpc_replier<rasn_runtime_response> &reply);
-    void on_task_orchestration_write(const rasn_runtime_request &request,
-                                     ::dsn::rpc_replier<rasn_runtime_response> &reply);
-    void on_determinism_ledger_write(const rasn_runtime_request &request,
-                                     ::dsn::rpc_replier<rasn_runtime_response> &reply);
-    void on_capability_directory_write(const rasn_runtime_request &request,
-                                       ::dsn::rpc_replier<rasn_runtime_response> &reply);
-    void on_resource_budget_write(const rasn_runtime_request &request,
-                                  ::dsn::rpc_replier<rasn_runtime_response> &reply);
-    void on_recovery_supervisor_write(const rasn_runtime_request &request,
-                                      ::dsn::rpc_replier<rasn_runtime_response> &reply);
-    void on_blackboard_write(const rasn_runtime_request &request,
-                             ::dsn::rpc_replier<rasn_runtime_response> &reply);
-    void on_contract_verifier_write(const rasn_runtime_request &request,
-                                    ::dsn::rpc_replier<rasn_runtime_response> &reply);
-    void on_human_interaction_write(const rasn_runtime_request &request,
-                                    ::dsn::rpc_replier<rasn_runtime_response> &reply);
-    void on_sandbox_runtime_write(const rasn_runtime_request &request,
-                                  ::dsn::rpc_replier<rasn_runtime_response> &reply);
+#define RASN_DECLARE_RPC_HANDLER(name, request_type, response_type)                                     \
+    void on_##name(const ::dsn::rasn::rpc::request_type &request,                                      \
+                   ::dsn::rpc_replier<::dsn::rasn::rpc::response_type> &reply);                        \
+    void on_##name##_write(const ::dsn::rasn::rpc::request_type &request,                              \
+                           ::dsn::rpc_replier<::dsn::rasn::rpc::response_type> &reply)
+
+    RASN_DECLARE_RPC_HANDLER(agent_control, agent_control_request, agent_control_response);
+    RASN_DECLARE_RPC_HANDLER(message_bus, message_bus_request, message_bus_response);
+    RASN_DECLARE_RPC_HANDLER(task_orchestration,
+                             task_orchestration_request,
+                             task_orchestration_response);
+    RASN_DECLARE_RPC_HANDLER(determinism_ledger, determinism_request, determinism_response);
+    RASN_DECLARE_RPC_HANDLER(capability_directory,
+                             capability_directory_request,
+                             capability_directory_response);
+    RASN_DECLARE_RPC_HANDLER(resource_budget, resource_budget_request, resource_budget_response);
+    RASN_DECLARE_RPC_HANDLER(recovery_supervisor,
+                             recovery_supervisor_request,
+                             recovery_supervisor_response);
+    RASN_DECLARE_RPC_HANDLER(blackboard, blackboard_request, blackboard_response);
+    RASN_DECLARE_RPC_HANDLER(contract_verifier,
+                             contract_verifier_request,
+                             contract_verifier_response);
+    RASN_DECLARE_RPC_HANDLER(human_interaction,
+                             human_interaction_rpc_request,
+                             human_interaction_rpc_response);
+    RASN_DECLARE_RPC_HANDLER(sandbox_runtime, sandbox_runtime_request, sandbox_runtime_response);
+
+#undef RASN_DECLARE_RPC_HANDLER
 
 private:
+    template <typename Request, typename Response>
+    void reply_module_request_typed(const Request &request,
+                                    ::dsn::rpc_replier<Response> &reply,
+                                    bool write_channel);
     bool register_module_handler(const std::string &module);
     void unregister_module_handler(const std::string &module);
     bool begin_request();
@@ -640,14 +569,27 @@ private:
         rasn_runtime_rpc_service *_service;
         bool _active;
     };
-    void reply_module_request(const std::string &module,
-                              const rasn_runtime_request &request,
-                              ::dsn::rpc_replier<rasn_runtime_response> &reply,
-                              bool write_channel);
+#define RASN_DECLARE_TYPED_REPLY(request_type, response_type)                                           \
+    void reply_module_request(const ::dsn::rasn::rpc::request_type &request,                           \
+                              ::dsn::rpc_replier<::dsn::rasn::rpc::response_type> &reply,              \
+                              bool write_channel)
+
+    RASN_DECLARE_TYPED_REPLY(agent_control_request, agent_control_response);
+    RASN_DECLARE_TYPED_REPLY(message_bus_request, message_bus_response);
+    RASN_DECLARE_TYPED_REPLY(task_orchestration_request, task_orchestration_response);
+    RASN_DECLARE_TYPED_REPLY(determinism_request, determinism_response);
+    RASN_DECLARE_TYPED_REPLY(capability_directory_request, capability_directory_response);
+    RASN_DECLARE_TYPED_REPLY(resource_budget_request, resource_budget_response);
+    RASN_DECLARE_TYPED_REPLY(recovery_supervisor_request, recovery_supervisor_response);
+    RASN_DECLARE_TYPED_REPLY(blackboard_request, blackboard_response);
+    RASN_DECLARE_TYPED_REPLY(contract_verifier_request, contract_verifier_response);
+    RASN_DECLARE_TYPED_REPLY(human_interaction_rpc_request, human_interaction_rpc_response);
+    RASN_DECLARE_TYPED_REPLY(sandbox_runtime_request, sandbox_runtime_response);
+
+#undef RASN_DECLARE_TYPED_REPLY
 
     std::vector<std::string> _modules;
-    dispatch_callback _dispatcher;
-    bool _replicated = false;
+    rasn_runtime_replica_store *_replica_store = nullptr;
     ::dsn_gpid _gpid;
     // Shards this service hosts per module, populated from config at construction
     // for sharded modules that host only a subset of partitions. A module absent
@@ -665,11 +607,27 @@ class rasn_runtime_client : public virtual ::dsn::clientlet
 {
 public:
     explicit rasn_runtime_client(::dsn::rpc_address server) : _server(server) {}
-    std::pair< ::dsn::error_code, rasn_runtime_response>
-    call_sync(const rasn_runtime_request &request,
-              std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
-              int thread_hash = 0,
-              uint64_t partition_hash = 0);
+
+#define RASN_DECLARE_CLIENT_CALL(request_type, response_type)                                           \
+    std::pair<::dsn::error_code, ::dsn::rasn::rpc::response_type> call_sync(                           \
+        const ::dsn::rasn::rpc::request_type &request,                                                 \
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(0),                              \
+        int thread_hash = 0,                                                                           \
+        uint64_t partition_hash = 0)
+
+    RASN_DECLARE_CLIENT_CALL(agent_control_request, agent_control_response);
+    RASN_DECLARE_CLIENT_CALL(message_bus_request, message_bus_response);
+    RASN_DECLARE_CLIENT_CALL(task_orchestration_request, task_orchestration_response);
+    RASN_DECLARE_CLIENT_CALL(determinism_request, determinism_response);
+    RASN_DECLARE_CLIENT_CALL(capability_directory_request, capability_directory_response);
+    RASN_DECLARE_CLIENT_CALL(resource_budget_request, resource_budget_response);
+    RASN_DECLARE_CLIENT_CALL(recovery_supervisor_request, recovery_supervisor_response);
+    RASN_DECLARE_CLIENT_CALL(blackboard_request, blackboard_response);
+    RASN_DECLARE_CLIENT_CALL(contract_verifier_request, contract_verifier_response);
+    RASN_DECLARE_CLIENT_CALL(human_interaction_rpc_request, human_interaction_rpc_response);
+    RASN_DECLARE_CLIENT_CALL(sandbox_runtime_request, sandbox_runtime_response);
+
+#undef RASN_DECLARE_CLIENT_CALL
 
 private:
     ::dsn::rpc_address _server;

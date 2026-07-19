@@ -41,6 +41,7 @@
 # include <fstream>
 # include <cstring>
 # include <atomic>
+# include <sstream>
 # include <string>
 # include <thread>
 # include <vector>
@@ -221,6 +222,213 @@ TEST(core, configuration)
     ASSERT_EQ(std::string("exsit"), std::string(c->get_string_value("not-exsit", "not-exsit", "", "")));
     c->set("not-exsit", "not-exsit", "exsit2", "kaka");
     ASSERT_EQ(std::string("exsit2"), std::string(c->get_string_value("not-exsit", "not-exsit", "", "")));
+}
+
+TEST(core, configuration_set_promotes_cached_default)
+{
+    configuration config;
+    const char* section = "explicit_override";
+    const char* key = "cached_default";
+
+    ASSERT_STREQ("fallback-a", config.get_string_value(section, key, "fallback-a", ""));
+    config.set(section, key, "explicit-b", "");
+
+    EXPECT_TRUE(config.has_key(section, key));
+    EXPECT_STREQ("explicit-b", config.get_string_value(section, key, "fallback-a", ""));
+    EXPECT_STREQ("explicit-b", config.get_string_value(section, key, "fallback-c", ""));
+}
+
+TEST(core, configuration_snapshots_restore_exact_value_state)
+{
+    configuration config;
+
+    const configuration_value_snapshot missing =
+        config.query_value("snapshot_missing", "value");
+    EXPECT_EQ(configuration_value_state::missing, missing.state);
+    EXPECT_FALSE(missing.section_existed);
+    EXPECT_TRUE(missing.value.empty());
+
+    const configuration_value_snapshot missing_before_override =
+        config.set_with_snapshot("snapshot_missing", "value", "override", "");
+    EXPECT_EQ(configuration_value_state::missing, missing_before_override.state);
+    EXPECT_EQ(configuration_value_state::explicit_value,
+              config.query_value("snapshot_missing", "value").state);
+    config.restore_snapshot("snapshot_missing", "value", missing_before_override);
+    const configuration_value_snapshot missing_after_restore =
+        config.query_value("snapshot_missing", "value");
+    EXPECT_EQ(configuration_value_state::missing, missing_after_restore.state);
+    EXPECT_FALSE(missing_after_restore.section_existed);
+
+    ASSERT_STREQ("cached-a",
+                 config.get_string_value("snapshot_cached", "value", "cached-a", ""));
+    const configuration_value_snapshot cached =
+        config.query_value("snapshot_cached", "value");
+    EXPECT_EQ(configuration_value_state::defaulted, cached.state);
+    EXPECT_TRUE(cached.section_existed);
+    EXPECT_EQ("cached-a", cached.value);
+    const configuration_value_snapshot cached_before_override =
+        config.set_with_snapshot("snapshot_cached", "value", "override", "");
+    EXPECT_EQ(configuration_value_state::defaulted, cached_before_override.state);
+    config.restore_snapshot("snapshot_cached", "value", cached_before_override);
+    const configuration_value_snapshot cached_after_restore =
+        config.query_value("snapshot_cached", "value");
+    EXPECT_EQ(configuration_value_state::defaulted, cached_after_restore.state);
+    EXPECT_EQ("cached-a", cached_after_restore.value);
+
+    config.set("snapshot_explicit", "value", "explicit-a", "");
+    const configuration_value_snapshot explicit_before_override =
+        config.set_with_snapshot("snapshot_explicit", "value", "explicit-b", "");
+    EXPECT_EQ(configuration_value_state::explicit_value, explicit_before_override.state);
+    EXPECT_EQ("explicit-a", explicit_before_override.value);
+    EXPECT_EQ("explicit-b", config.query_value("snapshot_explicit", "value").value);
+    config.restore_snapshot("snapshot_explicit", "value", explicit_before_override);
+    const configuration_value_snapshot explicit_after_restore =
+        config.query_value("snapshot_explicit", "value");
+    EXPECT_EQ(configuration_value_state::explicit_value, explicit_after_restore.state);
+    EXPECT_EQ("explicit-a", explicit_after_restore.value);
+}
+
+TEST(core, configuration_set_preserves_empty_inputs_and_rejects_nulls)
+{
+    scoped_test_stderr stderr_capture;
+    configuration config;
+
+    config.set("", "key", "empty-section", "empty section");
+    EXPECT_EQ("empty-section", config.query_value("", "key").value);
+    config.set("section", "", "empty-key", "empty key");
+    EXPECT_EQ("empty-key", config.query_value("section", "").value);
+    config.set("section", "empty-value", "", "empty value");
+    const configuration_value_snapshot empty_value =
+        config.query_value("section", "empty-value");
+    EXPECT_EQ(configuration_value_state::explicit_value, empty_value.state);
+    EXPECT_TRUE(empty_value.value.empty());
+
+    const configuration_value_snapshot empty_names =
+        config.set_with_snapshot("", "", "", "empty section and key");
+    EXPECT_EQ(configuration_value_state::missing, empty_names.state);
+    EXPECT_EQ(configuration_value_state::explicit_value, config.query_value("", "").state);
+    EXPECT_TRUE(config.query_value("", "").value.empty());
+    config.restore_snapshot("", "", empty_names);
+    EXPECT_EQ(configuration_value_state::missing, config.query_value("", "").state);
+    EXPECT_EQ("empty-section", config.query_value("", "key").value);
+
+    ASSERT_TRUE(::dsn::utils::test::prepare_test_tmp_dir("dsn.core.configuration.empty"));
+    const std::string config_path = ::dsn::utils::test::test_tmp_path(
+        "dsn.core.configuration.empty", "empty-overwrite.ini");
+    std::fstream output(config_path.c_str(), std::ios::out | std::ios::trunc);
+    ASSERT_TRUE(output.good());
+    output << "[seed]\nvalue = original\n";
+    output.close();
+
+    configuration overwritten;
+    ASSERT_TRUE(overwritten.load(config_path.c_str(), nullptr, ".foo=x;foo.=y"));
+    EXPECT_EQ("x", overwritten.query_value("", "foo").value);
+    EXPECT_EQ("y", overwritten.query_value("foo", "").value);
+
+    config.set(nullptr, "key", "value", "");
+    config.set("section", nullptr, "value", "");
+    config.set("section", "null-value", nullptr, "");
+    EXPECT_EQ(configuration_value_state::missing,
+              config.query_value("section", "null-value").state);
+    EXPECT_EQ(configuration_value_state::missing,
+              config.set_with_snapshot(nullptr, "key", "value", "").state);
+    EXPECT_EQ(configuration_value_state::missing,
+              config.set_with_snapshot("section", nullptr, "value", "").state);
+    EXPECT_EQ(configuration_value_state::missing,
+              config.set_with_snapshot("section", "null-snapshot-value", nullptr, "").state);
+    EXPECT_EQ(configuration_value_state::missing, config.query_value(nullptr, "key").state);
+    EXPECT_EQ(configuration_value_state::missing, config.query_value("section", nullptr).state);
+    config.restore_snapshot(nullptr, "key", empty_names);
+    config.restore_snapshot("section", nullptr, empty_names);
+    EXPECT_EQ("empty-key", config.query_value("section", "").value);
+}
+
+TEST(core, configuration_snapshot_restores_metadata_after_deletion)
+{
+    ASSERT_TRUE(::dsn::utils::test::prepare_test_tmp_dir("dsn.core.configuration.metadata"));
+    const std::string config_path = ::dsn::utils::test::test_tmp_path(
+        "dsn.core.configuration.metadata", "metadata.ini");
+    std::fstream output(config_path.c_str(), std::ios::out | std::ios::trunc);
+    ASSERT_TRUE(output.good());
+    output << "[metadata]\nvalue = original\n";
+    output.close();
+
+    configuration config;
+    ASSERT_TRUE(config.load(config_path.c_str()));
+    EXPECT_STREQ(
+        "original", config.get_string_value("metadata", "value", "", "original description"));
+    const configuration_value_snapshot original =
+        config.query_value("metadata", "value");
+    ASSERT_EQ(configuration_value_state::explicit_value, original.state);
+    EXPECT_EQ("original", original.value);
+    EXPECT_EQ("original description", original.description);
+    EXPECT_GT(original.line, 0);
+
+    const configuration_value_snapshot missing_in_section =
+        config.query_value("metadata", "missing");
+    ASSERT_EQ(configuration_value_state::missing, missing_in_section.state);
+    ASSERT_TRUE(missing_in_section.section_existed);
+    config.restore_snapshot("metadata", "value", missing_in_section);
+    EXPECT_EQ(configuration_value_state::missing,
+              config.query_value("metadata", "value").state);
+
+    config.restore_snapshot("metadata", "value", original);
+    const configuration_value_snapshot restored =
+        config.query_value("metadata", "value");
+    EXPECT_EQ(original.state, restored.state);
+    EXPECT_EQ(original.value, restored.value);
+    EXPECT_EQ(original.description, restored.description);
+    EXPECT_EQ(original.line, restored.line);
+
+    std::ostringstream dump;
+    config.dump(dump);
+    EXPECT_NE(std::string::npos, dump.str().find("; original description\n"));
+    EXPECT_NE(std::string::npos, dump.str().find("value = original\n"));
+}
+
+TEST(core, configuration_snapshot_restores_section_existence)
+{
+    configuration config;
+
+    const configuration_value_snapshot new_section =
+        config.set_with_snapshot("new_section", "override", "value", "");
+    ASSERT_EQ(configuration_value_state::missing, new_section.state);
+    ASSERT_FALSE(new_section.section_existed);
+    config.restore_snapshot("new_section", "override", new_section);
+    EXPECT_FALSE(config.has_section("new_section"));
+
+    config.set("existing_section", "seed", "value", "");
+    const configuration_value_snapshot missing_in_existing =
+        config.query_value("existing_section", "override");
+    ASSERT_EQ(configuration_value_state::missing, missing_in_existing.state);
+    ASSERT_TRUE(missing_in_existing.section_existed);
+    config.restore_snapshot("existing_section", "seed", missing_in_existing);
+    ASSERT_TRUE(config.has_section("existing_section"));
+    std::vector<const char*> keys;
+    config.get_all_keys("existing_section", keys);
+    ASSERT_TRUE(keys.empty());
+
+    const configuration_value_snapshot empty_section =
+        config.set_with_snapshot("existing_section", "override", "value", "");
+    ASSERT_EQ(configuration_value_state::missing, empty_section.state);
+    ASSERT_TRUE(empty_section.section_existed);
+    config.restore_snapshot("existing_section", "override", empty_section);
+    EXPECT_TRUE(config.has_section("existing_section"));
+    config.get_all_keys("existing_section", keys);
+    EXPECT_TRUE(keys.empty());
+    std::vector<std::string> sections;
+    config.get_all_sections(sections);
+    EXPECT_NE(sections.end(),
+              std::find(sections.begin(), sections.end(), "existing_section"));
+
+    const configuration_value_snapshot concurrent_section =
+        config.set_with_snapshot("concurrent_section", "override", "value", "");
+    config.set("concurrent_section", "unrelated", "keep", "");
+    config.restore_snapshot("concurrent_section", "override", concurrent_section);
+    EXPECT_TRUE(config.has_section("concurrent_section"));
+    EXPECT_EQ("keep", config.query_value("concurrent_section", "unrelated").value);
+    EXPECT_EQ(configuration_value_state::missing,
+              config.query_value("concurrent_section", "override").state);
 }
 
 TEST(core, configuration_invalid_numeric_values)

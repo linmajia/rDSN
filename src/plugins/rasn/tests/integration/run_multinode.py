@@ -30,6 +30,85 @@ MODULES = [
     "human_interaction",
 ]
 
+TYPED_RUNTIME_SCHEMAS = {
+    "agent_control_plane": (
+        "RPC_RASN_AGENT_CONTROL",
+        "agent_control_request",
+        "agent_control_response",
+    ),
+    "agent_message_bus": (
+        "RPC_RASN_MESSAGE_BUS",
+        "message_bus_request",
+        "message_bus_response",
+    ),
+    "task_orchestration_kernel": (
+        "RPC_RASN_TASK_ORCHESTRATION",
+        "task_orchestration_request",
+        "task_orchestration_response",
+    ),
+    "determinism_ledger": (
+        "RPC_RASN_DETERMINISM_LEDGER",
+        "determinism_request",
+        "determinism_response",
+    ),
+    "capability_directory": (
+        "RPC_RASN_CAPABILITY_DIRECTORY",
+        "capability_directory_request",
+        "capability_directory_response",
+    ),
+    "resource_budget": (
+        "RPC_RASN_RESOURCE_BUDGET",
+        "resource_budget_request",
+        "resource_budget_response",
+    ),
+    "recovery_supervisor": (
+        "RPC_RASN_RECOVERY_SUPERVISOR",
+        "recovery_supervisor_request",
+        "recovery_supervisor_response",
+    ),
+    "blackboard": (
+        "RPC_RASN_BLACKBOARD",
+        "blackboard_request",
+        "blackboard_response",
+    ),
+    "contract_verifier": (
+        "RPC_RASN_CONTRACT_VERIFIER",
+        "contract_verifier_request",
+        "contract_verifier_response",
+    ),
+    "human_interaction": (
+        "RPC_RASN_HUMAN_INTERACTION",
+        "human_interaction_rpc_request",
+        "human_interaction_rpc_response",
+    ),
+    "sandbox_runtime": (
+        "RPC_RASN_SANDBOX_RUNTIME",
+        "sandbox_runtime_request",
+        "sandbox_runtime_response",
+    ),
+}
+
+TYPED_RUNTIME_SCHEMA_ENTRY = re.compile(
+    r"^    // rasn\.runtime\.(?P<module>[a-z0-9_]+)\."
+    r"(?P<method>[a-z0-9_]+) -> (?P<task_code>RPC_RASN_[A-Z0-9_]+)\n"
+    r"(?:^    // routing: [^\n]+\n)?"
+    r"^    std::pair< ::dsn::error_code, "
+    r"(?P<response>dsn::rasn::rpc::[a-z0-9_]+)>\n"
+    r"^    (?P=method)_sync\(const "
+    r"(?P<request>dsn::rasn::rpc::[a-z0-9_]+) &request,\n"
+    r"^                  std::chrono::milliseconds timeout = "
+    r"std::chrono::milliseconds\(0\),\n"
+    r"^                  int thread_hash = 0,\n"
+    r"^                  std::uint64_t partition_hash = 0\)\n"
+    r"^    \{\n"
+    r"^        return ::dsn::rpc::wait_and_unwrap<(?P=response)>"
+    r"\(::dsn::rpc::call\(\n"
+    r"^            _server, (?P=task_code), request, nullptr, empty_callback, "
+    r"timeout, thread_hash, partition_hash\)\);\n"
+    r"^    \}$",
+    re.MULTILINE,
+)
+
 SERVICE_SPECS = [
     ("registry", "apps.rasn.registry", "registry"),
     ("llm_agent", "apps.rasn.llm.agent", "llm_agent"),
@@ -434,6 +513,67 @@ class Harness(object):
                 "distributed self-test failed (status={0})\n{1}".format(status, output)
             )
 
+    def assert_typed_runtime_schema(self, directory, binary):
+        status, output = self.run_client(
+            directory,
+            binary,
+            ["schema", "clients-cpp"],
+            "typed-runtime-schema",
+            timeout=30.0,
+        )
+        expected = set()
+        for module, schema in TYPED_RUNTIME_SCHEMAS.items():
+            task_code, request_type, response_type = schema
+            qualified_request = "dsn::rasn::rpc::{0}".format(request_type)
+            qualified_response = "dsn::rasn::rpc::{0}".format(response_type)
+            expected.add(
+                (module, module, task_code, qualified_request, qualified_response)
+            )
+            expected.add(
+                (
+                    module,
+                    module + "_write",
+                    task_code + "_WRITE",
+                    qualified_request,
+                    qualified_response,
+                )
+            )
+
+        found = [
+            (
+                match.group("module"),
+                match.group("method"),
+                match.group("task_code"),
+                match.group("request"),
+                match.group("response"),
+            )
+            for match in TYPED_RUNTIME_SCHEMA_ENTRY.finditer(output)
+        ]
+        found_set = set(found)
+        runtime_declarations = re.findall(
+            r"^    // rasn\.runtime\.[^\n]+$", output, re.MULTILINE
+        )
+        if (
+            status != 0
+            or len(found) != len(found_set)
+            or found_set != expected
+            or len(runtime_declarations) != len(expected)
+        ):
+            missing = sorted(expected - found_set)
+            unexpected = sorted(found_set - expected)
+            raise HarnessError(
+                "generated typed runtime schema discovery failed "
+                "(status={0}, entries={1}, declarations={2}, "
+                "missing={3}, unexpected={4})\n{5}".format(
+                    status,
+                    len(found),
+                    len(runtime_declarations),
+                    missing,
+                    unexpected,
+                    output,
+                )
+            )
+
 
 def explicit_scenario(harness):
     root = os.path.join(harness.root, "explicit")
@@ -470,6 +610,7 @@ def explicit_scenario(harness):
         "static",
         ports["rasn_runtime"],
     )
+    harness.assert_typed_runtime_schema(client_dir, client_binary)
     harness.wait_for_health(client_dir, client_binary, host=host)
     harness.assert_selftest(client_dir, client_binary)
     harness.stop_child(host)

@@ -46,7 +46,8 @@ rpc_operation_descriptor operation(const std::string &service,
                                    const std::string &method,
                                    const std::string &task_code,
                                    const std::string &request_type,
-                                   const std::string &response_type)
+                                   const std::string &response_type,
+                                   const std::string &routing = "")
 {
     rpc_operation_descriptor descriptor;
     descriptor.service = service;
@@ -55,6 +56,7 @@ rpc_operation_descriptor operation(const std::string &service,
     descriptor.task_code = task_code;
     descriptor.request_type = request_type;
     descriptor.response_type = response_type;
+    descriptor.routing = routing;
     return descriptor;
 }
 
@@ -176,11 +178,20 @@ std::string python_type(std::string type)
     return array ? "List[" + result + "]" : result;
 }
 
+bool is_generated_runtime_rpc_type(const std::string &type)
+{
+    return type.find("dsn::rasn::rpc::") == 0;
+}
+
 std::string typescript_client_type(const std::string &type)
 {
     if (type == "std::string")
     {
         return "string";
+    }
+    if (is_generated_runtime_rpc_type(type))
+    {
+        return "unknown";
     }
     return typescript_type(type);
 }
@@ -190,6 +201,10 @@ std::string python_client_type(const std::string &type)
     if (type == "std::string")
     {
         return "str";
+    }
+    if (is_generated_runtime_rpc_type(type))
+    {
+        return "Any";
     }
     return python_type(type);
 }
@@ -728,6 +743,80 @@ std::vector<rpc_operation_descriptor> rasn_rpc_operation_manifest()
     operations.push_back(operation("rasn.observability", "observability_rpc_client", "failures", "RPC_RASN_OBSERVABILITY_FAILURES", "observability_query_request", "observability_response"));
     operations.push_back(operation("rasn.observability", "observability_rpc_client", "load_replay", "RPC_RASN_OBSERVABILITY_LOAD_REPLAY", "replay_load_request", "observability_response"));
     operations.push_back(operation("rasn.observability", "observability_rpc_client", "snapshot", "RPC_RASN_OBSERVABILITY_SNAPSHOT", "std::string", "observability_response"));
+
+    const auto runtime_module = [&operations](const std::string &module,
+                                              const std::string &task_code,
+                                              const std::string &request_type,
+                                              const std::string &response_type) {
+        std::string routing;
+        if (module == "agent_message_bus")
+            routing = "partition key: message_id; aggregate operations: snapshot";
+        else if (module == "resource_budget")
+            routing = "partition key: scope; aggregate operations: describe";
+        else if (module == "blackboard")
+            routing = "partition key: key; aggregate operations: snapshot";
+        else if (module == "human_interaction")
+            routing =
+                "partition key: request_id; aggregate operations: expire, snapshot, pending";
+        operations.push_back(operation("rasn.runtime." + module,
+                                       "rasn_runtime_client",
+                                       module,
+                                       task_code,
+                                       request_type,
+                                       response_type,
+                                       routing));
+        operations.push_back(operation("rasn.runtime." + module,
+                                       "rasn_runtime_client",
+                                       module + "_write",
+                                       task_code + "_WRITE",
+                                       request_type,
+                                       response_type,
+                                       routing));
+    };
+    runtime_module("agent_control_plane",
+                   "RPC_RASN_AGENT_CONTROL",
+                   "dsn::rasn::rpc::agent_control_request",
+                   "dsn::rasn::rpc::agent_control_response");
+    runtime_module("agent_message_bus",
+                   "RPC_RASN_MESSAGE_BUS",
+                   "dsn::rasn::rpc::message_bus_request",
+                   "dsn::rasn::rpc::message_bus_response");
+    runtime_module("task_orchestration_kernel",
+                   "RPC_RASN_TASK_ORCHESTRATION",
+                   "dsn::rasn::rpc::task_orchestration_request",
+                   "dsn::rasn::rpc::task_orchestration_response");
+    runtime_module("determinism_ledger",
+                   "RPC_RASN_DETERMINISM_LEDGER",
+                   "dsn::rasn::rpc::determinism_request",
+                   "dsn::rasn::rpc::determinism_response");
+    runtime_module("capability_directory",
+                   "RPC_RASN_CAPABILITY_DIRECTORY",
+                   "dsn::rasn::rpc::capability_directory_request",
+                   "dsn::rasn::rpc::capability_directory_response");
+    runtime_module("resource_budget",
+                   "RPC_RASN_RESOURCE_BUDGET",
+                   "dsn::rasn::rpc::resource_budget_request",
+                   "dsn::rasn::rpc::resource_budget_response");
+    runtime_module("recovery_supervisor",
+                   "RPC_RASN_RECOVERY_SUPERVISOR",
+                   "dsn::rasn::rpc::recovery_supervisor_request",
+                   "dsn::rasn::rpc::recovery_supervisor_response");
+    runtime_module("blackboard",
+                   "RPC_RASN_BLACKBOARD",
+                   "dsn::rasn::rpc::blackboard_request",
+                   "dsn::rasn::rpc::blackboard_response");
+    runtime_module("contract_verifier",
+                   "RPC_RASN_CONTRACT_VERIFIER",
+                   "dsn::rasn::rpc::contract_verifier_request",
+                   "dsn::rasn::rpc::contract_verifier_response");
+    runtime_module("human_interaction",
+                   "RPC_RASN_HUMAN_INTERACTION",
+                   "dsn::rasn::rpc::human_interaction_rpc_request",
+                   "dsn::rasn::rpc::human_interaction_rpc_response");
+    runtime_module("sandbox_runtime",
+                   "RPC_RASN_SANDBOX_RUNTIME",
+                   "dsn::rasn::rpc::sandbox_runtime_request",
+                   "dsn::rasn::rpc::sandbox_runtime_response");
     return operations;
 }
 
@@ -852,6 +941,7 @@ std::string rasn_schema_manifest_cpp_clients()
     output << "#include \"model_agent.h\"\n";
     output << "#include \"observability.h\"\n";
     output << "#include \"rasn.code.definition.h\"\n";
+    output << "#include \"rasn_runtime.types.h\"\n";
     output << "#include \"state_service.h\"\n";
     output << "#include \"workflow_service.h\"\n\n";
     output << "#include <dsn/service_api_cpp.h>\n\n";
@@ -882,6 +972,7 @@ std::string rasn_schema_manifest_cpp_clients()
             output << "    explicit " << current_class << "(::dsn::rpc_address server) : _server(server) {}\n\n";
         }
         output << "    // " << op.service << "." << op.method << " -> " << op.task_code << "\n";
+        emit_cpp_comment(output, op.routing.empty() ? "" : "routing: " + op.routing, "    ");
         emit_cpp_client_method(output, op);
     }
 
@@ -951,6 +1042,10 @@ std::string rasn_schema_manifest_typescript_clients()
             output << "  constructor(private readonly transport: RasnRpcTransport) {}\n\n";
         }
         output << "  // " << op.service << "." << op.method << " -> " << op.task_code << "\n";
+        if (!op.routing.empty())
+        {
+            output << "  // routing: " << op.routing << "\n";
+        }
         output << "  " << op.method << "(request: " << typescript_client_type(op.request_type)
                << ", timeoutMs?: number): Promise<" << typescript_client_type(op.response_type) << "> {\n";
         output << "    return this.transport.call<" << typescript_client_type(op.request_type)
@@ -1022,6 +1117,7 @@ std::string rasn_schema_manifest_python_clients()
             output << "        self._transport = transport\n\n";
         }
         output << "    # " << op.service << "." << op.method << " -> " << op.task_code << "\n";
+        emit_line_comment(output, op.routing.empty() ? "" : "routing: " + op.routing, "    ");
         output << "    def " << op.method << "(self, request: " << python_client_type(op.request_type)
                << ", timeout_ms: Optional[int] = None) -> " << python_client_type(op.response_type) << ":\n";
         output << "        return cast(" << python_client_type(op.response_type)

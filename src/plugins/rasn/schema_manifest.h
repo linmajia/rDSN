@@ -31,6 +31,7 @@ struct rpc_operation_descriptor
     std::string task_code;
     std::string request_type;
     std::string response_type;
+    std::string routing;
 };
 
 std::vector<schema_type_descriptor> rasn_schema_manifest();
