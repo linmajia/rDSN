@@ -5143,11 +5143,14 @@ rasn_state_client::recover_sync(const state_checkpoint_request &request,
     }
 
     _rpc.open_service();
+    _registration.start(
+        "rasn.state", "rasn.service.state", primary_address(), name());
     return ::dsn::ERR_OK;
 }
 
 ::dsn::error_code rasn_state_app::stop(bool cleanup)
 {
+    _registration.stop();
     _rpc.close_service();
     return ::dsn::ERR_OK;
 }

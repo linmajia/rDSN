@@ -16,6 +16,7 @@
 #include <dsn/cpp/zlocks.h>
 #include <dsn/service_api_cpp.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -25,6 +26,8 @@
 
 namespace dsn {
 namespace rasn {
+
+class refreshable_endpoint_binding;
 
 class rasn_llm_agent_service : public agent_runtime
 {
@@ -376,14 +379,52 @@ public:
                             const ::dsn::rpc_address &state,
                             const ::dsn::rpc_address &workflow,
                             const ::dsn::rpc_address &observability);
-    bool rpc_clients_enabled() const { return _rpc_clients_enabled; }
-    const ::dsn::rpc_address &registry_address() const { return _registry_address; }
-    const ::dsn::rpc_address &coordinator_address() const { return _coordinator_address; }
-    const ::dsn::rpc_address &llm_agent_address() const { return _llm_agent_address; }
-    const ::dsn::rpc_address &tool_agent_address() const { return _tool_agent_address; }
-    const ::dsn::rpc_address &state_address() const { return _state_address; }
-    const ::dsn::rpc_address &workflow_address() const { return _workflow_address; }
-    const ::dsn::rpc_address &observability_address() const { return _observability_address; }
+    bool rpc_clients_enabled() const
+    {
+        return _rpc_clients_enabled.load(std::memory_order_acquire);
+    }
+    const ::dsn::rpc_address &registry_address() const
+    {
+        (void)rpc_clients_enabled();
+        return _registry_address;
+    }
+    const ::dsn::rpc_address &coordinator_address() const
+    {
+        (void)rpc_clients_enabled();
+        return _coordinator_address;
+    }
+    const ::dsn::rpc_address &llm_agent_address() const
+    {
+        (void)rpc_clients_enabled();
+        return _llm_agent_address;
+    }
+    const ::dsn::rpc_address &tool_agent_address() const
+    {
+        (void)rpc_clients_enabled();
+        return _tool_agent_address;
+    }
+    const ::dsn::rpc_address &state_address() const
+    {
+        (void)rpc_clients_enabled();
+        return _state_address;
+    }
+    const ::dsn::rpc_address &workflow_address() const
+    {
+        (void)rpc_clients_enabled();
+        return _workflow_address;
+    }
+    const ::dsn::rpc_address &observability_address() const
+    {
+        (void)rpc_clients_enabled();
+        return _observability_address;
+    }
+    agent_descriptor llm_agent_descriptor() const { return _llm_agent.descriptor(); }
+    agent_descriptor tool_agent_descriptor() const { return _tool_agent.descriptor(); }
+    agent_descriptor coordinator_descriptor() const { return _coordinator.descriptor(); }
+    // Returns null for an unknown logical service. Callers accepting dynamic
+    // names must reject that result before dereferencing it.
+    std::shared_ptr<refreshable_endpoint_binding>
+    service_endpoint_binding(const std::string &service) const;
 
     llm_response complete(const agent_completion_request &request);
     llm_response complete_streaming(const agent_completion_request &request, const llm_stream_callback &on_chunk);
@@ -421,11 +462,6 @@ private:
     friend class rasn_tool_agent_rpc_service;
     friend class rasn_coordinator_rpc_service;
 
-    void register_agents_with_registry_rpc();
-    void heartbeat_agents_to_registry();
-    void unregister_agents_from_registry_rpc();
-    void start_registry_heartbeat_timer();
-    void cancel_registry_heartbeat_timer();
     void register_ops_commands_once();
     bool ensure_inline_state_recovered(std::string *error);
     void record_inline_state_recovery(const state_response &response);
@@ -443,12 +479,19 @@ private:
     ::dsn::rpc_address _state_address;
     ::dsn::rpc_address _workflow_address;
     ::dsn::rpc_address _observability_address;
-    ::dsn::task_ptr _registry_heartbeat_timer;
+    std::shared_ptr<refreshable_endpoint_binding> _coordinator_binding;
+    std::shared_ptr<refreshable_endpoint_binding> _llm_agent_binding;
+    std::shared_ptr<refreshable_endpoint_binding> _tool_agent_binding;
+    std::shared_ptr<refreshable_endpoint_binding> _state_binding;
+    std::shared_ptr<refreshable_endpoint_binding> _workflow_binding;
+    std::shared_ptr<refreshable_endpoint_binding> _observability_binding;
     mutable ::dsn::service::zlock _lifecycle_lock;
     mutable ::dsn::service::zlock _inline_state_recovery_lock;
     uint32_t _lifecycle_ref_count;
     bool _lifecycle_transitioning;
-    bool _rpc_clients_enabled;
+    // Addresses and bindings are initialized before this one-way publication
+    // flag is released. They are never reconfigured after publication.
+    std::atomic<bool> _rpc_clients_enabled;
     bool _started;
     bool _inline_state_recovery_attempted;
     std::string _inline_state_recovery_error;
@@ -561,6 +604,7 @@ public:
 
 private:
     rasn_llm_agent_rpc_service _rpc;
+    rasn_core_service_registration _registration;
 };
 
 class rasn_tool_agent_app : public ::dsn::service_app
@@ -572,6 +616,7 @@ public:
 
 private:
     rasn_tool_agent_rpc_service _rpc;
+    rasn_core_service_registration _registration;
 };
 
 class rasn_coordinator_app : public ::dsn::service_app
@@ -583,6 +628,7 @@ public:
 
 private:
     rasn_coordinator_rpc_service _rpc;
+    rasn_core_service_registration _registration;
 };
 
 } // namespace rasn

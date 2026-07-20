@@ -245,8 +245,11 @@ bool has_module(const std::vector<std::string> &modules, const std::string &modu
 
 struct runtime_endpoint
 {
+    bool ok = true;
     ::dsn::rpc_address address;
     std::string source;
+    std::string error;
+    uint64_t generation = 0;
     uint32_t partition_index = 0;
     uint32_t partition_count = 1;
     // True when the operator explicitly declared this endpoint (a URI, host, or
@@ -256,6 +259,14 @@ struct runtime_endpoint
     // second-guessing through registry discovery (which may advertise a
     // primary_address() -- an auto-selected, possibly unreachable NIC).
     bool explicit_config = false;
+};
+
+struct runtime_registry_lookup
+{
+    bool ok = true;
+    bool found = false;
+    runtime_endpoint endpoint;
+    std::string error;
 };
 
 void warn_resolver_partition_contract_once(const std::string &module,
@@ -911,21 +922,32 @@ bool choose_registry_endpoint(const std::string &module,
     return false;
 }
 
-bool lookup_rasn_runtime_endpoint_capability(const std::string &module,
-                                             uint32_t partition_index,
-                                             const std::string &capability,
-                                             const std::string &source,
-                                             runtime_endpoint *endpoint)
+runtime_registry_lookup lookup_rasn_runtime_endpoint_capability(
+    const std::string &module,
+    uint32_t partition_index,
+    const std::string &capability,
+    const std::string &source)
 {
-    if (endpoint == nullptr || !rasn_runtime_registry_discovery_enabled())
+    runtime_registry_lookup lookup;
+    if (!rasn_runtime_registry_discovery_enabled())
     {
-        return false;
+        return lookup;
     }
 
-    std::vector<agent_descriptor> local_agents = global_agent_registry().query_by_capability(capability, true);
-    if (choose_registry_endpoint(module, local_agents, partition_index, source, endpoint))
+    std::vector<agent_descriptor> local_agents;
+    if (!global_agent_registry().query_by_capability(
+            capability, true, &local_agents, &lookup.error))
     {
-        return true;
+        lookup.ok = false;
+        lookup.error = "local registry query failed for capability '" +
+                       capability + "': " + lookup.error;
+        return lookup;
+    }
+    if (choose_registry_endpoint(
+            module, local_agents, partition_index, source, &lookup.endpoint))
+    {
+        lookup.found = true;
+        return lookup;
     }
 
     registry_query_request request;
@@ -936,51 +958,134 @@ bool lookup_rasn_runtime_endpoint_capability(const std::string &module,
     ::dsn::error_code err;
     registry_query_response response;
     std::tie(err, response) = registry.query_sync(request, rasn_runtime_registry_timeout());
-    if (err != ::dsn::ERR_OK || !response.ok || response.agents.empty())
+    if (err != ::dsn::ERR_OK)
     {
-        return false;
+        lookup.ok = false;
+        lookup.error = "registry query transport failure for capability '" +
+                       capability + "': " + err.to_string();
+        return lookup;
     }
-
-    return choose_registry_endpoint(module, response.agents, partition_index, source, endpoint);
+    if (!response.ok)
+    {
+        lookup.ok = false;
+        lookup.error = "registry query failed for capability '" + capability +
+                       "': " + response.error;
+        return lookup;
+    }
+    lookup.found = choose_registry_endpoint(
+        module, response.agents, partition_index, source, &lookup.endpoint);
+    return lookup;
 }
 
-bool lookup_rasn_runtime_endpoint_in_registry(const std::string &module, uint32_t partition_index, runtime_endpoint *endpoint)
+runtime_registry_lookup
+lookup_rasn_runtime_endpoint_in_registry(const std::string &module,
+                                         uint32_t partition_index)
 {
     const uint32_t partition_count = rasn_runtime_partition_count(module);
-    if (partition_count > 1 &&
-        lookup_rasn_runtime_endpoint_capability(module,
-                                                partition_index,
-                                                rasn_runtime_module_shard_capability(module, partition_index),
-                                                "registry:shard",
-                                                endpoint))
+    if (partition_count > 1)
     {
-        return true;
+        runtime_registry_lookup shard =
+            lookup_rasn_runtime_endpoint_capability(
+                module,
+                partition_index,
+                rasn_runtime_module_shard_capability(module, partition_index),
+                "registry:shard");
+        if (!shard.ok || shard.found)
+        {
+            return shard;
+        }
     }
     return lookup_rasn_runtime_endpoint_capability(
-        module, partition_index, rasn_runtime_module_capability(module), "registry", endpoint);
+        module,
+        partition_index,
+        rasn_runtime_module_capability(module),
+        "registry");
 }
 
-runtime_endpoint resolve_rasn_runtime_partition_endpoint(const std::string &module, uint32_t partition_index)
+endpoint_resolution resolve_rasn_runtime_partition_endpoint_once(
+    const std::string &module,
+    uint32_t partition_index,
+    const runtime_endpoint &static_endpoint)
 {
-    // An operator-declared endpoint wins over registry discovery. When the app was
-    // configured with an explicit runtime address ([rasn.service] rasn_runtime_host
-    // / _uri, or the per-module / per-shard variants) it must be honored verbatim:
-    // the app is meant to reach the runtime at exactly that address and should not
-    // fall back to a discovered primary_address() that a co-located or
-    // differently-homed client may be unable to reach. Discovery remains the
-    // mechanism for modules whose placement is left unconfigured (dynamic/sharded
-    // fleets), and the same static endpoint is the final localhost fallback.
-    const runtime_endpoint static_endpoint = static_rasn_runtime_endpoint(module, partition_index);
-    if (static_endpoint.explicit_config)
+    endpoint_resolution resolved;
+    const runtime_registry_lookup registry =
+        lookup_rasn_runtime_endpoint_in_registry(module, partition_index);
+    if (!registry.ok)
     {
-        return static_endpoint;
+        resolved.error = registry.error;
+        return resolved;
     }
+    resolved.ok = true;
+    resolved.found = true;
+    if (registry.found)
+    {
+        resolved.address = registry.endpoint.address;
+        resolved.source = registry.endpoint.source;
+        return resolved;
+    }
+    resolved.address = static_endpoint.address;
+    resolved.source = static_endpoint.source + ":fallback";
+    return resolved;
+}
+
+std::shared_ptr<refreshable_endpoint_binding>
+rasn_runtime_partition_binding(const std::string &module,
+                               uint32_t partition_index)
+{
+    static std::mutex lock;
+    static std::map<std::string, std::shared_ptr<refreshable_endpoint_binding>>
+        bindings;
+    const std::string key =
+        module + "#" + std::to_string(partition_index);
+    std::lock_guard<std::mutex> guard(lock);
+    const auto existing = bindings.find(key);
+    if (existing != bindings.end())
+    {
+        return existing->second;
+    }
+
+    const runtime_endpoint fallback =
+        static_rasn_runtime_endpoint(module, partition_index);
+    endpoint_resolver resolver;
+    const bool refreshable =
+        fallback.address.type() != HOST_TYPE_URI &&
+        rasn_runtime_registry_discovery_enabled();
+    if (refreshable)
+    {
+        resolver = [module, partition_index, fallback]() {
+            return resolve_rasn_runtime_partition_endpoint_once(
+                module, partition_index, fallback);
+        };
+    }
+    std::shared_ptr<refreshable_endpoint_binding> binding =
+        std::make_shared<refreshable_endpoint_binding>(
+            key,
+            fallback.address,
+            fallback.source,
+            /*resolve_on_first_use=*/refreshable && !fallback.explicit_config,
+            resolver);
+    bindings[key] = binding;
+    return binding;
+}
+
+runtime_endpoint
+resolve_rasn_runtime_partition_endpoint(const std::string &module,
+                                        uint32_t partition_index)
+{
+    const runtime_endpoint configured =
+        static_rasn_runtime_endpoint(module, partition_index);
+    const endpoint_snapshot snapshot =
+        rasn_runtime_partition_binding(module, partition_index)->current();
     runtime_endpoint endpoint;
-    if (lookup_rasn_runtime_endpoint_in_registry(module, partition_index, &endpoint))
-    {
-        return endpoint;
-    }
-    return static_endpoint;
+    endpoint.ok = snapshot.ok;
+    endpoint.address = snapshot.address;
+    endpoint.source = snapshot.source;
+    endpoint.error = snapshot.error;
+    endpoint.generation = snapshot.generation;
+    endpoint.partition_index = partition_index;
+    endpoint.partition_count = rasn_runtime_partition_count(module);
+    endpoint.explicit_config = configured.explicit_config;
+    return endpoint;
 }
 
 runtime_endpoint resolve_rasn_runtime_endpoint(const std::string &module, const std::string &key = "")
@@ -1003,7 +1108,13 @@ runtime_endpoint resolve_rasn_runtime_endpoint(const Request &request)
 std::string runtime_endpoint_label(const runtime_endpoint &endpoint)
 {
     std::ostringstream output;
-    output << endpoint.source << ":" << endpoint.address.to_string();
+    if (!endpoint.ok)
+    {
+        output << "unavailable:" << endpoint.error;
+        return output.str();
+    }
+    output << endpoint.source << ":" << endpoint.address.to_string()
+           << "#generation=" << endpoint.generation;
     if (endpoint.partition_count > 1)
     {
         output << "#shard=" << endpoint.partition_index << "/" << endpoint.partition_count;
@@ -3922,19 +4033,16 @@ typename runtime_response_for<Request>::type invoke_remote_module(const Request 
     }
     Request sending = input;
     initialize_runtime_request(&sending);
-    const runtime_endpoint resolved_endpoint = resolve_rasn_runtime_endpoint(sending);
-    const ::dsn::rpc_address address = resolved_endpoint.address;
+    const uint32_t partition_index =
+        rasn_runtime_partition_for_request(sending);
+    const uint32_t partition_count =
+        rasn_runtime_partition_count(module);
+    const std::shared_ptr<refreshable_endpoint_binding> binding =
+        rasn_runtime_partition_binding(module, partition_index);
     const uint64_t partition_hash = rasn_runtime_partition_hash_impl(sending);
-    const std::string endpoint = std::string(address.to_string());
-    const std::string breaker_key =
-        rasn_runtime_breaker_key(module, resolved_endpoint);
-    if (rasn_runtime_module_is_sharded(module) &&
-        resolved_endpoint.partition_count > 1)
+    if (rasn_runtime_module_is_sharded(module) && partition_count > 1)
     {
-        // Keep the wire-level ingress hint aligned with the partition selected
-        // from the stable key hash. The RPC header still carries the full hash so
-        // URI addresses let rDSN resolve the authoritative replica-group endpoint.
-        sending.metadata.__set_route_partition(resolved_endpoint.partition_index);
+        sending.metadata.__set_route_partition(partition_index);
     }
     std::string auth_error;
     if (!prepare_rasn_runtime_rpc_request(&sending, &auth_error))
@@ -3950,70 +4058,180 @@ typename runtime_response_for<Request>::type invoke_remote_module(const Request 
     lease_options.backoff_ms = backoff_ms;
     breaker_decision admission;
     const bool breaker_enabled = rasn_runtime_breaker_enabled();
+    std::string admitted_key;
+    bool admitted = false;
     if (breaker_enabled)
-    {
         ensure_rasn_runtime_breaker_config();
-        admission = global_rasn_runtime_breakers().allow(
-            breaker_key,
-            ::dsn_now_ms(),
-            rpc_breaker_probe_lease_hint(lease_options, timeout));
-        if (!admission.allowed)
+
+    const auto endpoint_from_snapshot =
+        [partition_index, partition_count](const endpoint_snapshot &snapshot) {
+            runtime_endpoint endpoint;
+            endpoint.ok = snapshot.ok;
+            endpoint.address = snapshot.address;
+            endpoint.source = snapshot.source;
+            endpoint.error = snapshot.error;
+            endpoint.generation = snapshot.generation;
+            endpoint.partition_index = partition_index;
+            endpoint.partition_count = partition_count;
+            return endpoint;
+        };
+    runtime_endpoint endpoint = endpoint_from_snapshot(binding->current());
+
+    const auto report_breaker = [&](bool ok) {
+        if (!breaker_enabled || !admitted)
+            return;
+        const breaker_report reported =
+            global_rasn_runtime_breakers().report(
+                admitted_key, admission, ok, ::dsn_now_ms());
+        if (!reported.available)
         {
-            dwarn("runtime module '%s' endpoint '%s' circuit breaker %s; short-circuiting RPC%s%s",
+            dwarn("runtime module '%s' endpoint breaker report failed for key '%s': %s",
                   module.c_str(),
-                  endpoint.c_str(),
-                  to_string(admission.state),
-                  admission.error.empty() ? "" : ": ",
-                  admission.error.c_str());
-            return make_runtime_transport_error(
-                input,
-                std::string("runtime module circuit breaker ") + to_string(admission.state) +
-                    (admission.error.empty() ? "" : ": " + admission.error));
+                  admitted_key.c_str(),
+                  reported.error.c_str());
         }
-    }
+        else if (reported.opened)
+        {
+            dwarn("runtime module '%s' endpoint breaker opened for key '%s' after %u consecutive failures",
+                  module.c_str(),
+                  admitted_key.c_str(),
+                  static_cast<unsigned int>(reported.consecutive_failures));
+        }
+    };
 
     for (uint32_t attempt = 1; attempt <= max_attempts; ++attempt)
     {
-        rasn_runtime_client client(address);
+        if (!endpoint.ok)
+        {
+            if (admitted)
+            {
+                report_breaker(false);
+                admitted = false;
+            }
+            if (attempt >= max_attempts || !binding->refreshable())
+            {
+                binding->record_exhausted();
+                return make_runtime_transport_error(
+                    input,
+                    "runtime module endpoint resolution failed for " + module +
+                        ": " + endpoint.error);
+            }
+            endpoint = endpoint_from_snapshot(
+                binding->refresh(endpoint.generation).endpoint);
+            if (backoff_ms > 0)
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(backoff_ms * attempt));
+            continue;
+        }
+
+        const std::string breaker_key =
+            rasn_runtime_breaker_key(module, endpoint);
+        if (admitted && admitted_key != breaker_key)
+        {
+            report_breaker(false);
+            admitted = false;
+        }
+        if (!admitted || admitted_key != breaker_key)
+        {
+            admitted_key = breaker_key;
+            if (breaker_enabled)
+            {
+                admission = global_rasn_runtime_breakers().allow(
+                    breaker_key,
+                    ::dsn_now_ms(),
+                    rpc_breaker_probe_lease_hint(lease_options, timeout));
+                if (!admission.allowed)
+                {
+                    dwarn("runtime module '%s' endpoint '%s' circuit breaker %s; refreshing binding%s%s",
+                          module.c_str(),
+                          endpoint.address.to_string(),
+                          to_string(admission.state),
+                          admission.error.empty() ? "" : ": ",
+                          admission.error.c_str());
+                    if (attempt >= max_attempts || !binding->refreshable())
+                    {
+                        binding->record_exhausted();
+                        return make_runtime_transport_error(
+                            input,
+                            std::string("runtime module circuit breaker ") +
+                                to_string(admission.state) +
+                                (admission.error.empty()
+                                     ? ""
+                                     : ": " + admission.error));
+                    }
+                    endpoint = endpoint_from_snapshot(
+                        binding->refresh(endpoint.generation).endpoint);
+                    if (backoff_ms > 0)
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(backoff_ms * attempt));
+                    continue;
+                }
+                admitted = true;
+            }
+        }
+
+        rasn_runtime_client client(endpoint.address);
         const std::pair< ::dsn::error_code, response_type> result =
             client.call_sync(sending, timeout, 0, partition_hash);
         if (result.first == ::dsn::ERR_OK)
         {
-            if (breaker_enabled)
+            const bool stale_topology =
+                !runtime_status_ok(result.second.status) &&
+                result.second.status.retryable &&
+                result.second.status.code ==
+                    ::dsn::rasn::rpc::runtime_error_code::misrouted;
+            if (!stale_topology)
             {
-                const breaker_report reported = global_rasn_runtime_breakers().report(
-                    breaker_key, admission, true, ::dsn_now_ms());
-                if (!reported.available)
-                {
-                    dwarn("runtime module '%s' endpoint '%s' circuit breaker report failed: %s",
-                          module.c_str(),
-                          endpoint.c_str(),
-                          reported.error.c_str());
-                }
+                report_breaker(true);
+                return result.second;
             }
-            return result.second;
+
+            // A misroute is a typed pre-dispatch topology rejection. It is safe to
+            // retry even for mutations, using the same request/auth/trace/dedup id.
+            report_breaker(true);
+            admitted = false;
+            endpoint = endpoint_from_snapshot(
+                binding->refresh(endpoint.generation).endpoint);
+            if (attempt >= max_attempts)
+            {
+                binding->record_exhausted();
+                return result.second;
+            }
+            dwarn("runtime module '%s' RPC attempt %u/%u was misrouted; refreshing shard %u binding",
+                  module.c_str(),
+                  static_cast<unsigned int>(attempt),
+                  static_cast<unsigned int>(max_attempts),
+                  static_cast<unsigned int>(partition_index));
+            if (backoff_ms > 0)
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(backoff_ms * attempt));
+            continue;
         }
-        if (attempt >= max_attempts || !is_retryable_rasn_runtime_error(result.first))
+
+        const bool transport_retryable =
+            is_retryable_rasn_runtime_error(result.first);
+        const bool ambiguous_mutation =
+            runtime_request_is_mutating(sending) &&
+            rpc_error_is_ambiguous_transient(result.first) &&
+            !rasn_runtime_module_uses_native_replication(module);
+        const bool retryable = transport_retryable && !ambiguous_mutation;
+        const runtime_endpoint failed_endpoint = endpoint;
+        if (transport_retryable && binding->refreshable())
         {
-            if (breaker_enabled)
+            endpoint = endpoint_from_snapshot(
+                binding->refresh(endpoint.generation).endpoint);
+            if (endpoint.ok &&
+                endpoint.address != failed_endpoint.address)
             {
-                const breaker_report reported = global_rasn_runtime_breakers().report(
-                    breaker_key, admission, false, ::dsn_now_ms());
-                if (!reported.available)
-                {
-                    dwarn("runtime module '%s' endpoint '%s' circuit breaker report failed: %s",
-                          module.c_str(),
-                          endpoint.c_str(),
-                          reported.error.c_str());
-                }
-                else if (reported.opened)
-                {
-                    dwarn("runtime module '%s' endpoint '%s' circuit breaker opened after %u consecutive failures",
-                          module.c_str(),
-                          endpoint.c_str(),
-                          static_cast<unsigned int>(reported.consecutive_failures));
-                }
+                report_breaker(false);
+                admitted = false;
             }
+        }
+        if (attempt >= max_attempts || !retryable)
+        {
+            report_breaker(false);
+            if (retryable && attempt >= max_attempts)
+                binding->record_exhausted();
             return make_runtime_transport_error(
                 input, std::string("runtime module RPC failed: ") + result.first.to_string());
         }
@@ -4053,7 +4271,26 @@ bool ping_remote_module_type(const std::string &module, std::string *error)
     std::string first_error;
     for (uint32_t partition_index = 0; partition_index < partition_count; ++partition_index)
     {
-        const runtime_endpoint resolved_endpoint = resolve_rasn_runtime_partition_endpoint(module, partition_index);
+        const std::shared_ptr<refreshable_endpoint_binding> binding =
+            rasn_runtime_partition_binding(module, partition_index);
+        runtime_endpoint resolved_endpoint =
+            resolve_rasn_runtime_partition_endpoint(module, partition_index);
+        if (!resolved_endpoint.ok && binding->refreshable())
+        {
+            (void)binding->refresh(resolved_endpoint.generation);
+            resolved_endpoint =
+                resolve_rasn_runtime_partition_endpoint(module, partition_index);
+        }
+        if (!resolved_endpoint.ok)
+        {
+            all_ok = false;
+            if (first_error.empty())
+            {
+                first_error = "runtime module endpoint resolution failed: " +
+                              resolved_endpoint.error;
+            }
+            continue;
+        }
         const ::dsn::rpc_address address = resolved_endpoint.address;
         const std::string endpoint = std::string(address.to_string());
         const std::string breaker_key =
@@ -4087,6 +4324,10 @@ bool ping_remote_module_type(const std::string &module, std::string *error)
                 breaker_key, ::dsn_now_ms(), static_cast<uint64_t>(ping_timeout.count()));
             if (!admission.allowed)
             {
+                if (binding->refreshable())
+                {
+                    (void)binding->refresh(resolved_endpoint.generation);
+                }
                 all_ok = false;
                 if (first_error.empty())
                 {
@@ -4103,6 +4344,11 @@ bool ping_remote_module_type(const std::string &module, std::string *error)
             client.call_sync(ping, ping_timeout, 0, partition_hash);
         if (result.first != ::dsn::ERR_OK)
         {
+            if (is_retryable_rasn_runtime_error(result.first) &&
+                binding->refreshable())
+            {
+                (void)binding->refresh(resolved_endpoint.generation);
+            }
             if (breaker_enabled)
             {
                 const breaker_report reported = global_rasn_runtime_breakers().report(
@@ -4134,6 +4380,13 @@ bool ping_remote_module_type(const std::string &module, std::string *error)
         std::string response_error;
         if (!response_bool(result.second, &response_error))
         {
+            if (result.second.status.retryable &&
+                result.second.status.code ==
+                    ::dsn::rasn::rpc::runtime_error_code::misrouted &&
+                binding->refreshable())
+            {
+                (void)binding->refresh(resolved_endpoint.generation);
+            }
             all_ok = false;
             if (first_error.empty())
             {
@@ -8080,14 +8333,40 @@ rasn_runtime_app::rasn_runtime_app(::dsn_gpid gpid, std::vector<std::string> mod
     state_query_request request;
     request.key_prefix = rasn_runtime_state_prefix(config.state_prefix);
 
-    rasn_state_client state(rasn_service_address("state", 27104));
+    const std::shared_ptr<refreshable_endpoint_binding> state_binding =
+        global_rasn_services().service_endpoint_binding("state");
+    if (state_binding == nullptr)
+    {
+        derror("runtime state hydration cannot find the state endpoint binding");
+        return ::dsn::ERR_INVALID_PARAMETERS;
+    }
     const uint32_t max_attempts = rasn_runtime_state_hydration_max_attempts();
     const std::chrono::milliseconds retry_backoff = rasn_runtime_state_hydration_retry_backoff();
     ::dsn::error_code err = ::dsn::ERR_OK;
     state_response response;
     for (uint32_t attempt = 1; attempt <= max_attempts; ++attempt)
     {
-        std::tie(err, response) = state.query_sync(request, rasn_runtime_state_hydration_timeout());
+        endpoint_snapshot endpoint = state_binding->current();
+        if (!endpoint.ok && endpoint.refreshable)
+        {
+            endpoint = state_binding->refresh(endpoint.generation).endpoint;
+        }
+        if (!endpoint.ok)
+        {
+            err = ::dsn::ERR_SERVICE_NOT_FOUND;
+        }
+        else
+        {
+            rasn_state_client state(endpoint.address);
+            std::tie(err, response) =
+                state.query_sync(request, rasn_runtime_state_hydration_timeout());
+            if (err != ::dsn::ERR_OK &&
+                is_retryable_rasn_runtime_error(err) &&
+                endpoint.refreshable)
+            {
+                (void)state_binding->refresh(endpoint.generation);
+            }
+        }
         if (err == ::dsn::ERR_OK)
         {
             break;

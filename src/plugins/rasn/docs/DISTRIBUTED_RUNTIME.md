@@ -337,14 +337,18 @@ same machine as the apps (clients dial `127.0.0.1`) or on a dedicated node
 (clients dial its routable address). Either way an app only ever needs the
 runtime's address — never its internal `[rasn.service]`/`[apps.*]` topology.
 
-**Endpoint resolution — explicit wins over discovery.** When an app configures an
-explicit runtime address (`[rasn.service] rasn_runtime_host`/`_uri`, or a
-`rasn_runtime_port` or per-module/per-shard variant), that endpoint is
-**authoritative**: the client
-dials exactly it and does **not** consult registry discovery, so it always reaches
-the runtime you pointed it at. Registry discovery
-(`rasn_runtime_registry_discovery_enabled`, default on) is used only for modules
-left unconfigured, with the static localhost endpoint as the final fallback.
+**Endpoint resolution — explicit wins initially; discovery repairs stale
+host/port routes.** When an app configures an explicit runtime address
+(`[rasn.service] rasn_runtime_host`/`_uri`, or a `rasn_runtime_port` or
+per-module/per-shard variant), that endpoint is generation 1 and is dialed first.
+An explicit host/port remains the static fallback, but after a retryable
+transport/breaker/misroute signal the client may refresh the corresponding
+registry capability and atomically bind a replacement. URI endpoints remain
+authoritative through rDSN's resolver and are not independently rebound by rASN.
+Registry discovery (`rasn_runtime_registry_discovery_enabled`, default on) is
+also used on first use for modules left unconfigured, with the static localhost
+endpoint as the fallback after a successful empty query. Registry failures are
+not converted into fallback success.
 Symmetrically, a runtime host registers its modules under the address in
 `rasn_runtime_advertise_host` (per-module `<module>_advertise_host`) when set —
 `127.0.0.1` for co-located clients, a routable IP/DNS name for multi-machine — so
@@ -370,6 +374,7 @@ sequenceDiagram
     participant Facade
     participant Remote as invoke_remote_module
     participant Breaker as circuit breaker (module + endpoint)
+    participant Registry as rasn.registry
     participant Svc as module service
 
     Facade->>Remote: call_module_api(request)
@@ -387,6 +392,8 @@ sequenceDiagram
                 Remote-->>Facade: response
             else transient error
                 Svc-->>Remote: ERR_TIMEOUT/NETWORK/BUSY/...
+                Remote->>Registry: refresh module/shard capability
+                Registry-->>Remote: endpoint generation N+1
                 Remote->>Remote: backoff (linear * attempt)
             end
         end
@@ -400,6 +407,15 @@ sequenceDiagram
   (`ERR_TIMEOUT`, `ERR_NETWORK_FAILURE`, `ERR_NETWORK_INIT_FAILED`, `ERR_BUSY`,
   `ERR_CAPACITY_EXCEEDED`, `ERR_TRY_AGAIN`), and linear backoff. Non-transient
   errors fail fast.
+- **Generation-aware rebinding.** Each module/shard owns one cached binding.
+  Refresh is single-flight, performs registry I/O without holding the state lock,
+  and rejects a resolver completion from an older generation. Resolver exceptions
+  propagate to the owning caller after releasing the matching flight and waking
+  waiters; they cannot overwrite a newer reset generation. A retryable transport
+  error, open breaker, or typed `misrouted` response can refresh within the same
+  attempt/backoff budget; typed application, validation, auth, conflict, and
+  not-found errors cannot. Request ID, trace ID, auth token, route partition,
+  deadline, and dedup identity are initialized once before the loop.
 - **Per-endpoint circuit breaker.** A process-global `circuit_breaker_registry`
   keyed by `module + shard + resolved endpoint`. For a URI this is intentionally
   the logical URI/partition: rDSN first invalidates and retries a failed physical
@@ -1003,7 +1019,7 @@ bespoke mechanism, the audit names the rDSN facility that should back it.
 | 1.3 | P0 | **Registry discovery was an in-memory SPOF on the request path.** Routing resolved live endpoints through one process-local `rasn.registry`; restart lost dynamic membership and one frontend failure interrupted discovery. | **RESOLVED (code/config)** — §9/§13.14: opt-in ZooKeeper-backed `meta_state_service` records, fenced active-writer election over `distributed_lock_service`, shared reads on every frontend, strict backend errors, and rDSN group-address failover/retry across `registry_addresses`. Local map + legacy one-address behavior remain the default |
 | 1.4 | P1 | **Runtime RPC carried no end-to-end trace id.** `agent_request`/`response` carried `trace_id`, but module calls did not propagate it, so a call could not be followed across nodes in logs. | **RESOLVED (code)** — §13.4; generated request/response metadata carries `trace_id`, stamped from an ambient scope on egress and restored/echoed on ingress |
 | 1.5 | P1 | **Resilience/quota/dedup state is per serving process.** Breaker, dedup, admission, and rate state live on whichever node serves the RPC; there is no shared view, so protection is per-replica, not cluster-global. | **PARTIALLY RESOLVED (code)** — all four circuit-breaker families can use the fenced coordination adapter (§13.7). Native module tables now replicate deterministic quota mutations and a bounded FIFO dedup window with each partition, including checkpoints (§13.15). Admission, rate/cost, and process-wide overload authorities remain per process because they need leased capacity or transactional allocation. |
-| 1.6 | P2 | **Core service endpoints are bound at construction.** Some core clients resolve their peer once, limiting failover for non-registry paths. | **PARTIALLY RESOLVED** — registry clients now bind one durable rDSN group whose leader changes in place; other core-service addresses still need resolver/group-based rebinding |
+| 1.6 | P2 | **Core service endpoints are bound at construction.** Some core clients resolve their peer once, limiting failover for non-registry paths. | **RESOLVED (code/config)** — §13.16: shared generation-aware bindings cover coordinator/model/tool/state/workflow/observability, runtime module shards, readiness/hydration, and dynamic remote-agent routing; URI paths remain rDSN-resolver-owned and registry resolution stays non-recursive |
 
 ### 13.2 Lens 2 — Reinvention vs. reuse of rDSN
 
@@ -1967,3 +1983,110 @@ enabled; use network/transport identity and isolation until authentication can b
 validated before replication. Remaining work is deployment evidence rather than
 an alternate consensus implementation: automate real multi-host primary
 failover/checkpoint transfer and add standalone-to-table migration tooling.
+
+### 13.16 Dynamic endpoint re-resolution (finding 1.6) — RESOLVED (code/config)
+
+`refreshable_endpoint_binding` is the shared host/port discovery abstraction for
+the service graph and distributed runtime. It stores an immutable endpoint
+snapshot plus a monotonic generation. Reads are lock-bounded; registry/network
+resolution runs outside the mutex. One caller refreshes while concurrent callers
+wait for that refresh result, and reset/reconfiguration advances the generation
+so an older failed resolver completion cannot overwrite newer state. A lazy
+resolution initiated by `current()` establishes the initial cached endpoint
+without reporting a rebind. An explicit `refresh(generation)` that changes the
+usable address advances the generation and reports a rebind even after a lazy
+reset. A no-throw guard is created immediately after ownership is claimed and
+owns matching-generation teardown through attempt accounting, resolver
+invocation, state preparation, publication, and return construction. Normal
+state/result data is fully prepared before publication with statically verified
+member-derived no-throw moves. Endpoint results store an allocation-free
+rASN-local scalar `dsn_address_t` value alongside their `std::string` members;
+conversion to and from the unchanged rDSN `rpc_address` happens only at
+ordinary boundaries and is not claimed no-throw. Construction from
+`rpc_address` is explicit, while outbound conversion remains compatible with
+existing RPC client and return boundaries; assignment remains intentional at
+visible `.address = rpc_address` storage boundaries. URI and GROUP payloads are
+raw non-owning handles exactly as in `rpc_address`: `endpoint_address` adds no
+refcounting or ownership, so the underlying handle must outlive its use. Normal
+host/port defaults and the runtime advertise override materialize IPv4 values;
+operator URI routes remain authoritative, and the configured registry frontend
+group is process-lifetime (§13.14). Publication clears the
+flight sentinel, advances the completion sequence, and notifies waiters; it is
+also the semantic commit point, so the published terminal outcome is staged
+immediately and cannot later be relabeled as an exception. Post-publication
+diagnostics contain all formatting/logging exceptions and only report an
+allocation-free, non-recursive drop. Any pre-publication unwind publishes a
+detailed failed completion when allocation permits, otherwise an allocation-free
+failed sentinel, and propagates the original exception. Stale exceptions
+preserve the newer reset generation.
+
+The test executable's allocation injector is a non-copyable thread-local RAII
+scope. Nested scopes suspend and restore the outer rule, destruction always
+disarms the current rule, and a fired rule auto-disarms before propagating
+`std::bad_alloc`. The focused refresh case skips the resolver's first matching
+large source allocation and fails the next allocation in that distinctive size
+class. It records both matching allocations and their requested sizes, then
+verifies unchanged fallback address, source, and generation before a
+same-generation recovery. A future
+pre-publication allocation in the same targeted size class still exercises the
+same flight-abandon path; the proof does not depend on one exact source line.
+
+Coverage by client family:
+
+| Client family | Initial route | Refresh authority |
+| --- | --- | --- |
+| Registry register/query/list/heartbeat | configured URI, static endpoint, or `registry_addresses` group | rDSN URI/group rotation only; never registry self-discovery |
+| Coordinator/model/tool | configured URI or host/port | rDSN URI resolver, otherwise `rasn.service.<name>` registry capability |
+| State/workflow/observability | configured URI or host/port | rDSN URI resolver, otherwise lease-published `rasn.service.<name>` capability |
+| Runtime modules | per-module/per-shard URI or host/port, or first-use discovery | rDSN URI resolver, otherwise exact `rasn.runtime.<module>.shard.<n>` then module capability |
+| Dynamic remote agents | coordinator registry route | capability query repeated after transport or typed stale-topology/misroute failure |
+| Local/co-located mode | in-process facade or localhost static route | no network discovery on the in-process path; localhost remains fallback |
+
+The existing resilience budgets remain authoritative. A transport failure may
+invalidate/re-resolve and then retry only when the operation's existing policy
+allows replay. Pre-apply rejections are safe for any operation; ambiguous
+network/timeout outcomes are replayed only for idempotent core calls. Runtime
+mutations reuse their stable request ID and server dedup contract. An ambiguous
+unsafe core mutation or non-native runtime mutation refreshes the cache for the
+next logical operation but returns the original failure without replay. Native
+replicated runtime modules may replay because their deduplication state is
+replicated. Request/trace/auth/deadline, partition, and dedup metadata are
+caller-owned and are not reconstructed during rebind.
+
+Breakers and remote-agent admission/rate state include the concrete endpoint in
+their key. A failed generation is reported before admission moves to a
+replacement, so the old endpoint cannot poison the new one. Application,
+validation, authorization, deterministic conflict/not-found, and other typed
+business errors return normally and do not trigger discovery.
+
+Concrete coordinator/model/tool RPC apps lease-publish their full descriptors
+with matching service aliases; graph-only processes do not advertise RPC
+handlers they do not host. Standalone state, workflow, and observability apps
+publish lease-tracked service aliases through the existing registry
+register/heartbeat/unregister API. A successful empty registry query keeps the
+configured static fallback; transport/backend/schema failures remain explicit
+after bounded attempts.
+
+Metrics expose refresh attempts, successful rebinds, unchanged resolutions,
+completed resolver failures, superseded generations, exceptions, and exhaustion.
+Every owning attempt emits exactly one terminal classification, so
+`attempts = rebound + unchanged + failed + superseded + exception`; waiters do
+not increment either side. This equality applies to updates accepted by the
+best-effort metrics backend: backend exceptions are contained, the affected
+update is dropped, and a fixed non-recursive stderr diagnostic is emitted at
+most once, so a partial backend outage may make exported counters diverge
+without affecting refresh teardown. A thrown resolver exception remains visible
+to its owner rather than being converted into a success-shaped result.
+Service topology and runtime diagnostics include the current endpoint source and
+generation without printing auth tokens or sensitive configuration. Focused
+coverage sources exercise stale-to-new rebinding, single-flight convergence,
+resolver and pre-publication allocation exception cleanup, terminal metric
+reconciliation, unchanged/failure results, static and registry-self paths,
+typed-error classification, metadata preservation, bounded mutations, breaker
+isolation, shard-specific capabilities, and local discovery. The allocation
+case uses a thread-local one-shot replacement allocator linked only into the
+test executable to verify owner exception propagation and same-generation
+recovery. Joiner notification remains covered by the resolver-exception test;
+the allocation case does not claim externally unobservable waiter admission.
+No production completion callback, failpoint, or synthetic post-resolution hook
+is shipped.

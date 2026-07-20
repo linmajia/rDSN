@@ -1,5 +1,6 @@
 #pragma once
 
+#include <rasn/endpoint_binding.h>
 #include <rasn/agent_types.h>
 #include <rasn/rasn.code.definition.h>
 #include <rasn/state_service.h>
@@ -274,6 +275,7 @@ public:
 private:
     rasn_workflow_rpc_service _rpc;
     ::dsn::task_ptr _recovery_task;
+    rasn_core_service_registration _registration;
 };
 
 } // namespace rasn

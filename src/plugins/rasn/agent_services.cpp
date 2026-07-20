@@ -67,6 +67,8 @@ struct service_endpoint_config
     std::string endpoint_uri;
 };
 
+std::chrono::milliseconds registry_registration_timeout();
+
 bool same_state_record_content(const state_record &left, const state_record &right)
 {
     return left.schema_version == right.schema_version && left.key == right.key &&
@@ -87,17 +89,77 @@ void set_rdsn_rpc_enabled(bool enabled)
 // ambiguous timeout (e.g. starting a workflow run, a compare-and-swap, or a plain
 // state put that allocates a fresh sequence per apply); those are only retried on
 // transport errors that prove the request never reached the server.
+endpoint_resolver make_core_endpoint_resolver(
+    const std::string &capability,
+    const std::string &preferred_identity,
+    const ::dsn::rpc_address &registry,
+    const ::dsn::rpc_address &fallback)
+{
+    if (fallback.type() == HOST_TYPE_URI)
+    {
+        // rDSN's URI address already owns partition/primary invalidation. Querying
+        // the agent registry in parallel would bypass that authoritative resolver.
+        return endpoint_resolver();
+    }
+    return [capability, preferred_identity, registry, fallback]() {
+        return resolve_registry_endpoint(capability,
+                                         preferred_identity,
+                                         registry,
+                                         fallback,
+                                         "static:fallback",
+                                         registry_registration_timeout());
+    };
+}
+
+std::shared_ptr<refreshable_endpoint_binding>
+make_core_endpoint_binding(const std::string &service,
+                           const std::string &capability,
+                           const std::string &preferred_identity,
+                           const ::dsn::rpc_address &registry,
+                           const ::dsn::rpc_address &fallback)
+{
+    return std::make_shared<refreshable_endpoint_binding>(
+        service,
+        fallback,
+        fallback.type() == HOST_TYPE_URI ? "resolver" : "static",
+        /*resolve_on_first_use=*/false,
+        make_core_endpoint_resolver(
+            capability, preferred_identity, registry, fallback));
+}
+
 template <typename TResponse, typename FCall>
 std::pair< ::dsn::error_code, TResponse>
-core_rpc_with_resilience(const char *op, const ::dsn::rpc_address &address, bool idempotent, FCall &&call)
+core_rpc_with_resilience_at_timeout(
+    const char *op,
+    const std::shared_ptr<refreshable_endpoint_binding> &binding,
+    bool idempotent,
+    std::chrono::milliseconds timeout,
+    FCall &&call)
 {
     ensure_rasn_core_breaker_config();
-    const rpc_resilience_options options = read_rasn_core_resilience_options();
-    // Key the breaker by service+endpoint (not operation+endpoint) so every
-    // operation to a down endpoint trips the same breaker together.
-    const std::string key = core_service_breaker_key(op, address.to_string());
-    return resilient_rpc_call<TResponse>(
-        global_rasn_core_breakers(), key, options, idempotent, default_rpc_timeout(), std::forward<FCall>(call));
+    return resilient_bound_rpc_call<TResponse>(global_rasn_core_breakers(),
+                                               *binding,
+                                               op,
+                                               read_rasn_core_resilience_options(),
+                                               idempotent,
+                                               timeout,
+                                               std::forward<FCall>(call));
+}
+
+template <typename TResponse, typename FCall>
+std::pair< ::dsn::error_code, TResponse>
+core_rpc_with_resilience(
+    const char *op,
+    const std::shared_ptr<refreshable_endpoint_binding> &binding,
+    bool idempotent,
+    FCall &&call)
+{
+    return core_rpc_with_resilience_at_timeout<TResponse>(
+        op,
+        binding,
+        idempotent,
+        default_rpc_timeout(),
+        std::forward<FCall>(call));
 }
 
 ::dsn::rpc_address make_ipv4_address(const std::string &host, uint16_t port)
@@ -183,18 +245,6 @@ void record_external_effect_if_needed(nucleus_runtime &runtime,
                                    status);
 }
 
-bool registry_dynamic_registration_enabled()
-{
-    return ::dsn_config_get_value_bool(
-        "rasn.registry", "dynamic_registration", true, "Register built-in rASN agents through registry RPC");
-}
-
-uint64_t registry_heartbeat_ms()
-{
-    return ::dsn_config_get_value_uint64(
-        "rasn.registry", "heartbeat_ms", 2000, "rASN registry heartbeat interval in milliseconds");
-}
-
 std::chrono::milliseconds registry_registration_timeout()
 {
     const uint64_t timeout_ms = ::dsn_config_get_value_uint64(
@@ -220,17 +270,6 @@ void set_agent_service_endpoint(agent_runtime &agent, const std::string &service
 {
     const service_endpoint_config endpoint = config_service_endpoint(service_name, default_port);
     agent.set_endpoint(endpoint.host, endpoint.port, endpoint.endpoint_uri);
-}
-
-std::vector<agent_descriptor> registered_service_agents(const rasn_llm_agent_service &llm_agent,
-                                                        const rasn_tool_agent_service &tool_agent,
-                                                        const rasn_coordinator_service &coordinator)
-{
-    std::vector<agent_descriptor> agents;
-    agents.push_back(llm_agent.descriptor());
-    agents.push_back(tool_agent.descriptor());
-    agents.push_back(coordinator.descriptor());
-    return agents;
 }
 
 llm_response rpc_error_response(const std::string &message)
@@ -420,19 +459,30 @@ std::string format_tool_rate_states(const std::vector<rate_limiter_registry::ent
 
 std::string remote_agent_key(const agent_descriptor &agent)
 {
-    if (!agent.agent_id.empty())
-    {
-        return agent.agent_id;
-    }
+    std::string endpoint;
     if (!agent.endpoint_uri.empty())
     {
-        return agent.endpoint_uri;
+        endpoint = agent.endpoint_uri;
     }
-    if (!agent.host.empty() || agent.port != 0)
+    else if (!agent.host.empty() || agent.port != 0)
     {
-        return agent.host + ":" + std::to_string(agent.port);
+        endpoint = agent.host + ":" + std::to_string(agent.port);
     }
-    return "<unknown-agent>";
+    if (!agent.agent_id.empty())
+    {
+        return endpoint.empty() ? agent.agent_id
+                                : agent.agent_id + "@" + endpoint;
+    }
+    return endpoint.empty() ? "<unknown-agent>" : endpoint;
+}
+
+bool remote_agent_response_requests_refresh(const agent_response &response)
+{
+    return !response.ok &&
+           ((response.error.failure_class == "rpc" &&
+             response.error.code == "agent_invoke_failed") ||
+            response.error.code == "stale_topology" ||
+            response.error.code == "misrouted");
 }
 
 agent_response remote_agent_gate_response(const agent_request &request,
@@ -2338,12 +2388,57 @@ agent_response rasn_coordinator_service::invoke(const agent_request &request, nu
             runtime,
             route.agent,
             "coordinator.invoke",
-            [request, route, this, &runtime](uint32_t) {
+            [request,
+             route,
+             this,
+             &runtime,
+             &services,
+             routed_agent = route.agent](uint32_t,
+                                         const agent_response *previous) mutable {
                 if (is_cancelled(request.request_id))
                 {
                     return cancelled_response(request);
                 }
-                return invoke_remote_agent(request, runtime, route.agent);
+                if (previous != nullptr &&
+                    remote_agent_response_requests_refresh(*previous))
+                {
+                    metrics_registry &metrics = metrics_registry::instance();
+                    coordinator_route refreshed;
+                    metrics.on_endpoint_refresh(
+                        endpoint_refresh_metric::attempt);
+                    try
+                    {
+                        refreshed =
+                            coordinator_router::resolve(
+                                request,
+                                services.rpc_clients_enabled(),
+                                services.registry_address());
+                        if (refreshed.ok)
+                        {
+                            const std::string previous_key =
+                                remote_agent_key(routed_agent);
+                            routed_agent = refreshed.agent;
+                            metrics.on_endpoint_refresh(
+                                previous_key ==
+                                        remote_agent_key(routed_agent)
+                                    ? endpoint_refresh_metric::unchanged
+                                    : endpoint_refresh_metric::rebound);
+                        }
+                    }
+                    catch (...)
+                    {
+                        metrics.on_endpoint_refresh(
+                            endpoint_refresh_metric::exception);
+                        throw;
+                    }
+                    if (!refreshed.ok)
+                    {
+                        metrics.on_endpoint_refresh(
+                            endpoint_refresh_metric::failed);
+                        return refreshed.error;
+                    }
+                }
+                return invoke_remote_agent(request, runtime, routed_agent);
             });
         if (is_cancelled(request.request_id))
         {
@@ -2360,7 +2455,8 @@ agent_response rasn_coordinator_service::invoke(const agent_request &request, nu
         runtime,
         route.agent,
         "coordinator.invoke",
-        [request, route, this, &runtime](uint32_t) {
+        [request, route, this, &runtime](uint32_t,
+                                        const agent_response *) {
             if (is_cancelled(request.request_id))
             {
                 return cancelled_response(request);
@@ -2415,6 +2511,37 @@ rasn_service_graph::rasn_service_graph()
     _state_address(config_service_address("state", 27104)),
     _workflow_address(config_service_address("workflow", 27105)),
     _observability_address(config_service_address("observability", 27106)),
+    _coordinator_binding(make_core_endpoint_binding("coordinator",
+                                                    "rasn.service.coordinator",
+                                                    "rasn.coordinator",
+                                                    _registry_address,
+                                                    _coordinator_address)),
+    _llm_agent_binding(make_core_endpoint_binding("llm_agent",
+                                                  "rasn.service.llm_agent",
+                                                  "rasn.llm.agent",
+                                                  _registry_address,
+                                                  _llm_agent_address)),
+    _tool_agent_binding(make_core_endpoint_binding("tool_agent",
+                                                   "rasn.service.tool_agent",
+                                                   "rasn.tool.agent",
+                                                   _registry_address,
+                                                   _tool_agent_address)),
+    _state_binding(make_core_endpoint_binding("state",
+                                              "rasn.service.state",
+                                              "rasn.state",
+                                              _registry_address,
+                                              _state_address)),
+    _workflow_binding(make_core_endpoint_binding("workflow",
+                                                 "rasn.service.workflow",
+                                                 "rasn.workflow",
+                                                 _registry_address,
+                                                 _workflow_address)),
+    _observability_binding(make_core_endpoint_binding(
+        "observability",
+        "rasn.service.observability",
+        "rasn.observability",
+        _registry_address,
+        _observability_address)),
     _lifecycle_ref_count(0),
     _lifecycle_transitioning(false),
     _rpc_clients_enabled(false),
@@ -2537,9 +2664,9 @@ uint32_t rasn_service_graph::lifecycle_ref_count() const
 
 void rasn_service_graph::start_unlocked()
 {
-    if (g_rdsn_rpc_enabled && !_rpc_clients_enabled)
+    if (g_rdsn_rpc_enabled && !rpc_clients_enabled())
     {
-        _rpc_clients_enabled = true;
+        _rpc_clients_enabled.store(true, std::memory_order_release);
         dinfo("enabled rASN RPC clients from service graph startup");
     }
 
@@ -2563,8 +2690,6 @@ void rasn_service_graph::start_unlocked()
     {
         dwarn("failed to register coordinator agent: %s", error.c_str());
     }
-    register_agents_with_registry_rpc();
-    start_registry_heartbeat_timer();
     register_ops_commands_once();
 }
 
@@ -2622,9 +2747,6 @@ void rasn_service_graph::register_ops_commands_once()
 
 void rasn_service_graph::stop_unlocked()
 {
-    cancel_registry_heartbeat_timer();
-    unregister_agents_from_registry_rpc();
-
     _coordinator.stop();
     _tool_agent.stop();
     _llm_agent.stop();
@@ -2636,156 +2758,26 @@ void rasn_service_graph::stop_unlocked()
     _started = false;
 }
 
-void rasn_service_graph::register_agents_with_registry_rpc()
-{
-    if (!_rpc_clients_enabled || !registry_dynamic_registration_enabled())
-    {
-        return;
-    }
-
-    rasn_registry_client registry(_registry_address);
-    const std::chrono::milliseconds timeout = registry_registration_timeout();
-    for (const agent_descriptor &descriptor : registered_service_agents(_llm_agent, _tool_agent, _coordinator))
-    {
-        ::dsn::error_code err;
-        agent_response response;
-        std::tie(err, response) = registry.register_sync(descriptor, timeout);
-        if (err != ::dsn::ERR_OK)
-        {
-            dwarn("failed to register rASN agent %s through registry RPC: %s",
-                  descriptor.agent_id.c_str(),
-                  err.to_string());
-        }
-        else if (!response.ok)
-        {
-            dwarn("registry rejected rASN agent %s: %s",
-                  descriptor.agent_id.c_str(),
-                  response.error.message.c_str());
-        }
-    }
-}
-
-void rasn_service_graph::heartbeat_agents_to_registry()
-{
-    if (!_rpc_clients_enabled || !registry_dynamic_registration_enabled())
-    {
-        return;
-    }
-
-    rasn_registry_client registry(_registry_address);
-    const std::chrono::milliseconds timeout = registry_registration_timeout();
-    for (const agent_descriptor &descriptor : registered_service_agents(_llm_agent, _tool_agent, _coordinator))
-    {
-        ::dsn::error_code err;
-        agent_response response;
-        std::tie(err, response) = registry.heartbeat_sync(descriptor, timeout);
-        if (err != ::dsn::ERR_OK)
-        {
-            dwarn("failed to heartbeat rASN agent %s through registry RPC: %s",
-                  descriptor.agent_id.c_str(),
-                  err.to_string());
-            continue;
-        }
-        if (registry_response_is_agent_not_found(response))
-        {
-            dwarn("registry no longer knows rASN agent %s: %s; registering again",
-                  descriptor.agent_id.c_str(),
-                  response.error.message.c_str());
-            std::tie(err, response) = registry.register_sync(descriptor, timeout);
-            if (err != ::dsn::ERR_OK)
-            {
-                dwarn("failed to re-register rASN agent %s after heartbeat rejection: %s",
-                      descriptor.agent_id.c_str(),
-                      err.to_string());
-            }
-            else if (!response.ok)
-            {
-                dwarn("registry rejected rASN agent %s after heartbeat rejection: %s",
-                      descriptor.agent_id.c_str(),
-                      response.error.message.c_str());
-            }
-        }
-        else if (!response.ok)
-        {
-            dwarn("registry heartbeat rejected rASN agent %s without a safe "
-                  "re-registration: %s",
-                  descriptor.agent_id.c_str(),
-                  response.error.message.c_str());
-        }
-    }
-}
-
-void rasn_service_graph::unregister_agents_from_registry_rpc()
-{
-    if (!_rpc_clients_enabled || !registry_dynamic_registration_enabled())
-    {
-        return;
-    }
-
-    rasn_registry_client registry(_registry_address);
-    const std::chrono::milliseconds timeout = registry_registration_timeout();
-    for (const agent_descriptor &descriptor : registered_service_agents(_llm_agent, _tool_agent, _coordinator))
-    {
-        ::dsn::error_code err;
-        agent_response response;
-        std::tie(err, response) = registry.unregister_sync(descriptor.agent_id, timeout);
-        if (err != ::dsn::ERR_OK)
-        {
-            dwarn("failed to unregister rASN agent %s through registry RPC: %s",
-                  descriptor.agent_id.c_str(),
-                  err.to_string());
-        }
-    }
-}
-
-void rasn_service_graph::start_registry_heartbeat_timer()
-{
-    if (!_rpc_clients_enabled || !registry_dynamic_registration_enabled() || _registry_heartbeat_timer != nullptr)
-    {
-        return;
-    }
-
-    const uint64_t interval_ms = registry_heartbeat_ms();
-    if (interval_ms == 0)
-    {
-        return;
-    }
-
-    const std::chrono::milliseconds interval(interval_ms);
-    _registry_heartbeat_timer = ::dsn::tasking::enqueue_timer(
-        LPC_RASN_REGISTRY_HEARTBEAT_TIMER,
-        nullptr,
-        [this]() { heartbeat_agents_to_registry(); },
-        interval,
-        0,
-        interval);
-    if (_registry_heartbeat_timer == nullptr)
-    {
-        dwarn("failed to start rASN registry heartbeat timer");
-    }
-}
-
-void rasn_service_graph::cancel_registry_heartbeat_timer()
-{
-    if (_registry_heartbeat_timer != nullptr)
-    {
-        _registry_heartbeat_timer->cancel(true);
-        _registry_heartbeat_timer = nullptr;
-    }
-}
-
 model_gateway_response rasn_service_graph::set_provider(const std::string &provider_name, const std::string &model_name)
 {
     start();
     model_provider_request request;
     request.provider = provider_name;
     request.model = model_name;
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
-        rasn_llm_agent_client client(_llm_agent_address);
         ::dsn::error_code err;
         model_gateway_response response;
-        std::tie(err, response) = client.set_provider_sync(request, default_rpc_timeout());
+        std::tie(err, response) =
+            core_rpc_with_resilience<model_gateway_response>(
+                "llm_agent.set_provider",
+                _llm_agent_binding,
+                /*idempotent=*/true,
+                [&](const ::dsn::rpc_address &address,
+                    std::chrono::milliseconds timeout) {
+                    rasn_llm_agent_client client(address);
+                    return client.set_provider_sync(request, timeout);
+                });
         if (err == ::dsn::ERR_OK)
         {
             return response;
@@ -2797,12 +2789,20 @@ model_gateway_response rasn_service_graph::set_provider(const std::string &provi
 
 model_gateway_response rasn_service_graph::model_provider() const
 {
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
-        rasn_llm_agent_client client(_llm_agent_address);
         ::dsn::error_code err;
         model_gateway_response response;
-        std::tie(err, response) = client.describe_model_sync("");
+        std::tie(err, response) =
+            core_rpc_with_resilience<model_gateway_response>(
+                "llm_agent.describe",
+                _llm_agent_binding,
+                /*idempotent=*/true,
+                [](const ::dsn::rpc_address &address,
+                   std::chrono::milliseconds timeout) {
+                    rasn_llm_agent_client client(address);
+                    return client.describe_model_sync("", timeout);
+                });
         if (err == ::dsn::ERR_OK)
         {
             return response;
@@ -2814,12 +2814,20 @@ model_gateway_response rasn_service_graph::model_provider() const
 
 model_gateway_response rasn_service_graph::model_health() const
 {
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
-        rasn_llm_agent_client client(_llm_agent_address);
         ::dsn::error_code err;
         model_gateway_response response;
-        std::tie(err, response) = client.health_sync("", default_rpc_timeout());
+        std::tie(err, response) =
+            core_rpc_with_resilience<model_gateway_response>(
+                "llm_agent.health",
+                _llm_agent_binding,
+                /*idempotent=*/true,
+                [](const ::dsn::rpc_address &address,
+                   std::chrono::milliseconds timeout) {
+                    rasn_llm_agent_client client(address);
+                    return client.health_sync("", timeout);
+                });
         if (err == ::dsn::ERR_OK)
         {
             return response;
@@ -2910,7 +2918,7 @@ std::string rasn_service_graph::resilience_report() const
 std::string rasn_service_graph::topology() const
 {
     std::string topology = _coordinator.describe_topology() + "\n" + global_agent_registry().describe();
-    if (!_rpc_clients_enabled)
+    if (!rpc_clients_enabled())
     {
         return topology;
     }
@@ -2920,19 +2928,27 @@ std::string rasn_service_graph::topology() const
     const struct
     {
         std::string label;
-        ::dsn::rpc_address address;
+        std::shared_ptr<refreshable_endpoint_binding> binding;
     } clients[] = {
-        {"coordinator", _coordinator_address},
-        {"model", _llm_agent_address},
-        {"tool", _tool_agent_address},
+        {"coordinator", _coordinator_binding},
+        {"model", _llm_agent_binding},
+        {"tool", _tool_agent_binding},
     };
 
     for (const auto &entry : clients)
     {
-        rasn_agent_client client(entry.address);
         ::dsn::error_code err;
         agent_descriptor descriptor;
-        std::tie(err, descriptor) = client.describe_sync("", default_rpc_timeout());
+        std::tie(err, descriptor) =
+            core_rpc_with_resilience<agent_descriptor>(
+                (entry.label + ".describe").c_str(),
+                entry.binding,
+                /*idempotent=*/true,
+                [](const ::dsn::rpc_address &address,
+                   std::chrono::milliseconds timeout) {
+                    rasn_agent_client client(address);
+                    return client.describe_sync("", timeout);
+                });
         if (err == ::dsn::ERR_OK)
         {
             oss << descriptor_line(entry.label, descriptor) << "\n";
@@ -2984,9 +3000,17 @@ std::string rasn_service_graph::topology() const
         }
     }
 
-    rasn_state_client state(_state_address);
     state_response state_listing;
-    std::tie(err, state_listing) = state.query_sync(state_query_request(), default_rpc_timeout());
+    std::tie(err, state_listing) =
+        core_rpc_with_resilience<state_response>(
+            "state.query",
+            _state_binding,
+            /*idempotent=*/true,
+            [](const ::dsn::rpc_address &address,
+               std::chrono::milliseconds timeout) {
+                rasn_state_client state(address);
+                return state.query_sync(state_query_request(), timeout);
+            });
     oss << "state RPC query:\n";
     if (err != ::dsn::ERR_OK)
     {
@@ -3016,12 +3040,20 @@ std::string rasn_service_graph::topology() const
             << (observed.truncated ? " [truncated]" : "") << "\n";
     }
 
+    oss << "endpoint bindings:\n"
+        << "- " << _coordinator_binding->describe() << "\n"
+        << "- " << _llm_agent_binding->describe() << "\n"
+        << "- " << _tool_agent_binding->describe() << "\n"
+        << "- " << _state_binding->describe() << "\n"
+        << "- " << _workflow_binding->describe() << "\n"
+        << "- " << _observability_binding->describe() << "\n";
+
     return oss.str();
 }
 
 std::string rasn_service_graph::tools_summary() const
 {
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
         agent_task task;
         task.id = make_trace_id();
@@ -3033,10 +3065,18 @@ std::string rasn_service_graph::tools_summary() const
         request.task = task;
         request.capability = "tool.describe";
 
-        rasn_agent_client client(_coordinator_address);
         ::dsn::error_code err;
         agent_response response;
-        std::tie(err, response) = client.invoke_sync(request, default_rpc_timeout());
+        std::tie(err, response) =
+            core_rpc_with_resilience<agent_response>(
+                "coordinator.invoke",
+                _coordinator_binding,
+                /*idempotent=*/true,
+                [&](const ::dsn::rpc_address &address,
+                    std::chrono::milliseconds timeout) {
+                    rasn_agent_client client(address);
+                    return client.invoke_sync(request, timeout);
+                });
         if (err == ::dsn::ERR_OK)
         {
             return response.ok ? response.output : response.error.message;
@@ -3060,6 +3100,24 @@ void rasn_service_graph::enable_rpc_clients(const ::dsn::rpc_address &registry,
                                             const ::dsn::rpc_address &workflow,
                                             const ::dsn::rpc_address &observability)
 {
+    // This is a one-time startup publication, not a live reconfiguration API.
+    // Repeated identical calls are harmless; a different set after publication
+    // would race readers of the address references and is therefore rejected.
+    if (rpc_clients_enabled())
+    {
+        if (_registry_address != registry ||
+            _coordinator_address != coordinator ||
+            _llm_agent_address != llm_agent ||
+            _tool_agent_address != tool_agent ||
+            _state_address != state ||
+            _workflow_address != workflow ||
+            _observability_address != observability)
+        {
+            derror("refusing to reconfigure published rASN RPC client endpoints");
+        }
+        return;
+    }
+
     _registry_address = registry;
     _coordinator_address = coordinator;
     _llm_agent_address = llm_agent;
@@ -3067,7 +3125,45 @@ void rasn_service_graph::enable_rpc_clients(const ::dsn::rpc_address &registry,
     _state_address = state;
     _workflow_address = workflow;
     _observability_address = observability;
-    _rpc_clients_enabled = true;
+    _coordinator_binding->reset(
+        coordinator,
+        coordinator.type() == HOST_TYPE_URI ? "resolver" : "static",
+        false,
+        make_core_endpoint_resolver(
+            "rasn.service.coordinator", "rasn.coordinator", registry, coordinator));
+    _llm_agent_binding->reset(
+        llm_agent,
+        llm_agent.type() == HOST_TYPE_URI ? "resolver" : "static",
+        false,
+        make_core_endpoint_resolver(
+            "rasn.service.llm_agent", "rasn.llm.agent", registry, llm_agent));
+    _tool_agent_binding->reset(
+        tool_agent,
+        tool_agent.type() == HOST_TYPE_URI ? "resolver" : "static",
+        false,
+        make_core_endpoint_resolver(
+            "rasn.service.tool_agent", "rasn.tool.agent", registry, tool_agent));
+    _state_binding->reset(
+        state,
+        state.type() == HOST_TYPE_URI ? "resolver" : "static",
+        false,
+        make_core_endpoint_resolver(
+            "rasn.service.state", "rasn.state", registry, state));
+    _workflow_binding->reset(
+        workflow,
+        workflow.type() == HOST_TYPE_URI ? "resolver" : "static",
+        false,
+        make_core_endpoint_resolver(
+            "rasn.service.workflow", "rasn.workflow", registry, workflow));
+    _observability_binding->reset(
+        observability,
+        observability.type() == HOST_TYPE_URI ? "resolver" : "static",
+        false,
+        make_core_endpoint_resolver("rasn.service.observability",
+                                    "rasn.observability",
+                                    registry,
+                                    observability));
+    _rpc_clients_enabled.store(true, std::memory_order_release);
     dinfo("enabled rASN RPC clients: registry=%s coordinator=%s llm=%s tool=%s state=%s workflow=%s observability=%s",
           registry.to_string(),
           coordinator.to_string(),
@@ -3078,16 +3174,57 @@ void rasn_service_graph::enable_rpc_clients(const ::dsn::rpc_address &registry,
           observability.to_string());
 }
 
+std::shared_ptr<refreshable_endpoint_binding>
+rasn_service_graph::service_endpoint_binding(const std::string &service) const
+{
+    if (service == "coordinator")
+    {
+        return _coordinator_binding;
+    }
+    if (service == "llm_agent")
+    {
+        return _llm_agent_binding;
+    }
+    if (service == "tool_agent")
+    {
+        return _tool_agent_binding;
+    }
+    if (service == "state")
+    {
+        return _state_binding;
+    }
+    if (service == "workflow")
+    {
+        return _workflow_binding;
+    }
+    if (service == "observability")
+    {
+        return _observability_binding;
+    }
+    dwarn("unknown rASN service endpoint binding requested: %s",
+          service.c_str());
+    return std::shared_ptr<refreshable_endpoint_binding>();
+}
+
 llm_response rasn_service_graph::complete(const agent_completion_request &request)
 {
     start();
     const agent_request generic_request = make_model_agent_request(request, _runtime.trace_id());
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
-        rasn_agent_client client(_coordinator_address);
         ::dsn::error_code err;
         agent_response response;
-        std::tie(err, response) = client.invoke_sync(generic_request, request_rpc_timeout(generic_request));
+        std::tie(err, response) =
+            core_rpc_with_resilience_at_timeout<agent_response>(
+                "coordinator.invoke",
+                _coordinator_binding,
+                /*idempotent=*/false,
+                request_rpc_timeout(generic_request),
+                [&](const ::dsn::rpc_address &address,
+                    std::chrono::milliseconds timeout) {
+                    rasn_agent_client client(address);
+                    return client.invoke_sync(generic_request, timeout);
+                });
         if (err != ::dsn::ERR_OK)
         {
             return rpc_error_response(std::string("RPC_RASN_AGENT_INVOKE coordinator failed: ") + err.to_string());
@@ -3102,7 +3239,7 @@ llm_response rasn_service_graph::complete_streaming(const agent_completion_reque
                                                     const llm_stream_callback &on_chunk)
 {
     start();
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
         const llm_response response = complete(request);
         if (response.ok)
@@ -3128,13 +3265,22 @@ tool_result rasn_service_graph::run_tool(const std::string &name,
     agent_request generic_request = make_tool_agent_request(generic_tool, _runtime.trace_id());
     generic_request.timeout_ms = timeout_ms;
     tool_result result;
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
-        rasn_agent_client client(_coordinator_address);
         ::dsn::error_code err;
         agent_response response;
         const uint64_t rpc_start_ms = ::dsn_now_ms();
-        std::tie(err, response) = client.invoke_sync(generic_request, request_rpc_timeout(generic_request));
+        std::tie(err, response) =
+            core_rpc_with_resilience_at_timeout<agent_response>(
+                "coordinator.invoke",
+                _coordinator_binding,
+                /*idempotent=*/false,
+                request_rpc_timeout(generic_request),
+                [&](const ::dsn::rpc_address &address,
+                    std::chrono::milliseconds timeout) {
+                    rasn_agent_client client(address);
+                    return client.invoke_sync(generic_request, timeout);
+                });
         if (err != ::dsn::ERR_OK)
         {
             // A failed RPC that never reached the tool agent produced no
@@ -3181,12 +3327,21 @@ agent_response rasn_service_graph::invoke(const agent_request &request)
     // issued from this operation carry one end-to-end trace id (finding 1.4).
     rasn_runtime_trace_scope runtime_trace(request.trace_id.empty() ? _runtime.trace_id()
                                                                      : request.trace_id);
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
-        rasn_agent_client client(_coordinator_address);
         ::dsn::error_code err;
         agent_response response;
-        std::tie(err, response) = client.invoke_sync(request, request_rpc_timeout(request));
+        std::tie(err, response) =
+            core_rpc_with_resilience_at_timeout<agent_response>(
+                "coordinator.invoke",
+                _coordinator_binding,
+                /*idempotent=*/false,
+                request_rpc_timeout(request),
+                [&](const ::dsn::rpc_address &address,
+                    std::chrono::milliseconds timeout) {
+                    rasn_agent_client client(address);
+                    return client.invoke_sync(request, timeout);
+                });
         if (err != ::dsn::ERR_OK)
         {
             agent_response failure;
@@ -3204,9 +3359,8 @@ agent_response rasn_service_graph::invoke(const agent_request &request)
 state_response rasn_service_graph::put_state(const state_record &record)
 {
     start();
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
-        rasn_state_client client(_state_address);
         ::dsn::error_code err;
         state_response response;
         // A plain put is NOT idempotent: state_store::put allocates a fresh
@@ -3215,7 +3369,9 @@ state_response rasn_service_graph::put_state(const state_record &record)
         // ambiguous timeout would double-journal and advance the sequence twice.
         // Retry only on transport errors that prove the request never applied.
         std::tie(err, response) = core_rpc_with_resilience<state_response>(
-            "state.put", _state_address, /*idempotent=*/false, [&](std::chrono::milliseconds timeout) {
+            "state.put", _state_binding, /*idempotent=*/false, [&](const ::dsn::rpc_address &address,
+                                                                  std::chrono::milliseconds timeout) {
+                rasn_state_client client(address);
                 return client.put_sync(record, timeout);
             });
         if (err == ::dsn::ERR_OK)
@@ -3241,13 +3397,16 @@ state_response rasn_service_graph::put_state(const state_record &record)
 state_response rasn_service_graph::put_state(const state_put_request &request)
 {
     start();
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
-        rasn_state_client client(_state_address);
         ::dsn::error_code err;
         state_response response;
         std::tie(err, response) = core_rpc_with_resilience<state_response>(
-            "state.put_conditional", _state_address, /*idempotent=*/false, [&](std::chrono::milliseconds timeout) {
+            "state.put_conditional",
+            _state_binding,
+            /*idempotent=*/false,
+            [&](const ::dsn::rpc_address &address, std::chrono::milliseconds timeout) {
+                rasn_state_client client(address);
                 return client.put_conditional_sync(request, timeout);
             });
         if (err == ::dsn::ERR_OK)
@@ -3273,13 +3432,16 @@ state_response rasn_service_graph::put_state(const state_put_request &request)
 state_response rasn_service_graph::get_state(const state_key_request &request)
 {
     start();
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
-        rasn_state_client client(_state_address);
         ::dsn::error_code err;
         state_response response;
         std::tie(err, response) = core_rpc_with_resilience<state_response>(
-            "state.get", _state_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
+            "state.get",
+            _state_binding,
+            /*idempotent=*/true,
+            [&](const ::dsn::rpc_address &address, std::chrono::milliseconds timeout) {
+                rasn_state_client client(address);
                 return client.get_sync(request, timeout);
             });
         if (err == ::dsn::ERR_OK)
@@ -3305,13 +3467,16 @@ state_response rasn_service_graph::get_state(const state_key_request &request)
 state_response rasn_service_graph::query_state(const state_query_request &request)
 {
     start();
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
-        rasn_state_client client(_state_address);
         ::dsn::error_code err;
         state_response response;
         std::tie(err, response) = core_rpc_with_resilience<state_response>(
-            "state.query", _state_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
+            "state.query",
+            _state_binding,
+            /*idempotent=*/true,
+            [&](const ::dsn::rpc_address &address, std::chrono::milliseconds timeout) {
+                rasn_state_client client(address);
                 return client.query_sync(request, timeout);
             });
         if (err == ::dsn::ERR_OK)
@@ -3338,16 +3503,16 @@ state_response
 rasn_service_graph::delete_state_prefix(const state_delete_prefix_request &request)
 {
     start();
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
-        rasn_state_client client(_state_address);
         ::dsn::error_code err;
         state_response response;
         std::tie(err, response) = core_rpc_with_resilience<state_response>(
             "state.delete_prefix",
-            _state_address,
+            _state_binding,
             /*idempotent=*/false,
-            [&](std::chrono::milliseconds timeout) {
+            [&](const ::dsn::rpc_address &address, std::chrono::milliseconds timeout) {
+                rasn_state_client client(address);
                 return client.delete_prefix_sync(request, timeout);
             });
         if (err == ::dsn::ERR_OK)
@@ -3375,19 +3540,20 @@ state_delete_prefix_result rasn_service_graph::delete_state_prefix_detailed(
     const state_delete_prefix_request &request)
 {
     start();
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
-        rasn_state_client client(_state_address);
         ::dsn::error_code err;
         state_delete_prefix_result result;
         std::tie(err, result) =
             core_rpc_with_resilience<state_delete_prefix_result>(
                 "state.delete_prefix_detailed",
-                _state_address,
+                _state_binding,
                 /*idempotent=*/false,
-                [&](std::chrono::milliseconds timeout)
+                [&](const ::dsn::rpc_address &address,
+                    std::chrono::milliseconds timeout)
                     -> std::pair< ::dsn::error_code,
                                   state_delete_prefix_result> {
+                    rasn_state_client client(address);
                     const std::pair< ::dsn::error_code,
                                      state_delete_prefix_result>
                         detailed =
@@ -3431,16 +3597,16 @@ state_response rasn_service_graph::advance_state_sequence(
     const state_sequence_barrier_request &request)
 {
     start();
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
-        rasn_state_client client(_state_address);
         ::dsn::error_code err;
         state_response response;
         std::tie(err, response) = core_rpc_with_resilience<state_response>(
             "state.advance_sequence",
-            _state_address,
+            _state_binding,
             /*idempotent=*/true,
-            [&](std::chrono::milliseconds timeout) {
+            [&](const ::dsn::rpc_address &address, std::chrono::milliseconds timeout) {
+                rasn_state_client client(address);
                 return client.advance_sequence_sync(request, timeout);
             });
         if (err == ::dsn::ERR_OK)
@@ -3474,19 +3640,20 @@ state_checkpoint_result rasn_service_graph::checkpoint_state_detailed(
     const state_checkpoint_request &request)
 {
     start();
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
-        rasn_state_client client(_state_address);
         ::dsn::error_code err;
         state_checkpoint_result result;
         std::tie(err, result) =
             core_rpc_with_resilience<state_checkpoint_result>(
                 "state.checkpoint_detailed",
-                _state_address,
+                _state_binding,
                 /*idempotent=*/true,
-                [&](std::chrono::milliseconds timeout)
+                [&](const ::dsn::rpc_address &address,
+                    std::chrono::milliseconds timeout)
                     -> std::pair< ::dsn::error_code,
                                   state_checkpoint_result> {
+                    rasn_state_client client(address);
                     const std::pair< ::dsn::error_code,
                                      state_checkpoint_result>
                         detailed =
@@ -3537,13 +3704,16 @@ state_checkpoint_result rasn_service_graph::checkpoint_state_detailed(
 state_response rasn_service_graph::recover_state(const state_checkpoint_request &request)
 {
     start();
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
-        rasn_state_client client(_state_address);
         ::dsn::error_code err;
         state_response response;
         std::tie(err, response) = core_rpc_with_resilience<state_response>(
-            "state.recover", _state_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
+            "state.recover",
+            _state_binding,
+            /*idempotent=*/true,
+            [&](const ::dsn::rpc_address &address, std::chrono::milliseconds timeout) {
+                rasn_state_client client(address);
                 return client.recover_sync(request, timeout);
             });
         if (err == ::dsn::ERR_OK)
@@ -3893,13 +4063,16 @@ state_migration_report migrate_state_checkpoint(rasn_service_graph &services,
 workflow_response rasn_service_graph::validate_workflow(const workflow_source &source)
 {
     start();
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
-        rasn_workflow_client client(_workflow_address);
         ::dsn::error_code err;
         workflow_response response;
         std::tie(err, response) = core_rpc_with_resilience<workflow_response>(
-            "workflow.validate", _workflow_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
+            "workflow.validate",
+            _workflow_binding,
+            /*idempotent=*/true,
+            [&](const ::dsn::rpc_address &address, std::chrono::milliseconds timeout) {
+                rasn_workflow_client client(address);
                 return client.validate_sync(source, timeout);
             });
         if (err == ::dsn::ERR_OK)
@@ -3917,13 +4090,16 @@ workflow_response rasn_service_graph::validate_workflow(const workflow_source &s
 workflow_response rasn_service_graph::compile_workflow(const workflow_source &source)
 {
     start();
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
-        rasn_workflow_client client(_workflow_address);
         ::dsn::error_code err;
         workflow_response response;
         std::tie(err, response) = core_rpc_with_resilience<workflow_response>(
-            "workflow.compile", _workflow_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
+            "workflow.compile",
+            _workflow_binding,
+            /*idempotent=*/true,
+            [&](const ::dsn::rpc_address &address, std::chrono::milliseconds timeout) {
+                rasn_workflow_client client(address);
                 return client.compile_sync(source, timeout);
             });
         if (err == ::dsn::ERR_OK)
@@ -3941,13 +4117,16 @@ workflow_response rasn_service_graph::compile_workflow(const workflow_source &so
 workflow_response rasn_service_graph::start_workflow(const workflow_start_request &request)
 {
     start();
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
-        rasn_workflow_client client(_workflow_address);
         ::dsn::error_code err;
         workflow_response response;
         std::tie(err, response) = core_rpc_with_resilience<workflow_response>(
-            "workflow.start", _workflow_address, /*idempotent=*/false, [&](std::chrono::milliseconds timeout) {
+            "workflow.start",
+            _workflow_binding,
+            /*idempotent=*/false,
+            [&](const ::dsn::rpc_address &address, std::chrono::milliseconds timeout) {
+                rasn_workflow_client client(address);
                 return client.start_sync(request, timeout);
             });
         if (err == ::dsn::ERR_OK)
@@ -3965,13 +4144,16 @@ workflow_response rasn_service_graph::start_workflow(const workflow_start_reques
 workflow_response rasn_service_graph::query_workflow(const workflow_run_query &request)
 {
     start();
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
-        rasn_workflow_client client(_workflow_address);
         ::dsn::error_code err;
         workflow_response response;
         std::tie(err, response) = core_rpc_with_resilience<workflow_response>(
-            "workflow.query", _workflow_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
+            "workflow.query",
+            _workflow_binding,
+            /*idempotent=*/true,
+            [&](const ::dsn::rpc_address &address, std::chrono::milliseconds timeout) {
+                rasn_workflow_client client(address);
                 return client.query_sync(request, timeout);
             });
         if (err == ::dsn::ERR_OK)
@@ -3989,13 +4171,16 @@ workflow_response rasn_service_graph::query_workflow(const workflow_run_query &r
 workflow_response rasn_service_graph::cancel_workflow(const workflow_run_query &request)
 {
     start();
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
-        rasn_workflow_client client(_workflow_address);
         ::dsn::error_code err;
         workflow_response response;
         std::tie(err, response) = core_rpc_with_resilience<workflow_response>(
-            "workflow.cancel", _workflow_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
+            "workflow.cancel",
+            _workflow_binding,
+            /*idempotent=*/true,
+            [&](const ::dsn::rpc_address &address, std::chrono::milliseconds timeout) {
+                rasn_workflow_client client(address);
                 return client.cancel_sync(request, timeout);
             });
         if (err == ::dsn::ERR_OK)
@@ -4012,13 +4197,16 @@ workflow_response rasn_service_graph::cancel_workflow(const workflow_run_query &
 
 observability_response rasn_service_graph::query_events(const observability_query_request &request) const
 {
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
-        rasn_observability_client client(_observability_address);
         ::dsn::error_code err;
         observability_response response;
         std::tie(err, response) = core_rpc_with_resilience<observability_response>(
-            "observability.query", _observability_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
+            "observability.query",
+            _observability_binding,
+            /*idempotent=*/true,
+            [&](const ::dsn::rpc_address &address, std::chrono::milliseconds timeout) {
+                rasn_observability_client client(address);
                 return client.query_sync(request, timeout);
             });
         if (err == ::dsn::ERR_OK)
@@ -4035,13 +4223,16 @@ observability_response rasn_service_graph::query_events(const observability_quer
 
 observability_response rasn_service_graph::query_failures(const observability_query_request &request) const
 {
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
-        rasn_observability_client client(_observability_address);
         ::dsn::error_code err;
         observability_response response;
         std::tie(err, response) = core_rpc_with_resilience<observability_response>(
-            "observability.failures", _observability_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
+            "observability.failures",
+            _observability_binding,
+            /*idempotent=*/true,
+            [&](const ::dsn::rpc_address &address, std::chrono::milliseconds timeout) {
+                rasn_observability_client client(address);
                 return client.failures_sync(request, timeout);
             });
         if (err == ::dsn::ERR_OK)
@@ -4058,13 +4249,16 @@ observability_response rasn_service_graph::query_failures(const observability_qu
 
 observability_response rasn_service_graph::load_replay(const replay_load_request &request)
 {
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
-        rasn_observability_client client(_observability_address);
         ::dsn::error_code err;
         observability_response response;
         std::tie(err, response) = core_rpc_with_resilience<observability_response>(
-            "observability.load_replay", _observability_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
+            "observability.load_replay",
+            _observability_binding,
+            /*idempotent=*/true,
+            [&](const ::dsn::rpc_address &address, std::chrono::milliseconds timeout) {
+                rasn_observability_client client(address);
                 return client.load_replay_sync(request, timeout);
             });
         if (err == ::dsn::ERR_OK)
@@ -4092,13 +4286,16 @@ observability_response rasn_service_graph::load_replay(const replay_load_request
 
 observability_response rasn_service_graph::observability_snapshot() const
 {
-    if (_rpc_clients_enabled)
+    if (rpc_clients_enabled())
     {
-        rasn_observability_client client(_observability_address);
         ::dsn::error_code err;
         observability_response response;
         std::tie(err, response) = core_rpc_with_resilience<observability_response>(
-            "observability.snapshot", _observability_address, /*idempotent=*/true, [&](std::chrono::milliseconds timeout) {
+            "observability.snapshot",
+            _observability_binding,
+            /*idempotent=*/true,
+            [&](const ::dsn::rpc_address &address, std::chrono::milliseconds timeout) {
+                rasn_observability_client client(address);
                 return client.snapshot_sync("", timeout);
             });
         if (err == ::dsn::ERR_OK)
@@ -4410,11 +4607,16 @@ rasn_llm_agent_client::health_sync(const std::string &request,
     set_rdsn_rpc_enabled(true);
     global_rasn_services().acquire();
     _rpc.open_service();
+    _registration.start(global_rasn_services().llm_agent_descriptor(),
+                        "rasn.service.llm_agent",
+                        primary_address(),
+                        name());
     return ::dsn::ERR_OK;
 }
 
 ::dsn::error_code rasn_llm_agent_app::stop(bool cleanup)
 {
+    _registration.stop();
     _rpc.close_service();
     global_rasn_services().release();
     return ::dsn::ERR_OK;
@@ -4425,11 +4627,16 @@ rasn_llm_agent_client::health_sync(const std::string &request,
     set_rdsn_rpc_enabled(true);
     global_rasn_services().acquire();
     _rpc.open_service();
+    _registration.start(global_rasn_services().tool_agent_descriptor(),
+                        "rasn.service.tool_agent",
+                        primary_address(),
+                        name());
     return ::dsn::ERR_OK;
 }
 
 ::dsn::error_code rasn_tool_agent_app::stop(bool cleanup)
 {
+    _registration.stop();
     _rpc.close_service();
     global_rasn_services().release();
     return ::dsn::ERR_OK;
@@ -4448,11 +4655,16 @@ rasn_llm_agent_client::health_sync(const std::string &request,
     global_rasn_services().enable_rpc_clients(registry, coordinator, llm_agent, tool_agent, state, workflow, observability);
     global_rasn_services().acquire();
     _rpc.open_service();
+    _registration.start(global_rasn_services().coordinator_descriptor(),
+                        "rasn.service.coordinator",
+                        primary_address(),
+                        name());
     return ::dsn::ERR_OK;
 }
 
 ::dsn::error_code rasn_coordinator_app::stop(bool cleanup)
 {
+    _registration.stop();
     _rpc.close_service();
     global_rasn_services().release();
     return ::dsn::ERR_OK;

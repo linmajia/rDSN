@@ -1,6 +1,7 @@
 #pragma once
 
 #include <rasn/agent_types.h>
+#include <rasn/endpoint_binding.h>
 #include <rasn/rasn.code.definition.h>
 
 #include <dsn/cpp/replicated_service_app.h>
@@ -490,6 +491,7 @@ public:
 
 private:
     rasn_state_rpc_service _rpc;
+    rasn_core_service_registration _registration;
 };
 
 class rasn_replicated_state_app : public ::dsn::replicated_service_app_type_1

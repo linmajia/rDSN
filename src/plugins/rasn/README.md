@@ -90,6 +90,20 @@ When `<name>_uri` is present, rASN constructs the client address with rDSN's
 resolved by `dsn.dist.uri.resolver`; otherwise it falls back to `<name>_host` and
 `<name>_port`.
 
+Core-service and distributed runtime clients cache these configured addresses as
+generation 1. After a retryable transport failure, breaker short-circuit, or typed
+runtime `misrouted` response, host/port clients query the existing
+`rasn.registry` capability again and atomically move to a live endpoint within
+the existing retry/backoff budget. Concurrent callers share one refresh. A
+successful empty query retains the configured address as the static fallback;
+a registry transport/backend failure is reported instead of silently changing
+success semantics. URI endpoints remain owned by rDSN's resolver, and registry
+clients retain their non-recursive rDSN group rotation. Typed application,
+validation, authorization, conflict, and not-found responses do not refresh.
+Request/trace/auth/deadline/dedup metadata is created once and reused unchanged,
+and ambiguous unsafe mutations refresh the cache for a later call without being
+replayed.
+
 Every app command loads the app's own `config.ini`. Runtime placement is selected
 only by `[rasn.runtime] rasn_runtime_provider`: `local` uses the same module
 implementations in-process, while `distributed`/`hybrid` starts a lightweight rDSN

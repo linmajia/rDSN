@@ -1,5 +1,7 @@
 #pragma once
 
+#include <rasn/endpoint_binding.h>
+
 #include <rasn/rasn.code.definition.h>
 
 #include <dsn/cpp/serialization.h>
@@ -356,6 +358,7 @@ public:
 
 private:
     rasn_observability_rpc_service _rpc;
+    rasn_core_service_registration _registration;
 };
 
 } // namespace rasn

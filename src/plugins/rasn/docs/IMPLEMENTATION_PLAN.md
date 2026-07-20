@@ -3465,6 +3465,101 @@ Validation:
 - [x] Regenerate artifacts and inspect determinism.
 - [x] Run final diff and removed-wire searches.
 
+## Phase 83: Dynamic endpoint re-resolution and rebinding (fd8)
+
+Status: Implemented and validated.
+
+Scope:
+
+- `endpoint_binding.{h,cpp}`, `rpc_resilience.h`
+- core service graph, CLI/readiness, workflow recovery, runtime module routing,
+  and remote-agent dispatch paths
+- state/workflow/observability service registration and refresh metrics
+- `tests/rasn_unit_tests.cpp`, configs, and operator/audit documentation
+
+Work items:
+
+- [x] Inventory registry, coordinator, model, tool, state, workflow,
+  observability, runtime-module shard, and application bypass clients.
+- [x] Add one race-free generation cache with single-flight refresh, stale-result
+  rejection, static fallback, and endpoint diagnostics.
+- [x] Re-query existing registry capabilities only after retryable transport,
+  breaker, or typed misroute signals; leave URI invalidation to rDSN.
+- [x] Preserve request/trace/auth/deadline/dedup metadata and existing bounded
+  retry classifications across endpoint changes.
+- [x] Keep ambiguous unsafe mutations from replaying; key breaker/admission state
+  by concrete replacement endpoint.
+- [x] Keep registry resolution non-recursive and registry failures explicit.
+- [x] Lease-publish standalone core-service capability aliases and retain
+  local/co-located service behavior.
+- [x] Add refresh attempt/rebind/unchanged/failure/exhaustion metrics and
+  generation-aware topology diagnostics.
+- [x] Add focused coverage sources for concurrency, unchanged/failure outcomes,
+  static/self registry behavior, application-error classification, metadata,
+  mutation safety, breaker isolation, shard capability selection, and local
+  discovery.
+
+Validation:
+
+- [x] Build `rasn`.
+- [x] Compile and link `rasn.unit_tests` without executing it.
+- [x] Build `codepilot` and `srepilot`.
+- [x] Run final diff/invariant searches and adversarial review.
+
+## Phase 84: Endpoint refresh edge-case hardening
+
+Status: Implementation and build validation complete; targeted runtime execution
+is pending on the user's remote development machine.
+
+Work items:
+
+- [x] Distinguish lazy initial resolution from explicit endpoint rebinding.
+- [x] Release and notify single-flight waiters when a resolver throws while
+  preserving the original exception and newer reset generations.
+- [x] Make unknown service binding lookups nullable-by-contract and reject null
+  at every current dereference.
+- [x] Publish immutable RPC client addresses and bindings through a
+  release/acquire atomic flag and reject post-publication reconfiguration.
+- [x] Replace CodePilot's blanket agent-control retry declaration with a typed,
+  fail-closed operation classifier.
+- [x] Add focused coverage sources for outcome semantics, throwing resolvers,
+  stale exception cleanup, unknown services, and control-operation retry safety.
+- [x] Wrap every claimed endpoint refresh in a no-throw owner guard that
+  publishes or abandons only its matching generation and notifies waiters once.
+- [x] Account every owning refresh attempt with exactly one rebound, unchanged,
+  failed, superseded, or exception terminal metric.
+- [x] Contain refresh metric backend exceptions inside the no-throw sink and
+  emit an allocation-free, non-recursive dropped-update diagnostic at most once.
+- [x] Make successful endpoint publication the semantic commit point, stage its
+  terminal outcome immediately, and contain all post-publication diagnostics.
+- [x] Remove the production completion-observer test seam; resolver-exception
+  coverage remains without a shipped callback or failpoint.
+- [x] Store endpoint-result addresses in an allocation-free rASN-local
+  `dsn_address_t` value, default aggregate moves so their no-throw traits derive
+  from actual address and `std::string` members, and leave rDSN unchanged.
+- [x] Make inbound `rpc_address` construction explicit, retain outbound RPC
+  boundary compatibility, and cover IPv4, URI, and group scalar round trips.
+- [x] Add a deterministic test-executable-only scoped allocation rule that
+  skips the resolver's matching large source copy, fails the next matching
+  pre-publication allocation, records both matching sizes/count, and always
+  disarms.
+  Verify owner `std::bad_alloc` propagation, unchanged published state, and
+  same-generation recovery. Joiner notification remains covered by the
+  resolver-exception test.
+
+Validation:
+
+- [x] Build `rasn`, `codepilot`, and `srepilot`.
+- [x] Compile and link `rasn.unit_tests`. Tests were not executed locally by
+  explicit policy; this does not claim runtime test success.
+- [x] Run final diff/invariant searches and adversarial review.
+- [ ] Run the focused coverage on the user's remote development machine:
+
+  ```bash
+  ./builder/bin/rasn.unit_tests/rasn.unit_tests \
+    --gtest_filter='rasn_endpoint_binding.*:rasn_metrics_registry.endpoint_refresh_terminal_counters_reconcile'
+  ```
+
 ## Dependency order
 
 ```text

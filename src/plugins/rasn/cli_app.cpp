@@ -2,6 +2,8 @@
 
 #include <rasn/agent_clients.h>
 #include <rasn/agent_registry.h>
+#include <rasn/endpoint_binding.h>
+#include <rasn/rpc_resilience.h>
 
 #include <dsn/cpp/utils.h>
 
@@ -558,7 +560,25 @@ bool probe_state_service(const rasn_service_graph &services,
                          const rasn_cli_service_readiness_options &options,
                          std::vector<std::string> *errors)
 {
-    rasn_state_client state(services.state_address());
+    const std::shared_ptr<refreshable_endpoint_binding> binding =
+        services.service_endpoint_binding("state");
+    if (binding == nullptr)
+    {
+        append_readiness_error(
+            errors, "state", "unknown service endpoint binding");
+        return false;
+    }
+    const endpoint_snapshot endpoint = binding->current();
+    if (!endpoint.ok)
+    {
+        append_readiness_error(errors, "state", endpoint.error);
+        if (endpoint.refreshable)
+        {
+            (void)binding->refresh(endpoint.generation);
+        }
+        return false;
+    }
+    rasn_state_client state(endpoint.address);
     state_query_request request;
     request.key_prefix = options.state_probe_key;
     ::dsn::error_code err;
@@ -566,6 +586,10 @@ bool probe_state_service(const rasn_service_graph &services,
     std::tie(err, response) = state.query_sync(request, std::chrono::milliseconds(500));
     if (err != ::dsn::ERR_OK)
     {
+        if (rpc_should_retry(err, true) && endpoint.refreshable)
+        {
+            (void)binding->refresh(endpoint.generation);
+        }
         append_readiness_error(errors, "state", err.to_string());
         return false;
     }
@@ -597,16 +621,36 @@ bool probe_registry_service(const rasn_service_graph &services, std::vector<std:
 }
 
 bool probe_agent_service(const std::string &label,
-                         const ::dsn::rpc_address &address,
+                         const std::shared_ptr<refreshable_endpoint_binding> &binding,
                          const std::string &expected_agent_id,
                          std::vector<std::string> *errors)
 {
-    rasn_agent_client client(address);
+    if (binding == nullptr)
+    {
+        append_readiness_error(
+            errors, label, "unknown service endpoint binding");
+        return false;
+    }
+    const endpoint_snapshot endpoint = binding->current();
+    if (!endpoint.ok)
+    {
+        append_readiness_error(errors, label, endpoint.error);
+        if (endpoint.refreshable)
+        {
+            (void)binding->refresh(endpoint.generation);
+        }
+        return false;
+    }
+    rasn_agent_client client(endpoint.address);
     ::dsn::error_code err;
     agent_descriptor descriptor;
     std::tie(err, descriptor) = client.describe_sync("readiness", std::chrono::milliseconds(500));
     if (err != ::dsn::ERR_OK)
     {
+        if (rpc_should_retry(err, true) && endpoint.refreshable)
+        {
+            (void)binding->refresh(endpoint.generation);
+        }
         append_readiness_error(errors, label, err.to_string());
         return false;
     }
@@ -620,12 +664,34 @@ bool probe_agent_service(const std::string &label,
 
 bool probe_model_health(const rasn_service_graph &services, std::vector<std::string> *errors)
 {
-    rasn_llm_agent_client model(services.llm_agent_address());
+    const std::shared_ptr<refreshable_endpoint_binding> binding =
+        services.service_endpoint_binding("llm_agent");
+    if (binding == nullptr)
+    {
+        append_readiness_error(
+            errors, "model.health", "unknown service endpoint binding");
+        return false;
+    }
+    const endpoint_snapshot endpoint = binding->current();
+    if (!endpoint.ok)
+    {
+        append_readiness_error(errors, "model.health", endpoint.error);
+        if (endpoint.refreshable)
+        {
+            (void)binding->refresh(endpoint.generation);
+        }
+        return false;
+    }
+    rasn_llm_agent_client model(endpoint.address);
     ::dsn::error_code err;
     model_gateway_response response;
     std::tie(err, response) = model.health_sync("readiness", std::chrono::milliseconds(500));
     if (err != ::dsn::ERR_OK)
     {
+        if (rpc_should_retry(err, true) && endpoint.refreshable)
+        {
+            (void)binding->refresh(endpoint.generation);
+        }
         append_readiness_error(errors, "model.health", err.to_string());
         return false;
     }
@@ -641,7 +707,25 @@ bool probe_workflow_service(const rasn_service_graph &services,
                             const rasn_cli_service_readiness_options &options,
                             std::vector<std::string> *errors)
 {
-    rasn_workflow_client workflow(services.workflow_address());
+    const std::shared_ptr<refreshable_endpoint_binding> binding =
+        services.service_endpoint_binding("workflow");
+    if (binding == nullptr)
+    {
+        append_readiness_error(
+            errors, "workflow", "unknown service endpoint binding");
+        return false;
+    }
+    const endpoint_snapshot endpoint = binding->current();
+    if (!endpoint.ok)
+    {
+        append_readiness_error(errors, "workflow", endpoint.error);
+        if (endpoint.refreshable)
+        {
+            (void)binding->refresh(endpoint.generation);
+        }
+        return false;
+    }
+    rasn_workflow_client workflow(endpoint.address);
     workflow_source source;
     source.workflow_id = options.workflow_id;
     source.source_name = options.workflow_source_name;
@@ -651,6 +735,10 @@ bool probe_workflow_service(const rasn_service_graph &services,
     std::tie(err, response) = workflow.validate_sync(source, std::chrono::milliseconds(500));
     if (err != ::dsn::ERR_OK)
     {
+        if (rpc_should_retry(err, true) && endpoint.refreshable)
+        {
+            (void)binding->refresh(endpoint.generation);
+        }
         append_readiness_error(errors, "workflow", err.to_string());
         return false;
     }
@@ -664,7 +752,25 @@ bool probe_workflow_service(const rasn_service_graph &services,
 
 bool probe_observability_service(const rasn_service_graph &services, std::vector<std::string> *errors)
 {
-    rasn_observability_client observability(services.observability_address());
+    const std::shared_ptr<refreshable_endpoint_binding> binding =
+        services.service_endpoint_binding("observability");
+    if (binding == nullptr)
+    {
+        append_readiness_error(
+            errors, "observability", "unknown service endpoint binding");
+        return false;
+    }
+    const endpoint_snapshot endpoint = binding->current();
+    if (!endpoint.ok)
+    {
+        append_readiness_error(errors, "observability", endpoint.error);
+        if (endpoint.refreshable)
+        {
+            (void)binding->refresh(endpoint.generation);
+        }
+        return false;
+    }
+    rasn_observability_client observability(endpoint.address);
     observability_query_request request;
     request.limit = 1;
     ::dsn::error_code err;
@@ -672,6 +778,10 @@ bool probe_observability_service(const rasn_service_graph &services, std::vector
     std::tie(err, response) = observability.query_sync(request, std::chrono::milliseconds(500));
     if (err != ::dsn::ERR_OK)
     {
+        if (rpc_should_retry(err, true) && endpoint.refreshable)
+        {
+            (void)binding->refresh(endpoint.generation);
+        }
         append_readiness_error(errors, "observability", err.to_string());
         return false;
     }
@@ -690,10 +800,22 @@ bool probe_service_dependencies_once(const rasn_service_graph &services,
     bool ready = true;
     ready = probe_state_service(services, options, errors) && ready;
     ready = probe_registry_service(services, errors) && ready;
-    ready = probe_agent_service("coordinator", services.coordinator_address(), "rasn.coordinator", errors) && ready;
-    ready = probe_agent_service("model.agent", services.llm_agent_address(), "rasn.llm.agent", errors) && ready;
+    ready = probe_agent_service("coordinator",
+                                services.service_endpoint_binding("coordinator"),
+                                "rasn.coordinator",
+                                errors) &&
+            ready;
+    ready = probe_agent_service("model.agent",
+                                services.service_endpoint_binding("llm_agent"),
+                                "rasn.llm.agent",
+                                errors) &&
+            ready;
     ready = probe_model_health(services, errors) && ready;
-    ready = probe_agent_service("tool.agent", services.tool_agent_address(), "rasn.tool.agent", errors) && ready;
+    ready = probe_agent_service("tool.agent",
+                                services.service_endpoint_binding("tool_agent"),
+                                "rasn.tool.agent",
+                                errors) &&
+            ready;
     ready = probe_workflow_service(services, options, errors) && ready;
     ready = probe_observability_service(services, errors) && ready;
     return ready;

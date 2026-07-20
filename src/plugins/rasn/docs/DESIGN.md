@@ -175,6 +175,40 @@ rDSN design:
   timer retries standby election and only the fenced writer emits expiry
   tombstones. Static descriptors are not lease-tracked.
 - Dynamic updates use typed register/unregister/heartbeat RPCs.
+- Each concrete coordinator, model, and tool RPC app lease-publishes its full
+  agent descriptor plus the matching `rasn.service.<name>` capability.
+  Standalone state, workflow, and observability apps lease-publish service
+  descriptors through the same registry protocol. Graph-only processes do not
+  advertise handlers they do not host.
+- Host/port core-service clients keep a generation-aware endpoint binding. A
+  retryable transport/topology failure performs one shared registry refresh,
+  rejects stale resolver completions, and scopes breaker/admission state to the
+  concrete endpoint generation. Static addresses are retained as fallback after
+  a successful empty query. Registry failures remain explicit. Resolver
+  ownership is wrapped immediately in a no-throw flight guard. It publishes or
+  abandons only the matching generation, clears the flight sentinel, advances
+  the completion sequence, and notifies waiters exactly once. Successful
+  publication is the semantic commit point: its terminal outcome is staged
+  immediately and endpoint result types are statically verified no-throw
+  movable from an allocation-free rASN-local `dsn_address_t` value and
+  `std::string` member moves, so later diagnostics or return materialization
+  cannot relabel or fail a committed refresh. Conversion to and from the
+  unchanged rDSN `rpc_address` occurs only at ordinary boundaries and is not
+  claimed no-throw. Inbound construction is explicit to prevent accidental
+  wrapper selection; outbound conversion remains compatible with existing RPC
+  client boundaries. Post-publication diagnostics are best effort and contain
+  formatting/logging exceptions. Pre-publication exceptions
+  propagate to the owner without changing a newer reset generation. The
+  refresh metric sink contains backend exceptions and emits a fixed,
+  non-recursive stderr diagnostic at most once, so best-effort observability
+  cannot terminate flight unwinding.
+- RPC client addresses and bindings are immutable after their one-time
+  publication. A release/acquire flag makes them visible to readers; repeated
+  attempts to publish different addresses are rejected rather than racing
+  returned address references.
+- URI endpoints delegate invalidation to rDSN's resolver. The registry client
+  itself remains a configured URI/group/static address and never discovers
+  `rasn.registry` through `rasn.registry`, preventing recursion.
 - Direct CLI mode also loads static entries before built-in agents register, so
   `registry` and `agentctl` see the same configured agents without requiring the
   full service graph.
@@ -190,6 +224,9 @@ Correctness and robustness requirements:
 - Capability matching is exact by default; fuzzy matching is an explicit policy.
 - Shared backend, schema, and identity/fence errors fail the typed query/list RPC
   rather than appearing as a successful empty roster.
+- Refresh never follows typed application, validation, authorization, conflict,
+  or not-found errors. Caller-owned request metadata and bounded mutation retry
+  classifications survive endpoint changes unchanged.
 
 ### 3. Task and message model
 

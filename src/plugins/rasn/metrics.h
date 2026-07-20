@@ -46,6 +46,17 @@ struct metrics_snapshot
     std::string to_json() const;
 };
 
+enum class endpoint_refresh_metric
+{
+    attempt,
+    rebound,
+    unchanged,
+    failed,
+    superseded,
+    exception,
+    exhausted
+};
+
 // Process-global rASN runtime metrics backed by rDSN perf counters.
 //
 // Counters are cumulative (Prometheus "_total" convention). Latency metrics use
@@ -65,6 +76,10 @@ public:
     // Update counters for a recorded runtime event. failure_class is only consulted
     // when kind == "failure".
     void on_event(const std::string &kind, const std::string &failure_class);
+
+    // Endpoint refresh lifecycle accounting is enum-based and contains backend
+    // exceptions so refresh teardown never propagates a metrics failure.
+    void on_endpoint_refresh(endpoint_refresh_metric metric) noexcept;
 
     void observe_task_latency_ms(uint64_t ms);
     void observe_llm_latency_ms(uint64_t ms);

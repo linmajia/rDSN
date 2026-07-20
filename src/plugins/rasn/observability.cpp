@@ -489,11 +489,16 @@ rasn_observability_client::snapshot_sync(const std::string &request,
 {
     global_rasn_services().acquire();
     _rpc.open_service();
+    _registration.start("rasn.observability",
+                        "rasn.service.observability",
+                        primary_address(),
+                        name());
     return ::dsn::ERR_OK;
 }
 
 ::dsn::error_code rasn_observability_app::stop(bool cleanup)
 {
+    _registration.stop();
     _rpc.close_service();
     global_rasn_services().release();
     return ::dsn::ERR_OK;

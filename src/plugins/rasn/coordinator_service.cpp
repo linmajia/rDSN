@@ -186,13 +186,17 @@ agent_response coordinator_router::invoke_with_retries(
     nucleus_runtime &runtime,
     const agent_descriptor &agent,
     const std::string &operation,
-    const std::function<agent_response(uint32_t retry_attempt)> &invoke_once)
+    const std::function<agent_response(uint32_t retry_attempt,
+                                       const agent_response *previous)> &invoke_once)
 {
     const uint32_t retry_budget = (std::min)(request.retry_budget, coordinator_max_retry_budget());
     const bool retry_allowed = retry_budget > 0 && !is_tool_capability(request.capability);
+    agent_response previous;
+    bool have_previous = false;
     for (uint32_t attempt = 0;; ++attempt)
     {
-        agent_response response = invoke_once(attempt);
+        agent_response response =
+            invoke_once(attempt, have_previous ? &previous : nullptr);
         if (response.ok)
         {
             if (attempt > 0)
@@ -225,6 +229,8 @@ agent_response coordinator_router::invoke_with_retries(
                              operation + ":" + agent.agent_id,
                              attempt + 1,
                              retry_reason(response));
+        previous = response;
+        have_previous = true;
     }
 }
 

@@ -19,6 +19,7 @@
 #include <rasn/coordinator_service.h>
 #include <rasn/apps/codepilot/local_tools.h>
 #include <rasn/determinism_ledger.h>
+#include <rasn/endpoint_binding.h>
 #include <rasn/human_interaction.h>
 #include <rasn/llm_provider.h>
 #include <rasn/metrics.h>
@@ -42,6 +43,8 @@
 #include <rasn/workspace_change.h>
 #include <rasn/workspace_index.h>
 
+#include "standalone/test_allocation_failure.h"
+
 #include <dsn/cpp/utils.h>
 #include <dsn/tool-api/command.h>
 #include <dsn/tool-api/task.h>
@@ -62,8 +65,10 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1199,6 +1204,975 @@ TEST(rasn_registry, unregistering_an_absent_agent_is_successful)
     EXPECT_TRUE(registry.unregister_agent(descriptor.agent_id, &error)) << error;
 }
 
+TEST(rasn_endpoint_binding, stale_endpoint_rebinds_and_retries_idempotent_call)
+{
+    ::dsn::rpc_address stale;
+    stale.assign_ipv4("127.0.0.1", 31001);
+    ::dsn::rpc_address replacement;
+    replacement.assign_ipv4("127.0.0.1", 31002);
+    int resolutions = 0;
+    refreshable_endpoint_binding binding(
+        "unit.service",
+        stale,
+        "static",
+        false,
+        [&]() {
+            ++resolutions;
+            endpoint_resolution result;
+            result.ok = true;
+            result.found = true;
+            result.address = replacement;
+            result.source = "registry";
+            return result;
+        });
+
+    breaker_config breaker_options;
+    breaker_options.enabled = false;
+    circuit_breaker_registry breakers(breaker_options);
+    rpc_resilience_options options;
+    options.breaker_enabled = false;
+    options.max_attempts = 2;
+    options.backoff_ms = 0;
+    std::vector< ::dsn::rpc_address> attempts;
+    const std::pair< ::dsn::error_code, agent_response> result =
+        resilient_bound_rpc_call<agent_response>(
+            breakers,
+            binding,
+            "unit.read",
+            options,
+            true,
+            std::chrono::milliseconds(1),
+            [&](const ::dsn::rpc_address &address,
+                std::chrono::milliseconds) {
+                attempts.push_back(address);
+                agent_response response;
+                response.ok = address == replacement;
+                return std::make_pair(response.ok ? ::dsn::ERR_OK
+                                                  : ::dsn::ERR_NETWORK_FAILURE,
+                                      response);
+            });
+
+    EXPECT_EQ(::dsn::ERR_OK, result.first);
+    ASSERT_EQ(2u, attempts.size());
+    EXPECT_EQ(stale, attempts[0]);
+    EXPECT_EQ(replacement, attempts[1]);
+    EXPECT_EQ(1, resolutions);
+    EXPECT_EQ(2u, binding.current().generation);
+}
+
+TEST(rasn_rpc_resilience, agent_control_retry_classifier_fails_closed)
+{
+    EXPECT_TRUE(agent_control_rpc_operation_is_idempotent(
+        agent_control_rpc_operation::describe));
+    EXPECT_TRUE(agent_control_rpc_operation_is_idempotent(
+        agent_control_rpc_operation::query));
+    EXPECT_TRUE(agent_control_rpc_operation_is_idempotent(
+        agent_control_rpc_operation::heartbeat));
+    EXPECT_TRUE(agent_control_rpc_operation_is_idempotent(
+        agent_control_rpc_operation::cancel));
+    EXPECT_FALSE(agent_control_rpc_operation_is_idempotent(
+        agent_control_rpc_operation::invoke));
+    EXPECT_FALSE(agent_control_rpc_operation_is_idempotent(
+        static_cast<agent_control_rpc_operation>(-1)));
+}
+
+TEST(rasn_endpoint_binding, concurrent_refresh_converges_with_single_resolution)
+{
+    ::dsn::rpc_address stale;
+    stale.assign_ipv4("127.0.0.1", 31101);
+    ::dsn::rpc_address replacement;
+    replacement.assign_ipv4("127.0.0.1", 31102);
+    std::atomic<int> resolutions(0);
+    std::atomic<int> ready(0);
+    std::atomic<bool> go(false);
+    std::mutex resolver_lock;
+    std::condition_variable resolver_entered;
+    std::condition_variable resolver_release;
+    bool entered = false;
+    bool released = false;
+    refreshable_endpoint_binding binding(
+        "unit.concurrent",
+        stale,
+        "static",
+        false,
+        [&]() {
+            ++resolutions;
+            std::unique_lock<std::mutex> guard(resolver_lock);
+            entered = true;
+            resolver_entered.notify_one();
+            resolver_release.wait(guard, [&]() { return released; });
+            endpoint_resolution result;
+            result.ok = true;
+            result.found = true;
+            result.address = replacement;
+            result.source = "registry";
+            return result;
+        });
+
+    const uint64_t generation = binding.current().generation;
+    std::vector<endpoint_refresh_result> results(8);
+    std::vector<std::thread> threads;
+    for (size_t i = 0; i < results.size(); ++i)
+    {
+        threads.emplace_back([&, i]() {
+            ++ready;
+            while (!go.load())
+            {
+                std::this_thread::yield();
+            }
+            results[i] = binding.refresh(generation);
+        });
+    }
+    while (ready.load() != static_cast<int>(results.size()))
+    {
+        std::this_thread::yield();
+    }
+    go.store(true);
+    {
+        std::unique_lock<std::mutex> guard(resolver_lock);
+        EXPECT_TRUE(resolver_entered.wait_for(
+            guard, std::chrono::seconds(1), [&]() { return entered; }));
+        released = true;
+    }
+    resolver_release.notify_one();
+    for (std::thread &thread : threads)
+    {
+        thread.join();
+    }
+
+    EXPECT_EQ(1, resolutions.load());
+    for (const endpoint_refresh_result &result : results)
+    {
+        EXPECT_TRUE(result.endpoint.ok);
+        EXPECT_EQ(replacement, result.endpoint.address);
+        EXPECT_EQ(2u, result.endpoint.generation);
+    }
+}
+
+TEST(rasn_endpoint_binding, lazy_initial_resolution_and_explicit_refresh_have_distinct_outcomes)
+{
+    ::dsn::rpc_address fallback;
+    fallback.assign_ipv4("127.0.0.1", 31105);
+    ::dsn::rpc_address replacement;
+    replacement.assign_ipv4("127.0.0.1", 31106);
+    int resolutions = 0;
+    refreshable_endpoint_binding binding(
+        "unit.lazy-outcome",
+        fallback,
+        "static",
+        false,
+        [&]() {
+            ++resolutions;
+            endpoint_resolution result;
+            result.ok = true;
+            result.found = true;
+            result.address = replacement;
+            result.source = "registry";
+            return result;
+        });
+
+    const uint64_t original_generation = binding.current().generation;
+    binding.reset(
+        fallback,
+        "static",
+        true,
+        [&]() {
+            ++resolutions;
+            endpoint_resolution result;
+            result.ok = true;
+            result.found = true;
+            result.address = replacement;
+            result.source = "registry";
+            return result;
+        });
+    const endpoint_snapshot lazy = binding.current();
+    EXPECT_TRUE(lazy.ok);
+    EXPECT_EQ(replacement, lazy.address);
+    EXPECT_EQ(original_generation + 1, lazy.generation);
+
+    binding.reset(
+        fallback,
+        "static",
+        true,
+        [&]() {
+            ++resolutions;
+            endpoint_resolution result;
+            result.ok = true;
+            result.found = true;
+            result.address = replacement;
+            result.source = "registry";
+            return result;
+        });
+    const endpoint_refresh_result explicit_refresh =
+        binding.refresh(lazy.generation + 1);
+    EXPECT_EQ(endpoint_refresh_outcome::rebound, explicit_refresh.outcome);
+    EXPECT_EQ(replacement, explicit_refresh.endpoint.address);
+    EXPECT_EQ(lazy.generation + 2, explicit_refresh.endpoint.generation);
+    EXPECT_EQ(2, resolutions);
+}
+
+TEST(rasn_endpoint_binding, stale_resolution_cannot_complete_a_new_generation)
+{
+    ::dsn::rpc_address original;
+    original.assign_ipv4("127.0.0.1", 31111);
+    ::dsn::rpc_address reset_fallback;
+    reset_fallback.assign_ipv4("127.0.0.1", 31112);
+    ::dsn::rpc_address replacement;
+    replacement.assign_ipv4("127.0.0.1", 31113);
+    std::mutex resolver_lock;
+    std::condition_variable resolver_entered;
+    std::condition_variable resolver_release;
+    bool entered = false;
+    bool released = false;
+    refreshable_endpoint_binding binding(
+        "unit.stale-generation",
+        original,
+        "static:original",
+        false,
+        [&]() {
+            std::unique_lock<std::mutex> guard(resolver_lock);
+            entered = true;
+            resolver_entered.notify_one();
+            resolver_release.wait(guard, [&]() { return released; });
+            endpoint_resolution result;
+            result.ok = true;
+            result.found = true;
+            result.address = original;
+            result.source = "registry:stale";
+            return result;
+        });
+
+    const uint64_t original_generation = binding.current().generation;
+    endpoint_refresh_result stale_result;
+    std::thread stale_refresh([&]() {
+        stale_result = binding.refresh(original_generation);
+    });
+    {
+        std::unique_lock<std::mutex> guard(resolver_lock);
+        EXPECT_TRUE(resolver_entered.wait_for(
+            guard, std::chrono::seconds(1), [&]() { return entered; }));
+    }
+    binding.reset(
+        reset_fallback,
+        "static:reset",
+        true,
+        [&]() {
+            endpoint_resolution result;
+            result.ok = true;
+            result.found = true;
+            result.address = replacement;
+            result.source = "registry:new";
+            return result;
+        });
+    endpoint_refresh_result new_result;
+    std::thread new_refresh([&]() {
+        new_result = binding.refresh(original_generation + 1);
+    });
+    {
+        std::lock_guard<std::mutex> guard(resolver_lock);
+        released = true;
+    }
+    resolver_release.notify_one();
+    stale_refresh.join();
+    new_refresh.join();
+
+    EXPECT_EQ(endpoint_refresh_outcome::superseded, stale_result.outcome);
+    EXPECT_EQ(reset_fallback, stale_result.endpoint.address);
+    EXPECT_EQ(endpoint_refresh_outcome::rebound, new_result.outcome);
+    EXPECT_EQ(replacement, new_result.endpoint.address);
+    const endpoint_snapshot resolved = binding.current();
+    EXPECT_TRUE(resolved.ok);
+    EXPECT_EQ(replacement, resolved.address);
+    EXPECT_EQ("registry:new", resolved.source);
+}
+
+TEST(rasn_endpoint_binding, resolver_exception_releases_joiners_and_allows_retry)
+{
+    ::dsn::rpc_address fallback;
+    fallback.assign_ipv4("127.0.0.1", 31121);
+    ::dsn::rpc_address replacement;
+    replacement.assign_ipv4("127.0.0.1", 31122);
+    std::atomic<int> resolutions(0);
+    std::mutex resolver_lock;
+    std::condition_variable resolver_entered;
+    std::condition_variable resolver_release;
+    bool entered = false;
+    bool released = false;
+    refreshable_endpoint_binding binding(
+        "unit.throwing-refresh",
+        fallback,
+        "static",
+        false,
+        [&]() {
+            if (++resolutions == 1)
+            {
+                std::unique_lock<std::mutex> guard(resolver_lock);
+                entered = true;
+                resolver_entered.notify_one();
+                resolver_release.wait(guard, [&]() { return released; });
+                throw std::runtime_error("resolver failure");
+            }
+            endpoint_resolution result;
+            result.ok = true;
+            result.found = true;
+            result.address = replacement;
+            result.source = "registry";
+            return result;
+        });
+
+    const uint64_t generation = binding.current().generation;
+    bool owner_threw = false;
+    std::thread owner([&]() {
+        try
+        {
+            (void)binding.refresh(generation);
+        }
+        catch (const std::runtime_error &error)
+        {
+            owner_threw = std::string(error.what()) == "resolver failure";
+        }
+    });
+    {
+        std::unique_lock<std::mutex> guard(resolver_lock);
+        EXPECT_TRUE(resolver_entered.wait_for(
+            guard, std::chrono::seconds(1), [&]() { return entered; }));
+    }
+
+    std::atomic<bool> joiner_started(false);
+    endpoint_refresh_result joiner_result;
+    std::thread joiner([&]() {
+        joiner_started.store(true);
+        joiner_result = binding.refresh(generation);
+    });
+    while (!joiner_started.load())
+    {
+        std::this_thread::yield();
+    }
+    {
+        std::lock_guard<std::mutex> guard(resolver_lock);
+        released = true;
+    }
+    resolver_release.notify_one();
+    owner.join();
+    joiner.join();
+
+    EXPECT_TRUE(owner_threw);
+    EXPECT_TRUE(joiner_result.outcome == endpoint_refresh_outcome::failed ||
+                joiner_result.outcome == endpoint_refresh_outcome::rebound);
+    if (joiner_result.outcome == endpoint_refresh_outcome::failed)
+    {
+        EXPECT_FALSE(joiner_result.endpoint.ok);
+        EXPECT_EQ("endpoint refresh threw an exception",
+                  joiner_result.endpoint.error);
+    }
+
+    const endpoint_refresh_result recovered =
+        binding.refresh(binding.current().generation);
+    EXPECT_TRUE(recovered.outcome == endpoint_refresh_outcome::rebound ||
+                recovered.outcome == endpoint_refresh_outcome::unchanged);
+    EXPECT_EQ(replacement, binding.current().address);
+}
+
+TEST(rasn_endpoint_binding, endpoint_address_preserves_rpc_address_semantics)
+{
+    ::dsn::rpc_address ipv4;
+    ipv4.assign_ipv4("127.0.0.1", 31123);
+    const endpoint_address stored_ipv4(ipv4);
+    const ::dsn::rpc_address roundtrip_ipv4 = stored_ipv4;
+    EXPECT_EQ(HOST_TYPE_IPV4, stored_ipv4.type());
+    EXPECT_EQ(ipv4.ip(), stored_ipv4.ip());
+    EXPECT_EQ(ipv4.port(), stored_ipv4.port());
+    EXPECT_EQ(ipv4, roundtrip_ipv4);
+    EXPECT_EQ(stored_ipv4, ipv4);
+
+    dsn_uri_t uri = ::dsn_uri_build("http://localhost:31124/");
+    ASSERT_NE(nullptr, uri);
+    {
+        ::dsn::rpc_address original;
+        original.assign_uri(uri);
+        const endpoint_address stored(original);
+        const ::dsn::rpc_address roundtrip = stored;
+        EXPECT_EQ(HOST_TYPE_URI, stored.type());
+        EXPECT_EQ(original, roundtrip);
+        EXPECT_EQ(stored, original);
+    }
+    ::dsn_uri_destroy(uri);
+
+    dsn_group_t group = ::dsn_group_build("rasn.endpoint.binding.test");
+    ASSERT_NE(nullptr, group);
+    {
+        ::dsn::rpc_address original;
+        original.assign_group(group);
+        const endpoint_address stored(original);
+        const ::dsn::rpc_address roundtrip = stored;
+        EXPECT_EQ(HOST_TYPE_GROUP, stored.type());
+        EXPECT_EQ(original, roundtrip);
+        EXPECT_EQ(stored, original);
+    }
+    ::dsn_group_destroy(group);
+}
+
+TEST(rasn_endpoint_binding,
+     prepublication_allocation_exception_allows_same_generation_retry)
+{
+    ::dsn::rpc_address fallback;
+    fallback.assign_ipv4("127.0.0.1", 31125);
+    ::dsn::rpc_address replacement;
+    replacement.assign_ipv4("127.0.0.1", 31126);
+    const std::string resolved_source =
+        "registry:prepublication-allocation:" + std::string(32768, 's');
+    const std::size_t target_allocation_minimum =
+        resolved_source.size() + 1;
+    int resolutions = 0;
+    refreshable_endpoint_binding binding(
+        "unit.prepublication-allocation",
+        fallback,
+        "static",
+        false,
+        [&]() {
+            endpoint_resolution result;
+            result.ok = true;
+            result.found = true;
+            result.address = replacement;
+            result.source = resolved_source;
+            ++resolutions;
+            return result;
+        });
+
+    const uint64_t generation = binding.current().generation;
+    EXPECT_FALSE(
+        test_support::allocation_failure_scope::current_thread_rule_armed());
+    {
+        test_support::allocation_failure_scope outer(
+            std::numeric_limits<std::size_t>::max());
+        EXPECT_TRUE(outer.armed());
+        EXPECT_TRUE(
+            test_support::allocation_failure_scope::
+                current_thread_rule_armed());
+        {
+            test_support::allocation_failure_scope inner(
+                std::numeric_limits<std::size_t>::max());
+            EXPECT_TRUE(inner.armed());
+            EXPECT_TRUE(
+                test_support::allocation_failure_scope::
+                    current_thread_rule_armed());
+        }
+        EXPECT_TRUE(outer.armed());
+        EXPECT_TRUE(
+            test_support::allocation_failure_scope::
+                current_thread_rule_armed());
+    }
+    EXPECT_FALSE(
+        test_support::allocation_failure_scope::current_thread_rule_armed());
+
+    {
+        // Skip the resolver's matching source copy, then fail the next
+        // allocation in that distinctive size class during pre-publication
+        // state preparation. Smaller incidental allocations pass through.
+        test_support::allocation_failure_scope failure(
+            target_allocation_minimum, 1);
+        EXPECT_TRUE(failure.armed());
+        EXPECT_FALSE(failure.triggered());
+        EXPECT_EQ(0u, failure.matching_allocations_observed());
+        EXPECT_EQ(0u, failure.last_skipped_allocation_size());
+        EXPECT_EQ(0u, failure.triggered_allocation_size());
+        EXPECT_THROW((void)binding.refresh(generation), std::bad_alloc);
+        EXPECT_FALSE(failure.armed());
+        EXPECT_TRUE(failure.triggered());
+        EXPECT_EQ(2u, failure.matching_allocations_observed());
+        EXPECT_GE(failure.last_skipped_allocation_size(),
+                  target_allocation_minimum);
+        EXPECT_GE(failure.triggered_allocation_size(),
+                  target_allocation_minimum);
+        EXPECT_FALSE(
+            test_support::allocation_failure_scope::
+                current_thread_rule_armed());
+    }
+    EXPECT_FALSE(
+        test_support::allocation_failure_scope::current_thread_rule_armed());
+    EXPECT_EQ(1, resolutions);
+    const endpoint_snapshot after_failure = binding.current();
+    EXPECT_TRUE(after_failure.ok);
+    EXPECT_EQ(fallback, after_failure.address);
+    EXPECT_EQ("static", after_failure.source);
+    EXPECT_EQ(generation, after_failure.generation);
+
+    const endpoint_refresh_result recovered = binding.refresh(generation);
+    EXPECT_EQ(endpoint_refresh_outcome::rebound, recovered.outcome);
+    EXPECT_TRUE(recovered.endpoint.ok);
+    EXPECT_EQ(replacement, recovered.endpoint.address);
+    EXPECT_EQ(resolved_source, recovered.endpoint.source);
+    EXPECT_EQ(generation + 1, recovered.endpoint.generation);
+    EXPECT_EQ(2, resolutions);
+}
+
+TEST(rasn_endpoint_binding, lazy_current_retries_after_resolver_exception)
+{
+    ::dsn::rpc_address fallback;
+    fallback.assign_ipv4("127.0.0.1", 31131);
+    ::dsn::rpc_address replacement;
+    replacement.assign_ipv4("127.0.0.1", 31132);
+    int resolutions = 0;
+    refreshable_endpoint_binding binding(
+        "unit.throwing-current",
+        fallback,
+        "static",
+        true,
+        [&]() {
+            if (++resolutions == 1)
+            {
+                throw std::runtime_error("lazy resolver failure");
+            }
+            endpoint_resolution result;
+            result.ok = true;
+            result.found = true;
+            result.address = replacement;
+            result.source = "registry";
+            return result;
+        });
+
+    EXPECT_THROW((void)binding.current(), std::runtime_error);
+    const endpoint_snapshot recovered = binding.current();
+    EXPECT_TRUE(recovered.ok);
+    EXPECT_EQ(replacement, recovered.address);
+    EXPECT_EQ(1u, recovered.generation);
+    EXPECT_EQ(2, resolutions);
+}
+
+TEST(rasn_endpoint_binding, stale_throwing_resolution_cannot_overwrite_reset)
+{
+    ::dsn::rpc_address original;
+    original.assign_ipv4("127.0.0.1", 31141);
+    ::dsn::rpc_address reset_fallback;
+    reset_fallback.assign_ipv4("127.0.0.1", 31142);
+    ::dsn::rpc_address replacement;
+    replacement.assign_ipv4("127.0.0.1", 31143);
+    std::mutex resolver_lock;
+    std::condition_variable resolver_entered;
+    std::condition_variable resolver_release;
+    bool entered = false;
+    bool released = false;
+    refreshable_endpoint_binding binding(
+        "unit.stale-throw",
+        original,
+        "static:original",
+        false,
+        [&]() -> endpoint_resolution {
+            std::unique_lock<std::mutex> guard(resolver_lock);
+            entered = true;
+            resolver_entered.notify_one();
+            resolver_release.wait(guard, [&]() { return released; });
+            throw std::runtime_error("stale resolver failure");
+        });
+
+    const uint64_t original_generation = binding.current().generation;
+    bool owner_threw = false;
+    std::thread stale_owner([&]() {
+        try
+        {
+            (void)binding.refresh(original_generation);
+        }
+        catch (const std::runtime_error &error)
+        {
+            owner_threw =
+                std::string(error.what()) == "stale resolver failure";
+        }
+    });
+    {
+        std::unique_lock<std::mutex> guard(resolver_lock);
+        EXPECT_TRUE(resolver_entered.wait_for(
+            guard, std::chrono::seconds(1), [&]() { return entered; }));
+    }
+
+    binding.reset(
+        reset_fallback,
+        "static:reset",
+        true,
+        [&]() {
+            endpoint_resolution result;
+            result.ok = true;
+            result.found = true;
+            result.address = replacement;
+            result.source = "registry:new";
+            return result;
+        });
+    endpoint_snapshot new_generation;
+    std::thread current_reader([&]() { new_generation = binding.current(); });
+    {
+        std::lock_guard<std::mutex> guard(resolver_lock);
+        released = true;
+    }
+    resolver_release.notify_one();
+    stale_owner.join();
+    current_reader.join();
+
+    EXPECT_TRUE(owner_threw);
+    EXPECT_TRUE(new_generation.ok);
+    EXPECT_EQ(replacement, new_generation.address);
+    EXPECT_EQ("registry:new", new_generation.source);
+    EXPECT_EQ(original_generation + 1, new_generation.generation);
+    EXPECT_EQ(replacement, binding.current().address);
+}
+
+TEST(rasn_endpoint_binding, unchanged_and_failed_resolutions_are_explicit)
+{
+    ::dsn::rpc_address endpoint;
+    endpoint.assign_ipv4("127.0.0.1", 31201);
+    bool fail = false;
+    refreshable_endpoint_binding binding(
+        "unit.outcomes",
+        endpoint,
+        "static",
+        false,
+        [&]() {
+            endpoint_resolution result;
+            if (fail)
+            {
+                result.error = "registry unavailable";
+                return result;
+            }
+            result.ok = true;
+            result.found = true;
+            result.address = endpoint;
+            result.source = "static";
+            return result;
+        });
+
+    const endpoint_refresh_result unchanged =
+        binding.refresh(binding.current().generation);
+    EXPECT_EQ(endpoint_refresh_outcome::unchanged, unchanged.outcome);
+    EXPECT_TRUE(unchanged.endpoint.ok);
+    fail = true;
+    const endpoint_refresh_result failed =
+        binding.refresh(binding.current().generation);
+    EXPECT_EQ(endpoint_refresh_outcome::failed, failed.outcome);
+    EXPECT_FALSE(failed.endpoint.ok);
+    EXPECT_EQ("registry unavailable", failed.endpoint.error);
+    EXPECT_GT(failed.endpoint.generation, unchanged.endpoint.generation);
+
+    fail = false;
+    const endpoint_refresh_result recovered =
+        binding.refresh(failed.endpoint.generation);
+    EXPECT_EQ(endpoint_refresh_outcome::rebound, recovered.outcome);
+    EXPECT_TRUE(recovered.endpoint.ok);
+    EXPECT_EQ(endpoint, recovered.endpoint.address);
+    EXPECT_GT(recovered.endpoint.generation, failed.endpoint.generation);
+}
+
+TEST(rasn_endpoint_binding, static_and_registry_self_bindings_never_recurse)
+{
+    ::dsn::rpc_address endpoint;
+    endpoint.assign_ipv4("127.0.0.1", 31301);
+    refreshable_endpoint_binding static_binding(
+        "unit.static", endpoint, "static", false);
+    refreshable_endpoint_binding registry_binding(
+        "rasn.registry", endpoint, "registry-group", false);
+
+    EXPECT_FALSE(static_binding.refreshable());
+    EXPECT_EQ(endpoint, static_binding.current().address);
+    EXPECT_EQ(endpoint_refresh_outcome::unchanged,
+              static_binding.refresh(
+                  static_binding.current().generation).outcome);
+    EXPECT_FALSE(registry_binding.refreshable());
+    EXPECT_EQ(endpoint, registry_binding.current().address);
+}
+
+TEST(rasn_endpoint_binding, service_graph_rejects_unknown_binding_names)
+{
+    rasn_service_graph services;
+    EXPECT_NE(nullptr, services.service_endpoint_binding("coordinator"));
+    EXPECT_NE(nullptr, services.service_endpoint_binding("llm_agent"));
+    EXPECT_NE(nullptr, services.service_endpoint_binding("tool_agent"));
+    EXPECT_NE(nullptr, services.service_endpoint_binding("state"));
+    EXPECT_NE(nullptr, services.service_endpoint_binding("workflow"));
+    EXPECT_NE(nullptr, services.service_endpoint_binding("observability"));
+    EXPECT_EQ(nullptr, services.service_endpoint_binding("unknown"));
+}
+
+TEST(rasn_endpoint_binding, application_errors_do_not_trigger_resolution)
+{
+    ::dsn::rpc_address endpoint;
+    endpoint.assign_ipv4("127.0.0.1", 31401);
+    int resolutions = 0;
+    refreshable_endpoint_binding binding(
+        "unit.application-errors",
+        endpoint,
+        "static",
+        false,
+        [&]() {
+            ++resolutions;
+            endpoint_resolution result;
+            result.error = "unexpected resolution";
+            return result;
+        });
+    breaker_config breaker_options;
+    breaker_options.enabled = false;
+    circuit_breaker_registry breakers(breaker_options);
+    rpc_resilience_options options;
+    options.breaker_enabled = false;
+    options.max_attempts = 3;
+    options.backoff_ms = 0;
+
+    const std::vector<std::string> failure_classes = {
+        "application", "authorization", "validation"};
+    for (const std::string &failure_class : failure_classes)
+    {
+        const std::pair< ::dsn::error_code, agent_response> result =
+            resilient_bound_rpc_call<agent_response>(
+                breakers,
+                binding,
+                "unit.read",
+                options,
+                true,
+                std::chrono::milliseconds(1),
+                [&](const ::dsn::rpc_address &,
+                    std::chrono::milliseconds) {
+                    agent_response response;
+                    response.ok = false;
+                    response.error = make_agent_error(
+                        failure_class,
+                        failure_class + "_rejected",
+                        "typed failure",
+                        false,
+                        "unit");
+                    return std::make_pair(::dsn::ERR_OK, response);
+                });
+        EXPECT_EQ(::dsn::ERR_OK, result.first);
+        EXPECT_FALSE(result.second.ok);
+    }
+    EXPECT_EQ(0, resolutions);
+}
+
+TEST(rasn_endpoint_binding, retries_preserve_runtime_request_metadata)
+{
+    ::dsn::rpc_address stale;
+    stale.assign_ipv4("127.0.0.1", 31501);
+    ::dsn::rpc_address replacement;
+    replacement.assign_ipv4("127.0.0.1", 31502);
+    refreshable_endpoint_binding binding(
+        "unit.metadata",
+        stale,
+        "static",
+        false,
+        [&]() {
+            endpoint_resolution result;
+            result.ok = true;
+            result.found = true;
+            result.address = replacement;
+            result.source = "registry";
+            return result;
+        });
+    rpc::runtime_request_metadata metadata;
+    metadata.__set_request_id("request-315");
+    metadata.__set_trace_id("trace-315");
+    metadata.__set_auth_token("auth-315");
+    metadata.__set_route_partition(7);
+
+    breaker_config breaker_options;
+    breaker_options.enabled = false;
+    circuit_breaker_registry breakers(breaker_options);
+    rpc_resilience_options options;
+    options.breaker_enabled = false;
+    options.max_attempts = 2;
+    options.backoff_ms = 0;
+    int calls = 0;
+    const std::pair< ::dsn::error_code, agent_response> result =
+        resilient_bound_rpc_call<agent_response>(
+            breakers,
+            binding,
+            "unit.metadata",
+            options,
+            true,
+            std::chrono::milliseconds(1),
+            [&](const ::dsn::rpc_address &,
+                std::chrono::milliseconds) {
+                ++calls;
+                EXPECT_EQ("request-315", metadata.request_id);
+                EXPECT_EQ("trace-315", metadata.trace_id);
+                EXPECT_EQ("auth-315", metadata.auth_token);
+                EXPECT_EQ(7, metadata.route_partition);
+                agent_response response;
+                response.ok = calls == 2;
+                return std::make_pair(
+                    response.ok ? ::dsn::ERR_OK : ::dsn::ERR_BUSY,
+                    response);
+            });
+
+    EXPECT_EQ(::dsn::ERR_OK, result.first);
+    EXPECT_EQ(2, calls);
+    EXPECT_EQ("request-315", metadata.request_id);
+    EXPECT_EQ("trace-315", metadata.trace_id);
+    EXPECT_EQ("auth-315", metadata.auth_token);
+}
+
+TEST(rasn_endpoint_binding, ambiguous_mutation_refreshes_without_replay)
+{
+    ::dsn::rpc_address stale;
+    stale.assign_ipv4("127.0.0.1", 31601);
+    ::dsn::rpc_address replacement;
+    replacement.assign_ipv4("127.0.0.1", 31602);
+    int resolutions = 0;
+    refreshable_endpoint_binding binding(
+        "unit.mutation",
+        stale,
+        "static",
+        false,
+        [&]() {
+            ++resolutions;
+            endpoint_resolution result;
+            result.ok = true;
+            result.found = true;
+            result.address = replacement;
+            result.source = "registry";
+            return result;
+        });
+    breaker_config breaker_options;
+    breaker_options.enabled = false;
+    circuit_breaker_registry breakers(breaker_options);
+    rpc_resilience_options options;
+    options.breaker_enabled = false;
+    options.max_attempts = 3;
+    options.backoff_ms = 0;
+    int calls = 0;
+    const std::pair< ::dsn::error_code, agent_response> result =
+        resilient_bound_rpc_call<agent_response>(
+            breakers,
+            binding,
+            "unit.mutate",
+            options,
+            false,
+            std::chrono::milliseconds(1),
+            [&](const ::dsn::rpc_address &,
+                std::chrono::milliseconds) {
+                ++calls;
+                return std::make_pair(::dsn::ERR_TIMEOUT,
+                                      agent_response());
+            });
+
+    EXPECT_EQ(::dsn::ERR_TIMEOUT, result.first);
+    EXPECT_EQ(1, calls);
+    EXPECT_EQ(1, resolutions);
+    EXPECT_EQ(replacement, binding.current().address);
+}
+
+TEST(rasn_endpoint_binding, replacement_endpoint_has_isolated_breaker_state)
+{
+    ::dsn::rpc_address stale;
+    stale.assign_ipv4("127.0.0.1", 31701);
+    ::dsn::rpc_address replacement;
+    replacement.assign_ipv4("127.0.0.1", 31702);
+    refreshable_endpoint_binding binding(
+        "unit.breaker",
+        stale,
+        "static",
+        false,
+        [&]() {
+            endpoint_resolution result;
+            result.ok = true;
+            result.found = true;
+            result.address = replacement;
+            result.source = "registry";
+            return result;
+        });
+    breaker_config breaker_options;
+    breaker_options.enabled = true;
+    breaker_options.failure_threshold = 1;
+    breaker_options.open_ms = 60000;
+    circuit_breaker_registry breakers(breaker_options);
+    rpc_resilience_options options;
+    options.breaker_enabled = true;
+    options.max_attempts = 2;
+    options.backoff_ms = 0;
+    std::vector< ::dsn::rpc_address> attempts;
+    const std::pair< ::dsn::error_code, agent_response> result =
+        resilient_bound_rpc_call<agent_response>(
+            breakers,
+            binding,
+            "unit.read",
+            options,
+            true,
+            std::chrono::milliseconds(1),
+            [&](const ::dsn::rpc_address &address,
+                std::chrono::milliseconds) {
+                attempts.push_back(address);
+                agent_response response;
+                response.ok = address == replacement;
+                return std::make_pair(
+                    response.ok ? ::dsn::ERR_OK
+                                : ::dsn::ERR_NETWORK_INIT_FAILED,
+                    response);
+            });
+
+    EXPECT_EQ(::dsn::ERR_OK, result.first);
+    ASSERT_EQ(2u, attempts.size());
+    const std::vector<circuit_breaker_registry::entry> states =
+        breakers.snapshot();
+    ASSERT_EQ(2u, states.size());
+    EXPECT_NE(states[0].key, states[1].key);
+    EXPECT_TRUE(states[0].state == breaker_state::open ||
+                states[1].state == breaker_state::open);
+    EXPECT_TRUE(states[0].state == breaker_state::closed ||
+                states[1].state == breaker_state::closed);
+}
+
+TEST(rasn_endpoint_binding, local_registry_resolves_shard_capabilities_independently)
+{
+    const std::string shard0_id = "unit.dynamic.shard.0";
+    const std::string shard1_id = "unit.dynamic.shard.1";
+    const std::string shard0_capability =
+        "rasn.runtime.unit_dynamic.shard.0";
+    const std::string shard1_capability =
+        "rasn.runtime.unit_dynamic.shard.1";
+    agent_descriptor shard0;
+    shard0.agent_id = shard0_id;
+    shard0.role = "rasn.runtime.unit_dynamic";
+    shard0.app_name = shard0.role;
+    shard0.host = "127.0.0.1";
+    shard0.port = 31801;
+    shard0.health = "healthy";
+    shard0.capabilities.push_back(make_capability(
+        shard0_capability, "runtime_rpc", "runtime_rpc", "service_endpoint"));
+    agent_descriptor shard1 = shard0;
+    shard1.agent_id = shard1_id;
+    shard1.port = 31802;
+    shard1.capabilities.clear();
+    shard1.capabilities.push_back(make_capability(
+        shard1_capability, "runtime_rpc", "runtime_rpc", "service_endpoint"));
+    std::string error;
+    ASSERT_TRUE(global_agent_registry().register_agent(
+        shard0, &error, true)) << error;
+    ASSERT_TRUE(global_agent_registry().register_agent(
+        shard1, &error, true)) << error;
+
+    const endpoint_resolution resolved0 = resolve_registry_endpoint(
+        shard0_capability,
+        shard0_id,
+        ::dsn::rpc_address(),
+        ::dsn::rpc_address(),
+        "",
+        std::chrono::milliseconds(1));
+    const endpoint_resolution resolved1 = resolve_registry_endpoint(
+        shard1_capability,
+        shard1_id,
+        ::dsn::rpc_address(),
+        ::dsn::rpc_address(),
+        "",
+        std::chrono::milliseconds(1));
+    EXPECT_TRUE(resolved0.ok);
+    EXPECT_TRUE(resolved0.found);
+    EXPECT_EQ("registry:local", resolved0.source);
+    EXPECT_EQ(31801, resolved0.address.port());
+    EXPECT_TRUE(resolved1.ok);
+    EXPECT_TRUE(resolved1.found);
+    EXPECT_EQ("registry:local", resolved1.source);
+    EXPECT_EQ(31802, resolved1.address.port());
+
+    EXPECT_TRUE(global_agent_registry().unregister_agent(shard0_id, &error))
+        << error;
+    EXPECT_TRUE(global_agent_registry().unregister_agent(shard1_id, &error))
+        << error;
+}
+
 TEST(rasn_coordinator, retries_retryable_model_invocations_with_trace)
 {
     agent_request request;
@@ -1220,7 +2194,7 @@ TEST(rasn_coordinator, retries_retryable_model_invocations_with_trace)
         runtime,
         agent,
         "unit.invoke",
-        [&request, &calls](uint32_t) {
+        [&request, &calls](uint32_t, const agent_response *) {
             ++calls;
             agent_response result;
             result.request_id = request.request_id;
@@ -1405,7 +2379,7 @@ TEST(rasn_coordinator, does_not_retry_tool_invocations)
         runtime,
         agent,
         "unit.invoke",
-        [&request, &calls](uint32_t) {
+        [&request, &calls](uint32_t, const agent_response *) {
             ++calls;
             agent_response result;
             result.request_id = request.request_id;
@@ -5599,6 +6573,10 @@ TEST(rasn_metrics_registry, snapshot_exposes_core_and_latency_series)
     EXPECT_NE(nullptr, snapshot.find("rasn_runtime_dedup_wait_total"));
     EXPECT_NE(nullptr, snapshot.find("rasn_runtime_dedup_evicted_total"));
     EXPECT_NE(nullptr, snapshot.find("rasn_runtime_dedup_expired_total"));
+    EXPECT_NE(nullptr,
+              snapshot.find("rasn_endpoint_refresh_superseded_total"));
+    EXPECT_NE(nullptr,
+              snapshot.find("rasn_endpoint_refresh_exceptions_total"));
 
     // Latency series are present and flagged as latency samples.
     const metric_sample *task_latency = snapshot.find("rasn_task_latency_ms");
@@ -5678,6 +6656,68 @@ TEST(rasn_metrics_registry, runtime_events_increment_cumulative_counters)
     registry.observe_task_latency_ms(5);
     registry.observe_llm_latency_ms(5);
     registry.observe_tool_latency_ms(5);
+}
+
+TEST(rasn_metrics_registry, endpoint_refresh_terminal_counters_reconcile)
+{
+    (void)::dsn::task::get_current_node();
+
+    metrics_registry &registry = metrics_registry::instance();
+    registry.ensure_core_counters();
+    const metrics_snapshot before = registry.snapshot();
+    const uint64_t attempts_before =
+        before.counter("rasn_endpoint_refresh_attempts_total");
+    const uint64_t rebound_before =
+        before.counter("rasn_endpoint_rebind_total");
+    const uint64_t unchanged_before =
+        before.counter("rasn_endpoint_refresh_unchanged_total");
+    const uint64_t failed_before =
+        before.counter("rasn_endpoint_refresh_failures_total");
+    const uint64_t superseded_before =
+        before.counter("rasn_endpoint_refresh_superseded_total");
+    const uint64_t exceptions_before =
+        before.counter("rasn_endpoint_refresh_exceptions_total");
+
+    const endpoint_refresh_metric terminals[] = {
+        endpoint_refresh_metric::rebound,
+        endpoint_refresh_metric::unchanged,
+        endpoint_refresh_metric::failed,
+        endpoint_refresh_metric::superseded,
+        endpoint_refresh_metric::exception,
+    };
+    for (endpoint_refresh_metric terminal : terminals)
+    {
+        registry.on_endpoint_refresh(endpoint_refresh_metric::attempt);
+        registry.on_endpoint_refresh(terminal);
+    }
+
+    const metrics_snapshot after = registry.snapshot();
+    const uint64_t attempts =
+        after.counter("rasn_endpoint_refresh_attempts_total") -
+        attempts_before;
+    const uint64_t rebound =
+        after.counter("rasn_endpoint_rebind_total") - rebound_before;
+    const uint64_t unchanged =
+        after.counter("rasn_endpoint_refresh_unchanged_total") -
+        unchanged_before;
+    const uint64_t failed =
+        after.counter("rasn_endpoint_refresh_failures_total") -
+        failed_before;
+    const uint64_t superseded =
+        after.counter("rasn_endpoint_refresh_superseded_total") -
+        superseded_before;
+    const uint64_t exceptions =
+        after.counter("rasn_endpoint_refresh_exceptions_total") -
+        exceptions_before;
+
+    EXPECT_EQ(5u, attempts);
+    EXPECT_EQ(1u, rebound);
+    EXPECT_EQ(1u, unchanged);
+    EXPECT_EQ(1u, failed);
+    EXPECT_EQ(1u, superseded);
+    EXPECT_EQ(1u, exceptions);
+    EXPECT_EQ(attempts,
+              rebound + unchanged + failed + superseded + exceptions);
 }
 
 TEST(rasn_metrics_registry, model_cost_events_increment_counters)

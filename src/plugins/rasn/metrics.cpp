@@ -10,6 +10,7 @@
 #include <dsn/tool-api/task.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <map>
 #include <mutex>
@@ -21,6 +22,17 @@ namespace dsn {
 namespace rasn {
 
 namespace {
+
+void report_endpoint_refresh_metric_drop() noexcept
+{
+    static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+    if (!reported.test_and_set(std::memory_order_relaxed))
+    {
+        std::fputs(
+            "rASN endpoint refresh metric update dropped after backend exception\n",
+            stderr);
+    }
+}
 
 // --- Pure formatting helpers (no rDSN dependency) ---
 
@@ -138,6 +150,13 @@ enum core_counter
     CC_RUNTIME_DEDUP_EVICTED,
     CC_RUNTIME_DEDUP_EXPIRED,
     CC_RUNTIME_AUTH_REJECTED,
+    CC_ENDPOINT_REFRESH_ATTEMPT,
+    CC_ENDPOINT_REFRESH_REBIND,
+    CC_ENDPOINT_REFRESH_UNCHANGED,
+    CC_ENDPOINT_REFRESH_FAILURE,
+    CC_ENDPOINT_REFRESH_SUPERSEDED,
+    CC_ENDPOINT_REFRESH_EXCEPTION,
+    CC_ENDPOINT_REFRESH_EXHAUSTED,
     CC_COUNT
 };
 
@@ -245,6 +264,27 @@ const counter_def k_core_counters[CC_COUNT] = {
     {"rasn_runtime_auth_rejected_total",
      "runtime.auth.rejected",
      "runtime module RPC requests rejected by service-to-service auth"},
+    {"rasn_endpoint_refresh_attempts_total",
+     "endpoint.refresh.attempts",
+     "endpoint resolution refresh attempts"},
+    {"rasn_endpoint_rebind_total",
+     "endpoint.refresh.rebind",
+     "successful endpoint generation changes"},
+    {"rasn_endpoint_refresh_unchanged_total",
+     "endpoint.refresh.unchanged",
+     "successful endpoint refreshes that returned the cached endpoint"},
+    {"rasn_endpoint_refresh_failures_total",
+     "endpoint.refresh.failures",
+     "completed resolver results without a usable endpoint"},
+    {"rasn_endpoint_refresh_superseded_total",
+     "endpoint.refresh.superseded",
+     "endpoint refresh attempts superseded by a newer generation"},
+    {"rasn_endpoint_refresh_exceptions_total",
+     "endpoint.refresh.exceptions",
+     "endpoint refresh attempts terminated by an exception"},
+    {"rasn_endpoint_refresh_exhausted_total",
+     "endpoint.refresh.exhausted",
+     "calls that exhausted their bounded endpoint refresh budget"},
 };
 
 enum latency_counter
@@ -311,8 +351,37 @@ const std::unordered_map<std::string, int> &kind_to_core_counter()
         {"runtime.dedup.evicted", CC_RUNTIME_DEDUP_EVICTED},
         {"runtime.dedup.expired", CC_RUNTIME_DEDUP_EXPIRED},
         {"runtime.auth.rejected", CC_RUNTIME_AUTH_REJECTED},
+        {"endpoint.refresh.attempt", CC_ENDPOINT_REFRESH_ATTEMPT},
+        {"endpoint.refresh.rebind", CC_ENDPOINT_REFRESH_REBIND},
+        {"endpoint.refresh.unchanged", CC_ENDPOINT_REFRESH_UNCHANGED},
+        {"endpoint.refresh.failure", CC_ENDPOINT_REFRESH_FAILURE},
+        {"endpoint.refresh.superseded", CC_ENDPOINT_REFRESH_SUPERSEDED},
+        {"endpoint.refresh.exception", CC_ENDPOINT_REFRESH_EXCEPTION},
+        {"endpoint.refresh.exhausted", CC_ENDPOINT_REFRESH_EXHAUSTED},
     };
     return m;
+}
+
+int endpoint_refresh_counter(endpoint_refresh_metric metric) noexcept
+{
+    switch (metric)
+    {
+    case endpoint_refresh_metric::attempt:
+        return CC_ENDPOINT_REFRESH_ATTEMPT;
+    case endpoint_refresh_metric::rebound:
+        return CC_ENDPOINT_REFRESH_REBIND;
+    case endpoint_refresh_metric::unchanged:
+        return CC_ENDPOINT_REFRESH_UNCHANGED;
+    case endpoint_refresh_metric::failed:
+        return CC_ENDPOINT_REFRESH_FAILURE;
+    case endpoint_refresh_metric::superseded:
+        return CC_ENDPOINT_REFRESH_SUPERSEDED;
+    case endpoint_refresh_metric::exception:
+        return CC_ENDPOINT_REFRESH_EXCEPTION;
+    case endpoint_refresh_metric::exhausted:
+        return CC_ENDPOINT_REFRESH_EXHAUSTED;
+    }
+    return CC_ENDPOINT_REFRESH_EXCEPTION;
 }
 
 uint64_t read_integer(dsn_handle_t handle)
@@ -438,6 +507,34 @@ void metrics_registry::on_event(const std::string &kind, const std::string &fail
         {
             dsn_perf_counter_increment(handle);
         }
+    }
+}
+
+void metrics_registry::on_endpoint_refresh(endpoint_refresh_metric metric) noexcept
+{
+    try
+    {
+        std::lock_guard<std::mutex> guard(_impl->lock);
+        _impl->maybe_read_config();
+        if (!_impl->enabled)
+        {
+            return;
+        }
+
+        const int idx = endpoint_refresh_counter(metric);
+        dsn_handle_t handle = _impl->ensure(
+            _impl->core[idx],
+            k_core_counters[idx].perf,
+            k_core_counters[idx].help,
+            COUNTER_TYPE_NUMBER);
+        if (handle != nullptr)
+        {
+            dsn_perf_counter_increment(handle);
+        }
+    }
+    catch (...)
+    {
+        report_endpoint_refresh_metric_drop();
     }
 }
 

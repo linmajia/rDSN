@@ -31,6 +31,7 @@
 #include <dsn/cpp/auto_codes.h> // ::dsn::error_code, ERR_*
 
 #include <rasn/circuit_breaker.h>
+#include <rasn/endpoint_binding.h>
 
 namespace dsn {
 namespace rasn {
@@ -43,6 +44,34 @@ struct rpc_resilience_options
     uint32_t max_attempts = 3;
     uint64_t backoff_ms = 50;
 };
+
+// Generic agent-control RPC retry safety. Keep this typed and fail closed so a
+// future control operation cannot become ambiguity-retryable merely by choosing
+// a new operation label.
+enum class agent_control_rpc_operation
+{
+    describe,
+    query,
+    heartbeat,
+    cancel,
+    invoke
+};
+
+inline bool agent_control_rpc_operation_is_idempotent(
+    agent_control_rpc_operation operation)
+{
+    switch (operation)
+    {
+    case agent_control_rpc_operation::describe:
+    case agent_control_rpc_operation::query:
+    case agent_control_rpc_operation::heartbeat:
+    case agent_control_rpc_operation::cancel:
+        return true;
+    case agent_control_rpc_operation::invoke:
+    default:
+        return false;
+    }
+}
 
 // Errors that reject the request before application dispatch. Safe to retry
 // even for non-idempotent operations.
@@ -196,6 +225,146 @@ std::pair< ::dsn::error_code, TResponse> resilient_rpc_call(circuit_breaker_regi
     // fallback keeps the function well-formed without parking an unread
     // error_code across the hot success return (which rDSN's TRACK_ERROR_CODE
     // would otherwise flag as a dropped error on every successful call).
+    return std::make_pair(::dsn::ERR_UNKNOWN, TResponse());
+}
+
+// Resilient RPC over a generation-aware endpoint. The caller-owned request is
+// reused unchanged across attempts; only the destination may advance. An
+// ambiguous non-idempotent failure refreshes the cache for the next operation
+// but is never replayed.
+template <typename TResponse, typename FCall>
+std::pair< ::dsn::error_code, TResponse>
+resilient_bound_rpc_call(circuit_breaker_registry &breakers,
+                         refreshable_endpoint_binding &binding,
+                         const std::string &op,
+                         const rpc_resilience_options &options,
+                         bool idempotent,
+                         std::chrono::milliseconds timeout,
+                         FCall &&call)
+{
+    const uint32_t max_attempts =
+        options.max_attempts == 0 ? 1 : options.max_attempts;
+    endpoint_snapshot endpoint = binding.current();
+    breaker_decision admission;
+    std::string breaker_key;
+    bool admitted = false;
+
+    const auto report = [&](bool ok) {
+        if (!options.breaker_enabled || !admitted)
+        {
+            return;
+        }
+        const breaker_report reported =
+            breakers.report(breaker_key, admission, ok, ::dsn_now_ms());
+        if (!reported.available)
+        {
+            dlog(LOG_LEVEL_WARNING,
+                 "rasn",
+                 "rASN bound RPC circuit breaker report failed for key=%s: %s",
+                 breaker_key.c_str(),
+                 reported.error.c_str());
+        }
+    };
+
+    for (uint32_t attempt = 1; attempt <= max_attempts; ++attempt)
+    {
+        if (!endpoint.ok)
+        {
+            if (admitted)
+            {
+                report(false);
+                admitted = false;
+            }
+            if (attempt >= max_attempts || !endpoint.refreshable)
+            {
+                binding.record_exhausted();
+                return std::make_pair(::dsn::ERR_SERVICE_NOT_FOUND,
+                                      TResponse());
+            }
+            endpoint = binding.refresh(endpoint.generation).endpoint;
+            if (options.backoff_ms > 0)
+            {
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(options.backoff_ms * attempt));
+            }
+            continue;
+        }
+
+        const std::string current_key =
+            core_service_breaker_key(op, endpoint.address.to_string());
+        if (admitted && current_key != breaker_key)
+        {
+            report(false);
+            admitted = false;
+        }
+        if (!admitted || current_key != breaker_key)
+        {
+            breaker_key = current_key;
+            if (options.breaker_enabled)
+            {
+                admission = breakers.allow(
+                    breaker_key,
+                    ::dsn_now_ms(),
+                    rpc_breaker_probe_lease_hint(options, timeout));
+                if (!admission.allowed)
+                {
+                    if (attempt >= max_attempts || !endpoint.refreshable)
+                    {
+                        binding.record_exhausted();
+                        return std::make_pair(::dsn::ERR_BUSY, TResponse());
+                    }
+                    endpoint =
+                        binding.refresh(endpoint.generation).endpoint;
+                    if (options.backoff_ms > 0)
+                    {
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(options.backoff_ms *
+                                                      attempt));
+                    }
+                    continue;
+                }
+                admitted = true;
+            }
+        }
+
+        std::pair< ::dsn::error_code, TResponse> result =
+            call(endpoint.address, timeout);
+        if (result.first == ::dsn::ERR_OK)
+        {
+            report(true);
+            return result;
+        }
+
+        const bool transport_refresh =
+            rpc_error_is_pre_apply(result.first) ||
+            rpc_error_is_ambiguous_transient(result.first);
+        const bool retry = rpc_should_retry(result.first, idempotent);
+        const endpoint_snapshot previous = endpoint;
+        if (transport_refresh && endpoint.refreshable)
+        {
+            endpoint = binding.refresh(endpoint.generation).endpoint;
+            if (endpoint.ok && endpoint.address != previous.address)
+            {
+                report(false);
+                admitted = false;
+            }
+        }
+
+        if (!retry || attempt >= max_attempts)
+        {
+            report(false);
+            if (retry && attempt >= max_attempts)
+            {
+                binding.record_exhausted();
+            }
+            return result;
+        }
+        if (options.backoff_ms > 0)
+        {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(options.backoff_ms * attempt));
+        }
+    }
     return std::make_pair(::dsn::ERR_UNKNOWN, TResponse());
 }
 

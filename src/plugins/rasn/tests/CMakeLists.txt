@@ -19,7 +19,8 @@ set(MY_PROJ_NAME rasn.unit_tests)
 
 set(MY_PROJ_SRC
     ${RASN_UNIT_TEST_SUPPORT_SRC}
-    "${CMAKE_CURRENT_SOURCE_DIR}/standalone/rasn_unit_test_main.cpp")
+    "${CMAKE_CURRENT_SOURCE_DIR}/standalone/rasn_unit_test_main.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/standalone/test_allocation_failure.cpp")
 
 set(MY_SRC_SEARCH_MODE "GLOB")
 

@@ -2,6 +2,8 @@
 
 #include <rasn/agent_registry.h>
 #include <rasn/agent_services.h>
+#include <rasn/endpoint_binding.h>
+#include <rasn/rpc_resilience.h>
 #include <rasn/state_service.h>
 
 #include <dsn/service_api_cpp.h>
@@ -177,12 +179,32 @@ bool workflow_state_service_ready()
         return true;
     }
 
-    rasn_state_client state(global_rasn_services().state_address());
+    const std::shared_ptr<refreshable_endpoint_binding> binding =
+        global_rasn_services().service_endpoint_binding("state");
+    if (binding == nullptr)
+    {
+        dwarn("workflow recovery cannot find the state endpoint binding");
+        return false;
+    }
+    const endpoint_snapshot endpoint = binding->current();
+    if (!endpoint.ok)
+    {
+        if (endpoint.refreshable)
+        {
+            (void)binding->refresh(endpoint.generation);
+        }
+        return false;
+    }
+    rasn_state_client state(endpoint.address);
     state_query_request request;
     request.key_prefix = "__rasn_workflow_recovery_probe__";
     ::dsn::error_code err;
     state_response response;
     std::tie(err, response) = state.query_sync(request, std::chrono::milliseconds(250));
+    if (rpc_should_retry(err, true) && endpoint.refreshable)
+    {
+        (void)binding->refresh(endpoint.generation);
+    }
     return err == ::dsn::ERR_OK && response.ok;
 }
 
@@ -2033,6 +2055,10 @@ rasn_workflow_client::cancel_sync(const workflow_run_query &request,
 {
     global_rasn_services().acquire();
     _rpc.open_service();
+    _registration.start("rasn.workflow",
+                        "rasn.service.workflow",
+                        primary_address(),
+                        name());
     _recovery_task = ::dsn::tasking::enqueue(LPC_RASN_WORKFLOW_STARTUP_RECOVERY,
                                              nullptr,
                                              []() { recover_workflow_state_after_start(); },
@@ -2047,6 +2073,7 @@ rasn_workflow_client::cancel_sync(const workflow_run_query &request,
 
 ::dsn::error_code rasn_workflow_app::stop(bool cleanup)
 {
+    _registration.stop();
     if (_recovery_task != nullptr)
     {
         _recovery_task->cancel(true);

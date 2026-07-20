@@ -47,7 +47,9 @@ public:
                                               nucleus_runtime &runtime,
                                               const agent_descriptor &agent,
                                               const std::string &operation,
-                                              const std::function<agent_response(uint32_t retry_attempt)> &invoke_once);
+                                              const std::function<agent_response(
+                                                  uint32_t retry_attempt,
+                                                  const agent_response *previous)> &invoke_once);
 
 private:
     static coordinator_route route_error(const agent_request &request,
