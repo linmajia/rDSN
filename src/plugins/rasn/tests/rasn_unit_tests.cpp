@@ -8352,36 +8352,106 @@ bool collect_runtime_checkpoint(const std::string &module,
 class scoped_main_config_override
 {
 public:
+    // The standalone test config explicitly seeds every key used below. Limiting
+    // this helper to existing keys lets stock rDSN APIs restore the prior value.
     scoped_main_config_override(std::string section,
                                 std::string key,
                                 std::string value)
         : _config(::dsn::get_main_config()),
           _section(std::move(section)),
-          _key(std::move(key))
+          _key(std::move(key)),
+          _active(_config != nullptr && _config->has_key(_section.c_str(), _key.c_str()))
     {
-        if (_config != nullptr)
+        if (_active)
         {
-            _snapshot = _config->set_with_snapshot(
-                _section.c_str(), _key.c_str(), value.c_str(), "unit-test override");
+            _previous_value = _config->get_string_value(
+                _section.c_str(), _key.c_str(), "", "existing unit-test configuration");
+            _config->set(_section.c_str(), _key.c_str(), value.c_str(), "unit-test override");
         }
     }
+
+    scoped_main_config_override(const scoped_main_config_override &) = delete;
+    scoped_main_config_override &operator=(const scoped_main_config_override &) = delete;
 
     ~scoped_main_config_override()
     {
-        if (_config != nullptr)
+        if (_active)
         {
-            _config->restore_snapshot(_section.c_str(), _key.c_str(), _snapshot);
+            _config->set(_section.c_str(),
+                         _key.c_str(),
+                         _previous_value.c_str(),
+                         "restored unit-test configuration");
         }
     }
 
-    bool active() const { return _config != nullptr; }
+    bool active() const { return _active; }
 
 private:
     ::dsn::configuration_ptr _config;
     std::string _section;
     std::string _key;
-    ::dsn::configuration_value_snapshot _snapshot;
+    std::string _previous_value;
+    bool _active;
 };
+
+TEST(rasn_configuration, scoped_override_restores_seeded_key)
+{
+    const ::dsn::configuration_ptr config = ::dsn::get_main_config();
+    ASSERT_NE(nullptr, config);
+    const char *section = "rasn.service";
+    const char *key = "agent_message_bus_shard_count";
+    ASSERT_TRUE(config->has_key(section, key));
+    ASSERT_STREQ("1", config->get_string_value(section, key, "", ""));
+
+    {
+        scoped_main_config_override override(section, key, "2");
+        ASSERT_TRUE(override.active());
+        EXPECT_STREQ("2", config->get_string_value(section, key, "", ""));
+    }
+
+    EXPECT_STREQ("1", config->get_string_value(section, key, "", ""));
+}
+
+TEST(rasn_configuration, nested_scoped_overrides_restore_in_lifo_order)
+{
+    const ::dsn::configuration_ptr config = ::dsn::get_main_config();
+    ASSERT_NE(nullptr, config);
+    const char *section = "rasn.service";
+    const char *key = "resource_budget_shard_count";
+    ASSERT_TRUE(config->has_key(section, key));
+    ASSERT_STREQ("1", config->get_string_value(section, key, "", ""));
+
+    {
+        scoped_main_config_override outer(section, key, "2");
+        ASSERT_TRUE(outer.active());
+        EXPECT_STREQ("2", config->get_string_value(section, key, "", ""));
+        {
+            scoped_main_config_override inner(section, key, "3");
+            ASSERT_TRUE(inner.active());
+            EXPECT_STREQ("3", config->get_string_value(section, key, "", ""));
+        }
+        EXPECT_STREQ("2", config->get_string_value(section, key, "", ""));
+    }
+
+    EXPECT_STREQ("1", config->get_string_value(section, key, "", ""));
+}
+
+TEST(rasn_configuration, scoped_override_rejects_missing_key)
+{
+    const ::dsn::configuration_ptr config = ::dsn::get_main_config();
+    ASSERT_NE(nullptr, config);
+    const char *section = "rasn.service";
+    const char *key = "missing_unit_test_override";
+    ASSERT_FALSE(config->has_key(section, key));
+
+    {
+        scoped_main_config_override override(section, key, "2");
+        EXPECT_FALSE(override.active());
+        EXPECT_FALSE(config->has_key(section, key));
+    }
+
+    EXPECT_FALSE(config->has_key(section, key));
+}
 
 bool replace_mirrored_state_records_for_test(rasn_runtime_replica_store *store,
                                              const std::vector<state_record> &records,

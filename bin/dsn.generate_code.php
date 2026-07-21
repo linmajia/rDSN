@@ -216,13 +216,6 @@ function normalize_line_endings($path)
     }
 
     $content = str_replace(array("\r\n", "\r"), "\n", $content);
-    $has_final_newline = substr($content, -1) === "\n";
-    $content = preg_replace('/[ \t]+$/m', '', $content);
-    $content = rtrim($content, "\n");
-    if ($has_final_newline)
-    {
-        $content .= "\n";
-    }
     if (file_put_contents($path, $content) === FALSE)
     {
         echo "failed to normalize generated file '".$path."'".PHP_EOL;
@@ -256,17 +249,6 @@ case "thrift":
             " -out ".$g_out_dir." ".$g_idl;
         echo "exec: ".$command.PHP_EOL;
         system($command);
-        if ($g_lang == "cpp")
-        {
-            foreach (array("_types.h", "_types.cpp", "_constants.h", "_constants.cpp") as $suffix)
-            {
-                $generated_file = $g_out_dir."/".$g_program.$suffix;
-                if (file_exists($generated_file))
-                {
-                    normalize_line_endings($generated_file);
-                }
-            }
-        }
     }
     break;
 case "proto":

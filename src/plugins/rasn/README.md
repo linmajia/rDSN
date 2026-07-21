@@ -1315,18 +1315,21 @@ Future compatible revisions add optional fields with new Thrift field IDs and
 widen the explicit compatibility range; incompatible semantics require a new
 major wire version.
 
-Generated artifacts are checked in as `rasn_runtime_types.{h,cpp}` and
-`rasn_runtime.types.h`. Regenerate them from the repository root with:
+Generated artifacts are checked in as `rasn_runtime_types.{h,cpp}`,
+`rasn_runtime_constants.{h,cpp}`, and `rasn_runtime.types.h`. Regenerate them
+from the repository root with:
 
 ```text
-bin/dsn.cg.sh src/plugins/rasn/rasn_runtime.thrift cpp src/plugins/rasn binary
+php src/plugins/rasn/generate_runtime_rpc.php
 ```
 
-The generator also emits unused service/client scaffolding and overwrites the
-destination CMake file; discard those outputs and retain the rASN CMake
-integration when refreshing types. `runtime_rpc_schema.{h,cpp}` owns validation,
-structured error mapping, and conversion between generated wire records and the
-application-facing domain types.
+The rASN-local wrapper invokes the stock rDSN generator in a temporary
+directory, normalizes the five tracked runtime artifacts, and copies only those
+files back, so unused scaffolding cannot overwrite rASN's CMake integration.
+Use `php src/plugins/rasn/generate_runtime_rpc.php --check` to verify that the
+checked-in files are current. `runtime_rpc_schema.{h,cpp}` owns validation,
+structured error mapping, and conversion between generated wire records and
+the application-facing domain types.
 
 A standalone host's aggregate `rasn.runtime` app hosts all eleven modules
 behind one endpoint (default port `27107`). Each module also has a standalone

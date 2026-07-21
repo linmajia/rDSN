@@ -707,43 +707,11 @@ void configuration::dump(std::ostream& os)
     }
 }
 
-configuration_value_snapshot configuration::query_value_locked(const char* section, const char* key)
-{
-    configuration_value_snapshot snapshot;
-    auto section_it = _configs.find(section);
-    if (section_it == _configs.end())
-    {
-        return snapshot;
-    }
-    snapshot.section_existed = true;
-    auto value_it = section_it->second.find(key);
-    if (value_it == section_it->second.end())
-    {
-        return snapshot;
-    }
-    snapshot.state = value_it->second->present ? configuration_value_state::explicit_value
-                                               : configuration_value_state::defaulted;
-    snapshot.value = value_it->second->value;
-    snapshot.description = value_it->second->dsptr;
-    snapshot.line = value_it->second->line;
-    return snapshot;
-}
-
-configuration_value_snapshot configuration::query_value(const char* section, const char* key)
-{
-    if (section == nullptr || key == nullptr)
-    {
-        dutil_error("configuration snapshot section and key cannot be null");
-        return configuration_value_snapshot();
-    }
-    std::lock_guard<std::mutex> guard(_lock);
-    return query_value_locked(section, key);
-}
-
-void configuration::set_value_locked(
-    const char* section, const char* key, const char* value, const char* dsptr)
+void configuration::set(const char* section, const char* key, const char* value, const char* dsptr)
 {
     std::map<std::string, conf*>* psection;
+
+    std::lock_guard<std::mutex> guard(_lock);
 
     auto it = _configs.find(section);
     if (it != _configs.end())
@@ -776,83 +744,7 @@ void configuration::set_value_locked(
             value);
 
         it2->second->value = value;
-        it2->second->present = true;
     }
-}
-
-void configuration::set(const char* section, const char* key, const char* value, const char* dsptr)
-{
-    (void)set_with_snapshot(section, key, value, dsptr);
-}
-
-configuration_value_snapshot configuration::set_with_snapshot(
-    const char* section, const char* key, const char* value, const char* dsptr)
-{
-    if (section == nullptr || key == nullptr || value == nullptr)
-    {
-        dutil_error("configuration override section, key, and value cannot be null");
-        return configuration_value_snapshot();
-    }
-    if (dsptr == nullptr)
-    {
-        dsptr = "";
-    }
-    std::lock_guard<std::mutex> guard(_lock);
-    const configuration_value_snapshot snapshot = query_value_locked(section, key);
-    set_value_locked(section, key, value, dsptr);
-    return snapshot;
-}
-
-void configuration::restore_snapshot(const char* section,
-                                     const char* key,
-                                     const configuration_value_snapshot& snapshot)
-{
-    if (section == nullptr || key == nullptr)
-    {
-        dutil_error("configuration restore section and key cannot be null");
-        return;
-    }
-    std::lock_guard<std::mutex> guard(_lock);
-    auto section_it = _configs.find(section);
-    if (snapshot.state == configuration_value_state::missing)
-    {
-        if (section_it == _configs.end())
-        {
-            return;
-        }
-        auto value_it = section_it->second.find(key);
-        if (value_it != section_it->second.end())
-        {
-            delete value_it->second;
-            section_it->second.erase(value_it);
-        }
-        if (!snapshot.section_existed && section_it->second.empty())
-        {
-            _configs.erase(section_it);
-        }
-        return;
-    }
-
-    if (section_it == _configs.end())
-    {
-        std::map<std::string, conf*> values;
-        section_it = _configs.insert(config_map::value_type(section, values)).first;
-    }
-    auto value_it = section_it->second.find(key);
-    if (value_it == section_it->second.end())
-    {
-        conf* cf = new conf();
-        cf->dsptr = "";
-        cf->key = key;
-        cf->line = 0;
-        cf->section = section;
-        value_it = section_it->second.insert(std::make_pair(cf->key, cf)).first;
-    }
-    value_it->second->value = snapshot.value;
-    value_it->second->dsptr = snapshot.description;
-    value_it->second->line = snapshot.line;
-    value_it->second->present =
-        snapshot.state == configuration_value_state::explicit_value;
 }
 
 void configuration::register_config_change_notification(config_file_change_notifier notifier)
