@@ -455,7 +455,7 @@ namespace dsn {
         }
         else
         {
-            dassert(false, "rpc registration confliction for '%s'", name.c_str());
+            derror("rpc registration confliction for '%s'", name.c_str());
             return false;
         }
     }
@@ -547,6 +547,10 @@ namespace dsn {
         if (handler)
         {
             handler->c_handler(msg, handler->parameter);
+            if (1 == handler->release_ref())
+            {
+                delete handler;
+            }
         }
         else
         {
@@ -636,13 +640,26 @@ namespace dsn {
         const service_spec& spec = service_engine::fast_instance().spec();
         network* net = utils::factory_store<network>::create(
             netcs.factory_name.c_str(), ::dsn::PROVIDER_TYPE_MAIN, this, nullptr);
+        if (net == nullptr)
+        {
+            derror("cannot create network provider '%s', please check the factory registration and configuration",
+                netcs.factory_name.c_str());
+            return nullptr;
+        }
         net->reset_parser_attr(client_hdr_format, netcs.message_buffer_block_size);
 
         for (auto it = spec.network_aspects.begin();
             it != spec.network_aspects.end();
             it++)
         {
-            net = utils::factory_store<network>::create(it->c_str(), ::dsn::PROVIDER_TYPE_ASPECT, this, net);
+            network* net2 = utils::factory_store<network>::create(it->c_str(), ::dsn::PROVIDER_TYPE_ASPECT, this, net);
+            if (net2 == nullptr)
+            {
+                derror("cannot create network aspect provider '%s', please check the factory registration and configuration",
+                    it->c_str());
+                return nullptr;
+            }
+            net = net2;
         }
 
         // start the net
@@ -939,7 +956,18 @@ namespace dsn {
 
                                 // still got time, retry
                                 uint64_t nms = dsn_now_ms();
-                                uint64_t gap = 8 << req2->send_retry_count;
+                                // Bound the shift width: 8 << 7 (1024) already exceeds the
+                                // 1000ms ceiling below, so clamping the exponent leaves the
+                                // exponential backoff identical while avoiding the signed
+                                // overflow / oversized-shift undefined behavior that occurs
+                                // once send_retry_count grows large during long-timeout
+                                // retries against a persistently failing partition.
+                                int retry_shift = req2->send_retry_count;
+                                if (retry_shift > 10)
+                                {
+                                    retry_shift = 10;
+                                }
+                                uint64_t gap = 8ull << retry_shift;
                                 if (gap > 1000)
                                     gap = 1000;
                                 if (nms + gap < timeout_ts_ms)

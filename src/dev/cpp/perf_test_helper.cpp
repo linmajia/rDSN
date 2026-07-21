@@ -55,7 +55,12 @@ namespace dsn {
 
             if (!read_config("task..default", _default_opts))
             {
-                dassert(false, "read configuration failed for section [task..default]");
+                // A malformed value in [task..default] (e.g. a non-integer in one of
+                // the INT_LIST fields) makes read_config return false. Report it and
+                // continue with defaults instead of aborting the whole process; the
+                // empty-list checks below fill in sensible defaults for any field that
+                // was not parsed.
+                derror("read configuration failed for section [task..default], using defaults");
             }
 
             if (_default_opts.perf_test_concurrency.size() == 0)
@@ -110,7 +115,13 @@ namespace dsn {
             perf_test_opts opt;
             if (!read_config(s.config_section, opt, &_default_opts))
             {
-                dassert(false, "read configuration failed for section [%s]", s.config_section);
+                // A malformed value in this perf-test section (e.g. a non-integer in one
+                // of the INT_LIST fields) makes read_config return false. Report it and
+                // skip this suite instead of aborting the whole benchmark process; the
+                // suite is left with no cases (its cases were cleared by the caller).
+                derror("read configuration failed for section [%s], skipping this suite",
+                       s.config_section);
+                return;
             }
 
             double ratio_sum = 0.0;
@@ -135,6 +146,13 @@ namespace dsn {
                         c.seconds = opt.perf_test_seconds;
                         c.payload_bytes = bytes;
                         c.key_space_size = opt.perf_test_key_space_size;
+                        if (c.key_space_size < 1)
+                        {
+                            // Perf clients derive keys with "random % key_space_size"; a
+                            // configured value of 0 (or negative) would divide by zero
+                            // (SIGFPE). Clamp centrally so every client is protected.
+                            c.key_space_size = 1;
+                        }
                         c.timeout_ms = opt.perf_test_timeouts_ms[i];
                         c.concurrency = cc;                        
                         c.ratios.resize(max_request_kind_count_for_hybrid_test, 0.0);

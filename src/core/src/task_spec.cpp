@@ -223,9 +223,15 @@ bool task_spec::init()
         if (!read_config(section_name.c_str(), *spec, &default_spec))
             return false;
 
-        dassert(spec->rpc_request_delays_milliseconds.size() == 0
-            || spec->rpc_request_delays_milliseconds.size() == 6,
-            "invalid length of rpc_request_delays_milliseconds, must be of length 6");
+        if (spec->rpc_request_delays_milliseconds.size() != 0
+            && spec->rpc_request_delays_milliseconds.size() != 6)
+        {
+            derror("%s: invalid length (%d) of rpc_request_delays_milliseconds, "
+                   "must be 0 or 6",
+                   spec->name.c_str(),
+                   (int)spec->rpc_request_delays_milliseconds.size());
+            return false;
+        }
         if (spec->rpc_request_delays_milliseconds.size() > 0)
         {
             std::vector<int> mss{ spec->rpc_request_delays_milliseconds.begin(),
@@ -323,6 +329,18 @@ bool threadpool_spec::init(/*out*/ safe_vector<threadpool_spec>& specs)
 
         if ("" == spec.name) 
             spec.name = dsn_threadpool_code_to_string(code);
+
+        if (spec.worker_count < 1)
+        {
+            // A partitioned pool with worker_count == 0 creates empty worker/queue
+            // vectors, so task_worker_pool::enqueue() and shared_same_worker_with_current_task()
+            // divide by _queues.size()/_workers.size() == 0 (SIGFPE); a non-partitioned pool
+            // with 0 workers silently hangs (tasks enqueued but never processed). Every pool
+            // needs at least one worker, so reject the misconfiguration up front.
+            derror("invalid worker_count %d for thread pool %s (%s); worker_count must be >= 1",
+                   spec.worker_count, spec.name.c_str(), dsn_threadpool_code_to_string(code));
+            return false;
+        }
 
         if (false == spec.worker_share_core && 0 == spec.worker_affinity_mask)
         {
