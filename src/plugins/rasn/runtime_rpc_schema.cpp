@@ -13,6 +13,13 @@ namespace {
 const size_t kMaxRuntimeRpcItems = 4096;
 const size_t kMaxRuntimeRpcTextBytes = 16 * 1024 * 1024;
 
+// Only this exact diagnostic means "the peer's protocol range and ours do not
+// overlap", which is the one validation failure a caller resolves by upgrading.
+// A malformed range is a bad request and must not be reported as an unsupported
+// version. The producer and the classifier share this constant so that rewording
+// the message can never silently change the wire error code.
+const char kUnsupportedVersionRangeError[] = "runtime RPC version range is unsupported";
+
 bool invalid(std::string *error, const std::string &message)
 {
     if (error != nullptr)
@@ -46,7 +53,7 @@ bool validate_metadata(const ::dsn::rasn::rpc::runtime_request_metadata &metadat
     if (metadata.min_compatible_version > RASN_RUNTIME_WIRE_VERSION ||
         metadata.wire_version < RASN_RUNTIME_MIN_COMPATIBLE_VERSION)
     {
-        return invalid(error, "runtime RPC version range is unsupported");
+        return invalid(error, kUnsupportedVersionRangeError);
     }
     if (metadata.__isset.route_partition &&
         (metadata.route_partition < 0 ||
@@ -186,7 +193,7 @@ bool finish_validation(const Request &request,
 ::dsn::rasn::rpc::runtime_error_code::type runtime_validation_error_code(
     const std::string &error)
 {
-    return error.find("version") != std::string::npos
+    return error == kUnsupportedVersionRangeError
                ? ::dsn::rasn::rpc::runtime_error_code::unsupported_version
                : ::dsn::rasn::rpc::runtime_error_code::invalid_request;
 }

@@ -8100,6 +8100,24 @@ TEST(rasn_runtime_typed_rpc, validates_tagged_body_and_version_range)
     EXPECT_FALSE(response.status.ok);
     EXPECT_EQ(::dsn::rasn::rpc::runtime_error_code::unsupported_version,
               response.status.code);
+
+    // A malformed range is a bad request, not a protocol gap. Reporting it as an
+    // unsupported version would send the caller chasing an upgrade that cannot
+    // help, when the fix is to correct the metadata it sent.
+    request.metadata.wire_version = RASN_RUNTIME_WIRE_VERSION;
+    request.metadata.min_compatible_version = RASN_RUNTIME_WIRE_VERSION + 1;
+    EXPECT_FALSE(validate_runtime_request(request, &error));
+    const ::dsn::rasn::rpc::resource_budget_response inverted = store.dispatch(request);
+    EXPECT_FALSE(inverted.status.ok);
+    EXPECT_EQ(::dsn::rasn::rpc::runtime_error_code::invalid_request, inverted.status.code);
+
+    // A non-positive version is malformed for the same reason.
+    request.metadata.wire_version = 0;
+    request.metadata.min_compatible_version = 0;
+    EXPECT_FALSE(validate_runtime_request(request, &error));
+    const ::dsn::rasn::rpc::resource_budget_response unset = store.dispatch(request);
+    EXPECT_FALSE(unset.status.ok);
+    EXPECT_EQ(::dsn::rasn::rpc::runtime_error_code::invalid_request, unset.status.code);
 }
 
 TEST(rasn_runtime_typed_rpc, preserves_specific_validation_errors)
