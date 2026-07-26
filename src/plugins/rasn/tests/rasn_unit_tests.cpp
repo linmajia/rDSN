@@ -246,6 +246,51 @@ std::string workspace_temp_file_path(const std::string &name)
     return normalize_platform_path(name);
 }
 
+class scoped_main_config_override
+{
+public:
+    // The standalone test config explicitly seeds every key used below. Limiting
+    // this helper to existing keys lets stock rDSN APIs restore the prior value.
+    scoped_main_config_override(std::string section,
+                                std::string key,
+                                std::string value)
+        : _config(::dsn::get_main_config()),
+          _section(std::move(section)),
+          _key(std::move(key)),
+          _active(_config != nullptr && _config->has_key(_section.c_str(), _key.c_str()))
+    {
+        if (_active)
+        {
+            _previous_value = _config->get_string_value(
+                _section.c_str(), _key.c_str(), "", "existing unit-test configuration");
+            _config->set(_section.c_str(), _key.c_str(), value.c_str(), "unit-test override");
+        }
+    }
+
+    scoped_main_config_override(const scoped_main_config_override &) = delete;
+    scoped_main_config_override &operator=(const scoped_main_config_override &) = delete;
+
+    ~scoped_main_config_override()
+    {
+        if (_active)
+        {
+            _config->set(_section.c_str(),
+                         _key.c_str(),
+                         _previous_value.c_str(),
+                         "restored unit-test configuration");
+        }
+    }
+
+    bool active() const { return _active; }
+
+private:
+    ::dsn::configuration_ptr _config;
+    std::string _section;
+    std::string _key;
+    std::string _previous_value;
+    bool _active;
+};
+
 enum class hard_link_creation
 {
     created,
@@ -3624,6 +3669,18 @@ TEST(rasn_workflow, resumes_completed_nodes_and_reuses_dependency_output)
 
 TEST(rasn_state, checkpoints_and_recovers_records)
 {
+    // A journal-backed recover() intentionally folds the configured append
+    // journal onto the checkpoint image so the in-memory store always matches
+    // what a restart would reconstruct. That makes the default configured state
+    // directory shared mutable state across every rasn_state test, so this test
+    // takes its own directory instead of inheriting whichever mutations happened
+    // to run before it.
+    const std::string state_dir = temp_file_path("rasn-state-recovery-unit-dir");
+    ::dsn::utils::filesystem::remove_path(state_dir);
+    scoped_main_config_override configured_state_dir(
+        "rasn.state", "checkpoint_dir", state_dir);
+    ASSERT_TRUE(configured_state_dir.active());
+
     const std::string checkpoint_path = temp_file_path("rasn-state-recovery-unit.chkpt");
     std::remove(checkpoint_path.c_str());
     std::remove((checkpoint_path + ".tmp").c_str());
@@ -3656,6 +3713,7 @@ TEST(rasn_state, checkpoints_and_recovers_records)
     std::remove(checkpoint_path.c_str());
     std::remove((checkpoint_path + ".tmp").c_str());
     std::remove((checkpoint_path + ".bak").c_str());
+    ::dsn::utils::filesystem::remove_path(state_dir);
 }
 
 TEST(rasn_state, replicated_checkpoint_copy_does_not_replace_live_state)
@@ -5478,6 +5536,17 @@ TEST(rasn_state, quarantine_sidecar_blocks_state_lifecycle_operations)
     const std::string quarantined_path = journal_path + ".quarantined";
     const std::string checkpoint_path =
         temp_file_path("rasn-state-quarantine-unit.chkpt");
+    // The configured state directory only exists once some other test has
+    // written durable state there, so create it explicitly: the marker write
+    // below silently produced no file otherwise, and every assertion in this
+    // test then depended on which tests happened to run first.
+    const std::string journal_directory =
+        ::dsn::utils::filesystem::remove_file_name(journal_path);
+    if (!journal_directory.empty())
+    {
+        ASSERT_TRUE(::dsn::utils::filesystem::create_directory(journal_directory))
+            << journal_directory;
+    }
     for (const std::string &path :
          {marker_path, quarantined_path, checkpoint_path})
     {
@@ -5853,7 +5922,11 @@ TEST(rasn_state, inline_lifecycle_commands_recover_before_checkpoint_and_prune)
     const state_response scoped =
         global_state_store().get(scoped_request);
     ASSERT_TRUE(scoped.ok) << scoped.error;
-    EXPECT_EQ("codepilot", scoped.record.scope);
+    // An explicitly namespaced key derives its scope from the key namespace, so
+    // "unit/..." stays in the "unit" scope even though the command ran as
+    // CodePilot. Only bare keys fall back to the application default (asserted
+    // below), and a different namespace keeps its own scope.
+    EXPECT_EQ("unit", scoped.record.scope);
 
     const std::string cross_scope_key =
         "other/inline-lifecycle-" + make_trace_id();
@@ -8010,7 +8083,16 @@ TEST(rasn_runtime_typed_rpc, validates_tagged_body_and_version_range)
     request.__set_usage(usage);
     EXPECT_FALSE(validate_runtime_request(request, &error));
     request.__isset.usage = false;
+
+    // A newer peer that still declares compatibility with this build is servable:
+    // min_compatible_version is the negotiated contract, and Thrift skips the
+    // fields this build does not know about.
     request.metadata.wire_version = RASN_RUNTIME_WIRE_VERSION + 1;
+    EXPECT_TRUE(validate_runtime_request(request, &error)) << error;
+
+    // A peer that requires a newer wire version than this build speaks cannot be
+    // served at all, so validation must reject it before any state is touched.
+    request.metadata.min_compatible_version = RASN_RUNTIME_WIRE_VERSION + 1;
     EXPECT_FALSE(validate_runtime_request(request, &error));
 
     rasn_runtime_replica_store store("resource_budget");
@@ -8348,51 +8430,6 @@ bool collect_runtime_checkpoint(const std::string &module,
     return source->module() == module &&
            source->checkpoint_records(gpid, decree, records, error);
 }
-
-class scoped_main_config_override
-{
-public:
-    // The standalone test config explicitly seeds every key used below. Limiting
-    // this helper to existing keys lets stock rDSN APIs restore the prior value.
-    scoped_main_config_override(std::string section,
-                                std::string key,
-                                std::string value)
-        : _config(::dsn::get_main_config()),
-          _section(std::move(section)),
-          _key(std::move(key)),
-          _active(_config != nullptr && _config->has_key(_section.c_str(), _key.c_str()))
-    {
-        if (_active)
-        {
-            _previous_value = _config->get_string_value(
-                _section.c_str(), _key.c_str(), "", "existing unit-test configuration");
-            _config->set(_section.c_str(), _key.c_str(), value.c_str(), "unit-test override");
-        }
-    }
-
-    scoped_main_config_override(const scoped_main_config_override &) = delete;
-    scoped_main_config_override &operator=(const scoped_main_config_override &) = delete;
-
-    ~scoped_main_config_override()
-    {
-        if (_active)
-        {
-            _config->set(_section.c_str(),
-                         _key.c_str(),
-                         _previous_value.c_str(),
-                         "restored unit-test configuration");
-        }
-    }
-
-    bool active() const { return _active; }
-
-private:
-    ::dsn::configuration_ptr _config;
-    std::string _section;
-    std::string _key;
-    std::string _previous_value;
-    bool _active;
-};
 
 TEST(rasn_configuration, scoped_override_restores_seeded_key)
 {
@@ -9080,8 +9117,19 @@ TEST(rasn_runtime_typed_rpc, routes_by_typed_key_and_explicit_partition)
     EXPECT_FALSE(runtime_request_is_partition_fanout(pending));
 
     snapshot.metadata.__set_route_partition(2);
-    EXPECT_TRUE(rasn_runtime_service_hosts_request(snapshot, {2}));
-    EXPECT_FALSE(rasn_runtime_service_hosts_request(snapshot, {1}));
+    // With a single configured partition every request maps to partition 0, so an
+    // explicit route hint is folded into the only partition that exists.
+    EXPECT_TRUE(rasn_runtime_service_hosts_request(snapshot, {0}));
+    EXPECT_FALSE(rasn_runtime_service_hosts_request(snapshot, {2}));
+    {
+        // Explicit partition routing is only observable once the module is really
+        // partitioned.
+        scoped_main_config_override human_shards(
+            "rasn.service", "human_interaction_shard_count", "4");
+        ASSERT_TRUE(human_shards.active());
+        EXPECT_TRUE(rasn_runtime_service_hosts_request(snapshot, {2}));
+        EXPECT_FALSE(rasn_runtime_service_hosts_request(snapshot, {1}));
+    }
 }
 
 // --- parse_chat_completion: provider response interpretation -----------------

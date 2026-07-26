@@ -1231,12 +1231,20 @@ rather than finalized under a late callback; (e) once unlock begins, the cached 
 is unusable, so an ambiguous unlock can never be mistaken for an idempotent re-acquire.
 If a timed-out cancel later grants the lock, a completion-side cleanup releases it.
 
-**Build wiring (reuse, not reinvent).** `src/CMakeLists.txt` now configures
-`plugins_ext` before `plugins` so rASN can see the dist targets. The rASN library,
-`codepilot`, `srepilot`, and `rasn.unit_tests` gate the dist include paths, link the
-`dsn.dist.service.*` closure, and define `RASN_HAS_DIST_COORDINATION=1` **only when**
-`TARGET dsn.dist.service.meta_server_lib` exists (i.e. a `--build_plugins` build).
-A plain build without the ext plugin still compiles rASN with just the `inproc`
+**Build wiring (reuse, not reinvent).** rASN is configured from
+`src/plugins/CMakeLists.txt` — the only rDSN build file the rASN branch modifies —
+so it is added alongside rDSN's other plugins and *before* `src/plugins_ext`. The
+rASN library, `codepilot`, `srepilot`, and `rasn.unit_tests` therefore gate the dist
+include paths, link the `dsn.dist.service.*` closure, and define
+`RASN_HAS_DIST_COORDINATION=1` on a **configure-order-independent** predicate: the
+`BUILD_PLUGINS` cache variable is `TRUE` *and* the `rDSN.dist.service` sources that
+define `dsn.dist.service.meta_server_lib` are present. An `if(TARGET ...)` probe must
+**not** be used here — it would always be false from this directory and would silently
+downgrade a `--build_plugins` build to the in-process fallback without any build error.
+The forward references in `target_link_libraries()` are fine (CMake resolves plain
+target names at generate time and derives the build-order dependency from them), but
+`add_dependencies()` on those same targets is not, because it requires them to already
+exist. A plain build without the ext plugin still compiles rASN with just the `inproc`
 fallback, so nothing regresses for lightweight checkouts.
 
 **Config.** `[rasn.coordination]` in the shared defaults:

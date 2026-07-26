@@ -80,6 +80,13 @@ void set_runtime_error(Response *response,
     response->status.retryable = retryable;
 }
 
+// A validation failure that names the wire version is a negotiation failure the
+// peer cannot fix by correcting its payload, so every ingress path must keep it
+// distinguishable from a malformed request. Sharing one classifier stops the
+// standalone and replicated dispatch paths from drifting apart.
+::dsn::rasn::rpc::runtime_error_code::type runtime_validation_error_code(
+    const std::string &error);
+
 template <typename Response>
 std::string runtime_error_message(const Response &response)
 {

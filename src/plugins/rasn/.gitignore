@@ -1,0 +1,47 @@
+# rASN-local ignore rules.
+#
+# rASN is developed as an independent project inside this repository and does not
+# modify rDSN's own files, so rASN-specific ignore rules live here instead of the
+# repository-root .gitignore.
+#
+# SCOPE LIMITATION (read before adding rules here). A nested .gitignore only
+# applies below its own directory, so nothing in this file can ignore anything at
+# the repository root. rASN's default durable-state, spilled-artifact, and JSONL
+# trace paths are all *relative to the process working directory*, so a binary
+# launched from the repository root would create an unignored `rasn/state`,
+# `rasn/artifacts`, and `rasn/traces` there. Two consequences:
+#
+#   * Launch CodePilot / SREPilot / the runtime host from their binplaced
+#     directory (builder/bin/<app>/) or from an install tree. rDSN's root
+#     .gitignore already ignores `builder/` and `install/` wholesale.
+#   * The shipped harnesses are self-contained and enforce this themselves:
+#     tests/fault_injection/run_fault_injection.sh runs every child process in
+#     its own output directory, and tests/integration/ allocates isolated
+#     config/data/log trees per scenario.
+#
+# Likewise, a custom root-level build tree (e.g. `DSN_BUILD_DIR=builder-rasn
+# ./run.sh build`, or `run.cmd build <type> <dir>` on Windows) cannot be ignored
+# from here. Either point DSN_BUILD_DIR at a subdirectory of the already ignored
+# `builder/`, or add the directory to your local .git/info/exclude.
+
+# Durable state, spilled artifacts, and JSONL traces (see docs/DESIGN.md).
+**/rasn/state/
+**/rasn/artifacts/
+**/rasn/traces/
+
+# Replicated-state development profile data directory (config.rasn.state.ini).
+**/rasn/state-cluster/
+
+# Default output tree of the opt-in fault-injection harness (RASN_FI_OUT).
+tests/fault_injection/out/
+
+# LaTeX build products of the report (docs/report/build.sh).
+docs/report/*.aux
+docs/report/*.bbl
+docs/report/*.blg
+docs/report/*.fdb_latexmk
+docs/report/*.fls
+docs/report/*.log
+docs/report/*.out
+docs/report/*.pdf
+docs/report/*.synctex.gz

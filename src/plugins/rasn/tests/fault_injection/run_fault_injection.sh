@@ -27,9 +27,19 @@
 #   RASN_BIN_DIR      directory holding the built binaries (auto-detected)
 #   RASN_FI_RUNS      runs per (target,fault) cell            [default 20]
 #   RASN_FI_TIMEOUT   per-run wall-clock timeout, seconds     [default 20]
-#   RASN_FI_OUT       output/log directory       [default ./fault_injection_out]
+#   RASN_FI_OUT       output/log directory  [default <this script's dir>/out]
 #   RASN_FI_KEEP_CORES  set to 1 to keep core dumps (default disables them so
 #                       core-dump write latency is not misreported as a hang)
+#
+# Output location: the harness is self-contained and never writes into the
+# caller's working directory. RASN_FI_OUT is resolved to an absolute path, and
+# every child process is launched with its working directory set to
+# "$RASN_FI_OUT/work" -- rASN's default durable state, spilled artifacts, and
+# JSONL trace paths are all CWD-relative, so this keeps them inside the output
+# directory instead of scattering `rasn/state`, `rasn/artifacts`, and
+# `rasn/traces` wherever the script happened to be invoked from. The default
+# output directory lives inside the rASN tree so it is covered by
+# src/plugins/rasn/.gitignore.
 #
 # Exit status: 0 if no genuine crash-class outcome was observed, 1 otherwise.
 
@@ -40,7 +50,7 @@ repo_root="$(cd "$script_dir/../../../../.." && pwd)"
 
 RUNS="${RASN_FI_RUNS:-20}"
 TIMEOUT_S="${RASN_FI_TIMEOUT:-20}"
-OUT_DIR="${RASN_FI_OUT:-./fault_injection_out}"
+OUT_DIR="${RASN_FI_OUT:-$script_dir/out}"
 KEEP_CORES="${RASN_FI_KEEP_CORES:-0}"
 CONFIRM_RETRIES="${RASN_FI_CONFIRM:-3}"
 
@@ -56,6 +66,8 @@ if [ -z "$BIN_DIR" ] || [ ! -x "$BIN_DIR/codepilot/codepilot" ]; then
     echo "       (expected e.g. \$repo/builder/bin/codepilot/codepilot)" >&2
     exit 2
 fi
+# Absolute, because every child is launched from the scratch working directory.
+BIN_DIR="$(cd "$BIN_DIR" && pwd)"
 
 if ! command -v fiu-run >/dev/null 2>&1; then
     echo "error: fiu-run not found; install libfiu (apt-get install fiu-utils libfiu-dev)" >&2
@@ -66,7 +78,15 @@ fi
 # otherwise be misreported as hangs; disable them unless explicitly requested.
 [ "$KEEP_CORES" = "1" ] || ulimit -c 0 2>/dev/null || true
 
-mkdir -p "$OUT_DIR"
+if ! mkdir -p "$OUT_DIR"; then
+    echo "error: could not create output directory: $OUT_DIR" >&2
+    exit 2
+fi
+# Resolve to an absolute path so the per-run working directory below cannot make
+# the log paths ambiguous, then create the scratch directory the children run in.
+OUT_DIR="$(cd "$OUT_DIR" && pwd)" || exit 2
+WORK_DIR="$OUT_DIR/work"
+mkdir -p "$WORK_DIR" || exit 2
 CODEPILOT="$BIN_DIR/codepilot/codepilot"
 SREPILOT="$BIN_DIR/srepilot/srepilot"
 UNIT_TESTS="$BIN_DIR/rasn.unit_tests/rasn.unit_tests"
@@ -164,7 +184,11 @@ is_hard_signal() {
 # hang detection in a one-shot CLI.
 run_one_to() {
     local to="$1"; local log="$2"; shift 2
-    timeout -s KILL "$to" "${FLAGS[@]}" "$@" >"$log" 2>&1
+    # Run in the scratch directory: rASN's default state/artifact/trace paths are
+    # CWD-relative, so this keeps every generated file inside $OUT_DIR rather
+    # than in whatever directory the harness was invoked from. $log, $BIN_DIR and
+    # the workflow path are all absolute, so the subshell cd is safe.
+    ( cd "$WORK_DIR" && timeout -s KILL "$to" "${FLAGS[@]}" "$@" >"$log" 2>&1 )
     classify $?
 }
 

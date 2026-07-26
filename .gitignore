@@ -17,24 +17,10 @@ bin/Windows/protoc.exe
 zk/
 builddbg/
 builder/
-builder-rasn/
 install/
 data/
 test_reports/
 include/thrift/
-**/rasn/state/
-**/rasn/artifacts/
-**/rasn/traces/
-
-src/plugins/rasn/docs/report/*.aux
-src/plugins/rasn/docs/report/*.bbl
-src/plugins/rasn/docs/report/*.blg
-src/plugins/rasn/docs/report/*.fdb_latexmk
-src/plugins/rasn/docs/report/*.fls
-src/plugins/rasn/docs/report/*.log
-src/plugins/rasn/docs/report/*.out
-src/plugins/rasn/docs/report/*.pdf
-src/plugins/rasn/docs/report/*.synctex.gz
 
 ext/boost_1_64_0.7z
 ext/boost_1_64_0/

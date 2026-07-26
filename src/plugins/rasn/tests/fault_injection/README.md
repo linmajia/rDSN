@@ -49,9 +49,19 @@ under test:
 ## Running
 
 ```sh
-# from the repo root, after building the plugins
+# from anywhere, after building the plugins
 src/plugins/rasn/tests/fault_injection/run_fault_injection.sh
 ```
+
+The harness is self-contained: it never writes into the caller's working
+directory. Logs go to `RASN_FI_OUT` (default:
+`src/plugins/rasn/tests/fault_injection/out/`, resolved to an absolute path),
+and every child process is launched with its working directory set to
+`$RASN_FI_OUT/work`. rASN's default durable state, spilled artifacts, and JSONL
+trace paths are all CWD-relative, so this keeps `rasn/state`, `rasn/artifacts`,
+and `rasn/traces` inside the output directory instead of scattering them across
+the repository. The default output directory is covered by
+`src/plugins/rasn/.gitignore`.
 
 Useful knobs (environment variables):
 

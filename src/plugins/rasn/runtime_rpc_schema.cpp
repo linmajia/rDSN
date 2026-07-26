@@ -183,6 +183,14 @@ bool finish_validation(const Request &request,
     return metadata;
 }
 
+::dsn::rasn::rpc::runtime_error_code::type runtime_validation_error_code(
+    const std::string &error)
+{
+    return error.find("version") != std::string::npos
+               ? ::dsn::rasn::rpc::runtime_error_code::unsupported_version
+               : ::dsn::rasn::rpc::runtime_error_code::invalid_request;
+}
+
 #define RASN_MODULE_NAME(type, name)                                                                    \
     const char *runtime_module_name(const ::dsn::rasn::rpc::type &) { return name; }
 

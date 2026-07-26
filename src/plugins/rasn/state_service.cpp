@@ -4575,6 +4575,16 @@ bool state_store::has_recovery_state(const state_checkpoint_request &request) co
 
     if (_journal_enabled)
     {
+        // Quarantine evidence means durable state exists and needs operator
+        // repair. Reporting "no recovery state" here would let startup skip
+        // recovery entirely and open the service on an empty store, silently
+        // discarding the quarantined lineage; the latched flag keeps that
+        // fail-open closed even after an operator deletes the marker file
+        // without repairing the journal.
+        if (journal_is_quarantined(false))
+        {
+            return true;
+        }
         return configured_state_recovery_available(request);
     }
     const std::string path =

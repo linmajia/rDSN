@@ -507,8 +507,16 @@ public:
             std::lock_guard<std::mutex> guard(_ownership->mu);
             auto it = _ownership->holds.find(resource_id);
             if (it != _ownership->holds.end()) {
+                // Contention must look identical to callers regardless of where the
+                // competing owner happens to live. A peer in another process reaches
+                // the lock service below and surfaces ERR_TIMEOUT, so a peer that is
+                // merely co-located in this process must report the same code; the
+                // facade contract in coordination_service.h documents ERR_TIMEOUT and
+                // the inproc provider already honors it. Leaking a provider-specific
+                // ERR_HOLD_BY_OTHERS here would make single-writer callers behave
+                // differently purely because of co-location.
                 if (it->second.owner != owner_id)
-                    return ::ERR_HOLD_BY_OTHERS;
+                    return ::dsn::ERR_TIMEOUT;
                 if (!it->second.usable)
                     return ::dsn::ERR_INVALID_STATE;
                 if (fencing_token != nullptr)

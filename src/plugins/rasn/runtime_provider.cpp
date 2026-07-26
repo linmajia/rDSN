@@ -2713,9 +2713,7 @@ private:
         std::string validation_error;
         if (!validate_runtime_request(request, &validation_error))
         {
-            const auto code = validation_error.find("version") != std::string::npos
-                                  ? ::dsn::rasn::rpc::runtime_error_code::unsupported_version
-                                  : ::dsn::rasn::rpc::runtime_error_code::invalid_request;
+            const auto code = runtime_validation_error_code(validation_error);
             return error_response<Request, Response>(request, code, validation_error);
         }
 
@@ -5207,8 +5205,10 @@ Response rasn_runtime_replica_store::dispatch_typed(const Request &request)
         if (!replicated_runtime_request_is_deterministic(request, &error))
         {
             Response response = make_runtime_response<Request, Response>(request);
-            set_runtime_error(
-                &response, ::dsn::rasn::rpc::runtime_error_code::invalid_request, error);
+            // Replicated ingress must classify a rejected mutation the same way
+            // the standalone path does: an unsupported wire version tells the
+            // peer to change build, not payload.
+            set_runtime_error(&response, runtime_validation_error_code(error), error);
             return response;
         }
         signature = replicated_runtime_request_signature(request);
@@ -7727,10 +7727,7 @@ void rasn_runtime_rpc_service::reply_module_request_typed(
     std::string validation_error;
     if (!validate_runtime_request(copy, &validation_error))
     {
-        reply_error(validation_error.find("version") != std::string::npos
-                        ? ::dsn::rasn::rpc::runtime_error_code::unsupported_version
-                        : ::dsn::rasn::rpc::runtime_error_code::invalid_request,
-                    validation_error);
+        reply_error(runtime_validation_error_code(validation_error), validation_error);
         return;
     }
 
